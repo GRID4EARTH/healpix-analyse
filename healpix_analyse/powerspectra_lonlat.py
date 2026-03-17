@@ -115,10 +115,11 @@ def powerspectra_lonlat(
     cnt_per_bin = np.bincount(bin_idx[valid], minlength=nbins)
 
     with np.errstate(invalid="ignore", divide="ignore"):
-        Pk = sum_per_bin / cnt_per_bin
+        Pk = sum_per_bin #/ cnt_per_bin
     Pk[cnt_per_bin == 0] = np.nan
 
     f_centers = 0.5 * (f_bins[1:] + f_bins[:-1])
 
-    return f_centers, Pk / (nx * ny)
+    return f_centers, Pk / (nx * ny)**2
+    
     
