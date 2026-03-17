@@ -98,8 +98,16 @@ def powerspectra_lonlat(
 
 
     ny, nx = F.shape
-    fx = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
-    fy = np.fft.fftshift(np.fft.fftfreq(ny, d=dx))
+    if ny>nx:
+        ldy=ny/nx*dx
+    else:
+        ldy=dx
+    if nx>ny:
+        ldx=nx/ny*dx
+    else:
+        ldx=dx
+    fx = np.fft.fftshift(np.fft.fftfreq(nx, d=ldx))
+    fy = np.fft.fftshift(np.fft.fftfreq(ny, d=ldy))
     fx2d, fy2d = np.meshgrid(fx, fy, indexing="xy")
     fr = np.sqrt(fx2d**2 + fy2d**2)
 
