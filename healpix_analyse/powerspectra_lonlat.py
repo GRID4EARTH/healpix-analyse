@@ -120,5 +120,5 @@ def powerspectra_lonlat(
 
     f_centers = 0.5 * (f_bins[1:] + f_bins[:-1])
 
-    return f_centers, Pk / (nx * ny),ltf.out_fft
+    return f_centers, Pk / (nx * ny)
     
