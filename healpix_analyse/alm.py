@@ -266,9 +266,15 @@ class AlmTransform:
             # Normalize
             out_fft[:,k] = tmp_fft * self.N_max / self.N_k[k]
 
+        if True:
+            import matplotlib.pyplot as plt
+            plt.imshow(np.fft.fftshift(np.abs(out_fft)), norm='log')
+            plt.colorbar(label='Power (log scale)', orientation='horizontal')
+            plt.show()
+
         # parallel 1D FFTs along latitude axis
         # TODO: NUFFT or direct Legendre analysis for the second stage, currently only FFT stage implemented
-        out_fft = np.fft.fft(out_fft) 
+        out_fft = np.fft.fft(out_fft.T) 
         #out_fft = torch.fft.nufft(out_fft, dim=1)
 
         # TODO: Legendre analysis over colatitude to get final Alm coefficients, currently only FFT stage implemented
