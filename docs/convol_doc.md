@@ -1,4 +1,4 @@
-# `HealPixConv` — Spherical convolution on HEALPix maps
+# `HealPixConv` — Gauge-equivariant spherical convolution
 
 **Module** `healpix_analyse.convol`  
 **Class** `HealPixConv(nside, in_channels, out_channels, ...)`  
@@ -6,64 +6,76 @@
 
 ---
 
-## What it does
+## Principle
 
-`HealPixConv` applies a spatial convolution to a map defined on a HEALPix sphere.
-For each pixel, it collects a local neighbourhood of **K = kernel_sz²** points
-(the pixel itself plus its up-to-8 nearest neighbours via `healpy.get_all_neighbours`),
-then mixes them with a weight tensor **W[C_in, C_out, K]**.
+`HealPixConv` is a **gauge-equivariant** spherical convolution.  The key
+idea is that the kernel is defined **once at the North Pole** as a regular
+grid of `P = kernel_sz²` points, then this grid is **rotated** to each
+target pixel by a gauge rotation matrix.  The result is that the
+convolution kernel has a consistent orientation at every pixel of the
+sphere — it is not based on HEALPix's own topology (which has no
+canonical N/E/S/W).
 
-The operation for a single output channel `o` at pixel `n` is:
+### The three stages (precomputed at construction)
+
+**A — Geometry**
+
+A `kernel_sz × kernel_sz` grid of unit vectors is placed at the North
+Pole, spaced by one HEALPix pixel size (`hp.nside2resol`).  For each
+target pixel `k` at colatitude `θ_k`, longitude `φ_k`, the full
+rotation matrix is:
 
 $$
-y_{o,n} = \text{bias}_o + \sum_{c=0}^{C_{in}-1} \sum_{k=0}^{K-1} W_{c,o,k} \cdot x_{c,\;\text{stencil}[n,k]}
+R_{\text{total}}(k, g) = R_{\text{gauge}}(\alpha_g) \cdot R_z(\phi_k) \cdot R_y(\theta_k)
 $$
 
-where `stencil[n, k]` is the index of the `k`-th neighbour of pixel `n`.
+where the gauge angle for orientation `g` is:
 
-The stencil is **precomputed once** at construction and stored as a
-`torch.long` buffer — forward passes do no HEALPix queries at all.
+$$
+\alpha_g = \alpha_{\text{base}}(k) + g \cdot \frac{\pi}{G}
+$$
 
----
+and the base angle depends on the `gauge_type`:
 
-## Stencil layout
+| `gauge_type` | `alpha_base` | Best for |
+|---|---|---|
+| `"phi"` | 0 (meridian-aligned) | Earth-observation, NWP |
+| `"cosmo"` | $2 \cdot \text{sign}(\theta - \pi/2) \cdot \phi$ | CMB, cosmology |
 
-With `kernel_sz=3` (K = 9), the stencil index `k` maps to the following
-geometrical positions:
+For `n_gauges = G > 1`, `G` evenly-spaced orientations are computed per
+pixel.  The kernel is **shared** across gauges; the G responses are
+concatenated along the channel dimension.
 
-```
-k=0  →  center pixel (always the target pixel itself)
-k=1  →  SW neighbour
-k=2  →  W  neighbour
-k=3  →  NW neighbour
-k=4  →  N  neighbour
-k=5  →  NE neighbour
-k=6  →  E  neighbour
-k=7  →  SE neighbour
-k=8  →  S  neighbour
-```
+**B — Binding**
 
-For pixels at the **boundary of a partial-sky patch** where a true
-neighbour does not exist in `cell_ids`, the missing position is silently
-replaced by the **center pixel value** (zero-padding equivalent in a
-spherical sense).
+For each rotated stencil point, `healpy.get_interp_weights` returns 4
+bilinear-interpolation neighbors and weights.  When the convolution
+covers a **partial-sky patch** (`cell_ids` given), out-of-patch neighbors
+are zeroed and the remaining weights are renormalized to sum to 1.
+Stencil points with zero total weight fall back to the center pixel.
 
-With `kernel_sz=1` (K = 1), only `k=0` exists — this is a 1×1 (channel-mixing)
-convolution with no spatial component.
+**C — Convolution**
+
+The gathered, interpolated values form a tensor `[B, C_in, K, P]`.  The
+kernel `W[G, C_in, C_out, P]` is applied via:
+
+$$
+y_{b, g \cdot C_{out} + o,\, k}
+= \text{bias}_{g \cdot C_{out}+o}
++ \sum_{c=0}^{C_{in}-1} \sum_{p=0}^{P-1} W_{g,c,o,p} \cdot x^{\text{interp}}_{b,c,k,p}
+$$
 
 ---
 
 ## Input / output shapes
 
-| Input shape | Output shape | Notes |
+| Input | Output | Notes |
 |---|---|---|
-| `[N]` | `[N]` | Only when `C_in = C_out = 1` |
-| `[N]` | `[C_out, N]` | When `C_out > 1` |
-| `[B, N]` | `[B, C_out, N]` | Single-channel batch |
-| `[B, C_in, N]` | `[B, C_out, N]` | Multi-channel batch |
+| `[N]` | `[G*C_out, N]` (or `[N]` if `G=C_out=1`) | numpy or torch |
+| `[B, N]` | `[B, G*C_out, N]` | single-channel batch |
+| `[B, C_in, N]` | `[B, G*C_out, N]` | multi-channel batch |
 
-Both **numpy arrays** and **torch tensors** are accepted and the return type
-matches the input type.
+The return type mirrors the input type (numpy → numpy, torch → torch).
 
 ---
 
@@ -71,75 +83,107 @@ matches the input type.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `nside` | `int` | — | HEALPix resolution (must be a power of 2). |
-| `in_channels` | `int` | — | Number of input feature channels `C_in`. |
-| `out_channels` | `int` | — | Number of output feature channels `C_out`. |
-| `kernel_sz` | `{1, 3}` | `3` | `1` → 1×1 conv (no spatial mixing). `3` → 9-point neighbourhood. |
-| `use_norm` | `bool` | `False` | If `True`, apply GroupNorm + ReLU after the linear mix. |
-| `cell_ids` | array-like or `None` | `None` | Pixel indices (NESTED) for partial-sky operation. `None` = full sphere. |
-| `level` | `int` or `None` | `None` | HEALPix level such that `nside = 2**level`. Required with `cell_ids`. |
-| `nest` | `bool` | `True` | NESTED ordering if `True`, RING if `False`. |
-| `device` | device or str or `None` | `None` | Torch device. Defaults to CUDA if available, else CPU. |
-| `dtype` | `torch.dtype` | `float32` | Dtype for learnable parameters. |
+| `nside` | `int` | — | HEALPix resolution (power of 2). |
+| `in_channels` | `int` | — | Input channels `C_in`. |
+| `out_channels` | `int` | — | Output channels per gauge `C_out`. Total = `G * C_out`. |
+| `kernel_sz` | `int` | `3` | Odd integer ≥ 1.  `P = kernel_sz²` stencil points. |
+| `n_gauges` | `int` | `1` | Number of gauge orientations `G`. |
+| `gauge_type` | `{"phi","cosmo"}` | `"phi"` | Gauge convention. |
+| `cell_ids` | array-like or `None` | `None` | Pixel indices (NESTED) for partial sky.  `None` = full sphere. |
+| `level` | `int` or `None` | `None` | `nside = 2**level`.  Required with `cell_ids`. |
+| `nest` | `bool` | `True` | NESTED ordering. |
+| `use_norm` | `bool` | `False` | GroupNorm + ReLU after convolution. |
+| `device` | device or `None` | auto | Torch device. |
+| `dtype` | `torch.dtype` | `float32` | Dtype for kernel parameters. |
 
 ---
 
-## Learnable parameters
+## Learnable attributes
 
 | Attribute | Shape | Description |
 |---|---|---|
-| `weight` | `[C_in, C_out, K]` | Spatial + channel mixing kernel. Initialised with Kaiming uniform. |
-| `bias` | `[C_out]` | Per-output-channel bias. Initialised to zero. |
+| `weight` | `[G, C_in, C_out, P]` | Kernel shared across pixels, applied per gauge. Initialised with Kaiming uniform. |
+| `bias` | `[G * C_out]` | Per-output-channel bias. Initialised to zero. |
+
+---
+
+## `set_kernel` method
+
+```python
+conv.set_kernel(W, bias=None, requires_grad=False)
+```
+
+Replace the learnable kernel with a fixed (or re-initialised) array.
+
+**Parameters**
+
+| | Type | Description |
+|---|---|---|
+| `W` | array-like `[C_in, C_out, P]` or `[G, C_in, C_out, P]` | Kernel values.  `[C_in, C_out, P]` is broadcast over all G gauges. |
+| `bias` | array-like `[G*C_out]` or `None` | If `None`, bias is reset to zero. |
+| `requires_grad` | `bool`, default `False` | Set to `True` to fine-tune from this initialisation. |
+
+**Returns** `self` (chainable).
+
+---
+
+## Stencil point indexing
+
+The `P = kernel_sz²` stencil positions are laid out row-major from the
+top-left of the local grid.  For `kernel_sz=3`:
+
+```
+p =  0   1   2
+     3   4   5     ← p=4 is the CENTER (kernel_sz//2 * (kernel_sz+1))
+     6   7   8
+```
+
+This indexing is used when setting fixed kernel weights manually.
 
 ---
 
 # Case 1 — Learned kernels: U-Net on the sphere
 
-This is the primary design intent of `HealPixConv`: use it as a building
-block in a learnable architecture such as a U-Net.
-
-## Architecture overview
+## Architecture
 
 ```
-Input map  [B, C_in, N]
-     │
-     ▼  HealPixConv  (encoder block 1)   nside=64
-     │  GroupNorm + ReLU
-     ▼
-[B, 32, N]
-     │
-     ▼  HealPixDown  (nside 64 → 32)
-     ▼
-[B, 32, N/4]
-     │
-     ▼  HealPixConv  (encoder block 2)   nside=32
-     │  GroupNorm + ReLU
-     ▼
-[B, 64, N/4]
-     │
-     ▼  HealPixDown  (nside 32 → 16)
-     ▼
-[B, 64, N/16]     ← bottleneck
-     │
-     ▼  HealPixUp    (nside 16 → 32)
-     ▼
-[B, 64, N/4]  +  skip connection
-     │
-     ▼  HealPixConv  (decoder block)
-     │  GroupNorm + ReLU
-     ▼
-[B, 32, N/4]
-     │
-     ▼  HealPixUp    (nside 32 → 64)
-     ▼
-[B, 32, N]
-     │
-     ▼  HealPixConv  kernel_sz=1  (output projection)
-     ▼
-Output  [B, C_out, N]
+Input [B, C_in, N]
+  │
+  ▼  HealPixConv  nside=64, 1→32 ch, use_norm=True
+  ▼
+[B, 32, N]  ─────────────────────────────────┐  skip s1
+  │                                          │
+  ▼  HealPixDown nside=64                    │
+[B, 32, N/4]                                 │
+  │                                          │
+  ▼  HealPixConv  nside=32, 32→64 ch         │
+[B, 64, N/4]  ───────────────────┐ skip s2   │
+  │                              │           │
+  ▼  HealPixDown nside=32        │           │
+[B, 64, N/16]  ← bottleneck      │           │
+  │                              │           │
+  ▼  HealPixConv  nside=16, 64→128 ch        │
+  │                              │           │
+  ▼  HealPixUp   nside=16        │           │
+[B, 128, N/4]                    │           │
+  │  cat(s2) ────────────────────┘           │
+[B, 192, N/4]                                │
+  │                                          │
+  ▼  HealPixConv  nside=32, 192→64 ch        │
+  │                                          │
+  ▼  HealPixUp   nside=32                    │
+[B, 64, N]                                   │
+  │  cat(s1) ───────────────────────────────-┘
+[B, 96, N]
+  │
+  ▼  HealPixConv  nside=64, 96→32 ch
+  │
+  ▼  HealPixConv  nside=64, 32→C_out ch, kernel_sz=1  (1×1 output head)
+  │
+Output [B, C_out, N]
 ```
 
-## Minimal U-Net example
+## Complete example
 
 ```python
 import torch
@@ -151,101 +195,78 @@ from healpix_analyse.up     import HealPixUp
 
 
 class SphereUNet(nn.Module):
-    """
-    Minimal 2-level spherical U-Net on a full HEALPix sphere.
-
-    Input : [B, C_in,  12*nside**2]
-    Output: [B, C_out, 12*nside**2]
-    """
+    """2-level spherical U-Net on the full HEALPix sphere."""
 
     def __init__(self, nside: int, in_channels: int, out_channels: int):
         super().__init__()
 
-        self.nside = nside
+        # Encoder
+        self.enc1  = HealPixConv(nside,    in_channels,  32, kernel_sz=3, use_norm=True)
+        self.down1 = HealPixDown(nside,    mode="smooth")
+        self.enc2  = HealPixConv(nside//2, 32,           64, kernel_sz=3, use_norm=True)
+        self.down2 = HealPixDown(nside//2, mode="smooth")
 
-        # ---- Encoder ----
-        self.enc1 = HealPixConv(
-            nside=nside, in_channels=in_channels, out_channels=32,
-            kernel_sz=3, use_norm=True,
-        )
-        self.down1 = HealPixDown(nside_in=nside, mode="smooth")
+        # Bottleneck
+        self.bottle = HealPixConv(nside//4, 64, 128, kernel_sz=3, use_norm=True)
 
-        self.enc2 = HealPixConv(
-            nside=nside // 2, in_channels=32, out_channels=64,
-            kernel_sz=3, use_norm=True,
-        )
-        self.down2 = HealPixDown(nside_in=nside // 2, mode="smooth")
+        # Decoder
+        self.up2   = HealPixUp(nside//4)
+        self.dec2  = HealPixConv(nside//2, 128+64, 64, kernel_sz=3, use_norm=True)
+        self.up1   = HealPixUp(nside//2)
+        self.dec1  = HealPixConv(nside,    64+32,  32, kernel_sz=3, use_norm=True)
 
-        # ---- Bottleneck ----
-        self.bottleneck = HealPixConv(
-            nside=nside // 4, in_channels=64, out_channels=128,
-            kernel_sz=3, use_norm=True,
-        )
+        # Output head: 1×1 convolution = channel projection, no spatial mixing
+        self.head  = HealPixConv(nside, 32, out_channels, kernel_sz=1)
 
-        # ---- Decoder ----
-        self.up2   = HealPixUp(nside_in=nside // 4)
-        # After upsampling, concatenate with skip → 128 + 64 = 192 channels
-        self.dec2  = HealPixConv(
-            nside=nside // 2, in_channels=192, out_channels=64,
-            kernel_sz=3, use_norm=True,
-        )
+    def forward(self, x):
+        # Encoder
+        s1 = self.enc1(x)                      # [B, 32, N]
+        x2, _ = self.down1(s1)                 # [B, 32, N/4]
+        s2 = self.enc2(x2)                     # [B, 64, N/4]
+        x3, _ = self.down2(s2)                 # [B, 64, N/16]
 
-        self.up1   = HealPixUp(nside_in=nside // 2)
-        # After upsampling, concatenate with skip → 64 + 32 = 96 channels
-        self.dec1  = HealPixConv(
-            nside=nside, in_channels=96, out_channels=32,
-            kernel_sz=3, use_norm=True,
-        )
+        # Bottleneck
+        xb = self.bottle(x3)                   # [B, 128, N/16]
 
-        # ---- Output head (1×1 conv = channel projection) ----
-        self.head = HealPixConv(
-            nside=nside, in_channels=32, out_channels=out_channels,
-            kernel_sz=1, use_norm=False,
-        )
+        # Decoder with skip connections
+        xu2, _ = self.up2(xb)                  # [B, 128, N/4]
+        xd2 = self.dec2(torch.cat([xu2, s2], dim=1))   # [B, 64, N/4]
+        xu1, _ = self.up1(xd2)                 # [B, 64, N]
+        xd1 = self.dec1(torch.cat([xu1, s1], dim=1))   # [B, 32, N]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x : [B, C_in, N]
-        returns : [B, C_out, N]
-        """
-        # ---- Encoder ----
-        s1 = self.enc1(x)                           # [B, 32, N]
-        x2, _ = self.down1(s1)                      # [B, 32, N/4]
-
-        s2 = self.enc2(x2)                          # [B, 64, N/4]
-        x3, _ = self.down2(s2)                      # [B, 64, N/16]
-
-        # ---- Bottleneck ----
-        xb = self.bottleneck(x3)                    # [B, 128, N/16]
-
-        # ---- Decoder ----
-        xu2, _ = self.up2(xb)                       # [B, 128, N/4]
-        xu2 = torch.cat([xu2, s2], dim=1)           # [B, 192, N/4]
-        xd2 = self.dec2(xu2)                        # [B, 64, N/4]
-
-        xu1, _ = self.up1(xd2)                      # [B, 64, N]
-        xu1 = torch.cat([xu1, s1], dim=1)           # [B, 96, N]
-        xd1 = self.dec1(xu1)                        # [B, 32, N]
-
-        return self.head(xd1)                       # [B, C_out, N]
+        return self.head(xd1)                  # [B, out_channels, N]
 
 
-# ---------- instantiate and run ----------
+# ---- instantiate ----
 nside = 64
-B, C_in, C_out = 4, 2, 1
-
-model = SphereUNet(nside=nside, in_channels=C_in, out_channels=C_out)
+model = SphereUNet(nside=nside, in_channels=2, out_channels=1)
 
 N = 12 * nside**2
-x = torch.randn(B, C_in, N)
+x = torch.randn(4, 2, N)
 y = model(x)
-
-print(f"Input  shape: {tuple(x.shape)}")   # (4, 2, 49152)
-print(f"Output shape: {tuple(y.shape)}")   # (4, 1, 49152)
-print(f"Trainable params: {sum(p.numel() for p in model.parameters()):,}")
+print(f"Input  {tuple(x.shape)}")   # (4, 2, 49152)
+print(f"Output {tuple(y.shape)}")   # (4, 1, 49152)
+print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 ```
 
-## Training loop sketch
+## Multi-gauge variant
+
+Setting `n_gauges=G` produces G rotated copies of the same kernel,
+concatenated as additional output channels.  This is useful to build
+rotation-equivariant features.
+
+```python
+# 4 gauges: 0°, 45°, 90°, 135° rotations of the same 3×3 kernel
+conv_g4 = HealPixConv(
+    nside=64, in_channels=2, out_channels=8,
+    kernel_sz=3, n_gauges=4, use_norm=True,
+)
+x = torch.randn(4, 2, 12 * 64**2)
+y = conv_g4(x)
+print(y.shape)    # (4, 32, 49152)  — G * C_out = 4 * 8
+```
+
+## Training loop
 
 ```python
 import torch.optim as optim
@@ -253,323 +274,273 @@ import torch.optim as optim
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
 criterion = nn.MSELoss()
 
-for epoch in range(100):
+for epoch in range(200):
     optimizer.zero_grad()
-
-    # x_batch: [B, C_in, N],   y_true: [B, C_out, N]
-    y_pred = model(x_batch)
-    loss   = criterion(y_pred, y_true)
+    pred = model(x_batch)        # [B, C_out, N]
+    loss = criterion(pred, y_true)
     loss.backward()
     optimizer.step()
-
-    if epoch % 10 == 0:
-        print(f"epoch {epoch:3d}  loss={loss.item():.4f}")
+    if epoch % 20 == 0:
+        print(f"epoch {epoch:3d}   loss={loss.item():.5f}")
 ```
 
-## Freezing or inspecting learned kernels
+## Inspecting learned kernels
 
-After training, the learned spatial weights are accessible as standard
-`nn.Parameter` tensors:
+After training, kernel weights are standard `nn.Parameter` tensors.
 
 ```python
-# Shape: [C_in, C_out, K=9]
-W = model.enc1.weight.detach().cpu().numpy()
+# weight shape: [G, C_in, C_out, P]
+W = model.enc1.weight.detach().cpu().numpy()   # [1, 1, 32, 9]
 
-# Weight for input channel 0, output channel 3, all 9 stencil positions:
-print(W[0, 3, :])
-# [center, SW, W, NW, N, NE, E, SE, S]
+# For gauge 0, input ch 0, output ch 3: show the 9 spatial weights
+print(W[0, 0, 3, :])
+# [ p0  p1  p2 ]
+# [ p3  p4  p5 ]    ← p4 is the center
+# [ p6  p7  p8 ]
 ```
 
 ---
 
-# Case 2 — Manual kernels: hand-crafted spherical filters
+# Case 2 — Fixed kernels: hand-crafted spherical filters
 
-`HealPixConv` can also be used as a **fixed filter** by assigning weights
-directly into `self.weight` and `self.bias` after construction, then setting
-`requires_grad=False`.  This is useful for:
+`HealPixConv` doubles as a **fixed spatial filter** by calling
+`conv.set_kernel(W)` after construction.  The kernel is then frozen
+(`requires_grad=False` by default) and no longer updated during training.
 
-- classical image processing (smoothing, edge detection, gradient estimation),
-- physics-motivated priors (isotropic Laplacian, directional derivatives),
-- analysis: computing local statistics or spatial correlations.
+This is useful for:
+- classical filtering (smoothing, sharpening, edge detection),
+- physics-motivated priors (Laplacian, gradient, divergence),
+- analysis pipelines that compute local statistics.
 
-## The kernel layout
+## Stencil point reference
 
-The weight tensor has shape **`[C_in, C_out, K]`** with `K = 9` for
-`kernel_sz=3`.  The index `k` maps to a fixed geometrical direction:
+For `kernel_sz=3`, `P=9`:
 
 ```
-k : 0=center, 1=SW, 2=W, 3=NW, 4=N, 5=NE, 6=E, 7=SE, 8=S
+p =  0   1   2
+     3   4   5     p=4 is the CENTER
+     6   7   8
 ```
 
-Because HEALPix pixels have the same area but are *not* arranged on a
-regular Cartesian grid, "N/S/E/W" here means the direction reported by
-`healpy.get_all_neighbours`, which is approximate.  For most filtering
-applications this is sufficient; for precision directional derivatives
-the `SphericalStencil` class (in the Healpix_UNET package) provides
-gauge-aware rotated stencils.
-
-## Helper: freeze weights
-
-```python
-def set_fixed_kernel(conv: HealPixConv,
-                     W: np.ndarray,
-                     bias: np.ndarray | None = None) -> HealPixConv:
-    """
-    Replace conv.weight (and optionally conv.bias) with fixed numpy arrays.
-
-    Parameters
-    ----------
-    conv  : HealPixConv  (already constructed)
-    W     : np.ndarray, shape [C_in, C_out, K]
-    bias  : np.ndarray, shape [C_out], optional (default: zeros)
-
-    Returns
-    -------
-    conv  : the same object with frozen weights
-    """
-    with torch.no_grad():
-        conv.weight.copy_(
-            torch.as_tensor(W, dtype=conv.dtype, device=conv.device)
-        )
-        if bias is not None:
-            conv.bias.copy_(
-                torch.as_tensor(bias, dtype=conv.dtype, device=conv.device)
-            )
-        else:
-            conv.bias.zero_()
-
-    conv.weight.requires_grad_(False)
-    conv.bias.requires_grad_(False)
-    return conv
-```
+> **Important**: the geometric meaning of `p=0..8` depends on the gauge.
+> With `gauge_type="phi"` and the default North-Pole grid, the layout
+> is approximately:
+>
+> ```
+>  NW   N   NE
+>   W  ctr   E
+>  SW   S   SE
+> ```
+>
+> but this orientation rotates smoothly across the sphere following the
+> meridian.  For a cosmological survey use `gauge_type="cosmo"`.
 
 ## Example A — Isotropic Gaussian smoothing
 
-Average the 9-point stencil with a Gaussian profile.  The center pixel
-carries the most weight; the 8 neighbours are weighted equally (they are
-all approximately at the same angular distance from the center for a
-regular HEALPix ring).
-
 ```python
 import numpy as np
-import torch
 from healpix_analyse.convol import HealPixConv
 
 nside = 64
-N     = 12 * nside**2
+conv = HealPixConv(nside=nside, in_channels=1, out_channels=1, kernel_sz=3)
 
-conv_smooth = HealPixConv(
-    nside=nside, in_channels=1, out_channels=1,
-    kernel_sz=3, use_norm=False,
-)
-
-# k=0: center weight, k=1..8: ring weight
-sigma   = 1.0   # in units of "pixel radii"
-w_center = np.exp(-0.0 / (2 * sigma**2))   # distance 0 → weight 1
-w_ring   = np.exp(-1.0 / (2 * sigma**2))   # distance ~1 pixel
+# 9-point Gaussian: center gets more weight than the 8 neighbours
+sigma     = 1.0   # in pixel-size units
+w_center  = np.exp(-0.0 / (2 * sigma**2))   # distance 0
+w_ring    = np.exp(-1.0 / (2 * sigma**2))   # distance ~1 pixel
 
 W = np.zeros((1, 1, 9), dtype=np.float32)
-W[0, 0, 0] = w_center
-W[0, 0, 1:] = w_ring
-W /= W.sum()   # normalise: output is a weighted mean
+W[0, 0, 4]  = w_center          # center (p=4)
+W[0, 0, [0,1,2,3,5,6,7,8]] = w_ring   # 8 neighbours
+W /= W.sum()                     # normalise so output = weighted mean
 
-set_fixed_kernel(conv_smooth, W)
+conv.set_kernel(W)
 
-# Apply to a HEALPix map
-import healpy as hp
-sky = np.random.randn(N).astype(np.float32)
-sky_smooth = conv_smooth(sky)    # returns np.ndarray [N] because C_in=C_out=1
-print(sky_smooth.shape)          # (49152,)
+import numpy as np
+sky = np.random.randn(12 * nside**2).astype(np.float32)
+sky_smooth = conv(sky)     # returns np.ndarray [N]
+print(sky_smooth.shape)    # (49152,)
 ```
 
-## Example B — Discrete Laplacian (edge detection / sharpening)
+## Example B — Discrete Laplacian (edge detection)
 
-The discrete Laplacian on a 2-D grid is:
-
-```
- 0  -1   0
--1  +4  -1        (standard 4-neighbour)
- 0  -1   0
-```
-
-On the 9-point HEALPix stencil we use all 8 neighbours with equal weight:
-
-```
-center weight: +8
-ring weight  : -1   (for each of the 8 neighbours)
-→ result ≈ Laplacian × pixel_area
-```
+With the isotropic 9-point stencil, the discrete Laplacian weights the
+8 neighbours equally with -1 and the center with +8:
 
 ```python
-conv_laplacian = HealPixConv(
-    nside=nside, in_channels=1, out_channels=1,
-    kernel_sz=3, use_norm=False,
-)
+conv_lap = HealPixConv(nside=nside, in_channels=1, out_channels=1, kernel_sz=3)
 
 W_lap = np.zeros((1, 1, 9), dtype=np.float32)
-W_lap[0, 0, 0]  =  8.0   # center
-W_lap[0, 0, 1:] = -1.0   # 8 neighbours
+W_lap[0, 0, 4]  =  8.0    # center
+W_lap[0, 0, [0,1,2,3,5,6,7,8]] = -1.0   # neighbours
 
-set_fixed_kernel(conv_laplacian, W_lap)
+conv_lap.set_kernel(W_lap)
 
-edges = conv_laplacian(sky)   # highlights structures
+edges = conv_lap(sky)      # highlights spatial gradients
 ```
 
-## Example C — Directional gradient (N–S and E–W)
+## Example C — Approximate directional gradients
 
-Two output channels: one for the approximate North–South derivative,
-one for East–West.
+Using `gauge_type="phi"` with `kernel_sz=3`, stencil points approximate:
 
 ```
-N–S gradient:  W[0, 0, k] = +1 for k=4 (N),  -1 for k=8 (S), 0 elsewhere
-E–W gradient:  W[0, 1, k] = +1 for k=6 (E),  -1 for k=2 (W), 0 elsewhere
+p : 0=NW  1=N  2=NE
+    3=W    4=ctr  5=E
+    6=SW  7=S  8=SE
 ```
 
 ```python
 conv_grad = HealPixConv(
     nside=nside, in_channels=1, out_channels=2,
-    kernel_sz=3, use_norm=False,
+    kernel_sz=3, gauge_type="phi",
 )
 
 W_grad = np.zeros((1, 2, 9), dtype=np.float32)
-# Channel 0: N–S  (k=4 North, k=8 South)
-W_grad[0, 0, 4] = +1.0
-W_grad[0, 0, 8] = -1.0
-# Channel 1: E–W  (k=6 East, k=2 West)
-W_grad[0, 1, 6] = +1.0
-W_grad[0, 1, 2] = -1.0
+# Output channel 0: approximate N–S gradient  (N minus S)
+W_grad[0, 0, 1] = +1.0   # N
+W_grad[0, 0, 7] = -1.0   # S
+# Output channel 1: approximate E–W gradient  (E minus W)
+W_grad[0, 1, 5] = +1.0   # E
+W_grad[0, 1, 3] = -1.0   # W
 
-set_fixed_kernel(conv_grad, W_grad)
+conv_grad.set_kernel(W_grad)
 
-# sky: [N]  →  grad: [2, N]
+# sky [N] → grad [2, N]
 grad = conv_grad(sky)
-grad_NS = grad[0]   # dsky/d(lat)
-grad_EW = grad[1]   # dsky/d(lon)
+grad_NS = grad[0]   # dT/dlat
+grad_EW = grad[1]   # dT/dlon
 ```
 
 ## Example D — Multi-channel co-convolution
 
-Apply several fixed filters simultaneously to a multi-channel input.
-For instance, compute both the mean and the Laplacian of each channel
-in a single pass using `in_channels=C`, `out_channels=2*C`.
+Apply several fixed filters in one pass to a multi-channel input.
 
 ```python
-C = 4   # number of physical channels (e.g. T, U, V, Q)
+C = 4   # e.g. T, U, V, Q
 
 conv_multi = HealPixConv(
     nside=nside, in_channels=C, out_channels=2 * C,
-    kernel_sz=3, use_norm=False,
+    kernel_sz=3,
 )
 
-# W shape: [C_in=4, C_out=8, K=9]
-W_multi = np.zeros((C, 2 * C, 9), dtype=np.float32)
+# W shape: [G=1, C_in=4, C_out=8, P=9]
+W_multi = np.zeros((1, C, 2 * C, 9), dtype=np.float32)
 
 for c in range(C):
     # First C output channels: Gaussian smoothing of input channel c
-    W_multi[c, c, 0]  = w_center
-    W_multi[c, c, 1:] = w_ring
-    W_multi[c, c, :]  /= W_multi[c, c, :].sum()
+    W_multi[0, c, c, 4]  = w_center          # center
+    W_multi[0, c, c, [0,1,2,3,5,6,7,8]] = w_ring
+    W_multi[0, c, c, :]  /= W_multi[0, c, c, :].sum()
 
     # Next C output channels: Laplacian of input channel c
-    W_multi[c, c + C, 0]  =  8.0
-    W_multi[c, c + C, 1:] = -1.0
+    W_multi[0, c, c + C, 4]  =  8.0
+    W_multi[0, c, c + C, [0,1,2,3,5,6,7,8]] = -1.0
 
-set_fixed_kernel(conv_multi, W_multi)
+conv_multi.set_kernel(W_multi)
 
-# sky_batch: [B, C, N]  →  result: [B, 2*C, N]
-sky_batch = np.random.randn(8, C, N).astype(np.float32)
-result    = conv_multi(sky_batch)
-print(result.shape)   # (8, 8, N)
+# [B, 4, N] → [B, 8, N]
+maps = np.random.randn(8, C, 12 * nside**2).astype(np.float32)
+result = conv_multi(maps)
+print(result.shape)           # (8, 8, 49152)
 
-smooth   = result[:, :C,  :]   # smoothed channels
-laplace  = result[:, C:,  :]   # Laplacian channels
+smooth  = result[:, :C,  :]  # smoothed channels
+laplace = result[:, C:,  :]  # Laplacian channels
 ```
 
-## Example E — Partial-sky co-convolution
+## Example E — Partial-sky patch
 
-All of the above work identically on a sky patch.  The only change is
-passing `cell_ids` and `level` at construction.
+Everything above works identically on a sky patch.
 
 ```python
 import healpy as hp
 
-nside  = 128
-level  = 7   # nside = 2**7
+nside = 128
+level = 7       # nside = 2**7 = 128
 
-# Disc of radius 15° around the Galactic centre
-vec    = hp.ang2vec(np.pi / 2, 0.0)
-patch  = hp.query_disc(nside, vec, np.radians(15.0), nest=True)
+# 15° disc around the Galactic centre
+vec   = hp.ang2vec(np.pi / 2, 0.0)
+patch = hp.query_disc(nside, vec, np.radians(15.0), nest=True)
 
 conv_patch = HealPixConv(
     nside=nside, in_channels=1, out_channels=1,
-    kernel_sz=3, use_norm=False,
-    cell_ids=patch, level=level,
+    kernel_sz=3, cell_ids=patch, level=level,
 )
 
-# Gaussian smoothing on the patch only
-set_fixed_kernel(conv_patch, W)   # same W as Example A, shape [1,1,9]
+# Gaussian smoothing, fixed
+conv_patch.set_kernel(W)    # same W as Example A
 
 sky_patch = np.random.randn(len(patch)).astype(np.float32)
-sky_patch_smooth = conv_patch(sky_patch)
-print(sky_patch_smooth.shape)   # (len(patch),)
+sky_smooth = conv_patch(sky_patch)
+print(sky_smooth.shape)     # (len(patch),)
 ```
 
----
+## Example F — Combining fixed pre-processing with learned features
 
-## Combining learned and fixed filters
-
-A common pattern is to use a fixed pre-processing filter (e.g. smoothing
-or gradient) followed by a learned block.  Because both are `nn.Module`
-instances they compose naturally:
+A fixed gradient filter followed by a learned block:
 
 ```python
-class PhysicsInformedBlock(nn.Module):
+class PhysicsGradientBlock(nn.Module):
     """
-    Fixed gradient estimator  →  learned feature extractor.
+    Fixed gauge-equivariant gradient → learned channel extractor.
     """
 
     def __init__(self, nside: int, out_channels: int):
         super().__init__()
 
-        # Fixed: compute 2 gradient channels from 1 input channel
+        # Fixed: 1 input → 2 gradient channels (N-S and E-W)
         self.grad = HealPixConv(nside=nside, in_channels=1, out_channels=2,
-                                kernel_sz=3)
-        set_fixed_kernel(self.grad, W_grad)   # from Example C
+                                kernel_sz=3, gauge_type="phi")
+        self.grad.set_kernel(W_grad)      # from Example C, requires_grad=False
 
-        # Learned: extract features from the 2 gradient channels
+        # Learned: 2 gradient channels → learned features
         self.feat = HealPixConv(nside=nside, in_channels=2, out_channels=out_channels,
                                 kernel_sz=3, use_norm=True)
 
     def forward(self, x):
-        # x: [B, 1, N]  or  [B, N]  or  [N]
-        g = self.grad(x)     # [B, 2, N]
-        return self.feat(g)  # [B, out_channels, N]
+        g = self.grad(x)     # [B, 2, N]  fixed, no gradient
+        return self.feat(g)  # [B, out_channels, N]  learned
 
 
-block = PhysicsInformedBlock(nside=64, out_channels=16)
+block = PhysicsGradientBlock(nside=64, out_channels=16)
 y = block(torch.randn(4, 1, 12 * 64**2))
 print(y.shape)   # (4, 16, 49152)
+
+# Only the learned part has parameters:
+trainable = sum(p.numel() for p in block.parameters() if p.requires_grad)
+print(f"Trainable params: {trainable:,}")
 ```
 
 ---
 
-## Stencil index reference
+## Multi-gauge fixed filters
 
-| `k` | Direction | Notes |
-|-----|-----------|-------|
-| 0 | **center** | The target pixel itself. Always present. |
-| 1 | SW | May fall back to center at patch boundaries. |
-| 2 | W  | |
-| 3 | NW | |
-| 4 | **N** | Use for N–S gradient (positive = northward). |
-| 5 | NE | |
-| 6 | **E** | Use for E–W gradient (positive = eastward). |
-| 7 | SE | |
-| 8 | **S** | |
+With `n_gauges=G`, `set_kernel` accepts shape `[C_in, C_out, P]` (same kernel
+broadcast to all gauges) or `[G, C_in, C_out, P]` (different kernel per gauge).
 
-> The exact geometric meaning of "N/S/E/W" depends on the local
-> HEALPix tile orientation.  For the full sphere with NESTED ordering,
-> the correspondence is consistent within each of the 12 base pixels
-> but rotates between them.  For filtering and smoothing applications
-> this has no practical impact; for precision directional derivatives
-> use gauge-corrected stencils from `SphericalStencil`.
+```python
+# Two-gauge Laplacian: isotropic (g=0) and rotated-45° (g=1)
+conv_2g = HealPixConv(nside=64, in_channels=1, out_channels=1, n_gauges=2)
+
+W_2g = np.zeros((2, 1, 1, 9), dtype=np.float32)
+# Both gauges: same isotropic Laplacian (rotation-invariant)
+for g in range(2):
+    W_2g[g, 0, 0, 4]  =  8.0
+    W_2g[g, 0, 0, [0,1,2,3,5,6,7,8]] = -1.0
+
+conv_2g.set_kernel(W_2g)
+
+y = conv_2g(sky)
+print(y.shape)   # (2, 49152)  — G * C_out = 2 * 1
+```
+
+---
+
+## Summary: kernel shape reference
+
+| `n_gauges` | `set_kernel(W)` shape | Meaning |
+|---|---|---|
+| 1 | `[C_in, C_out, P]` | Single gauge, broadcast. |
+| G | `[C_in, C_out, P]` | Same kernel, broadcast to all G gauges. |
+| G | `[G, C_in, C_out, P]` | Different kernel per gauge. |
+
+The `weight` parameter always has shape `[G, C_in, C_out, P]` internally.
