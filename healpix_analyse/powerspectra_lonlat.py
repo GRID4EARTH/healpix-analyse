@@ -24,6 +24,7 @@ def powerspectra_lonlat(
     dx: float = 1.0,
     cross: Optional[ArrayLike] = None,
     ellipsoid: str = "sphere",
+    plot_2D_fft=False,
     weights: np.ndarray = None
 ):
     """
@@ -87,6 +88,10 @@ def powerspectra_lonlat(
 
     F = np.fft.fftshift(ltf.fft(data))
 
+    
+    del ltf
+
+            
     if cross is not None:
         cross = np.asarray(cross)
         if cross.shape != data.shape:
@@ -96,6 +101,12 @@ def powerspectra_lonlat(
     else:
         P2D = np.abs(F) ** 2
 
+    if plot_2D_fft:
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.imshow(np.fft.fftshift(P2D), norm='log')
+        plt.colorbar(label='Power (log scale)', orientation='horizontal')
+        plt.show()
 
     ny, nx = F.shape
     ldy=dx
