@@ -40,22 +40,22 @@ def powerspectra(cell_ids,
         if ltf is None:
             assert ltf is None, "If data is provided,ltf should not be provided."
             ltf = AlmTransform(cell_ids, level, ellipsoid=ellipsoid, method=method, indexing_scheme=indexing_scheme)
-            F = np.fft.fftshift(ltf.fft(data))
+            F = torch.fft.fftshift(ltf.fft(data))
         else:
             assert data is None, "If ltf is provided, data should be None (ltf already contains the data)."
             assert cross is None
-            F = np.fft.fftshift(ltf)
+            F = torch.fft.fftshift(ltf)
 
         if cross is not None:
-            F2 = np.fft.fftshift(ltf.fft(cross))
-            P2D = (F*np.conjugate(F2)).real
+            F2 = torch.fft.fftshift(ltf.fft(cross))
+            P2D = (F*torch.conj(F2)).real
         else:
-            P2D = np.abs(F) ** 2
+            P2D = torch.abs(F) ** 2
         del ltf
 
         if plot_2D_fft:
             import matplotlib.pyplot as plt
-            plt.imshow(np.fft.fftshift(P2D), norm='log')
+            plt.imshow(torch.fft.fftshift(P2D).detach().cpu(), norm='log')
             plt.colorbar(label='Power (log scale)', orientation='horizontal')
             plt.show()
     
@@ -72,7 +72,7 @@ def powerspectra(cell_ids,
     
         # Vectorized bin average of P2D over annuli
         fr_flat = fr.ravel()
-        P_flat = P2D.ravel()
+        P_flat = P2D.detach().cpu().ravel()
         bin_idx = np.digitize(fr_flat, f_bins) - 1  # -> [0, nbins-1]
         valid = (bin_idx >= 0) & (bin_idx < nbins)
     

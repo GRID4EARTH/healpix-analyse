@@ -156,16 +156,29 @@ class AlmTransform:
             raise ValueError("dtype must be torch.float32 or torch.float64")
 
         self.cell_ids = self._as_long_tensor(cell_ids, device=self.device)
-        self.size = int(self.cell_ids.numel())
-        
+        self.n_lat, self.n_lon = self.cell_ids.shape
 
         if self.indexing_scheme == "2D_array":
-            self.lons_of_western_edge, _ = self._as_real_tensor(healpix_geo.ring.healpix_to_lonlat(cell_ids[:,0], level, ellipsoid=ellipsoid))
+            self.lons_of_western_edge, _ = healpix_geo.ring.healpix_to_lonlat(cell_ids[:,0], level, ellipsoid=ellipsoid)
+            self.lons_of_western_edge = self._as_real_tensor(self.lons_of_western_edge, device=self.device, dtype=self.dtype)
+
             #lon, lat = healpix_geo.ring.healpix_to_lonlat(self.cell_ids.flatten(), level, ellipsoid=ellipsoid)
             #self.idx_ordering = lon.argsort() # TODO: optimize knowing that it is already sorted
         else:
             raise NotImplementedError("For now, indexing_scheme must be '2D_array'")
         
+
+        # TODO: make more robust computaion because of possible wrap-around at the 0/360 boundary, currently assumes no wrap-around and that lons are sorted in ascending order
+        lon_range = healpix_geo.ring.healpix_to_lonlat(cell_ids[0,-1], level, ellipsoid=ellipsoid)[0]
+        lon_range -= healpix_geo.ring.healpix_to_lonlat(cell_ids[0,0], level, ellipsoid=ellipsoid)[0]
+        lon_range = lon_range[0]
+        print("lon_range", lon_range)
+        print("self.n_lon", self.n_lon)
+        print("self.lons_of_western_edge - self.lons_of_western_edge.min()", self.lons_of_western_edge - self.lons_of_western_edge.min())
+        pixel_shift = self.n_lon * (self.lons_of_western_edge - self.lons_of_western_edge.min()) / lon_range  # convert from longitude shift to pixel shift
+        print("pixel_shift", pixel_shift)
+        self.phase_shift = self.compute_phase_shift(-pixel_shift)
+
         # TODO: optimize knowing that it is already sorted
         #theta_uniq, idx_ring = np.unique(lat[self.idx_ordering], return_inverse=True)
     
@@ -180,36 +193,50 @@ class AlmTransform:
     # Public API
     # ------------------------------------------------------------------
 
-    def shift_from_fft_phase(self, fft_tensor, x0, dx=1.0, dim=-1):
+    def compute_phase_shift(self, x0, dim=-1):
         """
         Applique un décalage spatial x0 à un signal via sa FFT déjà calculée.
 
         Parameters
         ----------
-        fft_tensor : torch.Tensor
-            FFT déjà calculée (complexe).
         x0 : float or torch.Tensor
             Décalage à appliquer dans l'espace réel.
             Convention: f(x - x0) <-> F(k) * exp(-i 2π k x0)
-        dx : float
-            Pas d'échantillonnage dans l'espace réel.
         dim : int
             Dimension correspondant à la FFT 1D.
 
         Returns
         -------
         torch.Tensor
-            FFT modifiée par la rampe de phase.
+            Facteur de phase.
         """
-        n = fft_tensor.shape[dim]
+        assert dim == -1
 
         # fréquences en cycles / unité de x
-        k = torch.fft.fftfreq(n, d=dx, device=fft_tensor.device, dtype=fft_tensor.real.dtype)
+        f = torch.fft.fftfreq(self.n_lon, device=self.device, dtype=self.dtype)
+
+        if True:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(16,8))
+            plt.imshow((f[None, :] * x0[:, None]).cpu()[:20, :], cmap='bwr')
+            plt.colorbar(orientation='horizontal')
+            plt.tight_layout()
+            plt.show()
 
         # facteur de phase
-        phase = torch.exp(-2j * torch.pi * k[None, :] * x0[:, None])
+        phase = torch.exp(2j * torch.pi * f[None, :] * x0[:, None])
 
-        return fft_tensor * phase
+        if False:
+            print(phase)
+            import matplotlib.pyplot as plt
+            plt.imshow(phase.real.cpu())
+            plt.colorbar()
+            plt.show()
+
+            plt.plot(phase.real.cpu()[:,180])
+            plt.show()
+
+        return phase
         
     def fft(
         self,
@@ -223,15 +250,28 @@ class AlmTransform:
         
         # 1D FFTs along longitudes, in parallel over latitude rings
         # TODO: implement rfft
-        out_fft = torch.fft.fft(torch.as_tensor(data), dim=-1)
+        out_fft = torch.fft.fft(self._as_real_tensor(data, device=self.device, dtype=self.dtype), dim=-1)
+
+
+        if True:
+            import matplotlib.pyplot as plt
+            plt.plot(out_fft[:,130].real.cpu())
+            plt.plot(out_fft[:,130].imag.cpu())
+            plt.show()
 
         # Apply phase shift to align with the original longitude
-        out_fft = self.shift_from_fft_phase(out_fft, self.lons_of_western_edge)
+        out_fft = out_fft *self.phase_shift
         # TODO: raise Warning if phase shift is large
 
         if True:
             import matplotlib.pyplot as plt
-            plt.imshow(np.fft.fftshift(np.abs(out_fft)), norm='log')
+            plt.plot(out_fft[:,130].real.cpu())
+            plt.plot(out_fft[:,130].imag.cpu())
+            plt.show()
+
+        if True:
+            import matplotlib.pyplot as plt
+            plt.imshow(np.fft.fftshift(np.abs(out_fft.detach().cpu())), norm='log')
             plt.colorbar(label='Power (log scale)', orientation='horizontal')
             plt.show()
 
