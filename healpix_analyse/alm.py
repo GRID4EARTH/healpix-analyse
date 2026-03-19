@@ -176,8 +176,11 @@ class AlmTransform:
         print("self.n_lon", self.n_lon)
         print("self.lons_of_western_edge - self.lons_of_western_edge.min()", self.lons_of_western_edge - self.lons_of_western_edge.min())
         pixel_shift = self.n_lon * (self.lons_of_western_edge - self.lons_of_western_edge.min()) / lon_range  # convert from longitude shift to pixel shift
-        print("pixel_shift", pixel_shift)
-        self.phase_shift = self.compute_phase_shift(-pixel_shift)
+        self.pixel_shift = pixel_shift
+        self.pixel_shift = torch.zeros_like(self.pixel_shift)  # TODO: remove after testing, currently set to zero for testing purposes
+        self.pixel_shift[1::2] = .5
+        print("pixel_shift", self.pixel_shift)
+        self.phase_shift = self.compute_phase_shift(-self.pixel_shift)
 
         # TODO: optimize knowing that it is already sorted
         #theta_uniq, idx_ring = np.unique(lat[self.idx_ordering], return_inverse=True)
@@ -240,10 +243,20 @@ class AlmTransform:
         
     def fft(
         self,
-        data: ArrayLike,
+        data_: ArrayLike,
         pbc: bool = True,
     ) -> ArrayLike:
-        
+        data_ = self._as_real_tensor(data_, device=self.device, dtype=self.dtype)
+
+        assert (self.pixel_shift >= 0).all() # assumes Eastern deviation only to be corrected 
+
+        #data_shifted = torch.cat([data_[:,1:], data_[:,-1][:,None]], dim=1)  # shift data by one pixel to the right and pad by replicating the last pixel on the right
+        data_shifted = torch.cat([data_[:,0][:,None], data_[:,:-1]], dim=1)  # shift data by one pixel to the right and pad by replicating the last pixel on the right
+
+        data = (1-self.pixel_shift[:,None]) * data_ + self.pixel_shift[:,None] * data_shifted
+        print("data input", data_)
+        print("data corrected", data)
+
         # TODO: implement non PBC handling
         if pbc != True:
             raise NotImplementedError("Non-periodic boundary conditions are not yet implemented.")
@@ -260,7 +273,7 @@ class AlmTransform:
             plt.show()
 
         # Apply phase shift to align with the original longitude
-        out_fft = out_fft *self.phase_shift
+        #out_fft = out_fft * self.phase_shift
         # TODO: raise Warning if phase shift is large
 
         if True:
