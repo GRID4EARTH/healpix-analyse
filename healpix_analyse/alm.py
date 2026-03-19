@@ -177,8 +177,8 @@ class AlmTransform:
         print("self.lons_of_western_edge - self.lons_of_western_edge.min()", self.lons_of_western_edge - self.lons_of_western_edge.min())
         pixel_shift = self.n_lon * (self.lons_of_western_edge - self.lons_of_western_edge.min()) / lon_range  # convert from longitude shift to pixel shift
         self.pixel_shift = pixel_shift
-        self.pixel_shift = torch.zeros_like(self.pixel_shift)  # TODO: remove after testing, currently set to zero for testing purposes
-        self.pixel_shift[1::2] = .5
+        #self.pixel_shift = torch.zeros_like(self.pixel_shift)  # TODO: remove after testing, currently set to zero for testing purposes
+        #self.pixel_shift[1::2] = .5
         print("pixel_shift", self.pixel_shift)
         self.phase_shift = self.compute_phase_shift(-self.pixel_shift)
 
