@@ -29,6 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import healpix_geo
+from pyproj import Transformer
 
 # ---------------------------------------------------------------------------
 # Type alias
@@ -263,7 +264,7 @@ class HealPixDown(nn.Module):
             s2 = (w * w).sum()
             return w / np.sqrt(s2) if s2 > 0 else np.ones_like(w) / max(np.sqrt(len(w)), 1.0)
         return w  # "none"
-
+        
     def _build_smooth_matrix(self) -> torch.Tensor:
         """
         Build sparse matrix M of shape (N_out, N_in):
@@ -287,20 +288,22 @@ class HealPixDown(nn.Module):
                 return pix_arr.astype(np.int64), np.ones(len(pix_arr), dtype=bool)
 
         rows, cols, vals = [], [], []
-
+        
+        ilevel=int(np.log2(self.nside_in))
+        olevel=int(np.log2(self.nside_out))
         for i_out, p_out in enumerate(cell_ids_out):
             #theta0, phi0 = hp.pix2ang(self.nside_out, int(p_out), nest=True)
-            theta0, phi0 = healpix_geo.nested.healpix_to_lonlat(int(p_out), int(np.log2(self.nside_out)),ellipsoid=self.ellipsoid)
-            lat0 = 0.5 * np.pi - theta0
-
+            lon0, lat0 = healpix_geo.nested.healpix_to_lonlat(int(p_out), olevel,ellipsoid=self.ellipsoid)
+            #lat0 = 0.5 * np.pi - theta0
             # Query fine pixels within the disc
-            vec0 = hp.ang2vec(theta0, phi0)
-            cand = np.asarray(
-                hp.query_disc(self.nside_in, vec0, self.radius_rad,
-                              inclusive=True, nest=True),
-                dtype=np.int64
-            )
-
+            #vec0 = hp.ang2vec(theta0, phi0)
+            #cand2 = np.asarray(
+            #    hp.query_disc(self.nside_in, vec0, self.radius_rad,
+            #                  inclusive=True, nest=True),
+            #    dtype=np.int64
+            #)
+            cand,_,_ = healpix_geo.nested.cone_coverage((lon0,lat0), np.rad2deg(self.radius_rad),ilevel,ellipsoid=self.ellipsoid)
+            
             # Fallback: use 4 NESTED children if disc is empty
             if cand.size == 0:
                 cand = (4 * p_out + np.arange(4)).astype(np.int64)
@@ -321,9 +324,12 @@ class HealPixDown(nn.Module):
                 continue
 
             # Gaussian weights
-            theta_c, phi_c = hp.pix2ang(self.nside_in, cand.tolist(), nest=True)
-            lat_c = 0.5 * np.pi - theta_c
-            gamma = self._haversine(lat0, phi0, lat_c, phi_c)
+            lon_c, lat_c = healpix_geo.nested.healpix_to_lonlat(cand.tolist(), ilevel,ellipsoid=self.ellipsoid)
+            
+            #theta_c, phi_c = hp.pix2ang(self.nside_in, cand.tolist(), nest=True)
+            #lat_c = 0.5 * np.pi - theta_c
+            gamma = self._haversine(np.deg2rad(lat0), np.deg2rad(lon0), np.deg2rad(lat_c), np.deg2rad(lon_c))
+            
             w = np.exp(-0.5 * (gamma / self.sigma_rad) ** 2)
             w[gamma > self.radius_rad] = 0.0
             if w.sum() <= 0.0:

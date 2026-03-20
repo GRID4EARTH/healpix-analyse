@@ -48,7 +48,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import healpix_geo as hp
+import healpix_geo
+from healpix_analyse.healpix_interp import get_interp_weights
 
 '''
 try:
@@ -224,7 +225,7 @@ def _local_kernel_grid(kernel_sz, nside):
     """
     grid = np.arange(kernel_sz) - kernel_sz // 2
     xx, yy = np.meshgrid(grid, grid)
-    alpha_pix = hp.nside2resol(nside, arcmin=False)
+    alpha_pix = np.sqrt(4*np.pi/(12*nside**2))
 
     dtheta = np.sqrt(xx**2 + yy**2).ravel() * alpha_pix
     dphi   = np.arctan2(yy, xx).ravel()
@@ -258,11 +259,12 @@ def _get_interp_weights(nside, vecs, nest, device, dtype, chunk=1_000_000):
     idx_acc, w_acc = [], []
     for s in range(0, M, chunk):
         e = min(s + chunk, M)
-        i_np, w_np = hp.get_interp_weights(nside, th_np[s:e], ph_np[s:e], nest=nest)
-        idx_acc.append(i_np);  w_acc.append(w_np)
+        #i,v = hp.get_interp_weights(nside,th_np[s:e],ph_np[s:e])
+        i_np, w_np = get_interp_weights(np.rad2deg(ph_np[s:e]), 90.0-np.rad2deg(th_np[s:e]), int(np.log2(nside)))
+        idx_acc.append(i_np.T);  w_acc.append(w_np.T)
 
-    idx_np = np.concatenate(idx_acc, axis=1) if len(idx_acc) > 1 else idx_acc[0]
-    w_np   = np.concatenate(w_acc,   axis=1) if len(w_acc)   > 1 else w_acc[0]
+    idx_np = np.hstack(idx_acc) if len(idx_acc) > 1 else idx_acc[0]
+    w_np   = np.hstack(w_acc) if len(w_acc)   > 1 else w_acc[0]
     return (
         torch.as_tensor(idx_np, device=device, dtype=torch.long),
         torch.as_tensor(w_np,   device=device, dtype=dtype),
@@ -361,6 +363,7 @@ class HealPixConv(nn.Module):
         nest: bool = True,
         use_norm: bool = False,
         device=None,
+        ellipsoid: str = "WGS84",
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -369,6 +372,7 @@ class HealPixConv(nn.Module):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device)
         self.dtype  = dtype
+        self.ellipsoid = ellipsoid
 
         self.nside        = int(nside)
         self.in_channels  = int(in_channels)
@@ -407,8 +411,14 @@ class HealPixConv(nn.Module):
         self.K = len(ids_np)
 
         # ---- Stage A: rotated stencil + interpolation neighbors ----
-        th, ph = hp.pix2ang(self.nside, ids_np.tolist(), nest=self.nest)
-
+        #import healpy as hp
+        #th, ph = hp.pix2ang(self.nside, ids_np.tolist(), nest=self.nest)
+        lon, lat = healpix_geo.nested.healpix_to_lonlat(ids_np.tolist(),int(np.log2(self.nside)),
+                                                        ellipsoid=self.ellipsoid)
+                                                        
+        th = np.deg2rad(90.0-lat)
+        ph = np.deg2rad(lon)
+        
         R_tot = _build_rotation_matrices(
             th, ph, self.G, self.gauge_type, self.device, self.dtype,
             ref_direction=self.ref_direction,
