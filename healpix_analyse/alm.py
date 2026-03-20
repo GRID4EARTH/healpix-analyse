@@ -138,7 +138,11 @@ class AlmTransform:
         dtype: torch.dtype = torch.float32,
         device: Optional[Union[str, torch.device]] = None,
         debug: bool = False,
+        lon: np.ndarray = None,
+        lat: np.ndarray = None,
+        weights: np.array = None
     ) -> None:
+
         self.level = int(level)
         self.indexing_scheme = str(indexing_scheme)
         self.ellipsoid = str(ellipsoid)
@@ -305,7 +309,7 @@ class AlmTransform:
         idata = np.zeros([self.size])
         for k in range(self.n_rings):
             idx = np.where(self.idx_ring==k)[0]
-            inv_fft = o_fft[:,k]*self.N_k[k]/self.N_max
+            inv_fft = o_fft[:,k]/self.weights[k]
             inv_fft = self.shift_from_fft_phase(inv_fft,-self.xa[idx[0]])
             idata[idx]=torch.fft.ifft(inv_fft)[0:self.N_k[k]].real
         return idata 
