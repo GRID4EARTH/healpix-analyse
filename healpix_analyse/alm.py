@@ -132,7 +132,7 @@ class AlmTransform:
         self,
         cell_ids: ArrayLike,
         level: int,
-        indexing_scheme: str = "ring",
+        indexing_scheme: str = "2D_array",
         ellipsoid: str = "sphere",
         method: str = "fft",
         dtype: torch.dtype = torch.float32,
@@ -149,7 +149,6 @@ class AlmTransform:
         self.method = str(method)
         self.dtype = dtype
         self.cdtype = self._infer_complex_dtype(dtype)
-        device='cpu'
         self.device = self._resolve_device(device)
         self.debug = bool(debug)
 
@@ -161,135 +160,141 @@ class AlmTransform:
             raise ValueError("dtype must be torch.float32 or torch.float64")
 
         self.cell_ids = self._as_long_tensor(cell_ids, device=self.device)
-        if self.cell_ids.ndim != 1:
-            raise ValueError("cell_ids must be a 1D array-like")
-        if self.cell_ids.numel() == 0:
-            raise ValueError("cell_ids must not be empty")
+        self.n_lat, self.n_lon = self.cell_ids.shape
 
-        self.size = int(self.cell_ids.numel())
-        
+        if self.indexing_scheme == "2D_array":
+            self.lons_of_western_edge, _ = healpix_geo.ring.healpix_to_lonlat(cell_ids[:,0], level, ellipsoid=ellipsoid)
+            self.lons_of_western_edge = self._as_real_tensor(self.lons_of_western_edge, device=self.device, dtype=self.dtype)
 
-        if lon is None:
-            if self.indexing_scheme == "ring":
-                lon, lat = healpix_geo.ring.healpix_to_lonlat(cell_ids, level, ellipsoid=ellipsoid)
-                self.idx_ordering = lon.argsort() # TODO: optimize knowing that it is already sorted
-            else:
-                if self.indexing_scheme == "nested":
-                    lon, lat = healpix_geo.nested.healpix_to_lonlat(cell_ids, level, ellipsoid=ellipsoid)
-                else:
-                    raise NotImplementedError("For now, indexing_scheme must be 'ring' or 'nested'")
-                self.idx_ordering = lon.argsort()
+            #lon, lat = healpix_geo.ring.healpix_to_lonlat(self.cell_ids.flatten(), level, ellipsoid=ellipsoid)
+            #self.idx_ordering = lon.argsort() # TODO: optimize knowing that it is already sorted
         else:
-            self.idx_ordering = lon.argsort()
+            raise NotImplementedError("For now, indexing_scheme must be '2D_array'")
         
+
+        # TODO: make more robust computaion because of possible wrap-around at the 0/360 boundary, currently assumes no wrap-around and that lons are sorted in ascending order
+        lon_range = healpix_geo.ring.healpix_to_lonlat(cell_ids[0,-1], level, ellipsoid=ellipsoid)[0]
+        lon_range -= healpix_geo.ring.healpix_to_lonlat(cell_ids[0,0], level, ellipsoid=ellipsoid)[0]
+        lon_range = lon_range[0]
+        print("lon_range", lon_range)
+        print("self.n_lon", self.n_lon)
+        print("self.lons_of_western_edge - self.lons_of_western_edge.min()", self.lons_of_western_edge - self.lons_of_western_edge.min())
+        pixel_shift = self.n_lon * (self.lons_of_western_edge - self.lons_of_western_edge.min()) / lon_range  # convert from longitude shift to pixel shift
+        self.pixel_shift = pixel_shift
+        #self.pixel_shift = torch.zeros_like(self.pixel_shift)  # TODO: remove after testing, currently set to zero for testing purposes
+        #self.pixel_shift[1::2] = .5
+        print("pixel_shift", self.pixel_shift)
+        self.phase_shift = self.compute_phase_shift(-self.pixel_shift)
+
         # TODO: optimize knowing that it is already sorted
-        theta_uniq, idx_ring = np.unique(lat[self.idx_ordering], return_inverse=True)
+        #theta_uniq, idx_ring = np.unique(lat[self.idx_ordering], return_inverse=True)
     
-        self.n_rings = len(theta_uniq)
-        self.N_k = np.bincount(idx_ring)
-        self.N_max = int(np.max(self.N_k))
-        self.idx_ring = idx_ring
-        self.lon = (lon - np.min(lon))[self.idx_ordering]
-        if weights is None:
-            self.weights = self.N_max/self.N_k
+        #self.n_rings = len(theta_uniq)
+        #self.N_k = np.bincount(idx_ring)
+        #self.N_max = int(np.max(self.N_k))
+        #self.idx_ring = idx_ring
+        #self.lon = (lon - np.min(lon))[self.idx_ordering]
         
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def shift_from_fft_phase(self,fft_tensor, x0, dx=1.0, dim=-1):
+    def compute_phase_shift(self, x0, dim=-1):
         """
         Applique un décalage spatial x0 à un signal via sa FFT déjà calculée.
 
         Parameters
         ----------
-        fft_tensor : torch.Tensor
-            FFT déjà calculée (complexe).
         x0 : float or torch.Tensor
             Décalage à appliquer dans l'espace réel.
             Convention: f(x - x0) <-> F(k) * exp(-i 2π k x0)
-        dx : float
-            Pas d'échantillonnage dans l'espace réel.
         dim : int
             Dimension correspondant à la FFT 1D.
 
         Returns
         -------
         torch.Tensor
-            FFT modifiée par la rampe de phase.
+            Facteur de phase.
         """
-        n = fft_tensor.shape[dim]
-        device = fft_tensor.device
-        dtype = fft_tensor.real.dtype
+        assert dim == -1
 
         # fréquences en cycles / unité de x
-        k = torch.fft.fftfreq(n, d=dx, device=device, dtype=dtype)
+        f = torch.fft.fftfreq(self.n_lon, device=self.device, dtype=self.dtype)
+
+        if True:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(16,8))
+            plt.imshow((f[None, :] * x0[:, None]).cpu()[:20, :], cmap='bwr')
+            plt.colorbar(orientation='horizontal')
+            plt.tight_layout()
+            plt.show()
 
         # facteur de phase
-        phase = torch.exp(-2j * torch.pi * k * x0)
+        phase = torch.exp(2j * torch.pi * f[None, :] * x0[:, None])
 
-        # reshape pour broadcast sur la bonne dimension
-        shape = [1] * fft_tensor.ndim
-        shape[dim] = n
-        phase = phase.reshape(shape)
+        if False:
+            print(phase)
+            import matplotlib.pyplot as plt
+            plt.imshow(phase.real.cpu())
+            plt.colorbar()
+            plt.show()
 
-        return fft_tensor * phase
+            plt.plot(phase.real.cpu()[:,180])
+            plt.show()
+
+        return phase
         
     def fft(
         self,
-        data: ArrayLike,
+        data_: ArrayLike,
+        pbc: bool = True,
     ) -> ArrayLike:
+        data_ = self._as_real_tensor(data_, device=self.device, dtype=self.dtype)
+
+        assert (self.pixel_shift >= 0).all() # assumes Eastern deviation only to be corrected 
+
+        #data_shifted = torch.cat([data_[:,1:], data_[:,-1][:,None]], dim=1)  # shift data by one pixel to the right and pad by replicating the last pixel on the right
+        data_shifted = torch.cat([data_[:,0][:,None], data_[:,:-1]], dim=1)  # shift data by one pixel to the right and pad by replicating the last pixel on the right
+
+        data = (1-self.pixel_shift[:,None]) * data_ + self.pixel_shift[:,None] * data_shifted
+        print("data input", data_)
+        print("data corrected", data)
+
+        # TODO: implement non PBC handling
+        if pbc != True:
+            raise NotImplementedError("Non-periodic boundary conditions are not yet implemented.")
+        
+        # 1D FFTs along longitudes, in parallel over latitude rings
         # TODO: implement rfft
-         
-        ldata = data[self.idx_ordering]
-        out_fft = torch.zeros([self.n_rings*2,self.N_max], dtype=self.cdtype)
-        
-        for k in range(self.n_rings):
-            idx = np.where(self.idx_ring==k)[0] # TODO: optimize knowing that it is already sorted?????????????
-            if not torch.is_tensor(ldata):
-                ldata = torch.as_tensor(ldata)
-            ring_data = ldata[idx]
-            
-            # 1D FFT on latitude ring k
-            if torch.is_complex(ring_data): 
-                tmp_fft = torch.fft.fft(ring_data)
-                cutoff = ring_data.shape[0]//2+1 # si n pair : coupure à n/2 inclus, si n impair : coupure à (n-1)/2 = n//2 inclus
-                tmp_pos_freq = tmp_fft[:cutoff] 
-                tmp_neg_freq = tmp_fft[cutoff:]
-            else:
-                tmp_fft = torch.fft.rfft(ring_data)
-                tmp_pos_freq = tmp_fft # len n//2+1
-                tmp_neg_freq = tmp_fft[1:ring_data.shape[0] - ring_data.shape[0]//2] # do not copy Nyquist if n even, len n - n//2 - 1
-                tmp_neg_freq = tmp_neg_freq.flip(dims=[0]) # reverse negative frequencies to match FFT convention
+        out_fft = torch.fft.fft(self._as_real_tensor(data, device=self.device, dtype=self.dtype), dim=-1)
 
-            # apply upsampling with padding in Fourier space
-            tmp_fft = torch.zeros(self.N_max, dtype=tmp_fft.dtype, device=tmp_fft.device)
-            tmp_fft[:tmp_pos_freq.shape[0]] = tmp_pos_freq
-            tmp_fft[-tmp_neg_freq.shape[0]:] = tmp_neg_freq
 
-            # Apply phase shift to align with the original longitude
-            tmp_fft = self.shift_from_fft_phase(tmp_fft, self.lon[idx[0]])
-            # TODO: raise Warning if phase shift is large
+        if True:
+            import matplotlib.pyplot as plt
+            plt.plot(out_fft[:,130].real.cpu())
+            plt.plot(out_fft[:,130].imag.cpu())
+            plt.show()
 
-            # Normalize
-            out_fft[k]  = tmp_fft * self.N_max / self.N_k[k]
-            if k>0:
-                out_fft[-k] = - out_fft[k].flip(dims=[0])
-        
-        import matplotlib.pyplot as plt
-        plt.figure()
-        plt.imshow(abs(out_fft)+1E-7, norm='log')
-        plt.colorbar(label='Power (log scale)', orientation='horizontal')
+        # Apply phase shift to align with the original longitude
+        #out_fft = out_fft * self.phase_shift
+        # TODO: raise Warning if phase shift is large
 
-        
-        # parallel 1D FFTs along latitude axis
+        if True:
+            import matplotlib.pyplot as plt
+            plt.plot(out_fft[:,130].real.cpu())
+            plt.plot(out_fft[:,130].imag.cpu())
+            plt.show()
+
+        if True:
+            import matplotlib.pyplot as plt
+            plt.imshow(np.fft.fftshift(np.abs(out_fft.detach().cpu())), norm='log')
+            plt.colorbar(label='Power (log scale)', orientation='horizontal')
+            plt.show()
+
+        # 1D FFTs along latitudes, in parallel over longitudes
         # TODO: NUFFT or direct Legendre analysis for the second stage, currently only FFT stage implemented
-        out_fft = np.fft.fft(out_fft) 
-        #out_fft = torch.fft.nufft(out_fft, dim=1)
-        
-        # TODO: Legendre analysis over colatitude to get final Alm coefficients, currently only FFT stage implemented
-        # TODO: Should we reorder the output to match the original cell ordering?
+        out_fft = torch.fft.fft(out_fft, dim=0) 
 
         return out_fft
 
@@ -322,7 +327,7 @@ class AlmTransform:
     def _resolve_device(device: Optional[Union[str, torch.device]]) -> torch.device:
         if device is not None:
             return torch.device(device)
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
     @staticmethod
     def _as_long_tensor(
