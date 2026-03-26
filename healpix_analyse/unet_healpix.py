@@ -893,6 +893,139 @@ class HealPixUNet(nn.Module):
                 preds.append(self(xb).cpu())
         return torch.cat(preds, dim=0)
 
+    def encode_with_skips(self, x: torch.Tensor):
+        """
+        Encode x and return:
+          - bottleneck: [B, Cb, Kb]
+          - enc_feats: list of encoder feature maps for skip connections
+          - last_sst:   [B, 1, K] used by the residual cumulative head
+        """
+        x = x.to(self.device)
+        B, C, K = x.shape
+
+        N_full = 12 * self.nside ** 2
+        if K != N_full:
+            raise ValueError(
+                f"Expected full-sphere K={N_full} pixels at nside={self.nside}, got K={K}."
+            )
+
+        # Last observed SST, same logic as forward()
+        phys = x[:, :-1, :]   # [B, T·V, K]
+        T, V = self.time_steps, self.vars_per_t
+        if phys.shape[1] != T * V:
+            raise ValueError(
+                f"Expected phys channels T·V={T*V}, got {phys.shape[1]}."
+            )
+
+        phys_4d  = phys.view(B, T, V, K)
+        last_sst = phys_4d[:, -1, self.sst_index, :].unsqueeze(1)   # [B, 1, K]
+
+        # Encoder
+        feat = x
+        enc_feats = []
+
+        feat = self.enc_convs[0](feat)
+        enc_feats.append(feat)
+
+        for level in range(len(self.feature_channels) - 1):
+            feat, _ = self._apply_down(self.down_ops[level], feat)
+            feat = self.enc_convs[level + 1](feat)
+            enc_feats.append(feat)
+
+        bottleneck = enc_feats[-1]
+        return bottleneck, enc_feats, last_sst
+
+
+    def decode_from_bottleneck_and_skips(
+        self,
+        bottleneck: torch.Tensor,
+        enc_feats: list,
+        last_sst: torch.Tensor,
+        cumulative: bool = True,
+    ) -> torch.Tensor:
+        """
+        Decode from a bottleneck tensor, reusing skip connections from enc_feats.
+
+        Parameters
+        ----------
+        bottleneck : [B, Cb, Kb]
+            Forecasted bottleneck tensor.
+        enc_feats : list of tensors
+            Encoder feature maps returned by encode_with_skips(x).
+        last_sst : [B, 1, K]
+            Last observed SST used for cumulative reconstruction.
+        cumulative : bool
+            If True, return cumulative SST forecasts [B, T_out, K].
+            If False, return residual increments [B, T_out, K].
+
+        Returns
+        -------
+        y : torch.Tensor
+        """
+        x_dec = bottleneck.to(self.device)
+        last_sst = last_sst.to(self.device)
+
+        # Decoder: identical to forward()
+        for j in range(len(self.up_ops)):
+            x_up, _ = self.up_ops[j](x_dec)
+            skip = enc_feats[-(j + 2)].to(self.device)
+            x_cat = torch.cat([x_up, skip], dim=1)
+            x_dec = self.dec_convs[j](x_cat)
+
+        # Output head
+        residuals = self.out_conv(x_dec)
+        residuals = torch.clamp(
+            residuals, min=-self.residual_clip, max=self.residual_clip
+        ) * self.gate_scale
+
+        if not cumulative:
+            return residuals
+
+        # Same cumulative logic as forward()
+        T_out = residuals.shape[1]
+        current = last_sst
+        outputs = []
+        for h in range(T_out):
+            current = current + residuals[:, h:h+1, :]
+            outputs.append(current)
+
+        return torch.cat(outputs, dim=1)
+
+
+    def reconstruct_from_forecasted_bottleneck(
+        self,
+        x_input: torch.Tensor,
+        bottleneck_forecast: torch.Tensor,
+        cumulative: bool = True,
+    ) -> torch.Tensor:
+        """
+        Convenience wrapper:
+          1) encode x_input to get skips + last_sst
+          2) replace bottleneck by bottleneck_forecast
+          3) decode
+
+        Parameters
+        ----------
+        x_input : [B, C_in, K]
+            Real input used only to build skip connections + last_sst.
+        bottleneck_forecast : [B, Cb, Kb]
+            Forecasted bottleneck tensor.
+        cumulative : bool
+            If True, return cumulative SST forecasts.
+            If False, return residual increments.
+
+        Returns
+        -------
+        y : [B, T_out, K]
+        """
+        _, enc_feats, last_sst = self.encode_with_skips(x_input)
+        return self.decode_from_bottleneck_and_skips(
+            bottleneck=bottleneck_forecast,
+            enc_feats=enc_feats,
+            last_sst=last_sst,
+            cumulative=cumulative,
+        )
+        
     # =========================================================================
     # Checkpoint helpers
     # =========================================================================
