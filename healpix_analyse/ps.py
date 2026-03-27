@@ -1,8 +1,11 @@
 import numpy as np
 
-def ps(data, plot_2D_fft=False):
+def ps(data, data_cross=None, plot_2D_fft=False):
 
-    P2D = np.abs(np.fft.fftshift(np.fft.fft2(data))) ** 2
+    if data_cross is None:
+        P2D = np.abs(np.fft.fftshift(np.fft.fft2(data))) ** 2
+    else:
+        P2D = np.abs(np.fft.fftshift(np.fft.fft2(data) * np.conj(np.fft.fft2(data_cross))))
 
     if plot_2D_fft:
         import matplotlib.pyplot as plt
