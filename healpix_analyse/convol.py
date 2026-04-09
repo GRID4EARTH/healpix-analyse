@@ -885,6 +885,52 @@ class HealPixConv(nn.Module):
                     pos_all, w_all_norm, sort_order_t, inv_order_t,
                 )
 
+        # ---- Matrice sparse d'interpolation --------------------------------
+        # L'interpolation bilinéaire est une opération LINÉAIRE fixe sur les
+        # pixels d'entrée.  On la précompute comme une matrice sparse
+        #
+        #   S  [G*K*P, K]   avec exactement 4 valeurs non-nulles par ligne
+        #
+        # Le forward devient alors un seul torch.mm(S, x_flat) au lieu d'une
+        # boucle Python sur 4 voisins + 4 index_select.
+        #
+        # Avantages :
+        #  • Un seul appel BLAS/cuSPARSE au lieu de 4 appels index_select
+        #  • Meilleure localité de cache (cuSPARSE trie les colonnes par bloc)
+        #  • Compatible torch.compile / torch.jit
+        # -------------------------------------------------------------------
+        self._build_sparse_interp()
+
+    def _build_sparse_interp(self) -> None:
+        """
+        (Re)construit la matrice sparse d'interpolation _S [G*K*P, K]
+        à partir des buffers _pos_safe et _w_norm.
+
+        Appelé automatiquement après __init__ et après tout changement de
+        device/dtype via .to() (voir _apply).
+        """
+        G, P, K = self.G, self.P, self.K
+        M = G * K * P   # nombre de lignes
+
+        # pos_safe [4, G, K*P]  →  cols [4, G*K*P]  →  [4*M]
+        # w_norm   [4, G, K*P]  →  vals [4, G*K*P]  →  [4*M]
+        pos = self._pos_safe   # [4, G, K*P]
+        wn  = self._w_norm     # [4, G, K*P]
+
+        cols = pos.view(4, M)  # [4, M]
+        vals = wn.view(4, M).to(dtype=torch.float32)  # [4, M]
+
+        # Indices de lignes : [0, 1, ..., M-1] répétés 4 fois
+        rows = torch.arange(M, device=pos.device, dtype=torch.long) \
+                    .unsqueeze(0).expand(4, M)   # [4, M]
+
+        self._S = torch.sparse_coo_tensor(
+            indices=torch.stack([rows.reshape(-1), cols.reshape(-1)]),
+            values=vals.reshape(-1),
+            size=(M, K),
+            device=pos.device,
+        ).coalesce().to_sparse_csr()   # CSR : plus rapide pour SpMM CPU/GPU
+
         # ---- learnable kernel and bias ----
         # share_weights=True  → weight [C_in, C_out, P]  (same kernel for all G gauges)
         # share_weights=False → weight [G, C_in, C_out, P] (independent kernel per gauge)
@@ -936,6 +982,19 @@ class HealPixConv(nn.Module):
 
         self.to(self.device)
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
+
+    # ------------------------------------------------------------------
+    # Reconstruction de _S après .to(device/dtype)
+    # ------------------------------------------------------------------
+
+    def _apply(self, fn):
+        """Surcharge de nn.Module._apply pour reconstruire _S après .to()."""
+        result = super()._apply(fn)
+        # Les buffers (_pos_safe, _w_norm) ont été déplacés par super()._apply ;
+        # on reconstruit la matrice sparse avec le nouveau device/dtype.
+        if hasattr(self, '_pos_safe') and hasattr(self, '_w_norm'):
+            result._build_sparse_interp()
+        return result
 
     # ------------------------------------------------------------------
     # Kernel management  (unchanged)
@@ -1041,11 +1100,9 @@ class HealPixConv(nn.Module):
         if N != self.K:
             raise ValueError(f"Expected {self.K} pixels, got {N}.")
 
-        so  = self._sort_order.to(device=t.device)        # [K]
-        io  = self._inv_order.to(device=t.device)         # [K]
-        pos = self._pos_safe.to(device=t.device)          # [4, G, K*P]
-        wn  = self._w_norm.to(device=t.device, dtype=t.dtype)   # [4, G, K*P]
-        W   = self.weight.to(device=t.device, dtype=t.dtype)    # [G, C_in, C_out, P]
+        so  = self._sort_order.to(device=t.device)                # [K]
+        io  = self._inv_order.to(device=t.device)                # [K]
+        W   = self.weight.to(device=t.device, dtype=t.dtype)     # [G, C_in, C_out, P] ou [C_in, C_out, P]
 
         G, P, K = self.G, self.P, self.K
         C_out   = self.out_channels
@@ -1066,16 +1123,37 @@ class HealPixConv(nn.Module):
         # Each pos[j] is already contiguous ([G, K*P]) thanks to OPT 1,
         # so .reshape(-1) is a free zero-copy view.
         # ------------------------------------------------------------------
-        gathered = t.new_zeros(B, C_in, G, K, P)          # [B, C_in, G, K, P]
+        # ------------------------------------------------------------------
+        # OPT 5 — Reformulation SpMM (sparse matrix × dense).
+        #
+        # L'interpolation bilinéaire est une opération linéaire fixe :
+        #   gathered[b, c, g, k, p] = Σ_j  w[j,g,k*P+p] · x[pos[j,g,k*P+p]]
+        #
+        # On la représente comme un produit matrice-sparse :
+        #   S  [G*K*P, K]  (4 non-zéros par ligne, précompilé une fois)
+        #   x_flat  [K, B*C_in]
+        #   → S @ x_flat = [G*K*P, B*C_in]  ← un seul appel cuSPARSE/MKL
+        #
+        # Avantage vs boucle de 4 index_select :
+        #  • Un seul appel BLAS (cuSPARSE/MKL) au lieu de 4 gathers Python
+        #  • cuSPARSE trie les colonnes par blocs → meilleure localité cache
+        #  • Fonctionne avec torch.compile / torch.jit
+        # ------------------------------------------------------------------
+        S = self._S.to(device=t.device, dtype=t.dtype)   # [G*K*P, K]  (CSR)
 
-        for j in range(4):
-            pj  = pos[j].reshape(-1)                      # [G*K*P] — zero-copy
-            wj  = wn[j]                                   # [G, K*P] — contiguous
-            vf  = t_sorted.index_select(2, pj)            # [B, C_in, G*K*P]
-            # in-place accumulate to avoid a second large alloc
-            gathered.add_(
-                vf.view(B, C_in, G, K, P) * wj.view(1, 1, G, K, P)
-            )
+        # [B, C_in, K] → [K, B*C_in]
+        x_flat = t_sorted.permute(2, 0, 1).reshape(K, B * C_in)
+
+        # SpMM : [G*K*P, K] × [K, B*C_in] → [G*K*P, B*C_in]
+        gathered_flat = torch.mm(S, x_flat)               # [G*K*P, B*C_in]
+
+        # [G*K*P, B*C_in] → [G, K, P, B, C_in] → [B, C_in, G, K, P]
+        gathered = (
+            gathered_flat
+            .view(G, K, P, B, C_in)
+            .permute(3, 4, 0, 1, 2)   # [B, C_in, G, K, P]
+            .contiguous()
+        )
 
         # ------------------------------------------------------------------
         # OPT 3 — Replace einsum("bcgkp,gcop->bgok") with torch.bmm.
