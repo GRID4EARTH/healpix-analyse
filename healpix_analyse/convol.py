@@ -901,36 +901,6 @@ class HealPixConv(nn.Module):
         # -------------------------------------------------------------------
         self._build_sparse_interp()
 
-    def _build_sparse_interp(self) -> None:
-        """
-        (Re)construit la matrice sparse d'interpolation _S [G*K*P, K]
-        à partir des buffers _pos_safe et _w_norm.
-
-        Appelé automatiquement après __init__ et après tout changement de
-        device/dtype via .to() (voir _apply).
-        """
-        G, P, K = self.G, self.P, self.K
-        M = G * K * P   # nombre de lignes
-
-        # pos_safe [4, G, K*P]  →  cols [4, G*K*P]  →  [4*M]
-        # w_norm   [4, G, K*P]  →  vals [4, G*K*P]  →  [4*M]
-        pos = self._pos_safe   # [4, G, K*P]
-        wn  = self._w_norm     # [4, G, K*P]
-
-        cols = pos.view(4, M)  # [4, M]
-        vals = wn.view(4, M).to(dtype=torch.float32)  # [4, M]
-
-        # Indices de lignes : [0, 1, ..., M-1] répétés 4 fois
-        rows = torch.arange(M, device=pos.device, dtype=torch.long) \
-                    .unsqueeze(0).expand(4, M)   # [4, M]
-
-        self._S = torch.sparse_coo_tensor(
-            indices=torch.stack([rows.reshape(-1), cols.reshape(-1)]),
-            values=vals.reshape(-1),
-            size=(M, K),
-            device=pos.device,
-        ).coalesce().to_sparse_csr()   # CSR : plus rapide pour SpMM CPU/GPU
-
         # ---- learnable kernel and bias ----
         # share_weights=True  → weight [C_in, C_out, P]  (same kernel for all G gauges)
         # share_weights=False → weight [G, C_in, C_out, P] (independent kernel per gauge)
@@ -945,7 +915,6 @@ class HealPixConv(nn.Module):
                 self.weight.view(self.in_channels, self.out_channels * self.P),
                 a=0., mode="fan_in", nonlinearity="relu",
             )
-            # Bias shared across all G gauges: shape [C_out]
             self.bias = nn.Parameter(
                 torch.zeros(self.out_channels, device=self.device, dtype=self.dtype)
             )
@@ -982,6 +951,33 @@ class HealPixConv(nn.Module):
 
         self.to(self.device)
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
+
+    def _build_sparse_interp(self) -> None:
+        """
+        (Re)construit la matrice sparse d'interpolation _S [G*K*P, K]
+        à partir des buffers _pos_safe et _w_norm.
+
+        Appelé automatiquement après __init__ et après tout changement de
+        device/dtype via .to() (voir _apply).
+        """
+        G, P, K = self.G, self.P, self.K
+        M = G * K * P   # nombre de lignes
+
+        pos = self._pos_safe   # [4, G, K*P]
+        wn  = self._w_norm     # [4, G, K*P]
+
+        cols = pos.view(4, M)  # [4, M]
+        vals = wn.view(4, M).to(dtype=torch.float32)  # [4, M]
+
+        rows = torch.arange(M, device=pos.device, dtype=torch.long) \
+                    .unsqueeze(0).expand(4, M)   # [4, M]
+
+        self._S = torch.sparse_coo_tensor(
+            indices=torch.stack([rows.reshape(-1), cols.reshape(-1)]),
+            values=vals.reshape(-1),
+            size=(M, K),
+            device=pos.device,
+        ).coalesce().to_sparse_csr()
 
     # ------------------------------------------------------------------
     # Reconstruction de _S après .to(device/dtype)
