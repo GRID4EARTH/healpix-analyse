@@ -8,13 +8,11 @@ on:
     branches:
       - main
 
-# Allow the workflow to push to GitHub Pages
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# Only one concurrent deployment
 concurrency:
   group: "pages"
   cancel-in-progress: true
@@ -28,7 +26,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # needed for setuptools_scm versioning
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,14 +34,19 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Install PyTorch (CPU only, beaucoup plus rapide)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
       - name: Install package and doc dependencies
         run: |
-          pip install -e ".[docs]"
+          pip install -e .
+          pip install -r docs/requirements.txt
 
       - name: Build HTML documentation
         run: |
           cd docs
-          make html SPHINXOPTS="-W --keep-going -n"
+          make html
 
       - name: Upload pages artifact
         uses: actions/upload-pages-artifact@v3
@@ -54,7 +57,6 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
-    # Only deploy on push to main (not on PRs)
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     environment:

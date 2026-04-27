@@ -1,16 +1,14 @@
 # Sphinx core
 sphinx>=7.0
-sphinx-rtd-theme>=2.0
 
-# Markdown support
-myst-parser>=3.0
+# Theme (même que healpix-geo, numpy, scipy)
+pydata-sphinx-theme>=0.15
 
-# Automatic API generation from source
+# Markdown + notebooks Jupyter
+myst-nb>=1.0
+
+# Automatic API generation from source (parse uniquement, pas d'import)
 sphinx-autoapi>=3.0
 
-# Jupyter notebooks as doc pages
-nbsphinx>=0.9
-ipykernel
-
-# Math rendering
-sphinx-mathjax-offline
+# Extensions utiles
+sphinx-design>=0.5
