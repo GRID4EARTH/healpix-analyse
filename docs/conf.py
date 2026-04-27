@@ -40,7 +40,7 @@ nb_execution_mode = "off"  # don't execute notebooks at build time
 # ---------------------------------------------------------------------------
 autoapi_dirs = ["../healpix_analyse"]
 autoapi_type = "python"
-autoapi_output_dir = "api"
+autoapi_output_dir = "autoapi"
 autoapi_options = [
     "members",
     "undoc-members",

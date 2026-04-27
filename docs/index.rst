@@ -28,7 +28,7 @@ and multi-resolution up/downsampling operators — all differentiable through Py
    :maxdepth: 1
    :caption: API Reference
 
-   api/index
+   autoapi/index
 
 .. toctree::
    :maxdepth: 1
