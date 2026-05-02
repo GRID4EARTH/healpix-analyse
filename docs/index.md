@@ -134,6 +134,22 @@ Resolution increase: adjoint of smooth downsampling.
 
 ::::
 
+## Morphology & topology
+
+::::{grid} 1 1 3 3
+:gutter: 2
+
+:::{grid-item-card} Minkowski functionals
+:link: minkowski
+:link-type: doc
+
+Differentiable area, perimeter and Euler characteristic for 2D images.
+Supports scalar, per-image and spatial thresholds, and multi-threshold
+Minkowski curves.
+:::
+
+::::
+
 ## Resources
 
 - {doc}`healpix_sht` - Ring-based full-sky SHT optimised for HEALPix
@@ -171,6 +187,15 @@ hidden: true
 convol_doc
 down
 up
+```
+
+```{toctree}
+---
+maxdepth: 2
+caption: Morphology & topology
+hidden: true
+---
+minkowski
 ```
 
 ```{toctree}
