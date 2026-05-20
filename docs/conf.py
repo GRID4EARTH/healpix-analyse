@@ -109,9 +109,11 @@ html_theme_options = {
 
 # ---------------------------------------------------------------------------
 # Source suffixes
+# myst_nb (in extensions) registers .md and .ipynb automatically.
+# Listing .md first avoids Sphinx resolving root_doc to index.rst.
 # ---------------------------------------------------------------------------
 source_suffix = {
-    ".rst": "restructuredtext",
     ".md": "myst-nb",
     ".ipynb": "myst-nb",
+    ".rst": "restructuredtext",
 }
