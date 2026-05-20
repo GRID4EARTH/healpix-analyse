@@ -8,7 +8,7 @@ A Python toolkit for analysing signals defined on HEALPix spherical grids,
 with a focus on Earth Observation data. All operators are implemented in PyTorch
 and are fully differentiable through `torch.autograd`.
 
-**[Read the full documentation](https://eopf-dggs.github.io/healpix-analyse/)**
+**[Read the full documentation] (https://grid4earth.github.io/healpix-analyse/)**
 
 ---
 
@@ -86,7 +86,7 @@ pip install -e .
 
 ## Documentation
 
-Full documentation is available at **[eopf-dggs.github.io/healpix-analyse](https://eopf-dggs.github.io/healpix-analyse/)**.
+Full documentation is available at **[eopf-dggs.github.io/healpix-analyse](https://grid4earth.github.io/healpix-analyse/)**.
 
 To build locally:
 
