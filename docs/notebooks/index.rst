@@ -6,8 +6,10 @@ Interactive Jupyter notebooks demonstrating the main features of **healpix-analy
 .. toctree::
    :maxdepth: 1
 
-   ../Notebooks/TestAlm_healpix
-   ../Notebooks/Test_powerspectra
-   ../Notebooks/Test_Convol_ALM
-   ../Notebooks/Test_rectangle
-   ../Notebooks/Test_resampling_powerspectra
+   ../external_notebooks/TestAlm_healpix
+   Power spectra <../external_notebooks/Test_powerspectra>
+   Gauge-equivariant convolution <../external_notebooks/Test_Convol_ALM>
+   Rectangle patches <../external_notebooks/Test_rectangle>
+   Resampling and power spectra <../external_notebooks/Test_resampling_powerspectra>
+   Resampling (Sentinel-2 L2A) <../external_notebooks/Test_resampling_powerspectra-s2-l2a>
+   RWRAP round-trip test <../external_notebooks/RWRAP-test>

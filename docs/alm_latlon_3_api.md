@@ -1,7 +1,7 @@
 # `alm_latlon` — Part 3: API reference
 
 > **Module** `healpix_analyse.alm_latlon`  
-> **Parts** [1 · Quickstart](alm_latlon_1_quickstart.md) · [2 · Mathematics](alm_latlon_2_mathematics.md) · [3 · API reference](#)
+> **Parts** [1 · Quickstart](alm_latlon_1_quickstart.md) · [2 · Mathematics](alm_latlon_2_mathematics.md) · **3 · API reference**
 
 ---
 

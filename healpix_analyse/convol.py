@@ -3,38 +3,38 @@ convol.py  (optimised v3)
 =========================
 Gauge-equivariant spherical convolution on HEALPix maps.
 
-Optimisation summary
-──────────────────────────────────────────────────────────────────────────────
- #  Location              Before                        After
-──────────────────────────────────────────────────────────────────────────────
- 1  Buffer layout         _pos_safe / _w_norm stored     Stored as [4, G, K*P]
-    (__init__)            as [G, 4, K*P].                → pos[j] is contiguous
-                          pos[:, j, :].reshape(-1)        → reshape(-1) is a
-                          forces a hidden copy each       free view, zero copy.
-                          call in forward().
+Optimisation summary::
 
- 2  forward gather        One index_select over          Loop over 4 neighbors:
-    (forward)             [G*4*K*P] → peak alloc          accumulate in-place.
-                          B·C·G·4·K·P (~3.6 GB).         Peak: 2·B·C·G·K·P
-                                                         → 4× memory reduction.
+    #  Location              Before                        After
+    ──────────────────────────────────────────────────────────────────────────
+     1  Buffer layout         _pos_safe / _w_norm stored     Stored as [4, G, K*P]
+        (__init__)            as [G, 4, K*P].                → pos[j] is contiguous
+                              pos[:, j, :].reshape(-1)        → reshape(-1) is a
+                              forces a hidden copy each       free view, zero copy.
+                              call in forward().
 
- 3  einsum vs bmm         einsum("bcgkp,gcop->bgok")     Explicit torch.bmm
-    (forward)             may not fuse contractions.     → cuBLAS/MKL, 2–4×
-                                                         faster on GPU.
+     2  forward gather        One index_select over          Loop over 4 neighbors:
+        (forward)             [G*4*K*P] → peak alloc          accumulate in-place.
+                              B·C·G·4·K·P (~3.6 GB).         Peak: 2·B·C·G·K·P
+                                                             → 4× memory reduction.
 
- 4  Geometry cache        All of _get_interp_weights +   _geometry_cache_key()
-    (__init__)  ★ NEW ★   _bind_support_batched          hashes all ctor params
-                          recomputed from scratch        → torch.save on first
-                          on every __init__ call         run, torch.load on
-                          (~0.8 s for nside=64, G=4).    subsequent runs
-                                                         (~5 ms reload).
-                                                         Cache dir configurable
-                                                         via HEALPIXCONV_CACHE or
-                                                         cache_dir= kwarg.
-──────────────────────────────────────────────────────────────────────────────
- Differentiability: 100 % preserved.
- API: identical to v2 — drop-in replacement (one new optional kwarg: cache_dir).
-──────────────────────────────────────────────────────────────────────────────
+     3  einsum vs bmm         einsum("bcgkp,gcop->bgok")     Explicit torch.bmm
+        (forward)             may not fuse contractions.     → cuBLAS/MKL, 2–4×
+                                                             faster on GPU.
+
+     4  Geometry cache        All of _get_interp_weights +   _geometry_cache_key()
+        (__init__)  ★ NEW ★   _bind_support_batched          hashes all ctor params
+                              recomputed from scratch        → torch.save on first
+                              on every __init__ call         run, torch.load on
+                              (~0.8 s for nside=64, G=4).    subsequent runs
+                                                             (~5 ms reload).
+                                                             Cache dir configurable
+                                                             via HEALPIXCONV_CACHE or
+                                                             cache_dir= kwarg.
+    ──────────────────────────────────────────────────────────────────────────
+     Differentiability: 100 % preserved.
+     API: identical to v2 — drop-in replacement (one new optional kwarg: cache_dir).
+    ──────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -209,47 +209,47 @@ def _build_rotation_matrices(th, ph, G, gauge_type, device, dtype, ref_direction
 
     R_total = R_gauge(alpha_g) @ Rz(phi) @ Ry(theta)
 
-    Gauge types
-    -----------
-    "phi"
-        alpha_base = 0 everywhere.  Singularities at the geographic poles.
+    Gauge types::
 
-    "cosmo"
-        Same singularities as "phi" but the gauge angle flips sign across
-        the equator to match the cosmological convention.
+        "phi"
+            alpha_base = 0 everywhere.  Singularities at the geographic poles.
 
-    "projected_ref"
-        ref_direction is a single unit vector r (shape (3,)).
-        alpha_base = atan2(r_proj·e_φ,  r_proj·e_θ)
-        where r_proj = r - (r·n)·n  is the projection of r onto the
-        tangent plane at n.
-        Singularities at {+r, −r}  (antipodal pair), total index = 2.
+        "cosmo"
+            Same singularities as "phi" but the gauge angle flips sign across
+            the equator to match the cosmological convention.
 
-    "two_ref"
-        ref_direction is TWO unit vectors (shape (2, 3)): r1 and r2.
-        The gauge angle is defined as the argument of the complex PRODUCT
-        of the two projected tangent vectors:
+        "projected_ref"
+            ref_direction is a single unit vector r (shape (3,)).
+            alpha_base = atan2(r_proj·e_φ,  r_proj·e_θ)
+            where r_proj = r - (r·n)·n  is the projection of r onto the
+            tangent plane at n.
+            Singularities at {+r, −r}  (antipodal pair), total index = 2.
 
-            z_j(n) = (r_j_proj·e_θ) + i·(r_j_proj·e_φ)   j = 1, 2
-            alpha_base(n) = arg(z1(n) · z2(n))
-                          = atan2(Re(z1)·Im(z2) + Im(z1)·Re(z2),
-                                  Re(z1)·Re(z2) − Im(z1)·Im(z2))
+        "two_ref"
+            ref_direction is TWO unit vectors (shape (2, 3)): r1 and r2.
+            The gauge angle is defined as the argument of the complex PRODUCT
+            of the two projected tangent vectors:
 
-        Using the complex product is equivalent to arg(z1) + arg(z2), but
-        avoids two separate atan2 calls and never wraps independently.
+                z_j(n) = (r_j_proj·e_θ) + i·(r_j_proj·e_φ)   j = 1, 2
+                alpha_base(n) = arg(z1(n) · z2(n))
+                              = atan2(Re(z1)·Im(z2) + Im(z1)·Re(z2),
+                                      Re(z1)·Re(z2) − Im(z1)·Im(z2))
 
-        Singularity structure (Poincaré-Hopf, total index must = 2):
-          • +r1, −r1 : index +1 each   (zeros of z1)
-          • +r2, −r2 : index +1 each   (zeros of z2)
-          • N-Pole, S-Pole : index −1 each  (base-frame singularities
-                             absorbed by z1·z2, but each of z1 and z2 winds
-                             −1 there, so the poles get net index 1 − 2 = −1)
-          Total: 4×(+1) + 2×(−1) = 2  ✓
+            Using the complex product is equivalent to arg(z1) + arg(z2), but
+            avoids two separate atan2 calls and never wraps independently.
 
-        In practice the four user-chosen bad points {+r1, −r1, +r2, −r2}
-        are index +1 (well-behaved to avoid); the poles become index −1
-        (hyperbolic singularity — keep them away from the domain of interest
-        or over regions the network need not be accurate in).
+            Singularity structure (Poincaré-Hopf, total index must = 2):
+              - +r1, −r1 : index +1 each   (zeros of z1)
+              - +r2, −r2 : index +1 each   (zeros of z2)
+              - N-Pole, S-Pole : index −1 each  (base-frame singularities
+                                 absorbed by z1·z2, but each of z1 and z2 winds
+                                 −1 there, so the poles get net index 1 − 2 = −1)
+              Total: 4×(+1) + 2×(−1) = 2  (OK)
+
+            In practice the four user-chosen bad points {+r1, −r1, +r2, −r2}
+            are index +1 (well-behaved to avoid); the poles become index −1
+            (hyperbolic singularity — keep them away from the domain of interest
+            or over regions the network need not be accurate in).
     """
     th = np.asarray(th, dtype=np.float64).reshape(-1)
     ph = np.asarray(ph, dtype=np.float64).reshape(-1)
@@ -977,8 +977,10 @@ class HealPixConv(nn.Module):
         -------
         y : same type, shape [G*C_out, N] or [B, G*C_out, N]
 
-        Optimisation vs v1
-        ──────────────────
+        Notes
+        -----
+        Optimisation vs v1:
+
         v1 (single giant gather)::
 
             pos_flat  = pos.reshape(-1)              # [G*4*K*P]
@@ -1001,8 +1003,7 @@ class HealPixConv(nn.Module):
             W_mat = W.permute(0,1,3,2).reshape(G, C_in*P, C_out)
             y = bmm(g_mat, W_mat).reshape(G,B,K,C_out).permute(1,0,3,2)
 
-        Peak intermediate memory: B·C_in·G·K·P (v2) vs B·C_in·G·4·K·P (v1)
-        → 4× reduction.
+        Peak intermediate memory: ``B·C_in·G·K·P`` (v2) vs ``B·C_in·G·4·K·P`` (v1) — a 4x reduction.
         """
         t, is_numpy, was_1d, _ = _prepare_input_conv(x, self.device, self.dtype)
         B, C_in, N = t.shape
@@ -1104,9 +1105,9 @@ class HealPixConv(nn.Module):
         Return a human-readable description of the gauge singularities.
 
         For "phi" and "cosmo": singularities are always at the geographic poles.
-        For "projected_ref":   two antipodal singularities at ±r.
-        For "two_ref":         four singularities at {±r1, ±r2} (index +1 each)
-                               plus index-(-1) singularities at the geographic poles.
+        For "projected_ref": two antipodal singularities at plus/minus r.
+        For "two_ref": four singularities at {plus/minus r1, plus/minus r2}
+        (index +1 each) plus index-(-1) singularities at the geographic poles.
         """
         if self.gauge_type in ("phi", "cosmo"):
             return (

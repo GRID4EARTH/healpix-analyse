@@ -2,7 +2,7 @@
 
 > **Module** `healpix_analyse.alm_latlon`  
 > **Dependencies** `numpy`, `torch` only — no HEALPix, no FOSCAT  
-> **Parts** [1 · Quickstart](#) · [2 · Mathematics](alm_latlon_2_mathematics.md) · [3 · API reference](alm_latlon_3_api.md)
+> **Parts** **1 · Quickstart** · [2 · Mathematics](alm_latlon_2_mathematics.md) · [3 · API reference](alm_latlon_3_api.md)
 
 ---
 

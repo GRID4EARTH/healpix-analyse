@@ -57,7 +57,7 @@ HEALPixSHT(nside, lmax, dtype, device, ellipsoid)
 .anafast(im, map2, spin, nest)             → Tensor [..., lmax+1]
 
 Flat alm layout (same as healpy / alm_latlon.py):
-    [m=0: l=0..lmax | m=1: l=1..lmax | … | m=lmax: l=lmax]
+    ``[m=0: l=0..lmax | m=1: l=1..lmax | … | m=lmax: l=lmax]``
     K = (lmax+1)·(lmax+2)//2
 """
 
@@ -607,7 +607,7 @@ class HEALPixSHT:
         -------
         alm : (..., K) complex Tensor.
               K = (lmax+1)·(lmax+2)//2.
-              Flat layout: [m=0: l=0..lmax | m=1: l=1..lmax | … | m=lmax].
+              Flat layout: ``[m=0: l=0..lmax | m=1: l=1..lmax | … | m=lmax]``.
         """
         im      = self._to_real(im)
         self._check_map(im, "im")
@@ -956,7 +956,7 @@ class HEALPixSHT:
         Angular power spectrum C_l (or cross-spectrum C_l^{12}).
 
         For spin=0 (scalar):
-            C_l = 1/(2l+1) × [ |a_l0|² + 2 Σ_{m=1}^{l} |a_lm|² ]
+            ``C_l = 1/(2l+1) × [ |a_l0|² + 2 Σ_{m=1}^{l} |a_lm|² ]``
 
         For spin>0 (E/B modes):
             C_l^{EE}, C_l^{BB}, C_l^{EB} are returned as a (3, lmax+1) tensor.
