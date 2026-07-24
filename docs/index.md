@@ -201,6 +201,15 @@ minkowski
 ```{toctree}
 ---
 maxdepth: 1
+caption: Notebooks
+hidden: true
+---
+notebooks/index
+```
+
+```{toctree}
+---
+maxdepth: 1
 caption: API Reference
 hidden: true
 ---

@@ -25,7 +25,7 @@
 6. [Public API — `HealPixConv`](#6-public-api--healpixconv)
    - 6.1 [Constructor parameters](#61-constructor-parameters)
    - 6.2 [`forward(x)`](#62-forwardx)
-   - 6.3 [`set_kernel(W, bias, requires_grad)`](#63-set_kernelw-bias-requires_grad)
+   - 6.3 `set_kernel(W, bias=None, requires_grad=False)` (see Section 6 below)
    - 6.4 [`singularity_info()`](#64-singularity_info)
 7. [Tensor shapes reference](#7-tensor-shapes-reference)
 8. [Internal helpers](#8-internal-helpers)
@@ -295,7 +295,7 @@ required.
 To place singularities, pass a list of two `(lon, lat)` pairs:
 
 ```python
-singularity_lonlat = [(lon₁, lat₁), (lon₂, lat₂)]
+singularity_lonlat = [(lon_1, lat_1), (lon_2, lat_2)]
 ```
 
 Each pair controls one **user-specified** singularity; its antipodal point

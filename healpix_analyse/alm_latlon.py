@@ -36,7 +36,7 @@ The transform follows the standard orthonormal convention (same as healpy):
 
     Y_lm(θ,φ) = sqrt((2l+1)/(4π)) * P̃_lm(cosθ) * exp(imφ)
 
-    C_l = 1/(2l+1) * [|a_l0|² + 2 Σ_{m=1}^{l} |a_lm|²]
+    ``C_l = 1/(2l+1) * [|a_l0|² + 2 Σ_{m=1}^{l} |a_lm|²]``
 
 where P̃_lm are the normalised associated Legendre polynomials.
 """
@@ -629,9 +629,9 @@ def map2alm_latlon(
         Spherical harmonic coefficients where
         n_alm = Σ_{m=0}^{lmax} (lmax - m + 1).
 
-        Memory layout (same as healpy)::
+        Memory layout (same as healpy):
 
-            [m=0: ℓ=0..lmax | m=1: ℓ=1..lmax | … | m=lmax: ℓ=lmax]
+            ``[m=0: ℓ=0..lmax | m=1: ℓ=1..lmax | … | m=lmax: ℓ=lmax]``
     """
     ring_theta  = np.asarray(ring_theta,  dtype=np.float64)
     ring_counts = np.asarray(ring_counts, dtype=np.int64)
@@ -828,7 +828,7 @@ def anafast_latlon(
 
     Internally calls ``map2alm_latlon`` then accumulates:
 
-        C_l = 1/(2l+1) * [|a_l0|² + 2 Σ_{m=1}^{l} |a_lm|²]
+        ``C_l = 1/(2l+1) * [|a_l0|² + 2 Σ_{m=1}^{l} |a_lm|²]``
 
     All parameters are identical to ``map2alm_latlon``.
 
