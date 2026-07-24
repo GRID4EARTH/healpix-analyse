@@ -110,7 +110,7 @@ class AlmTransform:
     indexing_scheme : str, default="ring"
         The indexing scheme for the cell IDs.
     ellipsoid : {"sphere", "WGS84"}, default="sphere"
-        Geometry model. Ignored in this version but stored for compatibility.
+        Geometry model. 
     method : {"fft", "alm"}, default="fft", Alm approximation, alm option under development.
         Analysis mode used in the Legendre stage.
     dtype : torch.dtype, default=torch.float32
