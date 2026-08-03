@@ -18,6 +18,7 @@ classical data analysis.
 | `healpix_analyse.fft_conv` | FFT-accelerated large-kernel local convolution (`HealPixFFTConv`) |
 | `healpix_analyse.convol` | Gauge-equivariant spherical convolution (`HealPixConv`) |
 | `healpix_analyse.large_conv` | Multiresolution large-receptive-field convolution (`LargeConv`) |
+| `healpix_analyse.decomp` | Exact local multiscale decomposition for masked maps (`HealPixDecomp`) |
 | `healpix_analyse.down` | HEALPix resolution reduction — smooth or max-pool (`HealPixDown`) |
 | `healpix_analyse.up` | HEALPix resolution increase — adjoint of smooth downsampling (`HealPixUp`) |
 | `healpix_analyse.powerspectra` | Isotropic 1D power spectrum on HEALPix patches |

@@ -20,6 +20,7 @@ and are fully differentiable through `torch.autograd`.
 - **Gauge-equivariant convolution** — `HealPixConv` with configurable kernel size, gauge types, and number of gauges
 - **Large-kernel convolution** — matched Down/Up hierarchy with a compact learned kernel
 - **Multi-resolution operators** — `HealPixDown` (smooth / max-pool) and `HealPixUp` (adjoint upsampling), NESTED ordering
+- **Masked multiscale decomposition** — exactly reconstructing local `HealPixDecomp` pyramids
 - **Differentiable by default** — all hot-path operations are autograd-compatible
 - **NumPy and Torch interoperability** — accepts both array types, returns the same type
 
@@ -36,6 +37,7 @@ healpix_analyse/
 ├── large_conv.py         # Multiresolution large-receptive-field convolution
 ├── down.py               # Resolution reduction (HealPixDown)
 ├── up.py                 # Resolution increase (HealPixUp)
+├── decomp.py             # Exact local multiscale pyramid (HealPixDecomp)
 ├── powerspectra.py        # Isotropic power spectrum on HEALPix patches
 ├── powerspectra_lonlat.py # Power spectrum on irregular lon/lat grids
 ├── healpix_interp.py      # Bilinear interpolation on HEALPix (NESTED)
@@ -132,6 +134,20 @@ This example automatically uses three smooth Down operations, a compact
 `5×5` convolution, and the three exactly paired Up operations. See the
 [LargeConv documentation](docs/large_conv.md) for kernel planning, partial
 patches, gradients and limitations.
+
+### Exactly reconstructing multiscale decomposition
+
+```python
+from healpix_analyse import HealPixDecomp
+
+decomp = HealPixDecomp(level=10, cell_ids=ocean_cell_ids, Jmax=5)
+pyramid = decomp.compute(u_v)
+u_v_reconstructed = decomp.invert(pyramid)
+```
+
+The pyramid retains the NESTED cell identifiers at every scale and works on
+irregular masked domains such as ocean fields bounded by coastlines. See the
+[multiscale decomposition documentation](docs/decomp.md).
 
 ---
 

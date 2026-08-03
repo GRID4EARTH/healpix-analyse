@@ -17,3 +17,4 @@ Interactive Jupyter notebooks demonstrating the main features of **healpix-analy
    Local FFT on Sentinel-2 <../external_notebooks/fft_sentinel2_test>
    Large receptive-field convolution <../external_notebooks/large_conv_test>
    FFT large-kernel convolution <../external_notebooks/fft_conv_test>
+   Masked multiscale decomposition <../external_notebooks/decomp_test>
