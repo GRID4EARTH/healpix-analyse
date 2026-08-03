@@ -265,6 +265,16 @@ class LocalFFT(nn.Module):
         """Current device of the cached geometry buffers."""
         return self.cell_ids.device
 
+    @property
+    def coverage_mask(self) -> torch.Tensor:
+        """Boolean ``[grid_size, grid_size]`` mask reached by input cells."""
+        return (self._grid_density > 0).reshape(self.grid_shape)
+
+    @property
+    def grid_density(self) -> torch.Tensor:
+        """Accumulated interpolation weight on the projected square grid."""
+        return self._grid_density.reshape(self.grid_shape)
+
     def _input_tensor(self, data: ArrayLike) -> tuple[torch.Tensor, bool]:
         is_numpy = isinstance(data, np.ndarray)
         if not is_numpy and not torch.is_tensor(data):

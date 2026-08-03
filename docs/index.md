@@ -134,6 +134,27 @@ Resolution increase: adjoint of smooth downsampling.
 
 ::::
 
+## Local flat-sky analysis
+
+::::{grid} 1 1 2 2
+:gutter: 2
+
+:::{grid-item-card} Local 2D FFT
+:link: fft_local
+:link-type: doc
+
+Gnomonic projection, fast FFT/IFFT, CUDA, autograd and power-spectrum guidance.
+:::
+
+:::{grid-item-card} Sentinel-2 FFT notebook
+:link: external_notebooks/fft_sentinel2_test
+:link-type: doc
+
+Real B04/B08 reflectance, reconstruction metrics and local radial spectra.
+:::
+
+::::
+
 ## Morphology & topology
 
 ::::{grid} 1 1 3 3
@@ -187,6 +208,15 @@ hidden: true
 convol_doc
 down
 up
+```
+
+```{toctree}
+---
+maxdepth: 2
+caption: Local flat-sky analysis
+hidden: true
+---
+fft_local
 ```
 
 ```{toctree}

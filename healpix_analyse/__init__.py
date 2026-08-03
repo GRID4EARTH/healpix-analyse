@@ -10,6 +10,7 @@ Components
 - healpix_analyse.alm_latlon : ring-based SHT for arbitrary lat/lon grids (map2alm, anafast)
 - healpix_analyse.alm        : local spherical harmonic coefficients (AlmCoeffs, AlmTransform)
 - healpix_analyse.healpix_sht: ring-FFT SHT optimised for full-sky HEALPix maps
+- healpix_analyse.fft_local  : fast gnomonic 2D FFT on local HEALPix patches
 - healpix_analyse.powerspectra: angular power spectra on HEALPix subsets
 - healpix_analyse.convol     : gauge-equivariant spherical convolution
 - healpix_analyse.resample   : grid resampling helpers
@@ -38,6 +39,12 @@ from healpix_analyse.alm_latlon import (
 
 from healpix_analyse.alm import AlmCoeffs
 
+from healpix_analyse.fft_local import (
+    LocalFFT,
+    fft as local_fft,
+    ifft as local_ifft,
+)
+
 from healpix_analyse.minkowski import (
     minkowski_functionals,
     minkowski_curves,
@@ -59,6 +66,10 @@ __all__ = [
     "grid_summary",
     # ALM containers
     "AlmCoeffs",
+    # Local flat-sky FFT
+    "LocalFFT",
+    "local_fft",
+    "local_ifft",
     # Minkowski functionals — 2D planar
     "minkowski_functionals",
     "minkowski_curves",

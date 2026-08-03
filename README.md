@@ -15,6 +15,7 @@ and are fully differentiable through `torch.autograd`.
 ## Features
 
 - **Spherical harmonic transforms** — local ALM coefficients, ring-based full-sky SHT (spin-0, 1, 2), power spectra
+- **Local 2D FFT** — pole-safe gnomonic projection, fast FFT/IFFT, CUDA and autograd
 - **Gauge-equivariant convolution** — `HealPixConv` with configurable kernel size, gauge types, and number of gauges
 - **Multi-resolution operators** — `HealPixDown` (smooth / max-pool) and `HealPixUp` (adjoint upsampling), NESTED ordering
 - **Differentiable by default** — all hot-path operations are autograd-compatible
@@ -27,6 +28,7 @@ healpix_analyse/
 ├── alm.py               # Local complex spherical harmonic coefficients
 ├── alm_latlon.py         # SHT for arbitrary iso-latitude grids
 ├── healpix_sht.py        # Ring-based full-sky SHT for HEALPix
+├── fft_local.py          # Gnomonic 2D FFT for local HEALPix patches
 ├── convol.py             # Gauge-equivariant spherical convolution (HealPixConv)
 ├── down.py               # Resolution reduction (HealPixDown)
 ├── up.py                 # Resolution increase (HealPixUp)
@@ -67,6 +69,22 @@ cl = anafast_latlon(
 )
 print(cl.shape)   # torch.Size([193])
 ```
+
+### Local flat-sky FFT
+
+```python
+from healpix_analyse import LocalFFT
+
+transform = LocalFFT(cell_ids, level, device="cuda")
+spectrum = transform.fft(data)
+reconstructed = transform.ifft(spectrum)
+```
+
+The transform accepts local NESTED HEALPix patches up to a configurable
+angular radius (10 degrees by default). Its three-dimensional tangent-frame
+construction works at the poles and across 0/360 degrees. See the
+[detailed local FFT documentation](docs/fft_local.md) for geometry,
+normalisation, reconstruction accuracy and Sentinel-2 examples.
 
 ---
 
