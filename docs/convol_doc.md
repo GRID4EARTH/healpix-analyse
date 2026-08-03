@@ -78,13 +78,14 @@ import numpy as np
 import torch
 from healpix_analyse.convol import HealPixConv
 
-nside      = 64                        # HEALPix resolution
+level      = 6                         # Grid4Earth resolution level
+nside      = 2**level                  # internal HEALPix resolution
 npix       = 12 * nside ** 2           # 49 152 pixels
 in_ch, out_ch = 3, 16
 
 # --- build the layer (geometry precomputed here) ---
 conv = HealPixConv(
-    nside       = nside,
+    level       = level,
     in_channels = in_ch,
     out_channels= out_ch,
     kernel_sz   = 3,          # 3×3 = 9 stencil points
@@ -322,7 +323,7 @@ appears automatically. The full set of four bad points is thus:
 
 ```python
 HealPixConv(
-    nside,
+    level,
     in_channels,
     out_channels,
     kernel_sz          = 3,
@@ -331,7 +332,6 @@ HealPixConv(
     singularity_lonlat = None,
     ref_direction      = None,
     cell_ids           = None,
-    level              = None,
     nest               = True,
     use_norm           = False,
     device             = None,
@@ -342,7 +342,7 @@ HealPixConv(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `nside` | `int` | — | HEALPix resolution. Must be a power of 2 (e.g. 32, 64, 128). |
+| `level` | `int` | — | Grid4Earth/HEALPix level, integer ≥ 0. Internally, `nside = 2**level`. |
 | `in_channels` | `int` | — | Number of input feature channels C_in. |
 | `out_channels` | `int` | — | Output channels per gauge C_out. Total output channels = G × C_out. |
 | `kernel_sz` | `int` | `3` | Stencil side length. Must be a positive odd integer. P = kernel_sz². |
@@ -350,8 +350,7 @@ HealPixConv(
 | `gauge_type` | `str` | `"phi"` | One of `"phi"`, `"cosmo"`, `"projected_ref"`, `"two_ref"`. See Section 5. |
 | `singularity_lonlat` | `(lon, lat)` or `[(lon₁,lat₁),(lon₂,lat₂)]` or `None` | `None` | Geographic coordinates of the desired singularity point(s) in degrees. For `"projected_ref"`: one pair. For `"two_ref"`: a list of two pairs. Overrides `ref_direction`. |
 | `ref_direction` | `array (3,)` or `(2, 3)` or `None` | `None` | Low-level alternative: raw unit reference vector(s). Shape `(3,)` for `"projected_ref"`, `(2, 3)` for `"two_ref"`. Ignored when `singularity_lonlat` is provided. |
-| `cell_ids` | `array-like` or `None` | `None` | NESTED pixel indices for a partial-sky patch. `None` = full sphere. Requires `level`. |
-| `level` | `int` or `None` | `None` | HEALPix level such that `nside = 2**level`. Required when `cell_ids` is given. |
+| `cell_ids` | `array-like` or `None` | `None` | NESTED pixel indices for a partial-sky patch. `None` = full sphere. |
 | `nest` | `bool` | `True` | Pixel ordering of the input map. `True` = NESTED, `False` = RING. |
 | `use_norm` | `bool` | `False` | Apply GroupNorm + ReLU after the convolution. |
 | `device` | `str` or `torch.device` or `None` | `None` | Target device. Defaults to CUDA if available, else CPU. |
@@ -360,11 +359,11 @@ HealPixConv(
 
 **Raises:**
 
-- `ValueError` — if `nside` is not a positive power of 2.
+- `ValueError` — if `level` is not a non-negative integer.
 - `ValueError` — if `kernel_sz` is not a positive odd integer.
 - `ValueError` — if `gauge_type` is not one of the four valid strings.
-- `ValueError` — if `cell_ids` is provided without `level`, or with an
-  inconsistent `level`.
+- `ValueError` — if `cell_ids` contains identifiers outside the selected
+  level's valid pixel range.
 - `ValueError` — if `singularity_lonlat` is used with a gauge type that
   does not support it, or if the wrong number of pairs is provided for
   `"two_ref"`.
@@ -551,7 +550,7 @@ For very large nside, consider reducing G or kernel_sz, or using
 ### Full-sphere convolution, `"phi"` gauge
 
 ```python
-conv = HealPixConv(nside=64, in_channels=1, out_channels=32,
+conv = HealPixConv(level=6, in_channels=1, out_channels=32,
                    kernel_sz=3, n_gauges=1, gauge_type="phi")
 y = conv(x)   # x: [B, 1, 49152]  →  y: [B, 32, 49152]
 ```
@@ -559,7 +558,7 @@ y = conv(x)   # x: [B, 1, 49152]  →  y: [B, 32, 49152]
 ### Multi-gauge equivariant layer
 
 ```python
-conv = HealPixConv(nside=64, in_channels=16, out_channels=16,
+conv = HealPixConv(level=6, in_channels=16, out_channels=16,
                    kernel_sz=3, n_gauges=4, gauge_type="phi")
 # output has G * C_out = 64 channels
 ```
@@ -570,7 +569,7 @@ conv = HealPixConv(nside=64, in_channels=16, out_channels=16,
 # Singularity pair 1: Amazon basin + Borneo (its antipode)
 # Singularity pair 2: Africa + central Pacific (its antipode)
 conv = HealPixConv(
-    nside=64, in_channels=3, out_channels=16,
+    level=6, in_channels=3, out_channels=16,
     gauge_type="two_ref",
     singularity_lonlat=[(-55.0, -10.0), (20.0, 5.0)],
 )
@@ -581,7 +580,7 @@ print(conv.singularity_info())
 
 ```python
 conv = HealPixConv(
-    nside=64, in_channels=5, out_channels=32,
+    level=6, in_channels=5, out_channels=32,
     gauge_type="projected_ref",
     singularity_lonlat=(-160.0, 0.0),   # central Pacific + Indian Ocean antipode
 )
@@ -592,14 +591,14 @@ conv = HealPixConv(
 ```python
 import healpix_geo
 
-nside = 64
-depth = int(np.log2(nside))
+level = 6
+nside = 2**level
 cell_ids, _, _ = healpix_geo.nested.cone_coverage(
-    (0.0, 45.0), 20.0, depth, ellipsoid="WGS84"
+    (0.0, 45.0), 20.0, level, ellipsoid="WGS84"
 )
 conv = HealPixConv(
-    nside=nside, in_channels=1, out_channels=8,
-    cell_ids=cell_ids, level=depth,
+    level=level, in_channels=1, out_channels=8,
+    cell_ids=cell_ids,
 )
 x_patch = torch.randn(4, 1, len(cell_ids))
 y_patch = conv(x_patch)
@@ -608,7 +607,7 @@ y_patch = conv(x_patch)
 ### Fixed (non-learnable) isotropic kernel
 
 ```python
-conv = HealPixConv(nside=32, in_channels=1, out_channels=1, kernel_sz=3)
+conv = HealPixConv(level=5, in_channels=1, out_channels=1, kernel_sz=3)
 W = np.zeros((1, 1, 9), dtype=np.float32)
 W[0, 0, 4]              = 0.5       # centre
 W[0, 0, [0,1,2,3,5,6,7,8]] = 0.5/8 # ring
@@ -619,7 +618,7 @@ conv.set_kernel(W, requires_grad=False)
 
 ```python
 conv = HealPixConv(
-    nside=64, in_channels=16, out_channels=16,
+    level=6, in_channels=16, out_channels=16,
     n_gauges=4, use_norm=True,
 )
 # The output is already passed through GroupNorm then ReLU inside forward()

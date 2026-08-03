@@ -31,13 +31,12 @@ tensors are both accepted, and the return type mirrors the input type.
 
 ```python
 HealPixDown(
-    nside_in,
+    level,
     mode        = "smooth",
     radius_deg  = None,
     sigma_deg   = None,
     weight_norm = "l1",
     cell_ids    = None,
-    level       = None,
     device      = None,
     dtype       = torch.float32,
 )
@@ -45,13 +44,12 @@ HealPixDown(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `nside_in` | `int` | — | Input HEALPix resolution. Must be a power of 2 and ≥ 2. |
+| `level` | `int` | — | Input Grid4Earth/HEALPix level, integer ≥ 1. Internally, `nside_in = 2**level`. |
 | `mode` | `str` | `"smooth"` | Downsampling strategy: `"smooth"` or `"maxpool"`. |
 | `radius_deg` | `float` or `None` | auto | Angular radius of the Gaussian disc (degrees). Default ≈ 3 × pixel size. Used only with `"smooth"`. |
 | `sigma_deg` | `float` or `None` | auto | Gaussian sigma (degrees). Default = `radius_deg / 2`. Used only with `"smooth"`. |
 | `weight_norm` | `str` | `"l1"` | Per-output-pixel weight normalisation in `"smooth"` mode: `"l1"` (sum=1, preserves constants), `"l2"` (sum of squares=1, preserves energy), `"none"` (raw Gaussian). |
 | `cell_ids` | array-like or `None` | `None` | Input pixel indices (NESTED ordering) for partial-sky operation. `None` = full sphere. |
-| `level` | `int` or `None` | `None` | HEALPix level such that `nside_in = 2**level`. Required when `cell_ids` is provided. |
 | `device` | device or `None` | auto | Torch device. Defaults to CUDA if available, else CPU. |
 | `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values. |
 
@@ -136,8 +134,9 @@ pixels are set to zero and the remaining weights are renormalized.
 import numpy as np
 from healpix_analyse.down import HealPixDown
 
-nside = 64
-down  = HealPixDown(nside_in=nside)                      # "smooth", l1
+level = 6
+nside = 2**level
+down  = HealPixDown(level=level)                         # "smooth", l1
 
 # Single map
 x = np.random.randn(12 * nside**2)                      # [N]
@@ -160,7 +159,7 @@ from healpix_analyse.down import HealPixDown
 nside = 64;  level = 6   # nside = 2**6
 patch = hp.query_disc(nside, hp.ang2vec(np.pi/2, 0.), np.radians(20.), nest=True)
 
-down = HealPixDown(nside_in=nside, cell_ids=patch, level=level)
+down = HealPixDown(level=level, cell_ids=patch)
 
 x_patch = np.random.randn(len(patch))
 y_patch, coarse_ids = down(x_patch)
@@ -174,8 +173,9 @@ print(f"Coarse pixels: {len(coarse_ids)}")    # ≈ len(patch) / 4
 import torch
 from healpix_analyse.down import HealPixDown
 
-nside = 128
-down  = HealPixDown(nside_in=nside, device="cuda", dtype=torch.float32)
+level = 7
+nside = 2**level
+down  = HealPixDown(level=level, device="cuda", dtype=torch.float32)
 
 x = torch.randn(4, 12 * nside**2, device="cuda")        # [B, N]
 y, ids_out = down(x)
@@ -188,7 +188,7 @@ print(y.shape, y.device)   # (4, 49152) cuda:0
 from healpix_analyse.down import HealPixDown
 import numpy as np
 
-down_max = HealPixDown(nside_in=64, mode="maxpool")
+down_max = HealPixDown(level=6, mode="maxpool")
 x = np.random.randn(12 * 64**2)
 y, _ = down_max(x)
 ```
@@ -198,7 +198,7 @@ y, _ = down_max(x)
 ```python
 # Wider disc, sharper Gaussian — more blurring
 down_wide = HealPixDown(
-    nside_in=64,
+    level=6,
     mode="smooth",
     radius_deg=2.0,
     sigma_deg=0.5,
@@ -215,11 +215,12 @@ from healpix_analyse.convol import HealPixConv
 from healpix_analyse.down   import HealPixDown
 import torch
 
-nside = 64
-conv1 = HealPixConv(nside,    in_channels=1,  out_channels=32, use_norm=True)
-down1 = HealPixDown(nside,    mode="smooth")
-conv2 = HealPixConv(nside//2, in_channels=32, out_channels=64, use_norm=True)
-down2 = HealPixDown(nside//2, mode="smooth")
+level = 6
+nside = 2**level
+conv1 = HealPixConv(level,     in_channels=1,  out_channels=32, use_norm=True)
+down1 = HealPixDown(level,     mode="smooth")
+conv2 = HealPixConv(level - 1, in_channels=32, out_channels=64, use_norm=True)
+down2 = HealPixDown(level - 1, mode="smooth")
 
 x = torch.randn(4, 1, 12 * nside**2)        # [B, 1, N]
 f1 = conv1(x)                               # [B, 32, N]
@@ -234,6 +235,8 @@ f2_down, _ = down2(f2)                      # [B, 64, N/16]
 
 | Attribute | Description |
 |---|---|
+| `level_in` | Fine input Grid4Earth/HEALPix level. |
+| `level_out` | Coarse output level (`level_in - 1`). |
 | `nside_in` | Fine input resolution. |
 | `nside_out` | Coarse output resolution (`nside_in // 2`). |
 | `N_in` | Number of input pixels (full sphere or `len(cell_ids)`). |
@@ -255,9 +258,10 @@ and `sigma_deg`.  Use the same values in both constructors:
 from healpix_analyse.down import HealPixDown
 from healpix_analyse.up   import HealPixUp
 
-nside = 64
-down = HealPixDown(nside_in=nside, weight_norm="l1")
-up   = HealPixUp(nside_in=nside//2, weight_norm="l1", up_norm="col_l1")
+level = 6
+nside = 2**level
+down = HealPixDown(level=level, weight_norm="l1")
+up   = HealPixUp(level=level - 1, weight_norm="l1", up_norm="col_l1")
 
 x = torch.randn(4, 12 * nside**2)
 y, _  = down(x)          # [4, N/4]

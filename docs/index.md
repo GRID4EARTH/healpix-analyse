@@ -132,6 +132,41 @@ Resolution reduction: smooth or max-pool downsampling.
 Resolution increase: adjoint of smooth downsampling.
 :::
 
+:::{grid-item-card} LargeConv
+:link: large_conv
+:link-type: doc
+
+Large effective kernels through matched Down, compact convolution and Up.
+:::
+
+::::
+
+## Local flat-sky analysis
+
+::::{grid} 1 1 2 2
+:gutter: 2
+
+:::{grid-item-card} Local 2D FFT
+:link: fft_local
+:link-type: doc
+
+Gnomonic projection, fast FFT/IFFT, CUDA, autograd and power-spectrum guidance.
+:::
+
+:::{grid-item-card} FFT convolution
+:link: fft_conv
+:link-type: doc
+
+Fast zero-padded large kernels on local HEALPix patches.
+:::
+
+:::{grid-item-card} Sentinel-2 FFT notebook
+:link: external_notebooks/fft_sentinel2_test
+:link-type: doc
+
+Real B04/B08 reflectance, reconstruction metrics and local radial spectra.
+:::
+
 ::::
 
 ## Morphology & topology
@@ -187,6 +222,16 @@ hidden: true
 convol_doc
 down
 up
+large_conv
+```
+
+```{toctree}
+---
+maxdepth: 2
+caption: Local flat-sky analysis
+hidden: true
+---
+fft_local
 ```
 
 ```{toctree}

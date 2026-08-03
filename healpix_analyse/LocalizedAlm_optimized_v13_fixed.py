@@ -136,7 +136,11 @@ class LocalizedAlm(alm_base.alm):
     and transferred to GPU on-demand.
     """
     
-    def __init__(self, nside, patch_idx_ring, backend, lmax=None, lmax_compute=None):
+    def __init__(self, level, patch_idx_ring, backend, lmax=None, lmax_compute=None):
+        if isinstance(level, bool) or int(level) != level or int(level) < 0:
+            raise ValueError("level must be an integer >= 0")
+        self.level = int(level)
+        nside = 2 ** self.level
         patch_idx_ring = np.asarray(patch_idx_ring, dtype=np.int64)
         if patch_idx_ring.size > 1:
             patch_idx_ring = np.sort(patch_idx_ring)
@@ -375,7 +379,8 @@ def test_localized_anafast():
     print("Testing LocalizedAlm_optimized_v13_fixed")
     print("="*70)
     
-    nside_test = 64
+    level_test = 6
+    nside_test = 2**level_test
     npix = 12 * nside_test**2
     lmax = 3 * nside_test - 1
     
@@ -404,7 +409,7 @@ def test_localized_anafast():
     
     print("\nInitializing LocalizedAlm (includes CPU precomputation)...")
     t0 = time.time()
-    alm_loc = LocalizedAlm(nside_test, patch_idx, backend=bk, lmax=lmax)
+    alm_loc = LocalizedAlm(level_test, patch_idx, backend=bk, lmax=lmax)
     t_init = time.time() - t0
     print(f"Initialization time: {t_init:.2f}s")
     

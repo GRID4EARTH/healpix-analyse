@@ -33,31 +33,31 @@ tensors are both accepted, and the return type mirrors the input type.
 
 ```python
 HealPixUp(
-    nside_in,
+    level,
     radius_deg  = None,
     sigma_deg   = None,
     weight_norm = "l1",
     up_norm     = "col_l1",
     eps         = 1e-12,
     cell_ids    = None,
-    level       = None,
     device      = None,
     dtype       = torch.float32,
+    paired_down = None,
 )
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `nside_in` | `int` | — | **Coarse** input resolution. Must be a power of 2 and ≥ 1. Output resolution will be `nside_in * 2`. |
+| `level` | `int` | — | Coarse Grid4Earth/HEALPix level, integer ≥ 0. Internally, `nside_in = 2**level`; output level is `level + 1`. |
 | `radius_deg` | `float` or `None` | auto | Angular radius used to build the internal downsampling matrix (same semantics as `HealPixDown`). |
 | `sigma_deg` | `float` or `None` | auto | Gaussian sigma (degrees). Default = `radius_deg / 2`. |
 | `weight_norm` | `str` | `"l1"` | Normalisation used when building `M` (`"l1"`, `"l2"`, `"none"`). **Must match** the paired `HealPixDown`. |
 | `up_norm` | `str` | `"col_l1"` | Diagonal correction applied after the transpose (see table below). |
 | `eps` | `float` | `1e-12` | Floor for the denominator in normalisation, avoids division by zero. |
 | `cell_ids` | array-like or `None` | `None` | **Coarse** pixel indices (NESTED) for partial-sky operation. `None` = full sphere. |
-| `level` | `int` or `None` | `None` | HEALPix level such that `nside_in = 2**level`. Required when `cell_ids` is provided. |
 | `device` | device or `None` | auto | Torch device. Defaults to CUDA if available, else CPU. |
 | `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values. |
+| `paired_down` | `HealPixDown` or `None` | `None` | Reuse the exact matrix and fine-cell domain of an existing smooth Down operator. `cell_ids` must be omitted; `level` identifies the coarse output level. |
 
 ---
 
@@ -116,6 +116,28 @@ cell_ids_out = unique(cell_ids_in[:, None] * 4 + [0, 1, 2, 3])
 The internal downsampling matrix is built on the fine side
 (`cell_ids_out`) and then transposed.
 
+For an exact matrix pairing on an arbitrary partial fine-cell domain, pass the
+existing Down operator directly:
+
+```python
+down = HealPixDown(
+    level=6,
+    mode="smooth",
+    cell_ids=fine_cell_ids,
+    ellipsoid="sphere",
+)
+up = HealPixUp(
+    level=5,
+    paired_down=down,
+    up_norm="col_l1",
+)
+```
+
+In this mode, `HealPixUp` transposes `down`'s stored sparse matrix instead of
+rebuilding one. Its output identifiers are exactly the original fine
+`cell_ids`, including their order. The ellipsoid and weight normalisation are
+inherited from `down`.
+
 ---
 
 ## Examples
@@ -126,8 +148,9 @@ The internal downsampling matrix is built on the fine side
 import numpy as np
 from healpix_analyse.up import HealPixUp
 
-nside = 32   # coarse resolution
-up    = HealPixUp(nside_in=nside)            # col_l1 normalisation
+level = 5
+nside = 2**level   # coarse resolution
+up    = HealPixUp(level=level)                # col_l1 normalisation
 
 # Single map
 x = np.random.randn(12 * nside**2)          # [N_coarse]
@@ -152,7 +175,7 @@ patch_coarse = hp.query_disc(
     nside_coarse, hp.ang2vec(np.pi/2, 0.), np.radians(20.), nest=True
 )
 
-up = HealPixUp(nside_in=nside_coarse, cell_ids=patch_coarse, level=level_coarse)
+up = HealPixUp(level=level_coarse, cell_ids=patch_coarse)
 
 x_coarse = np.random.randn(len(patch_coarse))
 y_fine, fine_ids = up(x_coarse)
@@ -166,8 +189,9 @@ print(f"Fine   pixels: {len(fine_ids)}")    # ≈ 4 * len(patch_coarse)
 import torch
 from healpix_analyse.up import HealPixUp
 
-nside = 32
-up = HealPixUp(nside_in=nside, device="cuda", dtype=torch.float32)
+level = 5
+nside = 2**level
+up = HealPixUp(level=level, device="cuda", dtype=torch.float32)
 
 x = torch.randn(4, 12 * nside**2, device="cuda")   # [B, N_coarse]
 y, _ = up(x)
@@ -181,14 +205,15 @@ from healpix_analyse.up import HealPixUp
 import numpy as np
 
 nside = 32
+level = 5
 x     = np.random.randn(12 * nside**2).astype(np.float32)
 
 # Adjoint only (no amplitude correction)
-up_adj  = HealPixUp(nside_in=nside, up_norm="adjoint")
+up_adj  = HealPixUp(level=level, up_norm="adjoint")
 y_adj, _ = up_adj(x)
 
 # Least-squares diagonal preconditioner
-up_l2   = HealPixUp(nside_in=nside, weight_norm="l2", up_norm="diag_l2")
+up_l2   = HealPixUp(level=level, weight_norm="l2", up_norm="diag_l2")
 y_l2, _ = up_l2(x)
 ```
 
@@ -201,14 +226,15 @@ from healpix_analyse.convol import HealPixConv
 from healpix_analyse.up     import HealPixUp
 import torch
 
-nside = 64
+level = 6
+nside = 2**level
 
 # These match the encoder (down.py example)
-up1  = HealPixUp(nside//2, up_norm="col_l1")
-dec1 = HealPixConv(nside, 64 + 32, 32, kernel_sz=3, use_norm=True)
+up1  = HealPixUp(level - 1, up_norm="col_l1")
+dec1 = HealPixConv(level, 64 + 32, 32, kernel_sz=3, use_norm=True)
 
-up2  = HealPixUp(nside//4, up_norm="col_l1")
-dec2 = HealPixConv(nside//2, 128 + 64, 64, kernel_sz=3, use_norm=True)
+up2  = HealPixUp(level - 2, up_norm="col_l1")
+dec2 = HealPixConv(level - 1, 128 + 64, 64, kernel_sz=3, use_norm=True)
 
 # s1, s2 are skip connections from the encoder
 xu2, _ = up2(bottleneck)                           # [B, 128, N/4]
@@ -223,6 +249,8 @@ xd1    = dec1(torch.cat([xu1, s1], dim=1))         # [B,  32, N]
 
 | Attribute | Description |
 |---|---|
+| `level_in` | Coarse input Grid4Earth/HEALPix level. |
+| `level_out` | Fine output level (`level_in + 1`). |
 | `nside_in` | Coarse input resolution. |
 | `nside_out` | Fine output resolution (`nside_in * 2`). |
 | `N_in` | Number of input pixels (full sphere or `len(cell_ids)`). |
@@ -244,9 +272,10 @@ from healpix_analyse.down import HealPixDown
 from healpix_analyse.up   import HealPixUp
 import numpy as np
 
-nside = 64
-down = HealPixDown(nside_in=nside, weight_norm="l1")
-up   = HealPixUp(nside_in=nside//2, weight_norm="l1", up_norm="col_l1")
+level = 6
+nside = 2**level
+down = HealPixDown(level=level, weight_norm="l1")
+up   = HealPixUp(level=level - 1, weight_norm="l1", up_norm="col_l1")
 
 x = np.random.randn(12 * nside**2).astype(np.float32)
 

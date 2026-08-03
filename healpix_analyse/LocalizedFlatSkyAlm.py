@@ -41,7 +41,11 @@ class LocalizedFlatSkyAlm(alm_base.alm):
     Avoids O(lmax^2) memory bottlenecks for ultra-high resolution maps.
     """
     
-    def __init__(self, nside, patch_idx_ring, backend, lmax=None, lmax_compute=None):
+    def __init__(self, level, patch_idx_ring, backend, lmax=None, lmax_compute=None):
+        if isinstance(level, bool) or int(level) != level or int(level) < 0:
+            raise ValueError("level must be an integer >= 0")
+        self.level = int(level)
+        nside = 2 ** self.level
         patch_idx_ring = np.asarray(patch_idx_ring, dtype=np.int64)
         if patch_idx_ring.size > 1:
             patch_idx_ring = np.sort(patch_idx_ring)

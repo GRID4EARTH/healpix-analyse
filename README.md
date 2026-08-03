@@ -15,7 +15,10 @@ and are fully differentiable through `torch.autograd`.
 ## Features
 
 - **Spherical harmonic transforms** — local ALM coefficients, ring-based full-sky SHT (spin-0, 1, 2), power spectra
+- **Local 2D FFT** — pole-safe gnomonic projection, fast FFT/IFFT, CUDA and autograd
+- **FFT large-kernel convolution** — zero-padded local `HealPixFFTConv` with CUDA and autograd
 - **Gauge-equivariant convolution** — `HealPixConv` with configurable kernel size, gauge types, and number of gauges
+- **Large-kernel convolution** — matched Down/Up hierarchy with a compact learned kernel
 - **Multi-resolution operators** — `HealPixDown` (smooth / max-pool) and `HealPixUp` (adjoint upsampling), NESTED ordering
 - **Differentiable by default** — all hot-path operations are autograd-compatible
 - **NumPy and Torch interoperability** — accepts both array types, returns the same type
@@ -27,7 +30,10 @@ healpix_analyse/
 ├── alm.py               # Local complex spherical harmonic coefficients
 ├── alm_latlon.py         # SHT for arbitrary iso-latitude grids
 ├── healpix_sht.py        # Ring-based full-sky SHT for HEALPix
+├── fft_local.py          # Gnomonic 2D FFT for local HEALPix patches
+├── fft_conv.py           # FFT-accelerated large-kernel local convolution
 ├── convol.py             # Gauge-equivariant spherical convolution (HealPixConv)
+├── large_conv.py         # Multiresolution large-receptive-field convolution
 ├── down.py               # Resolution reduction (HealPixDown)
 ├── up.py                 # Resolution increase (HealPixUp)
 ├── powerspectra.py        # Isotropic power spectrum on HEALPix patches
@@ -41,6 +47,9 @@ healpix_analyse/
 ---
 
 ## Quick start
+
+All HEALPix-facing public interfaces use the Grid4Earth `level` convention;
+the internal HEALPix resolution is always `nside = 2**level`.
 
 ```python
 import numpy as np
@@ -67,6 +76,62 @@ cl = anafast_latlon(
 )
 print(cl.shape)   # torch.Size([193])
 ```
+
+### Local flat-sky FFT
+
+```python
+from healpix_analyse import LocalFFT
+
+transform = LocalFFT(cell_ids, level, device="cuda")
+spectrum = transform.fft(data)
+reconstructed = transform.ifft(spectrum)
+frequency, power = transform.ps(spectrum)
+```
+
+The transform accepts local NESTED HEALPix patches up to a configurable
+angular radius (10 degrees by default). Its three-dimensional tangent-frame
+construction works at the poles and across 0/360 degrees. See the
+[detailed local FFT documentation](docs/fft_local.md) for geometry,
+normalisation, reconstruction accuracy and Sentinel-2 examples.
+
+### FFT-accelerated large kernels
+
+```python
+from healpix_analyse import HealPixFFTConv
+
+layer = HealPixFFTConv(
+    level=12,
+    in_channels=4,
+    out_channels=8,
+    kernel_sz=65,
+    cell_ids=cell_ids,
+    device="cuda",
+)
+y = layer(x)
+```
+
+The layer performs a zero-padded linear convolution on the same pole-safe
+gnomonic grid used by `LocalFFT`. See the [FFT convolution documentation](docs/fft_conv.md).
+
+### Large receptive-field convolution
+
+```python
+from healpix_analyse import LargeConv
+
+layer = LargeConv(
+    level=8,  # nside = 2**level = 256
+    in_channels=8,
+    out_channels=16,
+    kernel_sz=33,
+    max_compact_kernel_sz=7,
+)
+y = layer(x)
+```
+
+This example automatically uses three smooth Down operations, a compact
+`5×5` convolution, and the three exactly paired Up operations. See the
+[LargeConv documentation](docs/large_conv.md) for kernel planning, partial
+patches, gradients and limitations.
 
 ---
 

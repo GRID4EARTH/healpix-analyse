@@ -48,7 +48,7 @@ and    Σ-(m) = Σ_r -sY_lm*(θ_r)·F_r^-(m),  F_r^- = FFT(Q - iU).
 
 Public API
 ----------
-HEALPixSHT(nside, lmax, dtype, device, ellipsoid)
+HEALPixSHT(level, lmax, dtype, device, ellipsoid)
 
 .map2alm(im, nest=False)                   → Tensor [..., K]
 .alm2map(alm, nest=False)                  → Tensor [..., N]
@@ -180,8 +180,9 @@ class HEALPixSHT:
 
     Parameters
     ----------
-    nside     : int            HEALPix resolution (power of 2).
-    lmax      : int or None    Maximum multipole.  Default: 3·nside - 1.
+    level     : int            Grid4Earth/HEALPix level (integer >= 0).
+                               Internally, nside = 2**level.
+    lmax      : int or None    Maximum multipole.  Default: 3·2**level - 1.
     dtype     : torch.dtype    torch.float32 or torch.float64.
     device    : str or device  Defaults to CUDA when available.
     ellipsoid : str            "sphere" (default) or "WGS84".
@@ -189,19 +190,20 @@ class HEALPixSHT:
 
     def __init__(
         self,
-        nside: int,
+        level: int,
         lmax:      Optional[int]               = None,
         dtype:     torch.dtype                 = torch.float32,
         device:    Optional[Union[str, torch.device]] = None,
         ellipsoid: str                         = "sphere",
     ) -> None:
-        if (nside & (nside - 1)) != 0 or nside < 1:
-            raise ValueError("nside must be a positive power of 2.")
+        if isinstance(level, bool) or int(level) != level or int(level) < 0:
+            raise ValueError("level must be an integer >= 0.")
         if dtype not in (torch.float32, torch.float64):
             raise ValueError("dtype must be torch.float32 or torch.float64.")
 
-        self.nside     = int(nside)
-        self.lmax      = int(lmax) if lmax is not None else 3 * nside - 1
+        self.level     = int(level)
+        self.nside     = 2 ** self.level
+        self.lmax      = int(lmax) if lmax is not None else 3 * self.nside - 1
         self.dtype     = dtype
         self.cdtype    = (
             torch.complex64 if dtype == torch.float32 else torch.complex128
@@ -213,9 +215,9 @@ class HEALPixSHT:
             else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        self._depth  = int(round(math.log2(nside)))
-        self.n_pix   = 12 * nside ** 2
-        self.n_rings = 4 * nside - 1
+        self._depth  = self.level
+        self.n_pix   = 12 * self.nside ** 2
+        self.n_rings = 4 * self.nside - 1
         self.n_alm   = (self.lmax + 1) * (self.lmax + 2) // 2
 
         # precompute ring geometry
@@ -569,7 +571,7 @@ class HEALPixSHT:
                 f"'{name}' has {x.shape[-1]} pixels (nside≈{got_nside}), "
                 f"but this HEALPixSHT was built for nside={self.nside} "
                 f"({self.n_pix} pixels).  "
-                f"Create a new HEALPixSHT(nside={got_nside}) or pass the "
+                f"Create a new HEALPixSHT(level={int(round(math.log2(got_nside)))}) or pass the "
                 f"correct map."
             )
 
@@ -1086,7 +1088,7 @@ class HEALPixSHT:
 
     def __repr__(self) -> str:
         return (
-            f"HEALPixSHT(nside={self.nside}, lmax={self.lmax}, "
+            f"HEALPixSHT(level={self.level}, nside={self.nside}, lmax={self.lmax}, "
             f"n_rings={self.n_rings}, n_alm={self.n_alm}, "
             f"dtype={self.dtype}, device={self.device})"
         )
