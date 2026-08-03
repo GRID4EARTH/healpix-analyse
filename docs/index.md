@@ -153,6 +153,13 @@ Large effective kernels through matched Down, compact convolution and Up.
 Gnomonic projection, fast FFT/IFFT, CUDA, autograd and power-spectrum guidance.
 :::
 
+:::{grid-item-card} FFT convolution
+:link: fft_conv
+:link-type: doc
+
+Fast zero-padded large kernels on local HEALPix patches.
+:::
+
 :::{grid-item-card} Sentinel-2 FFT notebook
 :link: external_notebooks/fft_sentinel2_test
 :link-type: doc
