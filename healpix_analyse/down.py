@@ -11,8 +11,8 @@ Two modes:
     "smooth"  -- weighted Gaussian average over a disc (linear, differentiable).
     "maxpool" -- non-linear max over the 4 direct NESTED children.
 
-Works on the full sphere (nside inferred from input size) or on a partial-sky
-subset (``cell_ids`` + ``level`` parameters).
+Works on the full sphere or on a partial-sky subset.  Resolution is exposed
+through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
 
 Accepts numpy arrays or torch tensors of shape ``[N]`` or ``[B, N]`` and
 returns an output of the same type and number of dimensions.
@@ -99,7 +99,7 @@ class HealPixDown(nn.Module):
     """
     HEALPix downsampling: reduce resolution by a factor of 2.
 
-    Reduces ``nside_in`` → ``nside_out = nside_in // 2`` using either a
+    Reduces ``level`` → ``level - 1`` using either a
     Gaussian-weighted sparse matrix (``mode="smooth"``) or a max-pooling
     over the 4 direct NESTED children (``mode="maxpool"``).
 
@@ -107,11 +107,11 @@ class HealPixDown(nn.Module):
 
     Parameters
     ----------
-    nside_in : int
-        Input HEALPix resolution.  Must be a power of 2 and ≥ 2.
+    level : int
+        Input Grid4Earth/HEALPix level.  Must be an integer ≥ 1.  The
+        corresponding HEALPix resolution is ``nside_in = 2**level``.
         When ``cell_ids`` is ``None``, the input is expected to have
         ``N = 12 * nside_in**2`` pixels.
-        When ``cell_ids`` is provided, ``nside_in`` must equal ``2**level``.
     mode : {"smooth", "maxpool"}, default "smooth"
         Downsampling strategy.
         *smooth*   -- differentiable Gaussian-weighted average (linear).
@@ -131,10 +131,6 @@ class HealPixDown(nn.Module):
     cell_ids : array-like of int or None
         Pixel indices (NESTED ordering) of the input sub-map.
         If ``None``, the operator covers the full sphere.
-        If provided, ``level`` is also required and ``nside_in = 2**level``.
-    level : int or None
-        HEALPix level such that ``nside_in = 2**level``.
-        Required when ``cell_ids`` is not ``None``.
     device : torch.device or str or None
         Device for the sparse matrix and computations.
         Defaults to CUDA if available, else CPU.
@@ -147,31 +143,31 @@ class HealPixDown(nn.Module):
 
     >>> import numpy as np
     >>> from healpix_analyse.down import HealPixDown
-    >>> nside = 64
+    >>> level = 6
+    >>> nside = 2**level
     >>> x = np.random.randn(12 * nside**2)          # [N]
-    >>> down = HealPixDown(nside_in=nside)
+    >>> down = HealPixDown(level=level)
     >>> y, cell_ids_out = down(x)
     >>> y.shape
-    (49152,)   # 12 * 32**2
+    (12288,)   # 12 * 32**2
 
     Partial sky:
 
     >>> import healpy as hp
     >>> cell_ids = hp.query_disc(nside, hp.ang2vec(np.pi/2, 0), 0.3, nest=True)
-    >>> down = HealPixDown(nside_in=nside, cell_ids=cell_ids, level=6)
+    >>> down = HealPixDown(level=level, cell_ids=cell_ids)
     >>> y, coarse_ids = down(x[cell_ids])
     """
 
     def __init__(
         self,
-        nside_in: int,
+        level: int,
         mode: str = "smooth",
         ellipsoid: str = "WGS84",
         radius_deg: Optional[float] = None,
         sigma_deg: Optional[float] = None,
         weight_norm: str = "l1",
         cell_ids: Optional[ArrayLike] = None,
-        level: Optional[int] = None,
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -184,10 +180,13 @@ class HealPixDown(nn.Module):
         self.dtype = dtype
         self.ellipsoid = ellipsoid
 
-        # ---- validate nside ----
-        self.nside_in = int(nside_in)
-        if self.nside_in < 2 or (self.nside_in & (self.nside_in - 1)) != 0:
-            raise ValueError("nside_in must be a power of 2 and >= 2.")
+        # ---- Grid4Earth level -> internal HEALPix nside ----
+        if isinstance(level, bool) or int(level) != level or int(level) < 1:
+            raise ValueError("level must be an integer >= 1.")
+        self.level_in = int(level)
+        self.level_out = self.level_in - 1
+        self.level = self.level_in
+        self.nside_in = 2 ** self.level_in
         self.nside_out = self.nside_in // 2
         self.N_in_full  = 12 * self.nside_in  * self.nside_in
         self.N_out_full = 12 * self.nside_out * self.nside_out
@@ -203,18 +202,15 @@ class HealPixDown(nn.Module):
         # ---- partial sky ----
         self.partial = cell_ids is not None
         if self.partial:
-            if level is None:
-                raise ValueError(
-                    "level must be provided together with cell_ids "
-                    "(nside_in = 2**level)."
-                )
-            expected_nside = 2 ** int(level)
-            if expected_nside != self.nside_in:
-                raise ValueError(
-                    f"Inconsistent level={level} (→ nside={expected_nside}) "
-                    f"and nside_in={self.nside_in}."
-                )
             cell_ids_in = np.asarray(cell_ids, dtype=np.int64).ravel()
+            if cell_ids_in.size == 0:
+                raise ValueError("cell_ids must not be empty.")
+            if np.unique(cell_ids_in).size != cell_ids_in.size:
+                raise ValueError("cell_ids must contain unique identifiers.")
+            if np.any(cell_ids_in < 0) or np.any(cell_ids_in >= self.N_in_full):
+                raise ValueError(
+                    f"cell_ids contain identifiers outside level={self.level_in}."
+                )
             # Coarse output pixels: parent of each input pixel in NESTED ordering
             cell_ids_out = np.unique(cell_ids_in // 4).astype(np.int64)
             self._cell_ids_in  = cell_ids_in

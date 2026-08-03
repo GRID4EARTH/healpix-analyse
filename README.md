@@ -17,6 +17,7 @@ and are fully differentiable through `torch.autograd`.
 - **Spherical harmonic transforms** — local ALM coefficients, ring-based full-sky SHT (spin-0, 1, 2), power spectra
 - **Local 2D FFT** — pole-safe gnomonic projection, fast FFT/IFFT, CUDA and autograd
 - **Gauge-equivariant convolution** — `HealPixConv` with configurable kernel size, gauge types, and number of gauges
+- **Large-kernel convolution** — matched Down/Up hierarchy with a compact learned kernel
 - **Multi-resolution operators** — `HealPixDown` (smooth / max-pool) and `HealPixUp` (adjoint upsampling), NESTED ordering
 - **Differentiable by default** — all hot-path operations are autograd-compatible
 - **NumPy and Torch interoperability** — accepts both array types, returns the same type
@@ -30,6 +31,7 @@ healpix_analyse/
 ├── healpix_sht.py        # Ring-based full-sky SHT for HEALPix
 ├── fft_local.py          # Gnomonic 2D FFT for local HEALPix patches
 ├── convol.py             # Gauge-equivariant spherical convolution (HealPixConv)
+├── large_conv.py         # Multiresolution large-receptive-field convolution
 ├── down.py               # Resolution reduction (HealPixDown)
 ├── up.py                 # Resolution increase (HealPixUp)
 ├── powerspectra.py        # Isotropic power spectrum on HEALPix patches
@@ -43,6 +45,9 @@ healpix_analyse/
 ---
 
 ## Quick start
+
+All HEALPix-facing public interfaces use the Grid4Earth `level` convention;
+the internal HEALPix resolution is always `nside = 2**level`.
 
 ```python
 import numpy as np
@@ -86,6 +91,26 @@ angular radius (10 degrees by default). Its three-dimensional tangent-frame
 construction works at the poles and across 0/360 degrees. See the
 [detailed local FFT documentation](docs/fft_local.md) for geometry,
 normalisation, reconstruction accuracy and Sentinel-2 examples.
+
+### Large receptive-field convolution
+
+```python
+from healpix_analyse import LargeConv
+
+layer = LargeConv(
+    level=8,  # nside = 2**level = 256
+    in_channels=8,
+    out_channels=16,
+    kernel_sz=33,
+    max_compact_kernel_sz=7,
+)
+y = layer(x)
+```
+
+This example automatically uses three smooth Down operations, a compact
+`5×5` convolution, and the three exactly paired Up operations. See the
+[LargeConv documentation](docs/large_conv.md) for kernel planning, partial
+patches, gradients and limitations.
 
 ---
 

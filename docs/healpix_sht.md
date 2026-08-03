@@ -61,13 +61,14 @@ import torch
 import healpy as hp
 from healpix_analyse.healpix_sht import HEALPixSHT
 
-nside = 64
+level = 6
+nside = 2**level
 t_map = np.random.randn(12 * nside**2).astype(np.float32)
 
 # --- create the transform object (precomputes geometry once) ---
-sht = HEALPixSHT(nside=nside)
+sht = HEALPixSHT(level=level)
 print(sht)
-# HEALPixSHT(nside=64, lmax=191, n_rings=255, n_alm=18528, dtype=torch.float32, device=cpu)
+# HEALPixSHT(level=6, nside=64, lmax=191, n_rings=255, n_alm=18528, dtype=torch.float32, device=cpu)
 
 # --- analysis: map → alm ---
 alm = sht.map2alm(t_map)           # torch.Tensor, shape (18528,), complex64
@@ -117,7 +118,7 @@ import healpy as hp
 from healpix_analyse.healpix_sht import HEALPixSHT
 
 nside = 64
-sht   = HEALPixSHT(nside=nside)
+sht   = HEALPixSHT(level=6)
 
 Q = np.random.randn(12 * nside**2).astype(np.float32)
 U = np.random.randn(12 * nside**2).astype(np.float32)
@@ -179,7 +180,7 @@ from healpix_analyse.healpix_sht import HEALPixSHT
 import numpy as np
 
 nside = 64
-sht   = HEALPixSHT(nside=nside)
+sht   = HEALPixSHT(level=6)
 
 # Wind or ocean current field: u = east component, v = north component
 u = np.random.randn(12 * nside**2).astype(np.float32)
@@ -221,7 +222,7 @@ div_filtered, curl_filtered = sht.alm2map_spin(almE_filtered, almB_filtered, spi
 ```python
 # Decompose ERA5-style wind into rotational and divergent parts
 nside = 128
-sht   = HEALPixSHT(nside=nside)
+sht   = HEALPixSHT(level=7)
 
 # u10, v10: 10-metre wind components on a HEALPix grid, ring-ordered
 div, curl = sht.uv_to_curl_div(u10, v10)
@@ -288,7 +289,7 @@ import torch
 from healpix_analyse.healpix_sht import HEALPixSHT
 
 nside  = 64
-sht    = HEALPixSHT(nside=nside, dtype=torch.float64)
+sht    = HEALPixSHT(level=6, dtype=torch.float64)
 target = torch.randn(12 * nside**2, dtype=torch.float64)
 
 # Learnable map
@@ -313,9 +314,9 @@ for step in range(200):
 
 ```python
 class SpectralLayer(torch.nn.Module):
-    def __init__(self, nside, lmax_out):
+    def __init__(self, level, lmax_out):
         super().__init__()
-        self.sht  = HEALPixSHT(nside=nside)
+        self.sht  = HEALPixSHT(level=level)
         self.weight = torch.nn.Parameter(
             torch.ones(self.sht.n_alm, dtype=torch.complex64)
         )
@@ -330,14 +331,14 @@ class SpectralLayer(torch.nn.Module):
 
 ## API reference
 
-### `HEALPixSHT(nside, lmax, dtype, device, ellipsoid)`
+### `HEALPixSHT(level, lmax, dtype, device, ellipsoid)`
 
 Instantiate the transform and precompute all geometry.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `nside` | `int` | — | HEALPix resolution parameter.  Must be a power of 2. |
-| `lmax` | `int` or `None` | `3·nside - 1` | Maximum multipole ℓ. |
+| `level` | `int` | — | Grid4Earth/HEALPix level, integer ≥ 0. Internally, `nside = 2**level`. |
+| `lmax` | `int` or `None` | `3·2**level - 1` | Maximum multipole ℓ. |
 | `dtype` | `torch.dtype` | `torch.float32` | Real dtype for maps.  Use `torch.float64` for high-precision work. |
 | `device` | `str` or `torch.device` or `None` | auto | Computation device.  Defaults to CUDA when available. |
 | `ellipsoid` | `str` | `"sphere"` | Geometry model: `"sphere"` or `"WGS84"`. |
@@ -582,7 +583,7 @@ Total: `K = (lmax+1)·(lmax+2)//2` complex coefficients.
 ## Performance notes
 
 - **Precomputation**: the Legendre tables and phase matrix are computed once
-  at `HEALPixSHT(nside=...)` time.  At nside=64 this takes ~0.5 s; subsequent
+  at `HEALPixSHT(level=...)` time.  At level=6 (nside=64) this takes ~0.5 s; subsequent
   calls to `map2alm` / `alm2map` are fast.
 
 - **Spin harmonics** are computed lazily on the first call to `map2alm_spin`

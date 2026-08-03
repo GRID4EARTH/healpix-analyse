@@ -13,6 +13,7 @@ Components
 - healpix_analyse.fft_local  : fast gnomonic 2D FFT on local HEALPix patches
 - healpix_analyse.powerspectra: angular power spectra on HEALPix subsets
 - healpix_analyse.convol     : gauge-equivariant spherical convolution
+- healpix_analyse.large_conv : multiresolution large-kernel convolution
 - healpix_analyse.resample   : grid resampling helpers
 - healpix_analyse.minkowski  : differentiable Minkowski functionals for 2D images
 
@@ -27,6 +28,7 @@ The symbols below are the primary user-facing API.  Import them directly::
 
 from healpix_analyse.down import HealPixDown
 from healpix_analyse.up import HealPixUp
+from healpix_analyse.large_conv import LargeConv
 
 from healpix_analyse.alm_latlon import (
     build_rings_from_latlon,
@@ -58,6 +60,7 @@ __all__ = [
     # Multi-resolution operators
     "HealPixDown",
     "HealPixUp",
+    "LargeConv",
     # Spherical harmonic transforms (arbitrary lat/lon ring grids)
     "build_rings_from_latlon",
     "anafast_latlon",

@@ -11,8 +11,8 @@ The operation is defined as the *adjoint* (transpose) of the smooth
 downsampling matrix from :mod:`healpix_analyse.down`, with an optional
 diagonal normalisation that improves round-trip consistency.
 
-Works on the full sphere (nside inferred from input size) or on a partial-sky
-subset (``cell_ids`` + ``level`` parameters).
+Works on the full sphere or on a partial-sky subset.  Resolution is exposed
+through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
 
 Accepts numpy arrays or torch tensors of shape ``[N]`` or ``[B, N]`` and
 returns an output of the same type and number of dimensions.
@@ -67,9 +67,9 @@ class HealPixUp(nn.Module):
 
     Parameters
     ----------
-    nside_in : int
-        Coarse input HEALPix resolution (must be a power of 2, ≥ 1).
-        Output resolution will be ``nside_in * 2``.
+    level : int
+        Coarse input Grid4Earth/HEALPix level (integer ≥ 0).  Internally,
+        ``nside_in = 2**level`` and the output level is ``level + 1``.
     radius_deg : float or None
         Angular radius passed to :class:`~healpix_analyse.down.HealPixDown`
         for building the transpose matrix.  ``None`` → default.
@@ -88,15 +88,15 @@ class HealPixUp(nn.Module):
     cell_ids : array-like of int or None
         Coarse pixel indices (NESTED) for partial-sky operation.
         If ``None``, the operator covers the full sphere.
-        If provided, ``level`` is also required and
-        ``nside_in = 2**level``.
-    level : int or None
-        HEALPix level such that ``nside_in = 2**level``.
-        Required when ``cell_ids`` is not ``None``.
     device : torch.device or str or None
         Device for computation.  Defaults to CUDA if available, else CPU.
     dtype : torch.dtype, default torch.float32
         Floating-point dtype for the sparse matrix values.
+    paired_down : HealPixDown or None
+        Reuse the exact sparse matrix and fine-cell domain of an existing
+        smooth downsampler.  This is the strictest way to construct a matched
+        Up operator for a partial patch.  ``cell_ids`` must then be omitted;
+        the ellipsoid and weight normalisation are inherited.
 
     Examples
     --------
@@ -104,9 +104,10 @@ class HealPixUp(nn.Module):
 
     >>> import numpy as np
     >>> from healpix_analyse.up import HealPixUp
-    >>> nside = 32
+    >>> level = 5
+    >>> nside = 2**level
     >>> x = np.random.randn(12 * nside**2)      # [N_coarse]
-    >>> up = HealPixUp(nside_in=nside)
+    >>> up = HealPixUp(level=level)
     >>> y, cell_ids_out = up(x)
     >>> y.shape
     (49152,)   # 12 * 64**2
@@ -115,13 +116,13 @@ class HealPixUp(nn.Module):
 
     >>> import healpy as hp
     >>> cell_ids_coarse = hp.query_disc(nside, hp.ang2vec(np.pi/2, 0), 0.3, nest=True)
-    >>> up = HealPixUp(nside_in=nside, cell_ids=cell_ids_coarse, level=5)
+    >>> up = HealPixUp(level=level, cell_ids=cell_ids_coarse)
     >>> y, fine_ids = up(x[cell_ids_coarse])
     """
 
     def __init__(
         self,
-        nside_in: int,
+        level: int,
         radius_deg: Optional[float] = None,
         sigma_deg: Optional[float] = None,
         weight_norm: str = "l1",
@@ -129,9 +130,9 @@ class HealPixUp(nn.Module):
         eps: float = 1e-12,
         ellipsoid: str = "WGS84",
         cell_ids: Optional[ArrayLike] = None,
-        level: Optional[int] = None,
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
+        paired_down: Optional[HealPixDown] = None,
     ) -> None:
         super().__init__()
 
@@ -140,12 +141,20 @@ class HealPixUp(nn.Module):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device)
         self.dtype = dtype
-        self.ellipsoid = ellipsoid
+        self.ellipsoid = (
+            paired_down.ellipsoid if paired_down is not None else ellipsoid
+        )
+        self.weight_norm = (
+            paired_down.weight_norm if paired_down is not None else weight_norm
+        )
 
-        # ---- validate nside ----
-        self.nside_in  = int(nside_in)
-        if self.nside_in < 1 or (self.nside_in > 1 and (self.nside_in & (self.nside_in - 1)) != 0):
-            raise ValueError("nside_in must be a power of 2 and >= 1.")
+        # ---- Grid4Earth level -> internal HEALPix nside ----
+        if isinstance(level, bool) or int(level) != level or int(level) < 0:
+            raise ValueError("level must be an integer >= 0.")
+        self.level_in = int(level)
+        self.level_out = self.level_in + 1
+        self.level = self.level_in
+        self.nside_in = 2 ** self.level_in
         self.nside_out = self.nside_in * 2   # fine resolution
         self.N_in_full  = 12 * self.nside_in  * self.nside_in
         self.N_out_full = 12 * self.nside_out * self.nside_out
@@ -156,21 +165,46 @@ class HealPixUp(nn.Module):
             raise ValueError("up_norm must be 'adjoint', 'col_l1', or 'diag_l2'.")
         self.eps = float(eps)
 
-        # ---- partial sky ----
-        self.partial = cell_ids is not None
-        if self.partial:
-            if level is None:
+        # ---- partial sky / exact pairing ----
+        if paired_down is not None:
+            if cell_ids is not None:
                 raise ValueError(
-                    "level must be provided together with cell_ids "
-                    "(nside_in = 2**level)."
+                    "cell_ids must be omitted when paired_down is given."
                 )
-            expected_nside = 2 ** int(level)
-            if expected_nside != self.nside_in:
+            if paired_down.mode != "smooth":
+                raise ValueError("paired_down must use mode='smooth'.")
+            if paired_down.nside_out != self.nside_in:
                 raise ValueError(
-                    f"Inconsistent level={level} (→ nside={expected_nside}) "
-                    f"and nside_in={self.nside_in}."
+                    f"paired_down outputs nside={paired_down.nside_out}, "
+                    f"but HealPixUp expects nside_in={self.nside_in}."
                 )
+            self.partial = paired_down.partial
+            if self.partial:
+                self._cell_ids_in = np.asarray(
+                    paired_down.cell_ids_out, dtype=np.int64
+                ).copy()
+                self._cell_ids_out = np.asarray(
+                    paired_down._cell_ids_in, dtype=np.int64
+                ).copy()
+            else:
+                self._cell_ids_in = None
+                self._cell_ids_out = np.arange(self.N_out_full, dtype=np.int64)
+            self.N_in = paired_down.N_out
+            self.N_out = paired_down.N_in
+
+        else:
+            self.partial = cell_ids is not None
+
+        if paired_down is None and self.partial:
             cell_ids_in = np.asarray(cell_ids, dtype=np.int64).ravel()
+            if cell_ids_in.size == 0:
+                raise ValueError("cell_ids must not be empty.")
+            if np.unique(cell_ids_in).size != cell_ids_in.size:
+                raise ValueError("cell_ids must contain unique identifiers.")
+            if np.any(cell_ids_in < 0) or np.any(cell_ids_in >= self.N_in_full):
+                raise ValueError(
+                    f"cell_ids contain identifiers outside level={self.level_in}."
+                )
             # Fine output pixels: 4 NESTED children of each coarse input pixel
             cell_ids_out = np.unique(
                 (cell_ids_in[:, None] * 4 + np.arange(4)[None, :]).ravel()
@@ -179,7 +213,7 @@ class HealPixUp(nn.Module):
             self._cell_ids_out = cell_ids_out
             self.N_in  = len(cell_ids_in)
             self.N_out = len(cell_ids_out)
-        else:
+        elif paired_down is None:
             self._cell_ids_in  = None
             self._cell_ids_out = np.arange(self.N_out_full, dtype=np.int64)
             self.N_in  = self.N_in_full
@@ -188,22 +222,25 @@ class HealPixUp(nn.Module):
         # ---- build M^T via HealPixDown at fine resolution ----
         # The paired Down operator goes from nside_out (fine) → nside_in (coarse).
         # We build it and immediately transpose it.
-        down = HealPixDown(
-            nside_in    = self.nside_out,          # fine nside
-            mode        = "smooth",
-            radius_deg  = radius_deg,
-            sigma_deg   = sigma_deg,
-            weight_norm = weight_norm,
-            cell_ids    = cell_ids_out if self.partial else None,
-            level       = (level + 1) if (self.partial and level is not None) else None,
-            device      = self.device,
-            dtype       = self.dtype,
-        )
+        if paired_down is None:
+            down = HealPixDown(
+                level       = self.level_out,          # fine level
+                mode        = "smooth",
+                ellipsoid   = self.ellipsoid,
+                radius_deg  = radius_deg,
+                sigma_deg   = sigma_deg,
+                weight_norm = weight_norm,
+                cell_ids    = cell_ids_out if self.partial else None,
+                device      = self.device,
+                dtype       = self.dtype,
+            )
+        else:
+            down = paired_down
 
         # Reconstruct Down matrix M_down: [N_in_coarse, N_out_fine]
         M_down = torch.sparse_coo_tensor(
-            down._M_indices,
-            down._M_values,
+            down._M_indices.to(device=self.device),
+            down._M_values.to(device=self.device, dtype=self.dtype),
             size=down._M_size,
             device=self.device,
             dtype=self.dtype,

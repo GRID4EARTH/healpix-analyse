@@ -132,6 +132,13 @@ Resolution reduction: smooth or max-pool downsampling.
 Resolution increase: adjoint of smooth downsampling.
 :::
 
+:::{grid-item-card} LargeConv
+:link: large_conv
+:link-type: doc
+
+Large effective kernels through matched Down, compact convolution and Up.
+:::
+
 ::::
 
 ## Local flat-sky analysis
@@ -208,6 +215,7 @@ hidden: true
 convol_doc
 down
 up
+large_conv
 ```
 
 ```{toctree}

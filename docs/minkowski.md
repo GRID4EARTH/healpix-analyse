@@ -322,11 +322,12 @@ from healpix_analyse import (
     minkowski_curves_healpix,
 )
 
-nside = 64
+level = 6
+nside = 2**level
 B     = 4
 
 # ── One-time setup (uses healpy, not differentiable) ─────────────────────
-edges, triangles = build_healpix_adjacency(nside, nest=True, device="cpu")
+edges, triangles = build_healpix_adjacency(level, nest=True, device="cpu")
 print(f"Edges: {edges.shape}, Triangles: {triangles.shape}")
 
 # ── Forward pass (fully differentiable) ──────────────────────────────────
@@ -348,7 +349,7 @@ curves = minkowski_curves_healpix(img, edges, triangles, thresholds)
 # ── Partial sky ───────────────────────────────────────────────────────────
 import healpy as hp
 patch = hp.query_disc(nside, hp.ang2vec(np.pi/2, 0.), np.radians(20.), nest=True)
-edges_p, tri_p = build_healpix_adjacency(nside, cell_ids=patch, nest=True)
+edges_p, tri_p = build_healpix_adjacency(level, cell_ids=patch, nest=True)
 
 img_patch = torch.rand(B, len(patch), requires_grad=True)
 mf_patch  = minkowski_functionals_healpix(img_patch, edges_p, tri_p)

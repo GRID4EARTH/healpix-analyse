@@ -557,8 +557,9 @@ class HealPixConv(nn.Module):
 
     Parameters
     ----------
-    nside : int
-        HEALPix resolution (power of 2).
+    level : int
+        Grid4Earth/HEALPix level (integer >= 0).  The internal HEALPix
+        resolution is ``nside = 2**level``.
     in_channels : int
         Number of input channels C_in.
     out_channels : int
@@ -588,8 +589,6 @@ class HealPixConv(nn.Module):
         (lon=0°, lat=0°) and (lon=180°, lat=0°).
     cell_ids : array-like or None
         Pixel indices (NESTED) for partial-sky.  None = full sphere.
-    level : int or None
-        nside = 2**level.  Required when cell_ids is provided.
     nest : bool, default True
         NESTED pixel ordering.
     use_norm : bool, default False
@@ -603,7 +602,7 @@ class HealPixConv(nn.Module):
     Ocean model — singularities over Africa and its antipode (Pacific):
 
     >>> conv = HealPixConv(
-    ...     nside=64, in_channels=1, out_channels=16,
+    ...     level=6, in_channels=1, out_channels=16,
     ...     gauge_type="projected_ref",
     ...     singularity_lonlat=(20.0, 5.0),   # Gulf of Guinea coast
     ... )
@@ -611,7 +610,7 @@ class HealPixConv(nn.Module):
     Atmosphere — singularities over the Pacific and Indian oceans:
 
     >>> conv = HealPixConv(
-    ...     nside=64, in_channels=1, out_channels=16,
+    ...     level=6, in_channels=1, out_channels=16,
     ...     gauge_type="projected_ref",
     ...     singularity_lonlat=(-160.0, 0.0),  # central Pacific
     ... )
@@ -619,7 +618,7 @@ class HealPixConv(nn.Module):
 
     def __init__(
         self,
-        nside: int,
+        level: int,
         in_channels: int,
         out_channels: int,
         kernel_sz: int = 3,
@@ -628,7 +627,6 @@ class HealPixConv(nn.Module):
         singularity_lonlat: Optional[tuple[float, float]] = None,
         ref_direction=None,
         cell_ids=None,
-        level=None,
         nest: bool = True,
         use_norm: bool = False,
         device=None,
@@ -644,7 +642,10 @@ class HealPixConv(nn.Module):
         self.dtype  = dtype
         self.ellipsoid = ellipsoid
 
-        self.nside        = int(nside)
+        if isinstance(level, bool) or int(level) != level or int(level) < 0:
+            raise ValueError("level must be an integer >= 0.")
+        self.level        = int(level)
+        self.nside        = 2 ** self.level
         self.in_channels  = int(in_channels)
         self.out_channels = int(out_channels)
         self.kernel_sz    = int(kernel_sz)
@@ -652,8 +653,6 @@ class HealPixConv(nn.Module):
         self.P            = self.kernel_sz * self.kernel_sz
         self.nest         = bool(nest)
 
-        if (self.nside & (self.nside - 1)) != 0 or self.nside < 1:
-            raise ValueError("nside must be a positive power of 2.")
         if self.kernel_sz < 1 or self.kernel_sz % 2 == 0:
             raise ValueError("kernel_sz must be a positive odd integer.")
         if gauge_type not in ("phi", "cosmo", "projected_ref", "two_ref"):
@@ -760,11 +759,16 @@ class HealPixConv(nn.Module):
         # ---- pixel domain ----
         self.partial = cell_ids is not None
         if self.partial:
-            if level is None:
-                raise ValueError("level required with cell_ids (nside = 2**level).")
-            if 2 ** int(level) != self.nside:
-                raise ValueError(f"2**level={2**level} != nside={self.nside}.")
             ids_np = np.asarray(cell_ids, dtype=np.int64).ravel()
+            if ids_np.size == 0:
+                raise ValueError("cell_ids must not be empty.")
+            if np.unique(ids_np).size != ids_np.size:
+                raise ValueError("cell_ids must contain unique identifiers.")
+            npix = 12 * self.nside**2
+            if np.any(ids_np < 0) or np.any(ids_np >= npix):
+                raise ValueError(
+                    f"cell_ids contain identifiers outside level={self.level}."
+                )
         else:
             ids_np = np.arange(12 * self.nside ** 2, dtype=np.int64)
         self.K = len(ids_np)
@@ -812,7 +816,7 @@ class HealPixConv(nn.Module):
 
             # Stage A: rotation matrices + stencil projection
             lon, lat = healpix_geo.nested.healpix_to_lonlat(
-                ids_np.tolist(), int(np.log2(self.nside)),
+                ids_np.tolist(), self.level,
                 ellipsoid=self.ellipsoid,
             )
             th = np.deg2rad(90.0 - np.asarray(lat, dtype=np.float64))
@@ -1138,7 +1142,7 @@ class HealPixConv(nn.Module):
 
     def extra_repr(self):
         base = (
-            f"nside={self.nside}, in={self.in_channels}, out={self.out_channels}, "
+            f"level={self.level}, nside={self.nside}, in={self.in_channels}, out={self.out_channels}, "
             f"kernel_sz={self.kernel_sz}, P={self.P}, G={self.G}, "
             f"gauge={self.gauge_type!r}, partial={self.partial}"
         )

@@ -62,7 +62,7 @@ print(f"Initializing LocalizedFlatSkyAlm...")
 f2 = sc.funct(BACKEND="torch", KERNELSZ=5, all_type="float32")
 
 alm_loc = LocalizedFlatSkyAlm(
-    nside=nside,
+    level=level,
     patch_idx_ring=idx_ring_sorted,
     backend=f2.backend, 
     lmax=lmax_full,

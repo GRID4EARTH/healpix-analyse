@@ -191,7 +191,7 @@ def minkowski_curves(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_healpix_adjacency(
-    nside: int,
+    level: int,
     cell_ids=None,
     nest: bool = True,
     device=None,
@@ -206,8 +206,9 @@ def build_healpix_adjacency(
 
     Parameters
     ----------
-    nside : int
-        HEALPix resolution parameter.
+    level : int
+        Grid4Earth/HEALPix level.  The internal resolution is
+        ``nside = 2**level``.
     cell_ids : array-like or None
         Global HEALPix pixel indices of the map.
         ``None`` = full sky (all ``12 * nside²`` pixels).
@@ -239,6 +240,10 @@ def build_healpix_adjacency(
     """
     import healpy as hp
     import numpy as np
+
+    if isinstance(level, bool) or int(level) != level or int(level) < 0:
+        raise ValueError("level must be an integer >= 0.")
+    nside = 2 ** int(level)
 
     if cell_ids is None:
         cell_ids = np.arange(hp.nside2npix(nside))
