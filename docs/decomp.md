@@ -164,11 +164,11 @@ to be an orthogonal or tight wavelet basis:
 These properties are intentional for masked climate fields: locality and
 exact synthesis are prioritised over global spectral orthogonality.
 
-At this stage `(u, v)` are decomposed as two ordinary channels. A subsequent
-operator can apply scale-dependent local derivative/convolution kernels to
-each band to estimate divergence and curl. That second step should use the
-physical scale and geometry stored by this pyramid; it is not yet part of
-`HealPixDecomp`.
+`(u, v)` are decomposed as two ordinary channels. The separate
+`HealPixMultiScaleDivCurl` operator applies fixed gauge-aware `HealPixConv`
+derivative kernels to every band, using the physical scale and exact cell
+geometry stored by this pyramid. See [Multiscale divergence and
+curl](divcurl.md).
 
 ## API
 
@@ -195,4 +195,3 @@ pyramid = decomp(data)             # same operation through nn.Module.forward
 data = decomp.invert(pyramid)
 fine_components = decomp.expand(pyramid)
 ```
-

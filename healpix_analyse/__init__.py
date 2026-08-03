@@ -16,6 +16,7 @@ Components
 - healpix_analyse.large_conv : multiresolution large-kernel convolution
 - healpix_analyse.fft_conv   : FFT-accelerated large-kernel local convolution
 - healpix_analyse.decomp     : exactly reconstructing local multiscale pyramid
+- healpix_analyse.divcurl    : gauge-aware multiscale divergence and curl
 - healpix_analyse.resample   : grid resampling helpers
 - healpix_analyse.minkowski  : differentiable Minkowski functionals for 2D images
 
@@ -33,6 +34,11 @@ from healpix_analyse.up import HealPixUp
 from healpix_analyse.large_conv import LargeConv
 from healpix_analyse.fft_conv import HealPixFFTConv
 from healpix_analyse.decomp import HealPixDecomp, HealPixPyramid
+from healpix_analyse.divcurl import (
+    HealPixDivCurl,
+    HealPixMultiScaleDivCurl,
+    HealPixDivCurlPyramid,
+)
 
 from healpix_analyse.alm_latlon import (
     build_rings_from_latlon,
@@ -68,6 +74,9 @@ __all__ = [
     "HealPixFFTConv",
     "HealPixDecomp",
     "HealPixPyramid",
+    "HealPixDivCurl",
+    "HealPixMultiScaleDivCurl",
+    "HealPixDivCurlPyramid",
     # Spherical harmonic transforms (arbitrary lat/lon ring grids)
     "build_rings_from_latlon",
     "anafast_latlon",

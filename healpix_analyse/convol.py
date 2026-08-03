@@ -83,6 +83,8 @@ def _geometry_cache_key(
     are stored as float32/int64 CPU tensors and cast at load time.
     """
     state: dict = {
+        # Bump when the meaning/layout of any cached buffer changes.
+        "cache_format": 2,
         "nside":      nside,
         "kernel_sz":  kernel_sz,
         "G":          G,
@@ -97,7 +99,10 @@ def _geometry_cache_key(
         ),
         "cell_ids": (
             None if cell_ids is None
-            else np.sort(np.asarray(cell_ids, dtype=np.int64)).tolist()
+            # The cached sort buffers depend on the user-facing input order,
+            # not only on the set of covered cells.  Keep that order in the
+            # key so two permutations cannot share an incompatible cache.
+            else np.asarray(cell_ids, dtype=np.int64).ravel().tolist()
         ),
     }
     blob = json.dumps(state, sort_keys=True).encode()

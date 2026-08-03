@@ -146,6 +146,13 @@ Large effective kernels through matched Down, compact convolution and Up.
 Exactly reconstructing local multiscale pyramids for masked HEALPix maps.
 :::
 
+:::{grid-item-card} Multiscale div/curl
+:link: divcurl
+:link-type: doc
+
+Gauge-aware local velocity derivatives at every HEALPix pyramid scale.
+:::
+
 ::::
 
 ## Local flat-sky analysis

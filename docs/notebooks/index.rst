@@ -18,3 +18,4 @@ Interactive Jupyter notebooks demonstrating the main features of **healpix-analy
    Large receptive-field convolution <../external_notebooks/large_conv_test>
    FFT large-kernel convolution <../external_notebooks/fft_conv_test>
    Masked multiscale decomposition <../external_notebooks/decomp_test>
+   Multiscale divergence and curl <../external_notebooks/divcurl_test>
