@@ -222,6 +222,68 @@ frequency = torch.fft.fftfreq(
 On a sphere of radius $R$, a small-patch physical approximation uses
 `d = R * transform.pixel_size_rad`, giving frequencies in cycles per metre.
 
+## Circular one-dimensional power spectrum
+
+`LocalFFT.ps` azimuthally averages the two-dimensional Fourier power in
+concentric frequency annuli:
+
+$$
+P_j = \frac{1}{N_j}\sum_{\boldsymbol k\,\in\,A_j}
+      |F(\boldsymbol k)|^2,
+$$
+
+where $A_j$ is radial bin $j$ and $N_j$ is its number of Fourier modes.
+
+```python
+spectrum = transform.fft(data)
+frequency, power = transform.ps(spectrum)
+```
+
+`frequency` contains the bin centres and `power` contains the mean power in
+each circular annulus. For a batched spectrum of shape
+`[..., grid_size, grid_size]`, the returned power has shape `[..., n_bins]`.
+
+By default, the spectrum stops at the axis Nyquist frequency. Every annulus is
+then fully contained in the square Fourier grid. Corner modes can be included
+explicitly:
+
+```python
+frequency, power = transform.ps(spectrum, include_corners=True)
+```
+
+The outer annuli are only partially sampled in that mode and should be
+interpreted with care. The number of bins can be selected with `n_bins`:
+
+```python
+frequency, power = transform.ps(spectrum, n_bins=128)
+```
+
+The standalone interface can use a cached transform or an explicit spacing:
+
+```python
+from healpix_analyse.fft_local import ps
+
+frequency, power = ps(spectrum, transform)
+frequency, power = ps(spectrum, pixel_size_rad=transform.pixel_size_rad)
+```
+
+No additional FFT normalisation is performed: `power` is always the circular
+mean of `abs(spectrum)**2`. Its amplitude therefore follows the `norm` used to
+create the FFT. Mean subtraction, apodization, coverage-mask correction and
+physical-unit conversion remain explicit analysis choices.
+
+With the default spacing, frequency is expressed in cycles per gnomonic
+tangent unit, approximately cycles per radian for a small patch. To express
+the returned axis in cycles per metre on a sphere of radius $R$:
+
+```python
+frequency_per_metre = frequency / R
+```
+
+The radial reduction uses PyTorch scatter operations. Torch inputs remain on
+their device and gradients propagate from the one-dimensional power back to
+the Fourier coefficients and input data.
+
 ## Meaning of IFFT and reconstruction error
 
 The FFT/IFFT pair is exact, up to floating-point precision, on the projected
@@ -370,4 +432,3 @@ B08 and NDVI.
   validation.
 - The local tangent-plane spectrum should not be interpreted as a full-sky
   spherical $C_\ell$ without an explicit flat-sky-to-spherical calibration.
-

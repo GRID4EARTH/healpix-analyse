@@ -43,6 +43,7 @@ from healpix_analyse.fft_local import (
     LocalFFT,
     fft as local_fft,
     ifft as local_ifft,
+    ps as local_ps,
 )
 
 from healpix_analyse.minkowski import (
@@ -70,6 +71,7 @@ __all__ = [
     "LocalFFT",
     "local_fft",
     "local_ifft",
+    "local_ps",
     # Minkowski functionals — 2D planar
     "minkowski_functionals",
     "minkowski_curves",

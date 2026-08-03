@@ -41,6 +41,96 @@ def _next_power_of_two(value: int) -> int:
     return 1 << (max(1, int(value)) - 1).bit_length()
 
 
+def _circular_power_spectrum_tensor(
+    spectrum: torch.Tensor,
+    *,
+    pixel_size: float,
+    n_bins: Optional[int],
+    include_corners: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Azimuthally average a square 2-D Fourier power spectrum."""
+    if spectrum.ndim < 2 or spectrum.shape[-2] != spectrum.shape[-1]:
+        raise ValueError(
+            "The last two spectrum dimensions must form a square 2-D grid, "
+            f"got shape {tuple(spectrum.shape)}"
+        )
+    if not spectrum.is_floating_point() and not torch.is_complex(spectrum):
+        raise TypeError("spectrum must have a floating-point or complex dtype")
+    if not math.isfinite(pixel_size) or pixel_size <= 0:
+        raise ValueError("pixel_size must be finite and strictly positive")
+
+    grid_size = int(spectrum.shape[-1])
+    if grid_size < 2:
+        raise ValueError("The Fourier grid must contain at least 2 x 2 samples")
+
+    if n_bins is None:
+        if include_corners:
+            n_bins = max(1, int(math.ceil(math.sqrt(2.0) * grid_size / 2)))
+        else:
+            n_bins = max(1, grid_size // 2)
+    elif int(n_bins) != n_bins or int(n_bins) < 1:
+        raise ValueError("n_bins must be a strictly positive integer")
+    n_bins = int(n_bins)
+
+    real_dtype = spectrum.real.dtype
+    frequency_1d = torch.fft.fftfreq(
+        grid_size,
+        d=pixel_size,
+        device=spectrum.device,
+        dtype=real_dtype,
+    )
+    frequency_y, frequency_x = torch.meshgrid(
+        frequency_1d, frequency_1d, indexing="ij"
+    )
+    radial_frequency = torch.sqrt(
+        frequency_x.square() + frequency_y.square()
+    ).reshape(-1)
+
+    nyquist = 0.5 / pixel_size
+    max_axis_frequency = (grid_size // 2) / (grid_size * pixel_size)
+    max_frequency = (
+        math.sqrt(2.0) * max_axis_frequency if include_corners else nyquist
+    )
+    scaled_radius = radial_frequency * (n_bins / max_frequency)
+    bin_indices = torch.floor(scaled_radius).to(torch.long)
+    tolerance = 4.0 * torch.finfo(real_dtype).eps * max_frequency
+    valid = radial_frequency <= max_frequency + tolerance
+    bin_indices = bin_indices.clamp(min=0, max=n_bins - 1)
+
+    leading_shape = spectrum.shape[:-2]
+    power_2d = spectrum.abs().square().reshape(-1, grid_size * grid_size)
+    selected_power = power_2d[:, valid]
+    selected_bins = bin_indices[valid].reshape(1, -1).expand(
+        selected_power.shape[0], -1
+    )
+    power_sum = torch.zeros(
+        (selected_power.shape[0], n_bins),
+        dtype=real_dtype,
+        device=spectrum.device,
+    )
+    power_sum.scatter_add_(1, selected_bins, selected_power)
+
+    counts = torch.zeros(n_bins, dtype=real_dtype, device=spectrum.device)
+    counts.scatter_add_(
+        0,
+        bin_indices[valid],
+        torch.ones_like(radial_frequency[valid]),
+    )
+    radial_power = power_sum / counts.clamp_min(1)
+    radial_power = torch.where(
+        counts > 0,
+        radial_power,
+        torch.full_like(radial_power, torch.nan),
+    )
+    radial_power = radial_power.reshape(*leading_shape, n_bins)
+
+    bin_width = max_frequency / n_bins
+    bin_centres = (
+        torch.arange(n_bins, device=spectrum.device, dtype=real_dtype) + 0.5
+    ) * bin_width
+    return bin_centres, radial_power
+
+
 class LocalFFT(nn.Module):
     """A reusable local flat-sky FFT for a set of NESTED HEALPix cells.
 
@@ -368,6 +458,63 @@ class LocalFFT(nn.Module):
             reconstructed = reconstructed.real
         return self._restore_type(reconstructed, is_numpy)
 
+    def ps(
+        self,
+        spectrum: ArrayLike,
+        *,
+        n_bins: Optional[int] = None,
+        include_corners: bool = False,
+    ) -> tuple[ArrayLike, ArrayLike]:
+        """Compute a circularly averaged 1-D power spectrum from a 2-D FFT.
+
+        Parameters
+        ----------
+        spectrum : numpy.ndarray or torch.Tensor, shape [..., grid_size, grid_size]
+            Unshifted Fourier coefficients, normally returned by :meth:`fft`.
+        n_bins : int, optional
+            Number of equally spaced radial-frequency bins.  The default is
+            ``grid_size // 2`` when excluding corners.
+        include_corners : bool, default=False
+            If False, stop at the axis Nyquist frequency so every annulus is
+            fully contained in the Fourier grid.  If True, include the corner
+            modes up to ``sqrt(2)`` times the axis Nyquist frequency; outer
+            annuli are then only partially sampled.
+
+        Returns
+        -------
+        frequency : numpy.ndarray or torch.Tensor, shape [n_bins]
+            Bin centres in cycles per gnomonic tangent unit.  With the default
+            grid spacing these are approximately cycles per radian.
+        power : numpy.ndarray or torch.Tensor, shape [..., n_bins]
+            Mean value of ``abs(spectrum)**2`` in each circular annulus.
+
+        Notes
+        -----
+        No additional FFT normalisation, mean removal, mask correction or
+        apodization is applied.  These choices belong to the spectral-analysis
+        workflow and should be performed before calling this method when
+        required.
+        """
+        is_numpy = isinstance(spectrum, np.ndarray)
+        if not is_numpy and not torch.is_tensor(spectrum):
+            raise TypeError("spectrum must be a numpy.ndarray or torch.Tensor")
+        tensor = torch.as_tensor(spectrum, device=self.device)
+        if tensor.ndim < 2 or tuple(tensor.shape[-2:]) != self.grid_shape:
+            raise ValueError(
+                f"The last two spectrum dimensions must be {self.grid_shape}, "
+                f"got shape {tuple(tensor.shape)}"
+            )
+        frequency, power = _circular_power_spectrum_tensor(
+            tensor,
+            pixel_size=self.pixel_size_rad,
+            n_bins=n_bins,
+            include_corners=include_corners,
+        )
+        return (
+            self._restore_type(frequency, is_numpy),
+            self._restore_type(power, is_numpy),
+        )
+
     def extra_repr(self) -> str:
         return (
             f"level={self.level}, n_cells={self.n_cells}, "
@@ -421,4 +568,42 @@ def ifft(
     return transform.ifft(spectrum, real_output=real_output)
 
 
-__all__ = ["LocalFFT", "fft", "ifft"]
+def ps(
+    spectrum: ArrayLike,
+    transform: Optional[LocalFFT] = None,
+    *,
+    pixel_size_rad: Optional[float] = None,
+    n_bins: Optional[int] = None,
+    include_corners: bool = False,
+) -> tuple[ArrayLike, ArrayLike]:
+    """Compute a circular 1-D power spectrum from a square unshifted 2-D FFT.
+
+    Pass a :class:`LocalFFT` to use its grid spacing and shape validation.  For
+    a standalone Fourier array, provide ``pixel_size_rad``; it defaults to 1,
+    in which case frequencies are expressed in cycles per grid-spacing unit.
+    """
+    if transform is not None:
+        if pixel_size_rad is not None:
+            raise ValueError("pixel_size_rad must be omitted when transform is given")
+        return transform.ps(
+            spectrum,
+            n_bins=n_bins,
+            include_corners=include_corners,
+        )
+
+    is_numpy = isinstance(spectrum, np.ndarray)
+    if not is_numpy and not torch.is_tensor(spectrum):
+        raise TypeError("spectrum must be a numpy.ndarray or torch.Tensor")
+    tensor = torch.as_tensor(spectrum)
+    frequency, power = _circular_power_spectrum_tensor(
+        tensor,
+        pixel_size=1.0 if pixel_size_rad is None else float(pixel_size_rad),
+        n_bins=n_bins,
+        include_corners=include_corners,
+    )
+    if is_numpy:
+        return frequency.detach().cpu().numpy(), power.detach().cpu().numpy()
+    return frequency, power
+
+
+__all__ = ["LocalFFT", "fft", "ifft", "ps"]

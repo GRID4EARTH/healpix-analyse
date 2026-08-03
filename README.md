@@ -78,6 +78,7 @@ from healpix_analyse import LocalFFT
 transform = LocalFFT(cell_ids, level, device="cuda")
 spectrum = transform.fft(data)
 reconstructed = transform.ifft(spectrum)
+frequency, power = transform.ps(spectrum)
 ```
 
 The transform accepts local NESTED HEALPix patches up to a configurable
