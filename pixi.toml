@@ -41,7 +41,7 @@ tabulate = "*"
 tests = { cmd = "pytest --cov=healpix_analyse" }
 
 [feature.docs.tasks]
-build-docs = { cmd = "rm -rf generated/; python -m sphinx -b html -w warnings.log -W -Tn -j auto . _build", cwd = "docs" }
+build-docs = { cmd = "rm -rf generated/; python -m sphinx -b html -w warnings.log -W -Tn -j auto . _build || { cat warnings.log; exit 1; }", cwd = "docs" }
 autobuild-docs = { cmd = "sphinx-autobuild -b html -w warnings.log -W -Tn -j auto . _build", cwd = "docs" }
 
 [feature.dev.dependencies]
@@ -56,4 +56,3 @@ isort = "*"
 [environments]
 default = ["test", "dev", "affine"]
 docs = ["docs"]
-
