@@ -618,7 +618,10 @@ class HEALPixSHT:
         im_2d   = im.reshape(B, self.n_pix)
 
         if nest:
-            im_2d = im_2d[:, self._n2r()]   # nested → ring
+            # ``_ring2nest_np[r]`` is the NESTED destination of RING
+            # sample ``r``.  Gathering a NESTED input in RING order must
+            # therefore use that forward map, not its inverse.
+            im_2d = im_2d[:, self._r2n()]   # nested → ring
 
         lmax = self.lmax
         K    = self.n_alm
@@ -681,7 +684,9 @@ class HEALPixSHT:
         im_2d = self._fft_to_rings(ft_syn)   # (B, N) real
 
         if nest:
-            im_2d = im_2d[:, self._r2n()]    # ring → nested
+            # Output position ``n`` needs the RING sample given by
+            # ``_nest2ring_np[n]``.
+            im_2d = im_2d[:, self._n2r()]    # ring → nested
 
         return im_2d.reshape(leading + (self.n_pix,))
 
@@ -738,8 +743,8 @@ class HEALPixSHT:
         U2      = U.reshape(B, self.n_pix)
 
         if nest:
-            Q2 = Q2[:, self._n2r()]
-            U2 = U2[:, self._n2r()]
+            Q2 = Q2[:, self._r2n()]          # nested → ring
+            U2 = U2[:, self._r2n()]
 
         # Complex spin combinations
         QpU = torch.complex(Q2, U2)    # Q + iU
@@ -900,8 +905,8 @@ class HEALPixSHT:
         U2  = ((QpU - QmU) / 2.0j).real
 
         if nest:
-            Q2 = Q2[:, self._r2n()]
-            U2 = U2[:, self._r2n()]
+            Q2 = Q2[:, self._n2r()]          # ring → nested
+            U2 = U2[:, self._n2r()]
 
         return (
             Q2.reshape(leading + (self.n_pix,)),
