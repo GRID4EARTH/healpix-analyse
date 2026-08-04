@@ -141,7 +141,7 @@ class LocalFFT(nn.Module):
     level : int
         HEALPix level, with ``nside = 2**level``.
     ellipsoid : str, default="sphere"
-        Geometry passed to :mod:`healpix_geo` when locating cell centres.
+        Geometry passed to ``healpix_geo`` when locating cell centres.
     max_patch_radius_deg : float, default=10
         Maximum angular distance of a cell centre from the spherical patch
         centre.  A single gnomonic plane is rejected above this radius.
