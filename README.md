@@ -22,6 +22,7 @@ and are fully differentiable through `torch.autograd`.
 - **Multi-resolution operators** — `HealPixDown` (smooth / max-pool) and `HealPixUp` (adjoint upsampling), NESTED ordering
 - **Masked multiscale decomposition** — exactly reconstructing local `HealPixDecomp` pyramids
 - **Multiscale divergence and curl** — gauge-aware local derivatives of HEALPix velocity fields
+- **HEALPix resampling** — local Up/Down conversion between full or partial NESTED domains
 - **Differentiable by default** — all hot-path operations are autograd-compatible
 - **NumPy and Torch interoperability** — accepts both array types, returns the same type
 
@@ -44,7 +45,7 @@ healpix_analyse/
 ├── powerspectra_lonlat.py # Power spectrum on irregular lon/lat grids
 ├── healpix_interp.py      # Bilinear interpolation on HEALPix (NESTED)
 ├── make_rectangle.py      # Rectangular HEALPix patches from bounding boxes
-├── resample.py            # Resample HEALPix onto regular lat/lon grids
+├── resample.py            # HEALPix level/domain resampling and regular lat/lon conversion
 └── ps.py                  # Power spectrum utilities
 ```
 
@@ -166,6 +167,23 @@ curl = diagnostics.curl
 Each scale uses a fixed derivative-of-Gaussian `HealPixConv` kernel normalised
 by that level's physical pixel spacing. See the
 [divergence and curl documentation](docs/divcurl.md).
+
+### HEALPix-to-HEALPix resampling
+
+```python
+from healpix_analyse import resample_healpix
+
+out_data, out_ids = resample_healpix(
+    in_data,
+    in_level=11,
+    out_level=8,
+    in_cell_ids=in_cell_ids,
+    out_cell_ids=out_cell_ids,
+)
+```
+
+The output order follows `out_cell_ids`; unavailable cells are filled with
+`NaN`. See the [HEALPix resampling documentation](docs/resample_healpix.md).
 
 ---
 

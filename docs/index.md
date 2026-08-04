@@ -153,6 +153,13 @@ Exactly reconstructing local multiscale pyramids for masked HEALPix maps.
 Gauge-aware local velocity derivatives at every HEALPix pyramid scale.
 :::
 
+:::{grid-item-card} HEALPix resampling
+:link: resample_healpix
+:link-type: doc
+
+Local Up/Down conversion between full or partial NESTED domains.
+:::
+
 ::::
 
 ## Local flat-sky analysis

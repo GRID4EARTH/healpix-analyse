@@ -39,6 +39,7 @@ from healpix_analyse.divcurl import (
     HealPixMultiScaleDivCurl,
     HealPixDivCurlPyramid,
 )
+from healpix_analyse.resample import HealPixResampler, resample_healpix
 
 from healpix_analyse.alm_latlon import (
     build_rings_from_latlon,
@@ -77,6 +78,8 @@ __all__ = [
     "HealPixDivCurl",
     "HealPixMultiScaleDivCurl",
     "HealPixDivCurlPyramid",
+    "HealPixResampler",
+    "resample_healpix",
     # Spherical harmonic transforms (arbitrary lat/lon ring grids)
     "build_rings_from_latlon",
     "anafast_latlon",

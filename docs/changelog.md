@@ -14,6 +14,8 @@
   buffers.
 
 ### Added
+- `HealPixResampler` and `resample_healpix`: reusable and one-shot local
+  resampling between full or partial NESTED HEALPix levels, with NaN support.
 - `HealPixDivCurl` and `HealPixMultiScaleDivCurl`: fixed gauge-aware
   derivative kernels for divergence and curl at every decomposition scale.
 - `HealPixDecomp` and `HealPixPyramid`: exactly reconstructing local

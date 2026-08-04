@@ -26,7 +26,7 @@ classical data analysis.
 | `healpix_analyse.powerspectra_lonlat` | Power spectrum on irregular lon/lat grids |
 | `healpix_analyse.healpix_interp` | Bilinear interpolation on HEALPix (NESTED) |
 | `healpix_analyse.make_rectangle` | Build rectangular HEALPix patches from bounding boxes |
-| `healpix_analyse.resample` | Resample HEALPix data onto regular lat/lon grids |
+| `healpix_analyse.resample` | HEALPix level/domain resampling and regular lat/lon conversion |
 
 ## Design principles
 
