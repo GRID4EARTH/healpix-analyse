@@ -38,6 +38,46 @@ Input channel zero is eastward velocity `u`; channel one is northward
 velocity `v`. If velocity is expressed in metres per second, the default
 output unit is inverse seconds.
 
+## Global-to-local validation pipeline
+
+The {doc}`div/curl validation notebook <external_notebooks/divcurl_test>` is
+the reference validation workflow for this module. It deliberately compares two
+different ways of estimating the same physical quantities from ERA5 10-m wind:
+
+1. **Global spectral reference.** The global eastward and northward wind maps
+   are transformed with spin-1 spherical harmonics. The E/B coefficients are
+   multiplied by $\sqrt{\ell(\ell+1)}/R$ before synthesis, yielding physical
+   divergence and outward-normal curl in `s^-1`. This is feasible on the full
+   sphere because the ALM transform has complete global support.
+2. **Local masked experiment.** The same global `u` and `v` maps are sampled
+   onto a coastal NESTED HEALPix domain. `HealPixDecomp` builds a local
+   multiscale pyramid from those samples, and `HealPixMultiScaleDivCurl`
+   differentiates every band with a kernel at its own physical scale. The
+   diagnostic bands are brought back to the input grid with
+   `decomp.invert(diagnostics.bands)` and compared with the corresponding
+   subset of the global spectral reference.
+
+The ordering is important: full-sphere maps passed to local operators must be
+synthesised with `nest=True`. The notebook also stops the pyramid at the
+native resolution of the global spectral source, rather than creating an
+extra very-coarse band with too little local support.
+
+The coastline mask is applied *after* the global wind exists: it does not
+prescribe no-slip, no-flux, or any other coastal boundary condition. Winds do
+not change abruptly at this artificial land/ocean mask, so the global signal
+remains smoothly extendable beneath the missing cells. This is useful for
+checking that the local operator remains sensible and does not create spurious
+large-scale structure from an irregular mask. It is not, however, a
+coastal-dynamics benchmark or a validation of physical boundary conditions.
+It tests the setting in which a global ALM calculation cannot be applied
+directly to the masked field.
+
+For interpretation, compare the single-scale local result first, then the
+reconstructed multiscale result, and report errors on an eroded interior mask.
+The remaining discrepancy near the coast or outer edge is expected from
+one-sided/incomplete derivative stencils, not necessarily from the multiscale
+construction itself.
+
 ## Convolutional construction
 
 For each target cell, `HealPixConv` provides two oriented stencil axes
