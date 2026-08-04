@@ -20,6 +20,9 @@ and are fully differentiable through `torch.autograd`.
 - **Gauge-equivariant convolution** — `HealPixConv` with configurable kernel size, gauge types, and number of gauges
 - **Large-kernel convolution** — matched Down/Up hierarchy with a compact learned kernel
 - **Multi-resolution operators** — `HealPixDown` (smooth / max-pool) and `HealPixUp` (adjoint upsampling), NESTED ordering
+- **Masked multiscale decomposition** — exactly reconstructing local `HealPixDecomp` pyramids
+- **Multiscale divergence and curl** — gauge-aware local derivatives of HEALPix velocity fields
+- **HEALPix resampling** — local Up/Down conversion between full or partial NESTED domains
 - **Differentiable by default** — all hot-path operations are autograd-compatible
 - **NumPy and Torch interoperability** — accepts both array types, returns the same type
 
@@ -36,11 +39,13 @@ healpix_analyse/
 ├── large_conv.py         # Multiresolution large-receptive-field convolution
 ├── down.py               # Resolution reduction (HealPixDown)
 ├── up.py                 # Resolution increase (HealPixUp)
+├── decomp.py             # Exact local multiscale pyramid (HealPixDecomp)
+├── divcurl.py            # Gauge-aware divergence/curl at every pyramid scale
 ├── powerspectra.py        # Isotropic power spectrum on HEALPix patches
 ├── powerspectra_lonlat.py # Power spectrum on irregular lon/lat grids
 ├── healpix_interp.py      # Bilinear interpolation on HEALPix (NESTED)
 ├── make_rectangle.py      # Rectangular HEALPix patches from bounding boxes
-├── resample.py            # Resample HEALPix onto regular lat/lon grids
+├── resample.py            # HEALPix level/domain resampling and regular lat/lon conversion
 └── ps.py                  # Power spectrum utilities
 ```
 
@@ -132,6 +137,53 @@ This example automatically uses three smooth Down operations, a compact
 `5×5` convolution, and the three exactly paired Up operations. See the
 [LargeConv documentation](docs/large_conv.md) for kernel planning, partial
 patches, gradients and limitations.
+
+### Exactly reconstructing multiscale decomposition
+
+```python
+from healpix_analyse import HealPixDecomp
+
+decomp = HealPixDecomp(level=10, cell_ids=ocean_cell_ids, Jmax=5)
+pyramid = decomp.compute(u_v)
+u_v_reconstructed = decomp.invert(pyramid)
+```
+
+The pyramid retains the NESTED cell identifiers at every scale and works on
+irregular masked domains such as ocean fields bounded by coastlines. See the
+[multiscale decomposition documentation](docs/decomp.md).
+
+### Multiscale divergence and curl
+
+```python
+from healpix_analyse import HealPixMultiScaleDivCurl
+
+divcurl = HealPixMultiScaleDivCurl(decomp, kernel_sz=3, n_gauges=2)
+diagnostics = divcurl(pyramid)
+
+divergence = diagnostics.div
+curl = diagnostics.curl
+```
+
+Each scale uses a fixed derivative-of-Gaussian `HealPixConv` kernel normalised
+by that level's physical pixel spacing. See the
+[divergence and curl documentation](docs/divcurl.md).
+
+### HEALPix-to-HEALPix resampling
+
+```python
+from healpix_analyse import resample_healpix
+
+out_data, out_ids = resample_healpix(
+    in_data,
+    in_level=11,
+    out_level=8,
+    in_cell_ids=in_cell_ids,
+    out_cell_ids=out_cell_ids,
+)
+```
+
+The output order follows `out_cell_ids`; unavailable cells are filled with
+`NaN`. See the [HEALPix resampling documentation](docs/resample_healpix.md).
 
 ---
 

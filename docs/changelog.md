@@ -8,7 +8,18 @@
   `LargeConv`, `HealPixDown`, `HealPixUp`, `HEALPixSHT`, localized ALM
   transforms, and `build_healpix_adjacency`.
 
+### Fixed
+- `HealPixConv` geometry cache keys retain the input `cell_ids` order, so a
+  permutation of the same partial domain cannot reuse incompatible sorting
+  buffers.
+
 ### Added
+- `HealPixResampler` and `resample_healpix`: reusable and one-shot local
+  resampling between full or partial NESTED HEALPix levels, with NaN support.
+- `HealPixDivCurl` and `HealPixMultiScaleDivCurl`: fixed gauge-aware
+  derivative kernels for divergence and curl at every decomposition scale.
+- `HealPixDecomp` and `HealPixPyramid`: exactly reconstructing local
+  Laplacian pyramids with cell identifiers retained at every scale.
 - `HealPixFFTConv`: differentiable, zero-padded FFT convolution for very large
   learned kernels on local pole-safe gnomonic HEALPix patches.
 - `HEALPixSHT`: ring-based full-sky spherical harmonic transform with spin support (spin-0, spin-1, spin-2)

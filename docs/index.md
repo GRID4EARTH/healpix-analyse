@@ -139,6 +139,27 @@ Resolution increase: adjoint of smooth downsampling.
 Large effective kernels through matched Down, compact convolution and Up.
 :::
 
+:::{grid-item-card} HealPixDecomp
+:link: decomp
+:link-type: doc
+
+Exactly reconstructing local multiscale pyramids for masked HEALPix maps.
+:::
+
+:::{grid-item-card} Multiscale div/curl
+:link: divcurl
+:link-type: doc
+
+Gauge-aware local velocity derivatives at every HEALPix pyramid scale.
+:::
+
+:::{grid-item-card} HEALPix resampling
+:link: resample_healpix
+:link-type: doc
+
+Local Up/Down conversion between full or partial NESTED domains.
+:::
+
 ::::
 
 ## Local flat-sky analysis

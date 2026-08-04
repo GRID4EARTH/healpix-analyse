@@ -18,13 +18,15 @@ classical data analysis.
 | `healpix_analyse.fft_conv` | FFT-accelerated large-kernel local convolution (`HealPixFFTConv`) |
 | `healpix_analyse.convol` | Gauge-equivariant spherical convolution (`HealPixConv`) |
 | `healpix_analyse.large_conv` | Multiresolution large-receptive-field convolution (`LargeConv`) |
+| `healpix_analyse.decomp` | Exact local multiscale decomposition for masked maps (`HealPixDecomp`) |
+| `healpix_analyse.divcurl` | Gauge-aware divergence and curl at every pyramid scale |
 | `healpix_analyse.down` | HEALPix resolution reduction — smooth or max-pool (`HealPixDown`) |
 | `healpix_analyse.up` | HEALPix resolution increase — adjoint of smooth downsampling (`HealPixUp`) |
 | `healpix_analyse.powerspectra` | Isotropic 1D power spectrum on HEALPix patches |
 | `healpix_analyse.powerspectra_lonlat` | Power spectrum on irregular lon/lat grids |
 | `healpix_analyse.healpix_interp` | Bilinear interpolation on HEALPix (NESTED) |
 | `healpix_analyse.make_rectangle` | Build rectangular HEALPix patches from bounding boxes |
-| `healpix_analyse.resample` | Resample HEALPix data onto regular lat/lon grids |
+| `healpix_analyse.resample` | HEALPix level/domain resampling and regular lat/lon conversion |
 
 ## Design principles
 
