@@ -29,6 +29,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+test = [
+  "pytest>=8",
+]
+
 docs = [
   "sphinx>=7.0",
   "pydata-sphinx-theme>=0.15",
@@ -48,3 +52,4 @@ include = [
 ]
 
 [tool.setuptools_scm]
+
