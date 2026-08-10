@@ -1,4 +1,36 @@
-"""Binary mathematical morphology for nested HEALPix grids."""
+"""Binary mathematical morphology for nested HEALPix grids.
+
+This module provides binary dilation and erosion for masks represented
+by active nested HEALPix cell IDs.
+
+Unlike morphology on a Cartesian raster, a HEALPix structuring
+neighbourhood cannot be represented by a fixed 2-D array. Instead,
+the neighbourhood is defined geometrically on the reference ellipsoid.
+
+Binary masks are represented by the nested HEALPix cell IDs of active
+cells. Structuring neighbourhoods are defined geometrically rather than
+by a fixed two-dimensional kernel.
+
+Two neighbourhood definitions are supported:
+
+``cell_center``
+    Include cells whose centres are within ``radius`` metres of the
+    target-cell centre, using WGS84 ellipsoidal geodesic distance.
+    This is the default and most closely reproduces the centre-distance
+    semantics of a disk-shaped raster structuring element.
+
+``cone_coverage``
+    Include cells intersecting the circular region using
+    :func:`healpix_geo.nested.cone_coverage`. This generally produces
+    a larger neighbourhood because boundary cells may be included even
+    when their centres lie outside ``radius``.
+
+An optional processing ``domain`` distinguishes inactive cells from
+cells outside the spatial processing extent.
+The ``cell_center`` definition is the default because it corresponds
+most closely to a classical disk-shaped raster structuring element,
+where inclusion is determined from pixel-centre distances.
+"""
 
 from __future__ import annotations
 
@@ -38,16 +70,27 @@ def binary_dilation(
         Radius of the structuring neighbourhood, in metres.
     refinement_level
         HEALPix refinement level.
+
     neighbourhood
         Definition of the structuring neighbourhood.
 
         ``"cell_center"``
-            Include cells whose centres are within ``radius`` according
-            to the ellipsoidal geodesic distance.
+            Include a HEALPix cell when the WGS84 geodesic distance
+            between its centre and the centre of the target cell is
+            less than or equal to ``radius``.
+
+            This is the default and corresponds most closely to the
+            centre-distance criterion of a disk-shaped structuring
+            element on a regular raster.
 
         ``"cone_coverage"``
-            Include all cells returned by
+            Include every HEALPix cell intersecting the circular region
+            defined by ``radius``, using
             :func:`healpix_geo.nested.cone_coverage`.
+
+            This generally produces a larger neighbourhood because cells
+            whose centres lie outside the radius may still intersect the
+            circular region.
 
     domain
         Optional HEALPix processing domain.
@@ -63,6 +106,29 @@ def binary_dilation(
     -------
     numpy.ndarray
         Sorted unique active HEALPix cell IDs after dilation.
+    Examples
+    --------
+    Dilate a binary HEALPix mask using a 240 m cell-centre
+    structuring neighbourhood:
+
+    >>> cells = np.array([0], dtype=np.uint64)
+    >>> result = binary_dilation(
+    ...     cells,
+    ...     radius=240.0,
+    ...     refinement_level=17,
+    ...     neighbourhood="cell_center",
+    ... )
+
+    The alternative coverage-based neighbourhood can be selected with:
+
+    >>> result = binary_dilation(
+    ...     cells,
+    ...     radius=240.0,
+    ...     refinement_level=17,
+    ...     neighbourhood="cone_coverage",
+    ... )
+
+
     """
     cells, domain = _validate_inputs(
         cells,
@@ -142,6 +208,22 @@ def binary_erosion(
     -------
     numpy.ndarray
         Sorted active HEALPix cell IDs remaining after erosion.
+
+
+    Examples
+    --------
+    Erode a regional binary mask while ignoring cells outside the
+    processing domain:
+
+    >>> eroded = binary_erosion(
+    ...     cells,
+    ...     radius=180.0,
+    ...     refinement_level=17,
+    ...     neighbourhood="cell_center",
+    ...     domain=domain_cells,
+    ... )
+
+
     """
     cells, domain = _validate_inputs(
         cells,
