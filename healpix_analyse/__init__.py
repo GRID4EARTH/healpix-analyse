@@ -67,6 +67,15 @@ from healpix_analyse.minkowski import (
     minkowski_curves_healpix,
 )
 
+from healpix_analyse.neighbour_reduce import (
+    HealPixNeighbourReducer,
+    max_filter,
+    mean_filter,
+    median_filter,
+    min_filter,
+    neighbour_reduce,
+)
+
 __all__ = [
     # Multi-resolution operators
     "HealPixDown",
@@ -101,4 +110,11 @@ __all__ = [
     "build_healpix_adjacency",
     "minkowski_functionals_healpix",
     "minkowski_curves_healpix",
+    # HEALPix neighbourhood reductions
+    "HealPixNeighbourReducer",
+    "neighbour_reduce",
+    "median_filter",
+    "mean_filter",
+    "min_filter",
+    "max_filter",
 ]
