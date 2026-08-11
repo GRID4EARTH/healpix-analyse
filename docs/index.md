@@ -185,6 +185,9 @@ Fast zero-padded large kernels on local HEALPix patches.
 :link: external_notebooks/fft_sentinel2_test
 :link-type: doc
 
+Real B04/B08 reflectance, reconstruction metrics and local radial spectra.
+:::
+
 :::{grid-item-card} Neighbourhood reductions
 :link: neighbour_reduce
 :link-type: doc
@@ -193,8 +196,6 @@ Mean, median, extrema, counts and mask reductions over
 physical HEALPix neighbourhoods, including partial-domain semantics.
 :::
 
-Real B04/B08 reflectance, reconstruction metrics and local radial spectra.
-:::
 
 ::::
 
