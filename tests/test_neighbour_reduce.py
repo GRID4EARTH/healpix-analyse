@@ -1497,6 +1497,70 @@ def test_cpu_cuda_consistency(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# CPU / MPS consistency
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="MPS is not available",
+)
+@pytest.mark.parametrize(
+    "reduction",
+    [
+        "mean",
+        "sum",
+        "min",
+        "max",
+        "median",
+        "count",
+        "std",
+    ],
+)
+def test_cpu_mps_consistency(
+    simple_geometry,
+    reduction,
+):
+    """Check consistency between CPU and Apple Metal (MPS).
+
+    MPS is the PyTorch GPU backend available on supported macOS
+    systems. Float32 is used deliberately because MPS does not provide
+    the same float64 support guarantees as CPU/CUDA backends.
+    """
+
+    cpu_values = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0],
+        dtype=torch.float32,
+    )
+
+    mps_values = cpu_values.to("mps")
+
+    cpu_result = neighbour_reduce(
+        cpu_values,
+        simple_geometry,
+        refinement_level=5,
+        radius_m=100.0,
+        reduction=reduction,
+    )
+
+    mps_result = neighbour_reduce(
+        mps_values,
+        simple_geometry,
+        refinement_level=5,
+        radius_m=100.0,
+        reduction=reduction,
+    )
+
+    torch.testing.assert_close(
+        cpu_result,
+        mps_result.cpu(),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Convenience wrappers
 # ---------------------------------------------------------------------------
