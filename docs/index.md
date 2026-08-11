@@ -195,6 +195,14 @@ Real B04/B08 reflectance, reconstruction metrics and local radial spectra.
 ::::{grid} 1 1 3 3
 :gutter: 2
 
+:::{grid-item-card} Binary morphology
+:link: morphology
+:link-type: doc
+
+Binary dilation and erosion on nested HEALPix grids using
+WGS84 geodesic cell-centre or cone-coverage neighbourhoods.
+:::
+
 :::{grid-item-card} Minkowski functionals
 :link: minkowski
 :link-type: doc
@@ -261,6 +269,7 @@ maxdepth: 2
 caption: Morphology & topology
 hidden: true
 ---
+morphology
 minkowski
 ```
 
