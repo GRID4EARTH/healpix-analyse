@@ -91,3 +91,5 @@ docs/_build/
 .pixi/*
 !.pixi/config.toml
 pixi.lock
+# Sphinx AutoAPI generated files
+/docs/autoapi/
