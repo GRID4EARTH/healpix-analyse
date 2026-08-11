@@ -1,3 +1,6 @@
+import math
+
+import healpy as hp
 import numpy as np
 import pytest
 
@@ -113,6 +116,207 @@ def _find_edge_chain(length=3, level=3):
         chain.append(current)
 
     return chain
+
+
+def _find_base_pixel_crossing_edge_pair(
+    level=3,
+):
+    """Find edge-sharing cells belonging to different base pixels."""
+
+    npix = 12 * (2**level) ** 2
+    cells_per_base_pixel = 4**level
+
+    cells = np.arange(
+        npix,
+        dtype=np.uint64,
+    )
+
+    neighbours = nested_neighbours(
+        cells,
+        level,
+        connectivity="edge",
+    )
+
+    for index, cell in enumerate(cells):
+        cell_id = int(cell)
+
+        base_pixel = (
+            cell_id
+            // cells_per_base_pixel
+        )
+
+        for neighbour in neighbours[index]:
+            neighbour_id = int(neighbour)
+
+            neighbour_base_pixel = (
+                neighbour_id
+                // cells_per_base_pixel
+            )
+
+            if (
+                neighbour_base_pixel
+                != base_pixel
+            ):
+                return (
+                    cell_id,
+                    neighbour_id,
+                )
+
+    raise AssertionError(
+        "could not find an edge neighbour "
+        "crossing a HEALPix base-pixel boundary"
+    )
+
+
+def _find_polar_edge_pair(
+    level=3,
+):
+    """Find an edge-connected pair in a high-latitude HEALPix region."""
+
+    nside = 2**level
+    npix = 12 * nside**2
+
+    cells = np.arange(
+        npix,
+        dtype=np.int64,
+    )
+
+    lon, lat = hp.pix2ang(
+        nside,
+        cells,
+        nest=True,
+        lonlat=True,
+    )
+
+    # Pick the cell centre with the largest absolute latitude.
+    index = int(
+        np.argmax(
+            np.abs(lat)
+        )
+    )
+
+    cell = int(
+        cells[index]
+    )
+
+    neighbours = nested_neighbours(
+        np.array(
+            [cell],
+            dtype=np.uint64,
+        ),
+        level,
+        connectivity="edge",
+    )[0]
+
+    neighbour = int(
+        neighbours[0]
+    )
+
+    return (
+        cell,
+        neighbour,
+        float(lat[index]),
+    )
+
+
+def _find_longitude_wrap_edge_pair(
+    level=3,
+):
+    """Find edge-sharing cells crossing the 0/360-degree longitude seam."""
+
+    nside = 2**level
+    npix = 12 * nside**2
+
+    cells = np.arange(
+        npix,
+        dtype=np.int64,
+    )
+
+    lon, _ = hp.pix2ang(
+        nside,
+        cells,
+        nest=True,
+        lonlat=True,
+    )
+
+    neighbours = nested_neighbours(
+        cells.astype(
+            np.uint64
+        ),
+        level,
+        connectivity="edge",
+    )
+
+    for index, cell in enumerate(cells):
+        cell_lon = float(
+            lon[index]
+        )
+
+        for neighbour in neighbours[index]:
+            neighbour_id = int(
+                neighbour
+            )
+
+            neighbour_lon = float(
+                lon[neighbour_id]
+            )
+
+            # A large numeric longitude difference indicates that the
+            # topological edge crosses the 0/360-degree coordinate seam.
+            if abs(
+                cell_lon
+                - neighbour_lon
+            ) > 180.0:
+                return (
+                    int(cell),
+                    neighbour_id,
+                    cell_lon,
+                    neighbour_lon,
+                )
+
+    raise AssertionError(
+        "could not find an edge neighbour "
+        "crossing the longitude seam"
+    )
+
+
+def _find_complete_immediate_neighbourhood(
+    level=3,
+):
+    """Find a cell having all eight edge-or-vertex neighbour positions."""
+
+    npix = 12 * (2**level) ** 2
+
+    cells = np.arange(
+        npix,
+        dtype=np.uint64,
+    )
+
+    neighbours = nested_neighbours(
+        cells,
+        level,
+        connectivity="edge_or_vertex",
+    )
+
+    for cell, row in zip(
+        cells,
+        neighbours,
+        strict=True,
+    ):
+        if np.all(
+            row >= 0
+        ):
+            return (
+                int(cell),
+                row.astype(
+                    np.uint64
+                ),
+            )
+
+    raise AssertionError(
+        "could not find a HEALPix cell "
+        "with eight immediate neighbours"
+    )
 
 
 def test_single_active_cell():
@@ -1050,3 +1254,654 @@ def test_torch_remove_small_components():
             dtype=torch.bool,
         ),
     )
+
+# ---------------------------------------------------------------------------
+# Real HEALPix topology integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_component_crosses_base_pixel_boundary():
+    """Connectivity must work across HEALPix base-pixel boundaries."""
+
+    level = 3
+
+    first, second = (
+        _find_base_pixel_crossing_edge_pair(
+            level
+        )
+    )
+
+    cells_per_base_pixel = (
+        4**level
+    )
+
+    assert (
+        first
+        // cells_per_base_pixel
+    ) != (
+        second
+        // cells_per_base_pixel
+    )
+
+    labels, n_components = (
+        connected_components(
+            np.array(
+                [True, True],
+                dtype=bool,
+            ),
+            np.array(
+                [first, second],
+                dtype=np.uint64,
+            ),
+            level,
+            connectivity="edge",
+        )
+    )
+
+    np.testing.assert_array_equal(
+        labels,
+        np.array(
+            [1, 1],
+            dtype=np.int64,
+        ),
+    )
+
+    assert n_components == 1
+
+
+def test_component_in_polar_region():
+    """Connected components must not depend on Cartesian latitude geometry."""
+
+    level = 3
+
+    first, second, latitude = (
+        _find_polar_edge_pair(
+            level
+        )
+    )
+
+    # Ensure this really exercises a high-latitude HEALPix region.
+    assert abs(latitude) > 60.0
+
+    labels, n_components = (
+        connected_components(
+            np.array(
+                [True, True],
+                dtype=bool,
+            ),
+            np.array(
+                [first, second],
+                dtype=np.uint64,
+            ),
+            level,
+            connectivity="edge",
+        )
+    )
+
+    np.testing.assert_array_equal(
+        labels,
+        np.array(
+            [1, 1],
+            dtype=np.int64,
+        ),
+    )
+
+    assert n_components == 1
+
+
+def test_component_crosses_longitude_wrap():
+    """Longitude coordinate discontinuity must not break topology."""
+
+    level = 3
+
+    (
+        first,
+        second,
+        longitude_first,
+        longitude_second,
+    ) = _find_longitude_wrap_edge_pair(
+        level
+    )
+
+    # Confirm that this pair crosses the numeric longitude seam.
+    assert abs(
+        longitude_first
+        - longitude_second
+    ) > 180.0
+
+    labels, n_components = (
+        connected_components(
+            np.array(
+                [True, True],
+                dtype=bool,
+            ),
+            np.array(
+                [first, second],
+                dtype=np.uint64,
+            ),
+            level,
+            connectivity="edge",
+        )
+    )
+
+    np.testing.assert_array_equal(
+        labels,
+        np.array(
+            [1, 1],
+            dtype=np.int64,
+        ),
+    )
+
+    assert n_components == 1
+
+
+def test_component_can_surround_background_hole():
+    """A background hole must not split a surrounding component."""
+
+    level = 3
+
+    center, ring = (
+        _find_complete_immediate_neighbourhood(
+            level
+        )
+    )
+
+    cell_ids = np.concatenate(
+        [
+            np.array(
+                [center],
+                dtype=np.uint64,
+            ),
+            ring,
+        ]
+    )
+
+    # Centre is background; its complete immediate neighbourhood is active.
+    mask = np.concatenate(
+        [
+            np.array(
+                [False],
+                dtype=bool,
+            ),
+            np.ones(
+                ring.size,
+                dtype=bool,
+            ),
+        ]
+    )
+
+    labels, n_components = (
+        connected_components(
+            mask,
+            cell_ids,
+            level,
+            connectivity="edge_or_vertex",
+        )
+    )
+
+    # The central hole remains background.
+    assert labels[0] == 0
+
+    # The surrounding cells form one connected component.
+    assert np.all(
+        labels[1:] == 1
+    )
+
+    assert n_components == 1
+
+
+def test_component_touching_domain_boundary_is_retained():
+    """A component may terminate naturally at the processing-domain edge."""
+
+    level = 3
+
+    chain = _find_edge_chain(
+        length=3,
+        level=level,
+    )
+
+    cell_ids = np.array(
+        chain,
+        dtype=np.uint64,
+    )
+
+    mask = np.array(
+        [True, True, True],
+        dtype=bool,
+    )
+
+    # The third active cell exists in the supplied data but is deliberately
+    # outside the processing domain.
+    domain = np.array(
+        chain[:2],
+        dtype=np.uint64,
+    )
+
+    labels, n_components = (
+        connected_components(
+            mask,
+            cell_ids,
+            level,
+            connectivity="edge",
+            domain=domain,
+        )
+    )
+
+    np.testing.assert_array_equal(
+        labels,
+        np.array(
+            [1, 1],
+            dtype=np.int64,
+        ),
+    )
+
+    assert n_components == 1
+@pytest.mark.parametrize(
+    "level",
+    [
+        0,
+        1,
+        2,
+        3,
+        5,
+        8,
+    ],
+)
+def test_connected_components_multiple_refinement_levels(
+    level,
+):
+    """Edge connectivity must be stable across HEALPix refinements."""
+
+    first, second = _find_edge_pair(
+        level
+    )
+
+    labels, n_components = (
+        connected_components(
+            np.array(
+                [True, True],
+                dtype=bool,
+            ),
+            np.array(
+                [first, second],
+                dtype=np.uint64,
+            ),
+            level,
+            connectivity="edge",
+        )
+    )
+
+    np.testing.assert_array_equal(
+        labels,
+        np.array(
+            [1, 1],
+            dtype=np.int64,
+        ),
+    )
+
+    assert n_components == 1
+
+def test_wgs84_total_surface_area_matches_reference_ellipsoid():
+    """Validate cell area against the defining WGS84 ellipsoid constants."""
+
+    # WGS84 defining constants.
+    semi_major = 6_378_137.0
+    inverse_flattening = 298.257223563
+
+    flattening = (
+        1.0
+        / inverse_flattening
+    )
+
+    semi_minor = (
+        semi_major
+        * (1.0 - flattening)
+    )
+
+    eccentricity_squared = (
+        1.0
+        - (
+            semi_minor
+            * semi_minor
+        )
+        / (
+            semi_major
+            * semi_major
+        )
+    )
+
+    eccentricity = math.sqrt(
+        eccentricity_squared
+    )
+
+    expected_surface_area = (
+        2.0
+        * math.pi
+        * semi_major
+        * semi_major
+        * (
+            1.0
+            + (
+                (
+                    1.0
+                    - eccentricity_squared
+                )
+                / eccentricity
+            )
+            * math.atanh(
+                eccentricity
+            )
+        )
+    )
+
+    actual_surface_area = (
+        12.0
+        * healpix_cell_area(
+            0,
+            ellipsoid="WGS84",
+        )
+    )
+
+    assert actual_surface_area == pytest.approx(
+        expected_surface_area,
+        rel=1e-12,
+    )
+
+def test_min_cells_threshold_is_inclusive():
+    """A component exactly equal to min_cells must be retained."""
+
+    level = 3
+
+    first, second = _find_edge_pair(
+        level
+    )
+
+    cleaned = remove_small_components(
+        np.array(
+            [True, True],
+            dtype=bool,
+        ),
+        np.array(
+            [first, second],
+            dtype=np.uint64,
+        ),
+        level,
+        min_cells=2,
+        connectivity="edge",
+    )
+
+    np.testing.assert_array_equal(
+        cleaned,
+        np.array(
+            [True, True],
+            dtype=bool,
+        ),
+    )
+
+
+def test_min_area_threshold_is_inclusive():
+    """A component exactly equal to min_area_m2 must be retained."""
+
+    level = 8
+
+    first, second = _find_edge_pair(
+        level
+    )
+
+    threshold = (
+        2.0
+        * healpix_cell_area(
+            level,
+            ellipsoid="WGS84",
+        )
+    )
+
+    cleaned = remove_small_components(
+        np.array(
+            [True, True],
+            dtype=bool,
+        ),
+        np.array(
+            [first, second],
+            dtype=np.uint64,
+        ),
+        level,
+        min_area_m2=threshold,
+        connectivity="edge",
+        ellipsoid="WGS84",
+    )
+
+    np.testing.assert_array_equal(
+        cleaned,
+        np.array(
+            [True, True],
+            dtype=bool,
+        ),
+    )
+
+# ---------------------------------------------------------------------------
+# Additional validation
+# ---------------------------------------------------------------------------
+
+
+def test_component_size_rejects_negative_labels():
+    with pytest.raises(
+        ValueError
+    ):
+        component_size(
+            np.array(
+                [0, 1, -1],
+                dtype=np.int64,
+            )
+        )
+
+
+def test_component_size_rejects_float_labels():
+    with pytest.raises(
+        TypeError
+    ):
+        component_size(
+            np.array(
+                [0.0, 1.0],
+                dtype=np.float64,
+            )
+        )
+
+
+def test_component_size_rejects_multidimensional_labels():
+    with pytest.raises(
+        ValueError
+    ):
+        component_size(
+            np.array(
+                [[0, 1]],
+                dtype=np.int64,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "level",
+    [
+        -1,
+        30,
+    ],
+)
+def test_component_area_rejects_invalid_refinement_level(
+    level,
+):
+    with pytest.raises(
+        ValueError
+    ):
+        component_area(
+            np.array(
+                [0, 1],
+                dtype=np.int64,
+            ),
+            level,
+        )
+
+
+def test_healpix_cell_area_rejects_unknown_ellipsoid():
+    with pytest.raises(
+        ValueError
+    ):
+        healpix_cell_area(
+            3,
+            ellipsoid="NOT_AN_ELLIPSOID",
+        )
+
+
+@pytest.mark.parametrize(
+    "min_cells",
+    [
+        -1,
+        1.5,
+        True,
+    ],
+)
+def test_remove_small_components_rejects_invalid_min_cells(
+    min_cells,
+):
+    with pytest.raises(
+        (TypeError, ValueError)
+    ):
+        remove_small_components(
+            np.array(
+                [True],
+                dtype=bool,
+            ),
+            np.array(
+                [0],
+                dtype=np.uint64,
+            ),
+            3,
+            min_cells=min_cells,
+        )
+
+
+@pytest.mark.parametrize(
+    "min_area_m2",
+    [
+        -1.0,
+        np.nan,
+        np.inf,
+        True,
+    ],
+)
+def test_remove_small_components_rejects_invalid_min_area(
+    min_area_m2,
+):
+    with pytest.raises(
+        (TypeError, ValueError)
+    ):
+        remove_small_components(
+            np.array(
+                [True],
+                dtype=bool,
+            ),
+            np.array(
+                [0],
+                dtype=np.uint64,
+            ),
+            3,
+            min_area_m2=min_area_m2,
+        )
+
+# ---------------------------------------------------------------------------
+# Torch device round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(),
+    reason="CUDA is not available",
+)
+def test_cuda_connected_components_round_trip():
+    import torch
+
+    level = 3
+    first, second = _find_edge_pair(
+        level
+    )
+
+    mask = torch.tensor(
+        [True, True],
+        dtype=torch.bool,
+        device="cuda",
+    )
+
+    cell_ids = torch.tensor(
+        [first, second],
+        dtype=torch.int64,
+        device="cuda",
+    )
+
+    labels, n_components = (
+        connected_components(
+            mask,
+            cell_ids,
+            level,
+            connectivity="edge",
+        )
+    )
+
+    assert labels.device.type == "cuda"
+
+    torch.testing.assert_close(
+        labels.cpu(),
+        torch.tensor(
+            [1, 1],
+            dtype=torch.int64,
+        ),
+    )
+
+    assert n_components == 1
+
+
+@pytest.mark.skipif(
+    not __import__("torch").backends.mps.is_available(),
+    reason="MPS is not available",
+)
+def test_mps_connected_components_round_trip():
+    import torch
+
+    level = 3
+    first, second = _find_edge_pair(
+        level
+    )
+
+    mask = torch.tensor(
+        [True, True],
+        dtype=torch.bool,
+        device="mps",
+    )
+
+    cell_ids = torch.tensor(
+        [first, second],
+        dtype=torch.int64,
+        device="mps",
+    )
+
+    labels, n_components = (
+        connected_components(
+            mask,
+            cell_ids,
+            level,
+            connectivity="edge",
+        )
+    )
+
+    assert labels.device.type == "mps"
+
+    torch.testing.assert_close(
+        labels.cpu(),
+        torch.tensor(
+            [1, 1],
+            dtype=torch.int64,
+        ),
+    )
+
+    assert n_components == 1
+
+
