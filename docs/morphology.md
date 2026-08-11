@@ -211,8 +211,5 @@ This prevents artificial erosion along the edge of a regional dataset.
 
 ## API reference
 
-```{eval-rst}
-.. autofunction:: healpix_analyse.morphology.binary_dilation
-.. autofunction:: healpix_analyse.morphology.binary_erosion
-```
-```
+See {doc}`autoapi/healpix_analyse/morphology/index`.
+
