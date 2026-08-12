@@ -196,6 +196,13 @@ Mean, median, extrema, counts and mask reductions over
 physical HEALPix neighbourhoods, including partial-domain semantics.
 :::
 
+:::{grid-item-card} Directional filtering
+:link: directional_filter
+:link-type: doc
+
+Geographical azimuth-dependent filtering over physical WGS84 HEALPix neighbourhoods.
+:::
+
 :::{grid-item-card} Scalar-field gradients
 :link: gradient
 :link-type: doc
@@ -288,6 +295,7 @@ hidden: true
 morphology
 minkowski
 neighbour_reduce
+directional_filter
 gradient
 ```
 
