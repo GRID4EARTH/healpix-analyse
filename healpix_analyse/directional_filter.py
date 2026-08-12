@@ -62,7 +62,7 @@ directions are not part of the public spatial semantics.
 
 The geometry is independent of signal values.  Neighbour selection and WGS84
 relative geometry are therefore delegated to the shared neighbourhood
-infrastructure in :mod:`healpix_analyse._neighbourhood`.
+infrastructure in ``healpix_analyse._neighbourhood``.
 """
 
 from __future__ import annotations
