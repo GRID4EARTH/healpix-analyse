@@ -302,7 +302,7 @@ def test_domain_restricts_dilation(monkeypatch):
         ]
 
     monkeypatch.setattr(
-        "healpix_analyse.morphology._neighbourhoods",
+        "healpix_analyse.morphology.build_neighbourhoods",
         fake_neighbourhoods,
     )
 
@@ -329,7 +329,7 @@ def test_erosion_without_domain_requires_full_neighbourhood(monkeypatch):
         ]
 
     monkeypatch.setattr(
-        "healpix_analyse.morphology._neighbourhoods",
+        "healpix_analyse.morphology.build_neighbourhoods",
         fake_neighbourhoods,
     )
 
@@ -356,7 +356,7 @@ def test_erosion_ignores_cells_outside_domain(monkeypatch):
         ]
 
     monkeypatch.setattr(
-        "healpix_analyse.morphology._neighbourhoods",
+        "healpix_analyse.morphology.build_neighbourhoods",
         fake_neighbourhoods,
     )
 

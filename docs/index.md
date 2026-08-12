@@ -188,6 +188,15 @@ Fast zero-padded large kernels on local HEALPix patches.
 Real B04/B08 reflectance, reconstruction metrics and local radial spectra.
 :::
 
+:::{grid-item-card} Neighbourhood reductions
+:link: neighbour_reduce
+:link-type: doc
+
+Mean, median, extrema, counts and mask reductions over
+physical HEALPix neighbourhoods, including partial-domain semantics.
+:::
+
+
 ::::
 
 ## Morphology & topology
@@ -271,6 +280,7 @@ hidden: true
 ---
 morphology
 minkowski
+neighbour_reduce
 ```
 
 ```{toctree}
