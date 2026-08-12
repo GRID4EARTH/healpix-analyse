@@ -18,7 +18,7 @@ up/downsampling operators.
 :::{tab-item} pip (from GitHub)
 
 ```bash
-pip install git+https://github.com/EOPF-DGGS/healpix-analyse.git
+pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 ```
 
 :::
@@ -26,7 +26,7 @@ pip install git+https://github.com/EOPF-DGGS/healpix-analyse.git
 :::{tab-item} From source
 
 ```bash
-git clone git@github.com:EOPF-DGGS/healpix-analyse.git
+git clone git@github.com:GRID4EARTH/healpix-analyse.git
 cd healpix-analyse
 pip install -e .
 ```
@@ -219,6 +219,14 @@ Binary dilation and erosion on nested HEALPix grids using
 WGS84 geodesic cell-centre or cone-coverage neighbourhoods.
 :::
 
+:::{grid-item-card} Connected components
+:link: components
+:link-type: doc
+
+Connected-component labelling, component size and physical area,
+and small-region filtering on NESTED HEALPix topology.
+:::
+
 :::{grid-item-card} Minkowski functionals
 :link: minkowski
 :link-type: doc
@@ -286,6 +294,7 @@ caption: Morphology & topology
 hidden: true
 ---
 morphology
+components
 minkowski
 neighbour_reduce
 gradient

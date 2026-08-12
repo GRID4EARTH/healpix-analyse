@@ -152,7 +152,7 @@ html_title = "healpix-analyse"
 html_theme_options = {
     "navigation_depth": 4,
     "show_toc_level": 2,
-    "github_url": "https://github.com/EOPF-DGGS/healpix-analyse",
+    "github_url": "https://github.com/GRID4EARTH/healpix-analyse",
     "icon_links_label": "Quick Links",
     "navbar_end": ["navbar-icon-links"],
     "footer_start": ["copyright"],
