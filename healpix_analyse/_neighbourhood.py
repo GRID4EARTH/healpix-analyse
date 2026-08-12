@@ -571,6 +571,33 @@ def _filter_by_cell_center_distance(
 
     return candidates[distance <= radius]
 
+def relative_geometry_from_neighbourhoods(
+    center_ids: np.ndarray,
+    neighbourhoods: list[np.ndarray],
+    refinement_level: int,
+    *,
+    ellipsoid: str = "WGS84",
+) -> RelativeNeighbourhoodGeometry:
+    """Compute relative geometry from variable-length neighbour lists.
+
+    This convenience helper converts variable-length HEALPix neighbourhoods
+    to the padded representation required by
+    :func:`relative_geometry_from_neighbours`.
+
+    It deliberately keeps neighbour selection separate from geometry so that
+    physical-radius, topological-ring, and future candidate-selection methods
+    can all share the same WGS84 distance and azimuth implementation.
+    """
+    padded_neighbour_ids, _ = _pad_neighbourhoods(
+        neighbourhoods,
+    )
+
+    return relative_geometry_from_neighbours(
+        center_ids,
+        padded_neighbour_ids,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
 
 __all__ = [
     "NeighbourhoodMethod",
@@ -581,4 +608,5 @@ __all__ = [
     "relative_geometry_from_neighbours",
     "validate_neighbourhood",
     "validate_ring",
+    "relative_geometry_from_neighbourhoods",
 ]

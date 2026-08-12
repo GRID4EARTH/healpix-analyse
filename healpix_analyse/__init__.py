@@ -127,6 +127,8 @@ from healpix_analyse.gradient import (
     gradient_magnitude,
 )
 
+from .directional_filter import directional_filter
+
 # ---------------------------------------------------------------------------
 # HEALPix connected components
 #
@@ -216,6 +218,11 @@ __all__ = [
     "mean_filter",
     "min_filter",
     "max_filter",
+
+    # ------------------------------------------------------------------
+    # HEALPix geographical weighted filtering
+    # ------------------------------------------------------------------
+    "directional_filter",
 
     # ------------------------------------------------------------------
     # HEALPix scalar-field gradients

@@ -255,3 +255,45 @@ row/column
 The same semantics apply across HEALPix base-pixel boundaries, near the poles, and across longitude wrap-around.
 
 Weighted, Gaussian, and arbitrary radial-kernel filters are separate operations and are not part of `neighbour_reduce`.
+
+## Related weighted neighbourhood operators
+
+`neighbour_reduce()` is intended for unweighted neighbourhood reductions such as
+mean, median, extrema, counts, and mask reductions.
+
+Weighted spatial kernels are implemented as separate operators because their
+semantics are different from categorical or unweighted reductions.
+
+Use:
+
+- radial filtering when weights depend only on physical distance,
+- directional filtering when weights depend on physical distance and
+  geographical bearing.
+
+For example, directional filtering uses:
+
+```text
+weight =
+    kernel(
+        distance_m,
+        relative_bearing_rad,
+    )
+```
+
+with geographical azimuth measured clockwise from North.
+
+See {doc}`directional_filter` for geographical directional filtering and its
+Sentinel-2 MSI migration example.
+
+All of these operators follow the same domain principle:
+
+```text
+cells outside domain
+    -> absent from the effective neighbourhood
+    -> not zero
+    -> not NaN padding
+    -> not periodic continuation
+```
+
+The weighted operators share generic neighbour-value aggregation internally,
+while neighbour discovery and WGS84 geometry remain separate spatial concerns.
