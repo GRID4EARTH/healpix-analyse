@@ -196,6 +196,13 @@ Mean, median, extrema, counts and mask reductions over
 physical HEALPix neighbourhoods, including partial-domain semantics.
 :::
 
+:::{grid-item-card} Scalar-field gradients
+:link: gradient
+:link-type: doc
+
+Geographic East/North gradients and directional derivatives over
+immediate HEALPix neighbourhoods using WGS84 relative geometry.
+:::
 
 ::::
 
@@ -290,6 +297,7 @@ morphology
 components
 minkowski
 neighbour_reduce
+gradient
 ```
 
 ```{toctree}

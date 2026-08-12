@@ -121,6 +121,11 @@ from healpix_analyse.neighbour_reduce import (
     max_filter,
 )
 
+from healpix_analyse.gradient import (
+    directional_derivative,
+    gradient,
+    gradient_magnitude,
+)
 
 # ---------------------------------------------------------------------------
 # HEALPix connected components
@@ -211,6 +216,13 @@ __all__ = [
     "mean_filter",
     "min_filter",
     "max_filter",
+
+    # ------------------------------------------------------------------
+    # HEALPix scalar-field gradients
+    # ------------------------------------------------------------------
+    "gradient",
+    "gradient_magnitude",
+    "directional_derivative",
 
     # ------------------------------------------------------------------
     # HEALPix connected components
