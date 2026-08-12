@@ -156,6 +156,10 @@ from healpix_analyse.components import (
     remove_small_components,
 )
 
+from healpix_analyse.radial_filter import (
+    gaussian_filter,
+    radial_filter,
+)
 
 __all__ = [
     # ------------------------------------------------------------------
@@ -223,6 +227,12 @@ __all__ = [
     # HEALPix geographical weighted filtering
     # ------------------------------------------------------------------
     "directional_filter",
+
+    # ------------------------------------------------------------------
+    # HEALPix radial filtering
+    # ------------------------------------------------------------------
+    "radial_filter",
+    "gaussian_filter",
 
     # ------------------------------------------------------------------
     # HEALPix scalar-field gradients

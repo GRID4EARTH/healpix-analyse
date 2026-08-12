@@ -196,6 +196,15 @@ Mean, median, extrema, counts and mask reductions over
 physical HEALPix neighbourhoods, including partial-domain semantics.
 :::
 
+:::{grid-item-card} Radial and Gaussian filters
+:link: radial_filter
+:link-type: doc
+
+Metric radial and Gaussian filtering on HEALPix using physical
+WGS84 distances and shared weighted-neighbour aggregation.
+:::
+
+
 :::{grid-item-card} Directional filtering
 :link: directional_filter
 :link-type: doc
@@ -305,6 +314,7 @@ components
 minkowski
 neighbour_reduce
 directional_filter
+radial_filter
 gradient
 ```
 
