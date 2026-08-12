@@ -1,4 +1,3 @@
-```markdown
 # Binary morphology
 
 `healpix-analyse` provides binary mathematical morphology for masks
