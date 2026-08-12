@@ -788,13 +788,16 @@ def directional_filter(
             0,
         )
 
-        if isinstance(
-            values,
-            torch.Tensor,
-        ):
+        if isinstance(values, torch.Tensor):
+            dtype = (
+                values.dtype
+                if values.is_floating_point() or values.is_complex()
+                else torch.get_default_dtype()
+            )
+
             return torch.empty(
                 output_shape,
-                dtype=_torch_output_dtype(values),
+                dtype=dtype,
                 device=values.device,
             )
 

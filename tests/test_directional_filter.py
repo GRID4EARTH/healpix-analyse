@@ -820,3 +820,29 @@ def test_s2msi_style_physical_shadow_direction():
 
     assert correct_direction[center_position] == pytest.approx(1.0)
     assert opposite_direction[center_position] == pytest.approx(0.0)
+
+def test_torch_empty_domain_returns_empty_tensor():
+    refinement_level = 5
+
+    cell_ids = np.array([1000], dtype=np.uint64)
+
+    values = torch.tensor(
+        [1.0],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    result = directional_filter(
+        values,
+        cell_ids,
+        refinement_level,
+        max_distance_m=1000.0,
+        azimuth_rad=0.0,
+        kernel=lambda d, a: np.ones_like(d),
+        domain=np.array([], dtype=np.uint64),
+    )
+
+    assert isinstance(result, torch.Tensor)
+    assert result.shape == (0,)
+    assert result.dtype == values.dtype
+    assert result.device == values.device
