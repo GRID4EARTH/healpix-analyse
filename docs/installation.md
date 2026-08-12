@@ -9,13 +9,13 @@
 ## Install from GitHub
 
 ```bash
-pip install git+https://github.com/EOPF-DGGS/healpix-analyse.git
+pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 ```
 
 ## Install from source (development)
 
 ```bash
-git clone git@github.com:EOPF-DGGS/healpix-analyse.git
+git clone git@github.com:GRID4EARTH/healpix-analyse.git
 cd healpix-analyse
 pip install -e .
 ```
