@@ -30,6 +30,7 @@ completely absent from the filter because it lies outside ``domain``.
 from __future__ import annotations
 
 import importlib
+import warnings
 
 import numpy as np
 import pytest
@@ -697,6 +698,61 @@ def test_gaussian_reuses_geometry_and_weights(monkeypatch):
     assert calls == 1
     np.testing.assert_allclose(second, first + 1.0)
     module._clear_filter_caches()
+
+
+def test_oversize_cache_warning_is_actionable_and_emitted_once():
+    module = importlib.import_module("healpix_analyse.radial_filter")
+    original = module.radial_filter_cache_info()
+    refinement_level = 5
+    cell_ids = _domain_around_center(1000, refinement_level)
+    values = np.ones(cell_ids.size, dtype=np.float64)
+
+    try:
+        module.configure_radial_filter_cache(
+            geometry_max_mib=0,
+            weight_max_mib=0,
+        )
+        with pytest.warns(RuntimeWarning) as captured:
+            gaussian_filter(
+                values,
+                cell_ids,
+                refinement_level,
+                sigma_m=100_000.0,
+            )
+        messages = [str(item.message) for item in captured]
+        assert len(messages) == 2
+        assert all("configure_radial_filter_cache" in item for item in messages)
+        assert all("halo of at least radius_m=" in item for item in messages)
+
+        with warnings.catch_warnings(record=True) as repeated:
+            warnings.simplefilter("always")
+            gaussian_filter(
+                values,
+                cell_ids,
+                refinement_level,
+                sigma_m=100_000.0,
+            )
+        assert repeated == []
+    finally:
+        module.configure_radial_filter_cache(
+            geometry_max_mib=original["geometry_max_mib"],
+            weight_max_mib=original["weight_max_mib"],
+        )
+        module._clear_filter_caches()
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value", "error"),
+    [
+        ("geometry_max_mib", -1.0, ValueError),
+        ("weight_max_mib", np.inf, ValueError),
+        ("geometry_max_mib", True, TypeError),
+    ],
+)
+def test_configure_cache_rejects_invalid_limits(keyword, value, error):
+    module = importlib.import_module("healpix_analyse.radial_filter")
+    with pytest.raises(error):
+        module.configure_radial_filter_cache(**{keyword: value})
 
 
 def test_gaussian_constant_field_preserved_at_partial_domain_boundary():

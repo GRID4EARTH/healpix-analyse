@@ -50,6 +50,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from threading import RLock
 from typing import Any
+import warnings
 
 import numpy as np
 import torch
@@ -74,6 +75,150 @@ _geometry_cache_bytes = 0
 _gaussian_weight_cache: OrderedDict[tuple[Any, ...], np.ndarray] = OrderedDict()
 _gaussian_weight_cache_bytes = 0
 _cache_lock = RLock()
+_warned_oversize_cache_entries: set[tuple[Any, ...]] = set()
+
+
+def _mib(number_of_bytes: int) -> float:
+    return number_of_bytes / (1024.0**2)
+
+
+def _validate_cache_limit_mib(value: float, *, name: str) -> int:
+    """Validate a public cache limit and convert it to bytes."""
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"'{name}' must be a finite non-negative number.")
+    try:
+        limit_mib = float(value)
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            f"'{name}' must be a finite non-negative number."
+        ) from error
+    if not np.isfinite(limit_mib) or limit_mib < 0.0:
+        raise ValueError(f"'{name}' must be finite and non-negative.")
+    return int(limit_mib * 1024.0**2)
+
+
+def radial_filter_cache_info() -> dict[str, float | int]:
+    """Return current radial/Gaussian cache limits and usage.
+
+    Returns
+    -------
+    dict
+        Geometry and weight limits and current usage in MiB, plus the number
+        of retained entries in each cache.
+    """
+    with _cache_lock:
+        return {
+            "geometry_max_mib": _mib(_GEOMETRY_CACHE_MAX_BYTES),
+            "weight_max_mib": _mib(_WEIGHT_CACHE_MAX_BYTES),
+            "geometry_used_mib": _mib(_geometry_cache_bytes),
+            "weight_used_mib": _mib(_gaussian_weight_cache_bytes),
+            "geometry_entries": len(_geometry_cache),
+            "weight_entries": len(_gaussian_weight_cache),
+        }
+
+
+def configure_radial_filter_cache(
+    *,
+    geometry_max_mib: float | None = None,
+    weight_max_mib: float | None = None,
+) -> dict[str, float | int]:
+    """Configure bounded radial/Gaussian caches and return their status.
+
+    ``None`` leaves a limit unchanged. A zero limit disables that cache.
+    Reducing a limit immediately evicts least-recently-used entries until the
+    retained data fits. Large production workloads should ensure sufficient
+    process memory for both cached arrays and temporary construction arrays.
+
+    Parameters
+    ----------
+    geometry_max_mib
+        Maximum retained metric-geometry size in MiB.
+    weight_max_mib
+        Maximum retained Gaussian-weight size in MiB.
+
+    Returns
+    -------
+    dict
+        Updated result from :func:`radial_filter_cache_info`.
+    """
+    global _GEOMETRY_CACHE_MAX_BYTES, _WEIGHT_CACHE_MAX_BYTES
+    global _geometry_cache_bytes, _gaussian_weight_cache_bytes
+
+    geometry_limit = (
+        None
+        if geometry_max_mib is None
+        else _validate_cache_limit_mib(
+            geometry_max_mib,
+            name="geometry_max_mib",
+        )
+    )
+    weight_limit = (
+        None
+        if weight_max_mib is None
+        else _validate_cache_limit_mib(
+            weight_max_mib,
+            name="weight_max_mib",
+        )
+    )
+
+    with _cache_lock:
+        if geometry_limit is not None:
+            _GEOMETRY_CACHE_MAX_BYTES = geometry_limit
+        if weight_limit is not None:
+            _WEIGHT_CACHE_MAX_BYTES = weight_limit
+        while (
+            _geometry_cache
+            and _geometry_cache_bytes > _GEOMETRY_CACHE_MAX_BYTES
+        ):
+            _, evicted = _geometry_cache.popitem(last=False)
+            _geometry_cache_bytes -= _geometry_nbytes(evicted)
+        while (
+            _gaussian_weight_cache
+            and _gaussian_weight_cache_bytes > _WEIGHT_CACHE_MAX_BYTES
+        ):
+            _, evicted = _gaussian_weight_cache.popitem(last=False)
+            _gaussian_weight_cache_bytes -= evicted.nbytes
+        _warned_oversize_cache_entries.clear()
+    return radial_filter_cache_info()
+
+
+def _warn_oversize_cache_entry(
+    *,
+    kind: str,
+    required_bytes: int,
+    limit_bytes: int,
+    domain_size: int,
+    refinement_level: int,
+    radius_m: float,
+    option_name: str,
+) -> None:
+    """Warn once when one spatial plan cannot fit its configured cache."""
+    token = (
+        kind,
+        domain_size,
+        refinement_level,
+        radius_m,
+        required_bytes,
+        limit_bytes,
+    )
+    with _cache_lock:
+        if token in _warned_oversize_cache_entries:
+            return
+        _warned_oversize_cache_entries.add(token)
+
+    suggested_mib = int(np.ceil(_mib(required_bytes) * 1.05))
+    warnings.warn(
+        f"The radial-filter {kind} cache entry requires "
+        f"{_mib(required_bytes):.1f} MiB, "
+        f"exceeding its configured {_mib(limit_bytes):.1f} MiB cache limit. "
+        f"It will not be cached, so repeated calls rebuild or recompute it. "
+        f"Either call configure_radial_filter_cache({option_name}="
+        f"{suggested_mib}) after checking available memory, or process tiles "
+        f"with a halo of at least radius_m={radius_m:g} m and discard halo "
+        f"outputs when stitching.",
+        RuntimeWarning,
+        stacklevel=4,
+    )
 
 
 def _validate_cell_ids(
@@ -322,6 +467,16 @@ def _filter_geometry(
                 _geometry_cache_bytes -= _geometry_nbytes(evicted)
             _geometry_cache[key] = geometry
             _geometry_cache_bytes += size
+    else:
+        _warn_oversize_cache_entry(
+            kind="geometry",
+            required_bytes=size,
+            limit_bytes=_GEOMETRY_CACHE_MAX_BYTES,
+            domain_size=domain.size,
+            refinement_level=refinement_level,
+            radius_m=radius,
+            option_name="geometry_max_mib",
+        )
 
     return key, geometry
 
@@ -368,6 +523,16 @@ def _gaussian_weights(
                 _gaussian_weight_cache_bytes -= evicted.nbytes
             _gaussian_weight_cache[weight_key] = weights
             _gaussian_weight_cache_bytes += weights.nbytes
+    else:
+        _warn_oversize_cache_entry(
+            kind="Gaussian-weight",
+            required_bytes=weights.nbytes,
+            limit_bytes=_WEIGHT_CACHE_MAX_BYTES,
+            domain_size=geometry.center_ids.size,
+            refinement_level=int(key[2]),
+            radius_m=float(key[3]),
+            option_name="weight_max_mib",
+        )
 
     return weights
 
@@ -378,6 +543,7 @@ def _clear_filter_caches() -> None:
     with _cache_lock:
         _geometry_cache.clear()
         _gaussian_weight_cache.clear()
+        _warned_oversize_cache_entries.clear()
         _geometry_cache_bytes = 0
         _gaussian_weight_cache_bytes = 0
 
@@ -704,6 +870,11 @@ def gaussian_filter(
 
     The physical smoothing scale is independent of HEALPix refinement level:
     ``sigma_m=240`` always means 240 metres rather than a number of pixels.
+
+    Geometry and Gaussian weights are retained in bounded caches. If one plan
+    exceeds a limit, a warning reports the measured requirement and suggests
+    :func:`configure_radial_filter_cache` or halo-safe tiling. Use
+    :func:`radial_filter_cache_info` to inspect current limits and usage.
     """
     sigma = _validate_positive_finite(
         sigma_m,
@@ -756,6 +927,8 @@ def gaussian_filter(
 
 
 __all__ = [
+    "configure_radial_filter_cache",
     "gaussian_filter",
+    "radial_filter_cache_info",
     "radial_filter",
 ]
