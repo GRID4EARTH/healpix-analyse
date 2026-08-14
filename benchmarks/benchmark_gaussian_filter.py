@@ -31,8 +31,14 @@ def patch(size_m: float, refinement_level: int) -> np.ndarray:
     return np.asarray(ids, dtype=np.uint64)
 
 
-def run(size_m: float, sigma_m: float, repeats: int, profile: bool) -> None:
-    level = 19
+def run(
+    level: int,
+    size_m: float,
+    sigma_m: float,
+    truncate: float,
+    repeats: int,
+    profile: bool,
+) -> None:
     cell_ids = patch(size_m, level)
     values = np.sin(np.arange(cell_ids.size, dtype=np.float64) * 0.01)
     values[::401] = np.nan
@@ -48,7 +54,7 @@ def run(size_m: float, sigma_m: float, repeats: int, profile: bool) -> None:
         cell_ids,
         level,
         sigma_m=sigma_m,
-        truncate=4.0,
+        truncate=truncate,
     )
     cold = time.perf_counter() - started
 
@@ -63,12 +69,14 @@ def run(size_m: float, sigma_m: float, repeats: int, profile: bool) -> None:
             cell_ids,
             level,
             sigma_m=sigma_m,
-            truncate=4.0,
+            truncate=truncate,
         )
         warm.append(time.perf_counter() - started)
 
     print(f"level={level} size_m={size_m:g} cells={cell_ids.size}")
-    print(f"sigma_m={sigma_m:g} cold_s={cold:.6f}")
+    print(
+        f"sigma_m={sigma_m:g} truncate={truncate:g} cold_s={cold:.6f}"
+    )
     print(f"warm_median_s={np.median(warm):.6f} repeats={repeats}")
     print(f"checksum={np.nanmean(result):.17g}")
 
@@ -82,12 +90,21 @@ def run(size_m: float, sigma_m: float, repeats: int, profile: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--level", type=int, default=19)
     parser.add_argument("--size-m", type=float, default=600.0)
     parser.add_argument("--sigma-m", type=float, default=20.0)
+    parser.add_argument("--truncate", type=float, default=4.0)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
-    run(args.size_m, args.sigma_m, args.repeats, args.profile)
+    run(
+        args.level,
+        args.size_m,
+        args.sigma_m,
+        args.truncate,
+        args.repeats,
+        args.profile,
+    )
 
 
 if __name__ == "__main__":

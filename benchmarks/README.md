@@ -18,7 +18,8 @@ working tree produced these cold timings for the default fixture:
 | implementation | cold time |
 | --- | ---: |
 | `main` (`b7234ec`) | 2.50 s |
-| vectorized | 0.32 s |
+| vectorized, serial geodesy | 0.32 s |
+| vectorized, up to 8 geodesy threads | 0.16 s |
 | cached repeat | 0.0055 s |
 
 The observed 3,600 m fixture (133,002 cells) measured 109.56 s on the same
@@ -35,9 +36,25 @@ per-cell coordinate conversion. The optimized code batches centre conversion,
 deduplicates and batches candidate conversion, and runs the exact WGS84 cutoff
 as one vector operation.
 
-The remaining cold-path bottleneck is exact WGS84 inverse geodesy: the two
-batched `Geod.inv` calls account for about 0.22 s of a 0.36 s profiled run.
-The first call selects candidates and the second constructs reusable metric
-geometry. Repeated calls with identical domain, level, radius, and Gaussian
-sigma reuse bounded geometry and weight caches. No approximate Gaussian or
-planar-distance algorithm is used.
+Before geodesy multithreading, the two batched `Geod.inv` calls accounted for
+about 0.22 s of a 0.36 s profiled run. The first call selects candidates and
+the second constructs reusable metric geometry. Repeated calls with identical
+domain, level, radius, and Gaussian sigma reuse bounded geometry and weight
+caches. No approximate Gaussian or planar-distance algorithm is used.
+
+Large WGS84 inverse-geodesic batches are split across at most eight threads.
+Small batches remain serial to avoid thread-pool overhead. PROJ still performs
+every inverse calculation, and tests require parallel distances to be
+bit-for-bit identical to the serial result.
+
+The requested Level-20 profile can be reproduced with:
+
+```console
+python benchmarks/benchmark_gaussian_filter.py \
+  --level 20 --size-m 600 --sigma-m 20 --truncate 5 --profile
+```
+
+That fixture contains 15,069 cells. Serial WGS84 geodesy measured 5.98 s cold;
+the eight-thread-capped implementation measured 2.15 s cold, a 2.8x overall
+speedup. Its geometry exceeds the 192 MiB cache limit, so the measured 1.95 s
+repeat rebuilds geometry rather than representing a cache hit.

@@ -12,6 +12,8 @@ where the Cartesian source operation is based on immediate/local pixels
 rather than on a prescribed physical radius.
 """
 
+import importlib
+
 import numpy as np
 import pytest
 from healpix_geo import nested
@@ -22,6 +24,39 @@ from healpix_analyse._neighbourhood import (
     relative_geometry_from_neighbours,
     validate_ring,
 )
+
+
+def test_geod_thread_count_is_capped_at_eight(monkeypatch):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    monkeypatch.setattr(module, "_GEOD_PARALLEL_MIN_PAIRS", 1)
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 64)
+
+    assert module._geod_thread_count(1_000_000) == 8
+
+
+def test_parallel_wgs84_distance_is_bit_identical(monkeypatch):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    longitude = np.linspace(-179.0, 179.0, 257, dtype=np.float64)
+    latitude = np.linspace(-80.0, 80.0, 257, dtype=np.float64)
+
+    monkeypatch.setattr(module, "_GEOD_PARALLEL_MIN_PAIRS", 1_000_000)
+    serial = module._wgs84_distance(
+        longitude,
+        latitude,
+        longitude[::-1].copy(),
+        latitude[::-1].copy(),
+    )
+
+    monkeypatch.setattr(module, "_GEOD_PARALLEL_MIN_PAIRS", 1)
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 64)
+    parallel = module._wgs84_distance(
+        longitude,
+        latitude,
+        longitude[::-1].copy(),
+        latitude[::-1].copy(),
+    )
+
+    np.testing.assert_array_equal(parallel, serial)
 
 
 # ---------------------------------------------------------------------------
@@ -770,4 +805,3 @@ def test_relative_geometry_rejects_non_wgs84_for_now():
             refinement_level=3,
             ellipsoid="GRS80",
         )
-

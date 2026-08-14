@@ -7,6 +7,8 @@ share exactly the same spatial semantics.
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,10 +23,78 @@ NeighbourhoodMethod = Literal[
 ]
 
 _WGS84 = Geod(ellps="WGS84")
+_GEOD_MAX_THREADS = 8
+_GEOD_PARALLEL_MIN_PAIRS = 100_000
 
 # Authalic radius of WGS84. Used only to convert a physical radius in metres
 # to an approximate angular radius for cone_coverage candidate generation.
 _WGS84_AUTHALIC_RADIUS_M = 6_371_007.1809
+
+
+def _geod_thread_count(number_of_pairs: int) -> int:
+    """Choose an automatic worker count capped at eight threads."""
+    if number_of_pairs < _GEOD_PARALLEL_MIN_PAIRS:
+        return 1
+
+    return min(
+        _GEOD_MAX_THREADS,
+        os.cpu_count() or 1,
+        number_of_pairs,
+    )
+
+
+def _wgs84_distance(
+    lon1: np.ndarray,
+    lat1: np.ndarray,
+    lon2: np.ndarray,
+    lat2: np.ndarray,
+) -> np.ndarray:
+    """Compute exact WGS84 distances, using at most eight threads.
+
+    ``pyproj`` releases the GIL while PROJ evaluates inverse geodesics. Large
+    one-dimensional batches can therefore be split across native calls
+    without changing the underlying geodesic algorithm or result ordering.
+    Each worker owns its ``Geod`` instance to avoid sharing mutable wrapper
+    state between threads.
+    """
+    first_lon = np.asarray(lon1, dtype=np.float64)
+    first_lat = np.asarray(lat1, dtype=np.float64)
+    second_lon = np.asarray(lon2, dtype=np.float64)
+    second_lat = np.asarray(lat2, dtype=np.float64)
+
+    number_of_pairs = first_lon.size
+    workers = _geod_thread_count(number_of_pairs)
+    if workers == 1:
+        return _WGS84.inv(
+            first_lon,
+            first_lat,
+            second_lon,
+            second_lat,
+        )[2]
+
+    bounds = np.linspace(
+        0,
+        number_of_pairs,
+        workers + 1,
+        dtype=np.int64,
+    )
+
+    def evaluate(bounds_pair: tuple[int, int]) -> np.ndarray:
+        start, stop = bounds_pair
+        geod = Geod(ellps="WGS84")
+        return geod.inv(
+            first_lon[start:stop],
+            first_lat[start:stop],
+            second_lon[start:stop],
+            second_lat[start:stop],
+        )[2]
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        chunks = executor.map(
+            evaluate,
+            zip(bounds[:-1], bounds[1:], strict=True),
+        )
+        return np.concatenate(list(chunks))
 
 
 @dataclass(frozen=True)
@@ -537,7 +607,7 @@ def build_neighbourhoods(
         counts,
     )
 
-    _, _, distance = _WGS84.inv(
+    distance = _wgs84_distance(
         repeated_lon,
         repeated_lat,
         candidate_lon,
@@ -724,7 +794,7 @@ def metric_geometry_from_neighbourhoods(
     center_inverse = inverse[:centers.size]
     neighbour_inverse = inverse[centers.size:]
 
-    _, _, flat_distance_m = _WGS84.inv(
+    flat_distance_m = _wgs84_distance(
         unique_lon[center_inverse[row_indices]],
         unique_lat[center_inverse[row_indices]],
         unique_lon[neighbour_inverse],
