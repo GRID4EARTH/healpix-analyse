@@ -38,6 +38,84 @@ def test_geod_thread_count_is_capped_at_eight(monkeypatch):
     assert module._geod_thread_count(1_000_000) == 8
 
 
+def test_cone_candidate_csr_uses_batched_api_with_at_most_eight_threads(
+    monkeypatch,
+):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    recorded = {}
+
+    def fake_many(centers, radius, depth, **kwargs):
+        recorded.update(
+            centers=centers,
+            radius=radius,
+            depth=depth,
+            kwargs=kwargs,
+        )
+        return (
+            np.array([0, 2, 3], dtype=np.uint64),
+            np.array([10, 11, 20], dtype=np.uint64),
+            np.full(3, depth, dtype=np.uint8),
+            np.zeros(3, dtype=bool),
+        )
+
+    def fail_scalar(*args, **kwargs):
+        raise AssertionError("scalar cone_coverage should not be called")
+
+    monkeypatch.setattr(module.nested, "cone_coverage_many", fake_many)
+    monkeypatch.setattr(module.nested, "cone_coverage", fail_scalar)
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 64)
+
+    offsets, candidates = module._cone_candidate_csr(
+        np.array([1.0, 2.0]),
+        np.array([3.0, 4.0]),
+        100.0,
+        20,
+        ellipsoid="WGS84",
+    )
+
+    np.testing.assert_array_equal(offsets, np.array([0, 2, 3]))
+    np.testing.assert_array_equal(candidates, np.array([10, 11, 20]))
+    np.testing.assert_array_equal(
+        recorded["centers"],
+        np.array([[1.0, 3.0], [2.0, 4.0]]),
+    )
+    assert recorded["depth"] == 20
+    assert recorded["kwargs"] == {
+        "ellipsoid": "WGS84",
+        "flat": True,
+        "num_threads": 8,
+    }
+
+
+def test_cone_candidate_csr_falls_back_to_scalar_api(monkeypatch):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    calls = []
+
+    def fake_scalar(center, radius, depth, **kwargs):
+        calls.append((center, radius, depth, kwargs))
+        first = int(center[0])
+        return (
+            np.array([first, first + 1], dtype=np.uint64),
+            np.full(2, depth, dtype=np.uint8),
+            np.zeros(2, dtype=bool),
+        )
+
+    monkeypatch.delattr(module.nested, "cone_coverage_many", raising=False)
+    monkeypatch.setattr(module.nested, "cone_coverage", fake_scalar)
+
+    offsets, candidates = module._cone_candidate_csr(
+        np.array([1.0, 3.0]),
+        np.array([2.0, 4.0]),
+        100.0,
+        20,
+        ellipsoid="WGS84",
+    )
+
+    np.testing.assert_array_equal(offsets, np.array([0, 2, 4]))
+    np.testing.assert_array_equal(candidates, np.array([1, 2, 3, 4]))
+    assert [call[0] for call in calls] == [(1.0, 2.0), (3.0, 4.0)]
+
+
 def test_parallel_wgs84_distance_is_bit_identical(monkeypatch):
     module = importlib.import_module("healpix_analyse._neighbourhood")
     longitude = np.linspace(-179.0, 179.0, 257, dtype=np.float64)

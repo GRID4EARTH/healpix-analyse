@@ -76,13 +76,27 @@ machine; it primarily
 shows the algorithmic advantage of a separable Cartesian Gaussian, rather
 than an implementation target attainable without changing HEALPix semantics.
 
-The final `cProfile` run attributed 1.574 s of 1.676 s to filter geometry.
-Within it, 15,069 `cone_coverage` calls used 0.514 s, the single multithreaded
-WGS84 distance pass used 0.486 s, and domain lookup used 0.131 s. Gaussian
-weight construction used 0.050 s. Threaded cumulative times overlap, so these
-numbers are not additive. The remaining cold bottleneck is split between
-exact inverse geodesy and per-centre candidate construction, rather than
-Gaussian weight application.
+Before batched cone coverage, the final `cProfile` run attributed 1.574 s of
+1.676 s to filter geometry. Within it, 15,069 scalar `cone_coverage` calls used
+0.514 s, the single multithreaded WGS84 distance pass used 0.486 s, and domain
+lookup used 0.131 s. Gaussian weight construction used 0.050 s. Threaded
+cumulative times overlap, so these numbers are not additive.
+
+When `healpix-geo` provides `cone_coverage_many` (introduced by
+`GRID4EARTH/healpix-geo#242`), the same candidate rows are requested in one
+native batched call using at most eight threads. A Level-20, 600 m profile
+measured 0.067 s in the single batched call, versus the earlier 0.514 s across
+15,069 scalar calls. The complete cold filter measured 1.015 s in that
+profile, of which exact WGS84 inverse geodesy used 0.415 s. The implementation
+automatically retains the scalar path as a compatibility fallback for released
+`healpix-geo` versions that do not yet expose the batched API.
+
+On a Level-20, 1,200 m fixture, back-to-back runs in the same environment
+measured 5.315 s with batched cone coverage and 6.522 s with the scalar
+fallback, an 18.5% cold-path reduction. Both produced the same checksum. This
+fixture exceeds the default geometry and weight cache limits, so its reported
+repeat still reconstructs both entries and should not be interpreted as a
+cache-hit timing.
 
 `line_profiler` gives the same conclusion inside the fused geometry builder:
 candidate `cone_coverage` uses 41.5%, the one WGS84 distance pass 29.5%, and

@@ -729,6 +729,65 @@ def _cone_candidates(
     return np.asarray(cell_ids, dtype=np.uint64)
 
 
+def _cone_candidate_csr(
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    radius: float,
+    refinement_level: int,
+    *,
+    ellipsoid: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return cone candidates for many centres in CSR form.
+
+    Newer ``healpix-geo`` versions expose ``cone_coverage_many`` and avoid one
+    Python-to-extension call per centre.  Retain the scalar construction as a
+    compatibility fallback until that API is available in a released version.
+    """
+    center_lon = np.asarray(longitude, dtype=np.float64)
+    center_lat = np.asarray(latitude, dtype=np.float64)
+    radius_degrees = np.rad2deg(radius / _WGS84_AUTHALIC_RADIUS_M)
+    cone_coverage_many = getattr(nested, "cone_coverage_many", None)
+
+    if cone_coverage_many is not None:
+        centers = np.column_stack((center_lon, center_lat))
+        offsets, cell_ids, _, _ = cone_coverage_many(
+            centers,
+            radius_degrees,
+            refinement_level,
+            ellipsoid=ellipsoid,
+            flat=True,
+            num_threads=min(_GEOD_MAX_THREADS, os.cpu_count() or 1),
+        )
+        return (
+            np.asarray(offsets, dtype=np.int64),
+            np.asarray(cell_ids, dtype=np.uint64),
+        )
+
+    candidates = [
+        _cone_candidates(
+            (float(lon), float(lat)),
+            radius,
+            refinement_level,
+            ellipsoid=ellipsoid,
+        )
+        for lon, lat in zip(center_lon, center_lat, strict=True)
+    ]
+    candidate_counts = np.fromiter(
+        (candidate.size for candidate in candidates),
+        dtype=np.int64,
+        count=center_lon.size,
+    )
+    offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(candidate_counts))
+    )
+    flat_candidates = (
+        np.concatenate(candidates)
+        if candidates and offsets[-1]
+        else np.empty(0, dtype=np.uint64)
+    )
+    return offsets, flat_candidates
+
+
 def _filter_by_cell_center_distance(
     center: tuple[float, float],
     candidates: np.ndarray,
@@ -899,20 +958,14 @@ def build_metric_neighbourhood_geometry(
         refinement_level,
         ellipsoid=ellipsoid,
     )
-    candidates = [
-        _cone_candidates(
-            (float(lon), float(lat)),
-            radius,
-            refinement_level,
-            ellipsoid=ellipsoid,
-        )
-        for lon, lat in zip(center_lon, center_lat, strict=True)
-    ]
-    candidate_counts = np.fromiter(
-        (candidate.size for candidate in candidates),
-        dtype=np.int64,
-        count=number_of_centers,
+    candidate_offsets, flat_candidates = _cone_candidate_csr(
+        center_lon,
+        center_lat,
+        radius,
+        refinement_level,
+        ellipsoid=ellipsoid,
     )
+    candidate_counts = np.diff(candidate_offsets)
     if not np.any(candidate_counts):
         return CompactMetricNeighbourhoodGeometry(
             centers.copy(),
@@ -921,7 +974,6 @@ def build_metric_neighbourhood_geometry(
             np.empty(0, dtype=np.float64),
         )
 
-    flat_candidates = np.concatenate(candidates)
     candidate_rows = np.repeat(
         np.arange(number_of_centers, dtype=np.int64),
         candidate_counts,
