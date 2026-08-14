@@ -56,6 +56,16 @@ class RelativeNeighbourhoodGeometry:
     north_offset_m: np.ndarray
 
 
+@dataclass(frozen=True)
+class MetricNeighbourhoodGeometry:
+    """Minimal padded geometry for kernels that depend only on distance."""
+
+    center_ids: np.ndarray
+    neighbour_ids: np.ndarray
+    valid_mask: np.ndarray
+    distance_m: np.ndarray
+
+
 def validate_neighbourhood(
     neighbourhood: NeighbourhoodMethod,
 ) -> None:
@@ -462,15 +472,85 @@ def build_neighbourhoods(
     """Build a geometric neighbourhood for each HEALPix cell."""
     validate_neighbourhood(neighbourhood)
 
-    return [
-        _neighbourhood(
-            int(cell),
+    cells_array = np.asarray(cells, dtype=np.uint64)
+    if cells_array.size == 0:
+        return []
+
+    # Coordinate conversion has appreciable fixed overhead in healpix-geo.
+    # Convert all centres in one call, then retain the exact cone-coverage
+    # candidate generation used by the original implementation.
+    center_lon, center_lat = nested.healpix_to_lonlat(
+        cells_array,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    centers = list(zip(center_lon, center_lat, strict=True))
+    candidates = [
+        _cone_candidates(
+            (float(lon), float(lat)),
             radius,
             refinement_level,
-            neighbourhood=neighbourhood,
             ellipsoid=ellipsoid,
         )
-        for cell in cells
+        for lon, lat in centers
+    ]
+
+    if neighbourhood == "cone_coverage":
+        return candidates
+
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Cell-centre geodesic filtering currently supports "
+            "ellipsoid='WGS84' only."
+        )
+
+    counts = np.fromiter(
+        (candidate.size for candidate in candidates),
+        dtype=np.int64,
+        count=cells_array.size,
+    )
+    if not np.any(counts):
+        return candidates
+
+    flat_candidates = np.concatenate(candidates)
+
+    # Candidate IDs repeat heavily between adjacent centres. Resolve each
+    # distinct HEALPix centre once, then expand the coordinates without
+    # changing the candidate order supplied by cone_coverage.
+    unique_candidates, inverse = np.unique(
+        flat_candidates,
+        return_inverse=True,
+    )
+    unique_lon, unique_lat = nested.healpix_to_lonlat(
+        unique_candidates,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    candidate_lon = unique_lon[inverse]
+    candidate_lat = unique_lat[inverse]
+    repeated_lon = np.repeat(
+        np.asarray(center_lon, dtype=np.float64),
+        counts,
+    )
+    repeated_lat = np.repeat(
+        np.asarray(center_lat, dtype=np.float64),
+        counts,
+    )
+
+    _, _, distance = _WGS84.inv(
+        repeated_lon,
+        repeated_lat,
+        candidate_lon,
+        candidate_lat,
+    )
+    within_radius = distance <= radius
+
+    offsets = np.concatenate(
+        (np.array([0], dtype=np.int64), np.cumsum(counts))
+    )
+    return [
+        flat_candidates[start:stop][within_radius[start:stop]]
+        for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
     ]
 
 
@@ -599,8 +679,69 @@ def relative_geometry_from_neighbourhoods(
         ellipsoid=ellipsoid,
     )
 
+
+def metric_geometry_from_neighbourhoods(
+    center_ids: np.ndarray,
+    neighbourhoods: list[np.ndarray],
+    refinement_level: int,
+    *,
+    ellipsoid: str = "WGS84",
+) -> MetricNeighbourhoodGeometry:
+    """Compute only the WGS84 distances required by radial kernels."""
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Metric neighbour geometry currently supports "
+            "ellipsoid='WGS84' only."
+        )
+
+    centers = np.asarray(center_ids, dtype=np.uint64)
+    neighbour_ids, valid_mask = _pad_neighbourhoods(neighbourhoods)
+    distance_m = np.full(neighbour_ids.shape, np.nan, dtype=np.float64)
+
+    if not np.any(valid_mask):
+        return MetricNeighbourhoodGeometry(
+            centers.copy(),
+            neighbour_ids,
+            valid_mask,
+            distance_m,
+        )
+
+    row_indices, column_indices = np.nonzero(valid_mask)
+    valid_neighbours = neighbour_ids[
+        row_indices,
+        column_indices,
+    ].astype(np.uint64, copy=False)
+
+    # Resolve each HEALPix centre once. Both arrays contain many repeated IDs
+    # on a dense patch, so this reduces conversion work and temporary memory.
+    all_ids = np.concatenate((centers, valid_neighbours))
+    unique_ids, inverse = np.unique(all_ids, return_inverse=True)
+    unique_lon, unique_lat = nested.healpix_to_lonlat(
+        unique_ids,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    center_inverse = inverse[:centers.size]
+    neighbour_inverse = inverse[centers.size:]
+
+    _, _, flat_distance_m = _WGS84.inv(
+        unique_lon[center_inverse[row_indices]],
+        unique_lat[center_inverse[row_indices]],
+        unique_lon[neighbour_inverse],
+        unique_lat[neighbour_inverse],
+    )
+    distance_m[row_indices, column_indices] = flat_distance_m
+
+    return MetricNeighbourhoodGeometry(
+        centers.copy(),
+        neighbour_ids,
+        valid_mask,
+        distance_m,
+    )
+
 __all__ = [
     "NeighbourhoodMethod",
+    "MetricNeighbourhoodGeometry",
     "RelativeNeighbourhoodGeometry",
     "build_neighbourhoods",
     "build_relative_geometry",
@@ -609,4 +750,5 @@ __all__ = [
     "validate_neighbourhood",
     "validate_ring",
     "relative_geometry_from_neighbourhoods",
+    "metric_geometry_from_neighbourhoods",
 ]

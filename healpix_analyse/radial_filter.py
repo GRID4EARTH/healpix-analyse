@@ -46,22 +46,35 @@ not part of this API.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
+from threading import RLock
 from typing import Any
 
 import numpy as np
 import torch
 
 from ._neighbourhood import (
+    MetricNeighbourhoodGeometry,
     RelativeNeighbourhoodGeometry,
     build_neighbourhoods,
-    relative_geometry_from_neighbourhoods,
+    metric_geometry_from_neighbourhoods,
 )
 from ._weighted_neighbourhood import weighted_neighbourhood_reduce
 
 
 ArrayLike = np.ndarray | torch.Tensor
 Kernel = Callable[[np.ndarray], Any]
+
+_GEOMETRY_CACHE_MAX_BYTES = 192 * 1024 * 1024
+_WEIGHT_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_geometry_cache: OrderedDict[tuple[Any, ...], MetricNeighbourhoodGeometry] = (
+    OrderedDict()
+)
+_geometry_cache_bytes = 0
+_gaussian_weight_cache: OrderedDict[tuple[Any, ...], np.ndarray] = OrderedDict()
+_gaussian_weight_cache_bytes = 0
+_cache_lock = RLock()
 
 
 def _validate_cell_ids(
@@ -247,31 +260,173 @@ def _restrict_neighbourhoods_to_domain(
     if domain.size == 0:
         return []
 
-    domain_set = {
-        int(cell)
-        for cell in domain
-    }
+    counts = np.fromiter(
+        (neighbourhood.size for neighbourhood in neighbourhoods),
+        dtype=np.int64,
+        count=len(neighbourhoods),
+    )
+    if not np.any(counts):
+        return [np.empty(0, dtype=np.uint64) for _ in neighbourhoods]
 
-    restricted: list[np.ndarray] = []
+    flat = np.concatenate(neighbourhoods)
+    keep = np.isin(flat, domain, assume_unique=False)
+    offsets = np.concatenate(
+        (np.array([0], dtype=np.int64), np.cumsum(counts))
+    )
+    return [
+        flat[start:stop][keep[start:stop]]
+        for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
+    ]
 
-    for neighbourhood in neighbourhoods:
-        kept = np.asarray(
-            [
-                cell
-                for cell in neighbourhood
-                if int(cell) in domain_set
-            ],
-            dtype=np.uint64,
+
+def _cache_key(
+    domain: np.ndarray,
+    refinement_level: int,
+    radius: float,
+    ellipsoid: str,
+) -> tuple[Any, ...]:
+    """Return an exact, mutation-safe key for reusable filter geometry."""
+    contiguous = np.ascontiguousarray(domain, dtype=np.uint64)
+    return (
+        contiguous.size,
+        contiguous.tobytes(),
+        int(refinement_level),
+        float(radius),
+        ellipsoid,
+    )
+
+
+def _geometry_nbytes(geometry: MetricNeighbourhoodGeometry) -> int:
+    return sum(
+        array.nbytes
+        for array in (
+            geometry.center_ids,
+            geometry.neighbour_ids,
+            geometry.valid_mask,
+            geometry.distance_m,
+        )
+    )
+
+
+def _filter_geometry(
+    domain: np.ndarray,
+    refinement_level: int,
+    radius: float,
+    ellipsoid: str,
+) -> tuple[tuple[Any, ...], MetricNeighbourhoodGeometry]:
+    """Build or retrieve value-independent radial filter geometry."""
+    global _geometry_cache_bytes
+
+    key = _cache_key(domain, refinement_level, radius, ellipsoid)
+    with _cache_lock:
+        cached = _geometry_cache.get(key)
+        if cached is not None:
+            _geometry_cache.move_to_end(key)
+            return key, cached
+
+    if radius == 0.0:
+        neighbourhoods = [
+            np.asarray([cell], dtype=np.uint64)
+            for cell in domain
+        ]
+    else:
+        neighbourhoods = build_neighbourhoods(
+            domain,
+            radius,
+            refinement_level,
+            neighbourhood="cell_center",
+            ellipsoid=ellipsoid,
         )
 
-        restricted.append(kept)
+    neighbourhoods = _restrict_neighbourhoods_to_domain(
+        neighbourhoods,
+        domain,
+    )
+    geometry = metric_geometry_from_neighbourhoods(
+        domain,
+        neighbourhoods,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
 
-    return restricted
+    size = _geometry_nbytes(geometry)
+    if size <= _GEOMETRY_CACHE_MAX_BYTES:
+        with _cache_lock:
+            replaced = _geometry_cache.pop(key, None)
+            if replaced is not None:
+                _geometry_cache_bytes -= _geometry_nbytes(replaced)
+            while (
+                _geometry_cache
+                and _geometry_cache_bytes + size > _GEOMETRY_CACHE_MAX_BYTES
+            ):
+                _, evicted = _geometry_cache.popitem(last=False)
+                _geometry_cache_bytes -= _geometry_nbytes(evicted)
+            _geometry_cache[key] = geometry
+            _geometry_cache_bytes += size
+
+    return key, geometry
+
+
+def _gaussian_weights(
+    key: tuple[Any, ...],
+    geometry: MetricNeighbourhoodGeometry,
+    sigma: float,
+) -> np.ndarray:
+    """Build or retrieve exact Gaussian weights for cached geometry."""
+    global _gaussian_weight_cache_bytes
+
+    weight_key = (*key, float(sigma))
+    with _cache_lock:
+        cached = _gaussian_weight_cache.get(weight_key)
+        if cached is not None:
+            _gaussian_weight_cache.move_to_end(weight_key)
+            return cached
+
+    weights = np.zeros(geometry.distance_m.shape, dtype=np.float64)
+    valid = geometry.valid_mask
+    distance = geometry.distance_m[valid].copy()
+    self_mask = (
+        geometry.neighbour_ids[valid]
+        == np.broadcast_to(
+            geometry.center_ids[:, None],
+            geometry.neighbour_ids.shape,
+        )[valid]
+    )
+    distance[self_mask] = 0.0
+    scaled = distance / sigma
+    weights[valid] = np.exp(-0.5 * scaled * scaled)
+
+    if weights.nbytes <= _WEIGHT_CACHE_MAX_BYTES:
+        with _cache_lock:
+            replaced = _gaussian_weight_cache.pop(weight_key, None)
+            if replaced is not None:
+                _gaussian_weight_cache_bytes -= replaced.nbytes
+            while (
+                _gaussian_weight_cache
+                and _gaussian_weight_cache_bytes + weights.nbytes
+                > _WEIGHT_CACHE_MAX_BYTES
+            ):
+                _, evicted = _gaussian_weight_cache.popitem(last=False)
+                _gaussian_weight_cache_bytes -= evicted.nbytes
+            _gaussian_weight_cache[weight_key] = weights
+            _gaussian_weight_cache_bytes += weights.nbytes
+
+    return weights
+
+
+def _clear_filter_caches() -> None:
+    """Clear private geometry/weight caches (primarily for tests)."""
+    global _geometry_cache_bytes, _gaussian_weight_cache_bytes
+    with _cache_lock:
+        _geometry_cache.clear()
+        _gaussian_weight_cache.clear()
+        _geometry_cache_bytes = 0
+        _gaussian_weight_cache_bytes = 0
 
 
 def _evaluate_kernel(
     kernel: Kernel,
-    geometry: RelativeNeighbourhoodGeometry,
+    geometry: RelativeNeighbourhoodGeometry | MetricNeighbourhoodGeometry,
 ) -> np.ndarray:
     """Evaluate a radial kernel for every valid centre-neighbour pair.
 
@@ -541,40 +696,11 @@ def radial_filter(
             "Radial filtering currently supports ellipsoid='WGS84' only."
         )
 
-    # A zero-radius radial neighbourhood has an exact and useful semantic:
-    # each target cell contributes only to itself.  Handle this explicitly
-    # instead of relying on candidate-generation / geodesic round-off at the
-    # zero-distance boundary.
-    if radius == 0.0:
-        neighbourhoods = [
-            np.asarray([cell], dtype=np.uint64)
-            for cell in output_domain
-        ]
-    else:
-        # Public radial semantics are physical centre-to-centre distance.  The
-        # shared cell_center neighbourhood applies the exact WGS84 distance
-        # cutoff after candidate generation.
-        neighbourhoods = build_neighbourhoods(
-            output_domain,
-            radius,
-            refinement_level,
-            neighbourhood="cell_center",
-            ellipsoid=ellipsoid,
-        )
-
-    # Domain is both the participating spatial set and output domain.  Cells
-    # outside it are removed before geometry/aggregation rather than being
-    # represented by zero-valued or NaN-valued samples.
-    neighbourhoods = _restrict_neighbourhoods_to_domain(
-        neighbourhoods,
+    _, geometry = _filter_geometry(
         output_domain,
-    )
-
-    geometry = relative_geometry_from_neighbourhoods(
-        output_domain,
-        neighbourhoods,
         refinement_level,
-        ellipsoid=ellipsoid,
+        radius,
+        ellipsoid,
     )
 
     weights = _evaluate_kernel(
@@ -660,23 +786,33 @@ def gaussian_filter(
             "'truncate * sigma_m' must be finite."
         )
 
-    def _gaussian_kernel(
-        distance_m: np.ndarray,
-    ) -> np.ndarray:
-        scaled = distance_m / sigma
-        return np.exp(
-            -0.5 * scaled * scaled
+    cells = _validate_cell_ids(
+        cell_ids,
+        name="cell_ids",
+    )
+    _validate_values(values, cells.size)
+    output_domain = _validate_domain(cells, domain)
+
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Radial filtering currently supports ellipsoid='WGS84' only."
         )
 
-    return radial_filter(
-        values,
-        cell_ids,
+    key, geometry = _filter_geometry(
+        output_domain,
         refinement_level,
-        radius_m=radius,
-        kernel=_gaussian_kernel,
+        radius,
+        ellipsoid,
+    )
+    weights = _gaussian_weights(key, geometry, sigma)
+
+    return weighted_neighbourhood_reduce(
+        values,
+        cells,
+        geometry.neighbour_ids,
+        geometry.valid_mask,
+        weights,
         normalize=True,
-        domain=domain,
-        ellipsoid=ellipsoid,
     )
 
 

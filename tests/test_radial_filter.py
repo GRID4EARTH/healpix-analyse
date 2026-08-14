@@ -37,7 +37,10 @@ import torch
 from healpix_geo import nested
 from pyproj import Geod
 
-from healpix_analyse._neighbourhood import RelativeNeighbourhoodGeometry
+from healpix_analyse._neighbourhood import (
+    MetricNeighbourhoodGeometry,
+    RelativeNeighbourhoodGeometry,
+)
 from healpix_analyse.radial_filter import gaussian_filter, radial_filter
 
 
@@ -653,6 +656,45 @@ def test_gaussian_filter_matches_explicit_radial_gaussian():
     )
 
 
+def test_gaussian_reuses_geometry_and_weights(monkeypatch):
+    """Repeated filtering of new values must reuse the spatial plan."""
+    module = importlib.import_module("healpix_analyse.radial_filter")
+    module._clear_filter_caches()
+
+    refinement_level = 7
+    center = 12 * 4**refinement_level // 2
+    cell_ids = _domain_around_center(center, refinement_level)
+    values = np.arange(cell_ids.size, dtype=np.float64)
+    sigma_m = 50_000.0
+
+    calls = 0
+    original = module.build_neighbourhoods
+
+    def counted_build(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "build_neighbourhoods", counted_build)
+
+    first = gaussian_filter(
+        values,
+        cell_ids,
+        refinement_level,
+        sigma_m=sigma_m,
+    )
+    second = gaussian_filter(
+        values + 1.0,
+        cell_ids.copy(),
+        refinement_level,
+        sigma_m=sigma_m,
+    )
+
+    assert calls == 1
+    np.testing.assert_allclose(second, first + 1.0)
+    module._clear_filter_caches()
+
+
 def test_gaussian_constant_field_preserved_at_partial_domain_boundary():
     refinement_level = 5
     center = 1000
@@ -942,7 +984,7 @@ def test_same_metric_geometry_gives_same_gaussian_response_across_levels(
         np.array([10, 11], dtype=np.uint64),
     ]
 
-    fake_geometry = RelativeNeighbourhoodGeometry(
+    fake_geometry = MetricNeighbourhoodGeometry(
         center_ids=cell_ids.copy(),
         neighbour_ids=np.array(
             [
@@ -960,18 +1002,6 @@ def test_same_metric_geometry_gives_same_gaussian_response_across_levels(
                 [0.0, 250.0],
                 [250.0, 0.0],
             ],
-            dtype=np.float64,
-        ),
-        azimuth_rad=np.zeros(
-            (2, 2),
-            dtype=np.float64,
-        ),
-        east_offset_m=np.zeros(
-            (2, 2),
-            dtype=np.float64,
-        ),
-        north_offset_m=np.zeros(
-            (2, 2),
             dtype=np.float64,
         ),
     )
@@ -1004,7 +1034,7 @@ def test_same_metric_geometry_gives_same_gaussian_response_across_levels(
     )
     monkeypatch.setattr(
         module,
-        "relative_geometry_from_neighbourhoods",
+        "metric_geometry_from_neighbourhoods",
         fake_relative_geometry,
     )
 
