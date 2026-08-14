@@ -96,9 +96,31 @@ local planar area as the circular HEALPix fixture. The Cartesian pixel sigma
 is derived as `sigma_m / spacing_m`, and the same `truncate` is used. Install
 the benchmark dependency first with `pip install -e '.[benchmark]'`.
 
-This is a reference throughput comparison, not a numerical-equivalence test.
+The comparison now evaluates the same smooth, non-symmetric analytic scene at
+the HEALPix and Cartesian cell centres. After filtering, the Cartesian result
+is bilinearly sampled at HEALPix centre coordinates. Error metrics use only
+the common interior where the full truncated kernel is separated from both
+domain boundaries by two additional grid spacings.
+
+For the requested Level-20 parameters, a new run used 6,821 common interior
+points and measured:
+
+| result metric | value |
+| --- | ---: |
+| mean absolute error | 0.000141410 |
+| root mean square error | 0.000247732 |
+| maximum absolute error | 0.00189367 |
+| normalized RMSE | 0.000350969 |
+| correlation | 0.999999158 |
+
+The same run measured 1.724 s HEALPix cold, 0.0541 s cached-repeat median,
+and 0.000203 s SciPy apply median. Timing variation is expected at this scale.
+
+This remains a reference comparison, not a numerical-equivalence test.
 SciPy uses a separable Gaussian on a square Cartesian grid with reflected
 boundaries. The HEALPix implementation evaluates a finite radial kernel using
 exact WGS84 inverse-geodesic distances on an irregular spherical grid and
-renormalizes at the supplied-domain boundary. Those semantics and asymptotic
-costs are intentionally not changed merely to match the SciPy timing.
+renormalizes at the supplied-domain boundary. The reported numerical errors
+therefore include discretization and interpolation differences between the
+grids. Those semantics and asymptotic costs are intentionally not changed
+merely to match the SciPy timing.
