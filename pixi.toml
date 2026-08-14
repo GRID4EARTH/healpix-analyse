@@ -2,7 +2,7 @@
 authors = ["Jean-Marc Delouis"]
 channels = ["conda-forge"]
 name = "healpix-analyse"
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 version = "2026.8.1"
 
 [tasks]
@@ -12,11 +12,16 @@ numpy = ">=2.4.2,<3"
 python = ">=3.10,<3.14"
 jupyterlab = ">=4.5.5,<5"
 pytorch = ">=2.0,<3"
+pyproj = ">=3.6"
+healpy = ">=1.16"
 
 
 [pypi-dependencies]
 healpix-analyse= { path = ".", editable = true }
-healpix-geo = "*"
+# Use the batched cone-coverage implementation while developing PR #37.
+# Keep pyproject.toml on the released dependency so normal installations are
+# not tied to a contributor fork.
+healpix-geo = { git = "https://github.com/tinaok/healpix-geo.git", branch = "perf/batched-cone-coverage", subdirectory = "python/healpix-geo" }
 
 [feature.affine.dependencies]
 affine = "*"
