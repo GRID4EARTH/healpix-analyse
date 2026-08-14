@@ -38,7 +38,7 @@ from healpix_geo import nested
 from pyproj import Geod
 
 from healpix_analyse._neighbourhood import (
-    MetricNeighbourhoodGeometry,
+    CompactMetricNeighbourhoodGeometry,
     RelativeNeighbourhoodGeometry,
 )
 from healpix_analyse.radial_filter import gaussian_filter, radial_filter
@@ -668,14 +668,18 @@ def test_gaussian_reuses_geometry_and_weights(monkeypatch):
     sigma_m = 50_000.0
 
     calls = 0
-    original = module.build_neighbourhoods
+    original = module.build_metric_neighbourhood_geometry
 
     def counted_build(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(module, "build_neighbourhoods", counted_build)
+    monkeypatch.setattr(
+        module,
+        "build_metric_neighbourhood_geometry",
+        counted_build,
+    )
 
     first = gaussian_filter(
         values,
@@ -979,63 +983,33 @@ def test_same_metric_geometry_gives_same_gaussian_response_across_levels(
         dtype=np.float64,
     )
 
-    fake_neighbourhoods = [
-        np.array([10, 11], dtype=np.uint64),
-        np.array([10, 11], dtype=np.uint64),
-    ]
-
-    fake_geometry = MetricNeighbourhoodGeometry(
+    fake_geometry = CompactMetricNeighbourhoodGeometry(
         center_ids=cell_ids.copy(),
-        neighbour_ids=np.array(
-            [
-                [10, 11],
-                [10, 11],
-            ],
-            dtype=np.int64,
+        neighbour_indices=np.array(
+            [0, 1, 0, 1],
+            dtype=np.uint32,
         ),
-        valid_mask=np.ones(
-            (2, 2),
-            dtype=bool,
-        ),
+        row_offsets=np.array([0, 2, 4], dtype=np.int64),
         distance_m=np.array(
-            [
-                [0.0, 250.0],
-                [250.0, 0.0],
-            ],
+            [0.0, 250.0, 250.0, 0.0],
             dtype=np.float64,
         ),
     )
 
-    def fake_build_neighbourhoods(
+    def fake_metric_geometry(
         cells,
         radius,
         refinement_level,
         *,
-        neighbourhood,
         ellipsoid,
     ):
-        del cells, radius, refinement_level, neighbourhood, ellipsoid
-        return fake_neighbourhoods
-
-    def fake_relative_geometry(
-        center_ids,
-        neighbourhoods,
-        refinement_level,
-        *,
-        ellipsoid,
-    ):
-        del center_ids, neighbourhoods, refinement_level, ellipsoid
+        del cells, radius, refinement_level, ellipsoid
         return fake_geometry
 
     monkeypatch.setattr(
         module,
-        "build_neighbourhoods",
-        fake_build_neighbourhoods,
-    )
-    monkeypatch.setattr(
-        module,
-        "metric_geometry_from_neighbourhoods",
-        fake_relative_geometry,
+        "build_metric_neighbourhood_geometry",
+        fake_metric_geometry,
     )
 
     outputs = []

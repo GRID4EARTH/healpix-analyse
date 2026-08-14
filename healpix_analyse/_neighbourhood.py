@@ -136,6 +136,23 @@ class MetricNeighbourhoodGeometry:
     distance_m: np.ndarray
 
 
+@dataclass(frozen=True)
+class CompactMetricNeighbourhoodGeometry:
+    """Unpadded distance geometry with CSR-style row offsets."""
+
+    center_ids: np.ndarray
+    neighbour_indices: np.ndarray
+    row_offsets: np.ndarray
+    distance_m: np.ndarray
+
+
+def _domain_index_dtype(number_of_centers: int) -> type[np.unsignedinteger]:
+    """Return the smallest practical dtype for domain-local indices."""
+    if number_of_centers <= np.iinfo(np.uint32).max:
+        return np.uint32
+    return np.uint64
+
+
 def validate_neighbourhood(
     neighbourhood: NeighbourhoodMethod,
 ) -> None:
@@ -809,9 +826,129 @@ def metric_geometry_from_neighbourhoods(
         distance_m,
     )
 
+
+def build_metric_neighbourhood_geometry(
+    cells: np.ndarray,
+    radius: float,
+    refinement_level: int,
+    *,
+    ellipsoid: str = "WGS84",
+) -> CompactMetricNeighbourhoodGeometry:
+    """Build domain-restricted metric geometry with one distance pass.
+
+    Candidate cells outside ``cells`` are discarded before coordinate lookup
+    and inverse geodesy. Coordinates are looked up from the already converted
+    domain centres, and the distances used for the radius cutoff are retained
+    directly in the returned geometry.
+    """
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Metric neighbour geometry currently supports "
+            "ellipsoid='WGS84' only."
+        )
+
+    centers = np.asarray(cells, dtype=np.uint64)
+    number_of_centers = centers.size
+    if number_of_centers == 0:
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.empty(0, dtype=np.int64),
+            np.zeros(1, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+        )
+
+    if radius == 0.0:
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.arange(
+                number_of_centers,
+                dtype=_domain_index_dtype(number_of_centers),
+            ),
+            np.arange(number_of_centers + 1, dtype=np.int64),
+            np.zeros(number_of_centers, dtype=np.float64),
+        )
+
+    center_lon, center_lat = nested.healpix_to_lonlat(
+        centers,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    candidates = [
+        _cone_candidates(
+            (float(lon), float(lat)),
+            radius,
+            refinement_level,
+            ellipsoid=ellipsoid,
+        )
+        for lon, lat in zip(center_lon, center_lat, strict=True)
+    ]
+    candidate_counts = np.fromiter(
+        (candidate.size for candidate in candidates),
+        dtype=np.int64,
+        count=number_of_centers,
+    )
+    if not np.any(candidate_counts):
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.empty(0, dtype=np.int64),
+            np.zeros(number_of_centers + 1, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+        )
+
+    flat_candidates = np.concatenate(candidates)
+    candidate_rows = np.repeat(
+        np.arange(number_of_centers, dtype=np.int64),
+        candidate_counts,
+    )
+
+    # All contributing neighbours must belong to the processing domain.
+    # Search the unique domain rather than sorting every repeated candidate.
+    domain_order = np.argsort(centers)
+    sorted_domain = centers[domain_order]
+    positions = np.searchsorted(sorted_domain, flat_candidates)
+    in_domain = positions < number_of_centers
+    possible = np.flatnonzero(in_domain)
+    in_domain[possible] = (
+        sorted_domain[positions[possible]] == flat_candidates[possible]
+    )
+
+    flat_candidates = flat_candidates[in_domain]
+    candidate_rows = candidate_rows[in_domain]
+    domain_positions = domain_order[positions[in_domain]]
+
+    distance_m = _wgs84_distance(
+        np.asarray(center_lon)[candidate_rows],
+        np.asarray(center_lat)[candidate_rows],
+        np.asarray(center_lon)[domain_positions],
+        np.asarray(center_lat)[domain_positions],
+    )
+    within_radius = distance_m <= radius
+    neighbour_rows = candidate_rows[within_radius]
+    neighbour_indices = domain_positions[within_radius]
+    flat_distance_m = distance_m[within_radius]
+
+    row_counts = np.bincount(
+        neighbour_rows,
+        minlength=number_of_centers,
+    )
+    row_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(row_counts))
+    )
+
+    return CompactMetricNeighbourhoodGeometry(
+        centers.copy(),
+        neighbour_indices.astype(
+            _domain_index_dtype(number_of_centers),
+            copy=False,
+        ),
+        row_offsets,
+        flat_distance_m,
+    )
+
 __all__ = [
     "NeighbourhoodMethod",
     "MetricNeighbourhoodGeometry",
+    "CompactMetricNeighbourhoodGeometry",
     "RelativeNeighbourhoodGeometry",
     "build_neighbourhoods",
     "build_relative_geometry",
@@ -821,4 +958,5 @@ __all__ = [
     "validate_ring",
     "relative_geometry_from_neighbourhoods",
     "metric_geometry_from_neighbourhoods",
+    "build_metric_neighbourhood_geometry",
 ]

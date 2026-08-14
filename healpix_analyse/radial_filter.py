@@ -55,22 +55,21 @@ import numpy as np
 import torch
 
 from ._neighbourhood import (
-    MetricNeighbourhoodGeometry,
-    RelativeNeighbourhoodGeometry,
-    build_neighbourhoods,
-    metric_geometry_from_neighbourhoods,
+    CompactMetricNeighbourhoodGeometry,
+    build_metric_neighbourhood_geometry,
 )
-from ._weighted_neighbourhood import weighted_neighbourhood_reduce
+from ._weighted_neighbourhood import compact_weighted_neighbourhood_reduce
 
 
 ArrayLike = np.ndarray | torch.Tensor
 Kernel = Callable[[np.ndarray], Any]
 
 _GEOMETRY_CACHE_MAX_BYTES = 192 * 1024 * 1024
-_WEIGHT_CACHE_MAX_BYTES = 64 * 1024 * 1024
-_geometry_cache: OrderedDict[tuple[Any, ...], MetricNeighbourhoodGeometry] = (
-    OrderedDict()
-)
+_WEIGHT_CACHE_MAX_BYTES = 96 * 1024 * 1024
+_geometry_cache: OrderedDict[
+    tuple[Any, ...],
+    CompactMetricNeighbourhoodGeometry,
+] = OrderedDict()
 _geometry_cache_bytes = 0
 _gaussian_weight_cache: OrderedDict[tuple[Any, ...], np.ndarray] = OrderedDict()
 _gaussian_weight_cache_bytes = 0
@@ -222,6 +221,16 @@ def _validate_domain(
     return domain_ids
 
 
+def _positions_in_input(
+    cell_ids: np.ndarray,
+    domain: np.ndarray,
+) -> np.ndarray:
+    """Map the validated output domain to positions in the input signal."""
+    sorter = np.argsort(cell_ids)
+    positions = np.searchsorted(cell_ids[sorter], domain)
+    return sorter[positions]
+
+
 def _validate_values(
     values: ArrayLike,
     number_of_cells: int,
@@ -247,38 +256,6 @@ def _validate_values(
         )
 
 
-def _restrict_neighbourhoods_to_domain(
-    neighbourhoods: list[np.ndarray],
-    domain: np.ndarray,
-) -> list[np.ndarray]:
-    """Remove cells outside the processing domain before aggregation.
-
-    Domain filtering belongs to the spatial-neighbourhood stage rather than
-    to ``weighted_neighbourhood_reduce``.  A cell outside ``domain`` is not a
-    zero, NaN, or padded sample; it is simply absent from the operation.
-    """
-    if domain.size == 0:
-        return []
-
-    counts = np.fromiter(
-        (neighbourhood.size for neighbourhood in neighbourhoods),
-        dtype=np.int64,
-        count=len(neighbourhoods),
-    )
-    if not np.any(counts):
-        return [np.empty(0, dtype=np.uint64) for _ in neighbourhoods]
-
-    flat = np.concatenate(neighbourhoods)
-    keep = np.isin(flat, domain, assume_unique=False)
-    offsets = np.concatenate(
-        (np.array([0], dtype=np.int64), np.cumsum(counts))
-    )
-    return [
-        flat[start:stop][keep[start:stop]]
-        for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
-    ]
-
-
 def _cache_key(
     domain: np.ndarray,
     refinement_level: int,
@@ -296,13 +273,13 @@ def _cache_key(
     )
 
 
-def _geometry_nbytes(geometry: MetricNeighbourhoodGeometry) -> int:
+def _geometry_nbytes(geometry: CompactMetricNeighbourhoodGeometry) -> int:
     return sum(
         array.nbytes
         for array in (
             geometry.center_ids,
-            geometry.neighbour_ids,
-            geometry.valid_mask,
+            geometry.neighbour_indices,
+            geometry.row_offsets,
             geometry.distance_m,
         )
     )
@@ -313,7 +290,7 @@ def _filter_geometry(
     refinement_level: int,
     radius: float,
     ellipsoid: str,
-) -> tuple[tuple[Any, ...], MetricNeighbourhoodGeometry]:
+) -> tuple[tuple[Any, ...], CompactMetricNeighbourhoodGeometry]:
     """Build or retrieve value-independent radial filter geometry."""
     global _geometry_cache_bytes
 
@@ -324,27 +301,9 @@ def _filter_geometry(
             _geometry_cache.move_to_end(key)
             return key, cached
 
-    if radius == 0.0:
-        neighbourhoods = [
-            np.asarray([cell], dtype=np.uint64)
-            for cell in domain
-        ]
-    else:
-        neighbourhoods = build_neighbourhoods(
-            domain,
-            radius,
-            refinement_level,
-            neighbourhood="cell_center",
-            ellipsoid=ellipsoid,
-        )
-
-    neighbourhoods = _restrict_neighbourhoods_to_domain(
-        neighbourhoods,
+    geometry = build_metric_neighbourhood_geometry(
         domain,
-    )
-    geometry = metric_geometry_from_neighbourhoods(
-        domain,
-        neighbourhoods,
+        radius,
         refinement_level,
         ellipsoid=ellipsoid,
     )
@@ -369,7 +328,7 @@ def _filter_geometry(
 
 def _gaussian_weights(
     key: tuple[Any, ...],
-    geometry: MetricNeighbourhoodGeometry,
+    geometry: CompactMetricNeighbourhoodGeometry,
     sigma: float,
 ) -> np.ndarray:
     """Build or retrieve exact Gaussian weights for cached geometry."""
@@ -382,19 +341,18 @@ def _gaussian_weights(
             _gaussian_weight_cache.move_to_end(weight_key)
             return cached
 
-    weights = np.zeros(geometry.distance_m.shape, dtype=np.float64)
-    valid = geometry.valid_mask
-    distance = geometry.distance_m[valid].copy()
+    distance = geometry.distance_m.copy()
+    row_counts = np.diff(geometry.row_offsets)
     self_mask = (
-        geometry.neighbour_ids[valid]
-        == np.broadcast_to(
-            geometry.center_ids[:, None],
-            geometry.neighbour_ids.shape,
-        )[valid]
+        geometry.neighbour_indices
+        == np.repeat(
+            np.arange(geometry.center_ids.size, dtype=np.int64),
+            row_counts,
+        )
     )
     distance[self_mask] = 0.0
     scaled = distance / sigma
-    weights[valid] = np.exp(-0.5 * scaled * scaled)
+    weights = np.exp(-0.5 * scaled * scaled)
 
     if weights.nbytes <= _WEIGHT_CACHE_MAX_BYTES:
         with _cache_lock:
@@ -426,12 +384,12 @@ def _clear_filter_caches() -> None:
 
 def _evaluate_kernel(
     kernel: Kernel,
-    geometry: RelativeNeighbourhoodGeometry | MetricNeighbourhoodGeometry,
+    geometry: CompactMetricNeighbourhoodGeometry,
 ) -> np.ndarray:
     """Evaluate a radial kernel for every valid centre-neighbour pair.
 
-    The user kernel is called only on valid physical distances.  Padded
-    ``NaN`` distances are never passed to user code.
+    The user kernel is called only on valid physical distances. Compact
+    geometry contains no padding positions.
 
     The callable receives a one-dimensional NumPy array containing the
     physical distances of all valid pairs and may return either:
@@ -449,15 +407,8 @@ def _evaluate_kernel(
             "'kernel' must be callable."
         )
 
-    weights = np.zeros(
-        geometry.distance_m.shape,
-        dtype=np.float64,
-    )
-
-    valid = geometry.valid_mask
-
-    if not np.any(valid):
-        return weights
+    if geometry.distance_m.size == 0:
+        return np.empty(0, dtype=np.float64)
 
     # The centre cell is a valid neighbour of itself for radial filtering.
     # WGS84 inverse geodesics can return tiny non-zero round-off values even
@@ -465,21 +416,13 @@ def _evaluate_kernel(
     # self-distances to exactly zero before user-kernel evaluation so kernels
     # may safely use conditions such as ``distance_m == 0.0``.
     distance_m = geometry.distance_m.copy()
-
-    self_mask = (
-        geometry.valid_mask
-        & (
-            geometry.neighbour_ids
-            == geometry.center_ids[:, None]
-        )
+    self_mask = geometry.neighbour_indices == np.repeat(
+        np.arange(geometry.center_ids.size, dtype=np.int64),
+        np.diff(geometry.row_offsets),
     )
     distance_m[self_mask] = 0.0
 
-    distance = distance_m[
-        valid
-    ]
-
-    raw_weights = kernel(distance)
+    raw_weights = kernel(distance_m)
 
     if isinstance(
         raw_weights,
@@ -496,7 +439,7 @@ def _evaluate_kernel(
 
     if raw_weights.ndim == 0:
         valid_weights = np.full(
-            distance.shape,
+            distance_m.shape,
             raw_weights.item(),
             dtype=np.float64,
         )
@@ -504,7 +447,7 @@ def _evaluate_kernel(
         try:
             valid_weights = np.broadcast_to(
                 raw_weights,
-                distance.shape,
+                distance_m.shape,
             ).astype(
                 np.float64,
                 copy=False,
@@ -522,11 +465,7 @@ def _evaluate_kernel(
             "'kernel' returned non-finite weights for valid neighbour pairs."
         )
 
-    weights[
-        valid
-    ] = valid_weights
-
-    return weights
+    return valid_weights
 
 
 def radial_filter(
@@ -708,11 +647,11 @@ def radial_filter(
         geometry,
     )
 
-    return weighted_neighbourhood_reduce(
+    domain_positions = _positions_in_input(cells, geometry.center_ids)
+    return compact_weighted_neighbourhood_reduce(
         values,
-        cells,
-        geometry.neighbour_ids,
-        geometry.valid_mask,
+        domain_positions[geometry.neighbour_indices],
+        geometry.row_offsets,
         weights,
         normalize=normalize,
     )
@@ -806,11 +745,11 @@ def gaussian_filter(
     )
     weights = _gaussian_weights(key, geometry, sigma)
 
-    return weighted_neighbourhood_reduce(
+    domain_positions = _positions_in_input(cells, geometry.center_ids)
+    return compact_weighted_neighbourhood_reduce(
         values,
-        cells,
-        geometry.neighbour_ids,
-        geometry.valid_mask,
+        domain_positions[geometry.neighbour_indices],
+        geometry.row_offsets,
         weights,
         normalize=True,
     )

@@ -19,8 +19,11 @@ import pytest
 from healpix_geo import nested
 
 from healpix_analyse._neighbourhood import (
+    build_metric_neighbourhood_geometry,
+    build_neighbourhoods,
     build_relative_geometry,
     build_ring_neighbourhoods,
+    metric_geometry_from_neighbourhoods,
     relative_geometry_from_neighbours,
     validate_ring,
 )
@@ -57,6 +60,55 @@ def test_parallel_wgs84_distance_is_bit_identical(monkeypatch):
     )
 
     np.testing.assert_array_equal(parallel, serial)
+
+
+def test_fused_metric_geometry_matches_legacy_two_pass_pipeline():
+    refinement_level = 5
+    domain = build_ring_neighbourhoods(
+        np.array([1000], dtype=np.uint64),
+        refinement_level,
+        ring=2,
+        include_self=True,
+    )[0][::-1].copy()
+    radius_m = 500_000.0
+
+    neighbourhoods = build_neighbourhoods(
+        domain,
+        radius_m,
+        refinement_level,
+        neighbourhood="cell_center",
+        ellipsoid="WGS84",
+    )
+    legacy_neighbourhoods = [
+        neighbours[np.isin(neighbours, domain)]
+        for neighbours in neighbourhoods
+    ]
+    legacy = metric_geometry_from_neighbourhoods(
+        domain,
+        legacy_neighbourhoods,
+        refinement_level,
+    )
+
+    fused = build_metric_neighbourhood_geometry(
+        domain,
+        radius_m,
+        refinement_level,
+    )
+
+    legacy_counts = np.sum(legacy.valid_mask, axis=1)
+    legacy_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(legacy_counts))
+    )
+    np.testing.assert_array_equal(fused.center_ids, legacy.center_ids)
+    np.testing.assert_array_equal(
+        fused.center_ids[fused.neighbour_indices],
+        legacy.neighbour_ids[legacy.valid_mask],
+    )
+    np.testing.assert_array_equal(fused.row_offsets, legacy_offsets)
+    np.testing.assert_array_equal(
+        fused.distance_m,
+        legacy.distance_m[legacy.valid_mask],
+    )
 
 
 # ---------------------------------------------------------------------------
