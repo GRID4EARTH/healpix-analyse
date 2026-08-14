@@ -19,6 +19,7 @@ import pytest
 from healpix_geo import nested
 
 from healpix_analyse._neighbourhood import (
+    build_metric_geometry_from_vectorized_ring,
     build_metric_neighbourhood_geometry,
     build_neighbourhoods,
     build_relative_geometry,
@@ -109,6 +110,52 @@ def test_fused_metric_geometry_matches_legacy_two_pass_pipeline():
         fused.distance_m,
         legacy.distance_m[legacy.valid_mask],
     )
+
+
+def test_vectorized_ring_geometry_matches_cone_geometry_when_ring_covers():
+    refinement_level = 5
+    domain = build_ring_neighbourhoods(
+        np.array([1000], dtype=np.uint64),
+        refinement_level,
+        ring=2,
+        include_self=True,
+    )[0][::-1].copy()
+    radius_m = 500_000.0
+
+    cone = build_metric_neighbourhood_geometry(
+        domain,
+        radius_m,
+        refinement_level,
+    )
+    vectorized = build_metric_geometry_from_vectorized_ring(
+        domain,
+        radius_m,
+        refinement_level,
+        ring=6,
+        num_threads=2,
+        max_candidate_pairs=150,
+    )
+
+    for row in range(domain.size):
+        cone_slice = slice(cone.row_offsets[row], cone.row_offsets[row + 1])
+        vectorized_slice = slice(
+            vectorized.row_offsets[row],
+            vectorized.row_offsets[row + 1],
+        )
+        cone_ids = domain[cone.neighbour_indices[cone_slice]]
+        vectorized_ids = domain[
+            vectorized.neighbour_indices[vectorized_slice]
+        ]
+        cone_order = np.argsort(cone_ids)
+        vectorized_order = np.argsort(vectorized_ids)
+        np.testing.assert_array_equal(
+            cone_ids[cone_order],
+            vectorized_ids[vectorized_order],
+        )
+        np.testing.assert_array_equal(
+            cone.distance_m[cone_slice][cone_order],
+            vectorized.distance_m[vectorized_slice][vectorized_order],
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -90,6 +90,23 @@ domain `searchsorted` plus matching about 12.7%. Compact NumPy reduction takes
 about 0.034 s in the profiled cold call; its largest individual operations are
 value gathering and construction of weighted contributions.
 
+An experimental helper,
+`build_metric_geometry_from_vectorized_ring`, is available in the private
+`healpix_analyse._neighbourhood` module for further candidate-generation
+work. It batches `kth_neighbourhood`, filters to the domain, applies a cheap
+WGS84 ECEF chord-distance lower bound, and then uses the normal exact inverse-
+geodesic cutoff. It is deliberately not connected to the public filter path:
+the caller must supply a topological ring proven to cover the requested
+physical radius at every relevant location.
+
+For the complete Level-20, 600 m fixture, `ring=22` reproduced all 10,942,451
+cone-derived pairs with no missing or extra neighbours and bit-identical
+distances. In that run cone geometry took 1.871 s and vectorized-ring geometry
+took 1.931 s. Eliminating 15,069 scalar cone calls was offset by processing
+the larger ring candidate set, so the experimental helper is not currently a
+performance replacement. A separate global sample needed `ring=24` rather
+than 22, which reinforces why no general automatic ring is assumed.
+
 `--compare-scipy` also times `scipy.ndimage.gaussian_filter` on a regular
 two-dimensional grid with approximately the same sample count and the same
 local planar area as the circular HEALPix fixture. The Cartesian pixel sigma

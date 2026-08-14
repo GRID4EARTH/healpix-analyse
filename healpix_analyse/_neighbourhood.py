@@ -29,6 +29,8 @@ _GEOD_PARALLEL_MIN_PAIRS = 100_000
 # Authalic radius of WGS84. Used only to convert a physical radius in metres
 # to an approximate angular radius for cone_coverage candidate generation.
 _WGS84_AUTHALIC_RADIUS_M = 6_371_007.1809
+_WGS84_SEMI_MAJOR_AXIS_M = 6_378_137.0
+_WGS84_FLATTENING = 1.0 / 298.257_223_563
 
 
 def _geod_thread_count(number_of_pairs: int) -> int:
@@ -151,6 +153,30 @@ def _domain_index_dtype(number_of_centers: int) -> type[np.unsignedinteger]:
     if number_of_centers <= np.iinfo(np.uint32).max:
         return np.uint32
     return np.uint64
+
+
+def _wgs84_ecef(
+    longitude_deg: np.ndarray,
+    latitude_deg: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert WGS84 geodetic coordinates to ECEF metres."""
+    longitude = np.deg2rad(longitude_deg)
+    latitude = np.deg2rad(latitude_deg)
+    eccentricity_squared = _WGS84_FLATTENING * (
+        2.0 - _WGS84_FLATTENING
+    )
+    sin_latitude = np.sin(latitude)
+    cos_latitude = np.cos(latitude)
+    prime_vertical_radius = _WGS84_SEMI_MAJOR_AXIS_M / np.sqrt(
+        1.0 - eccentricity_squared * sin_latitude * sin_latitude
+    )
+    return (
+        prime_vertical_radius * cos_latitude * np.cos(longitude),
+        prime_vertical_radius * cos_latitude * np.sin(longitude),
+        prime_vertical_radius
+        * (1.0 - eccentricity_squared)
+        * sin_latitude,
+    )
 
 
 def validate_neighbourhood(
@@ -945,6 +971,171 @@ def build_metric_neighbourhood_geometry(
         flat_distance_m,
     )
 
+
+def build_metric_geometry_from_vectorized_ring(
+    cells: np.ndarray,
+    radius: float,
+    refinement_level: int,
+    *,
+    ring: int,
+    ellipsoid: str = "WGS84",
+    num_threads: int = 8,
+    max_candidate_pairs: int = 4_000_000,
+) -> CompactMetricNeighbourhoodGeometry:
+    """Experimentally build exact-cutoff geometry from batched ring candidates.
+
+    ``kth_neighbourhood`` generates candidates for many centres in one native
+    call. Domain filtering and an ECEF chord-distance lower bound remove cheap
+    false positives before the surviving pairs receive the same exact WGS84
+    inverse-geodesic cutoff as :func:`build_metric_neighbourhood_geometry`.
+
+    This helper is not used by the public filter path. The caller must choose
+    a ``ring`` that contains every cell centre within ``radius`` for all
+    requested locations. The exact cutoff removes false positives, but it
+    cannot recover a true neighbour omitted by an insufficient topological
+    ring. ``max_candidate_pairs`` bounds each temporary candidate matrix.
+    """
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Metric neighbour geometry currently supports "
+            "ellipsoid='WGS84' only."
+        )
+    ring = validate_ring(ring)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("'radius' must be finite and non-negative.")
+    if isinstance(num_threads, (bool, np.bool_)) or not isinstance(
+        num_threads,
+        (int, np.integer),
+    ):
+        raise TypeError("'num_threads' must be a positive integer.")
+    if int(num_threads) < 1:
+        raise ValueError("'num_threads' must be a positive integer.")
+    if (
+        isinstance(max_candidate_pairs, (bool, np.bool_))
+        or not isinstance(max_candidate_pairs, (int, np.integer))
+    ):
+        raise TypeError("'max_candidate_pairs' must be a positive integer.")
+    if int(max_candidate_pairs) < 1:
+        raise ValueError("'max_candidate_pairs' must be a positive integer.")
+
+    centers = np.asarray(cells)
+    if centers.ndim != 1:
+        raise ValueError("'cells' must be one-dimensional.")
+    if centers.dtype == np.bool_ or not np.issubdtype(
+        centers.dtype,
+        np.integer,
+    ):
+        raise TypeError("'cells' must contain integer HEALPix IDs.")
+    if np.any(centers < 0):
+        raise ValueError("'cells' must contain non-negative HEALPix IDs.")
+    centers = centers.astype(np.uint64, copy=False)
+    if np.unique(centers).size != centers.size:
+        raise ValueError("'cells' must not contain duplicate HEALPix IDs.")
+
+    number_of_centers = centers.size
+    index_dtype = _domain_index_dtype(number_of_centers)
+    if number_of_centers == 0:
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.empty(0, dtype=index_dtype),
+            np.zeros(1, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+        )
+    if radius == 0.0:
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.arange(number_of_centers, dtype=index_dtype),
+            np.arange(number_of_centers + 1, dtype=np.int64),
+            np.zeros(number_of_centers, dtype=np.float64),
+        )
+
+    longitude, latitude = nested.healpix_to_lonlat(
+        centers,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    ecef_x, ecef_y, ecef_z = _wgs84_ecef(longitude, latitude)
+    domain_order = np.argsort(centers)
+    sorted_domain = centers[domain_order]
+    candidate_width = (2 * ring + 1) ** 2
+    chunk_size = max(1, int(max_candidate_pairs) // candidate_width)
+    workers = min(_GEOD_MAX_THREADS, int(num_threads))
+    radius_with_roundoff = radius * (1.0 + 1.0e-12)
+    chord_limit_squared = radius_with_roundoff**2
+
+    row_parts: list[np.ndarray] = []
+    index_parts: list[np.ndarray] = []
+    distance_parts: list[np.ndarray] = []
+
+    for start in range(0, number_of_centers, chunk_size):
+        stop = min(start + chunk_size, number_of_centers)
+        raw = nested.kth_neighbourhood(
+            centers[start:stop],
+            refinement_level,
+            ring,
+            num_threads=workers,
+        )
+        raw = np.asarray(raw)
+        flat_candidates = raw.reshape(-1)
+        candidate_rows = np.repeat(
+            np.arange(start, stop, dtype=np.int64),
+            raw.shape[1],
+        )
+        valid = flat_candidates >= 0
+        flat_candidates = flat_candidates[valid].astype(
+            np.uint64,
+            copy=False,
+        )
+        candidate_rows = candidate_rows[valid]
+
+        positions = np.searchsorted(sorted_domain, flat_candidates)
+        in_domain = positions < number_of_centers
+        possible = np.flatnonzero(in_domain)
+        in_domain[possible] = (
+            sorted_domain[positions[possible]]
+            == flat_candidates[possible]
+        )
+        candidate_rows = candidate_rows[in_domain]
+        domain_positions = domain_order[positions[in_domain]]
+
+        delta_x = ecef_x[candidate_rows] - ecef_x[domain_positions]
+        delta_y = ecef_y[candidate_rows] - ecef_y[domain_positions]
+        delta_z = ecef_z[candidate_rows] - ecef_z[domain_positions]
+        chord_candidate = (
+            delta_x * delta_x + delta_y * delta_y + delta_z * delta_z
+            <= chord_limit_squared
+        )
+        candidate_rows = candidate_rows[chord_candidate]
+        domain_positions = domain_positions[chord_candidate]
+
+        distance_m = _wgs84_distance(
+            longitude[candidate_rows],
+            latitude[candidate_rows],
+            longitude[domain_positions],
+            latitude[domain_positions],
+        )
+        within_radius = distance_m <= radius
+        row_parts.append(candidate_rows[within_radius])
+        index_parts.append(domain_positions[within_radius])
+        distance_parts.append(distance_m[within_radius])
+
+    neighbour_rows = np.concatenate(row_parts)
+    neighbour_indices = np.concatenate(index_parts)
+    flat_distance_m = np.concatenate(distance_parts)
+    row_counts = np.bincount(
+        neighbour_rows,
+        minlength=number_of_centers,
+    )
+    row_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(row_counts))
+    )
+    return CompactMetricNeighbourhoodGeometry(
+        centers.copy(),
+        neighbour_indices.astype(index_dtype, copy=False),
+        row_offsets,
+        flat_distance_m,
+    )
+
 __all__ = [
     "NeighbourhoodMethod",
     "MetricNeighbourhoodGeometry",
@@ -959,4 +1150,5 @@ __all__ = [
     "relative_geometry_from_neighbourhoods",
     "metric_geometry_from_neighbourhoods",
     "build_metric_neighbourhood_geometry",
+    "build_metric_geometry_from_vectorized_ring",
 ]
