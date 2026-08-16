@@ -18,10 +18,10 @@ healpy = ">=1.16"
 
 [pypi-dependencies]
 healpix-analyse= { path = ".", editable = true }
-# Use the batched cone-coverage implementation while developing PR #37.
+# Validate against the shared upstream integration branch while developing PR #37.
 # Keep pyproject.toml on the released dependency so normal installations are
-# not tied to a contributor fork.
-healpix-geo = { git = "https://github.com/tinaok/healpix-geo.git", branch = "perf/batched-cone-coverage", subdirectory = "python/healpix-geo" }
+# not tied to an unreleased branch.
+healpix-geo = { git = "https://github.com/GRID4EARTH/healpix-geo.git", branch = "integration", subdirectory = "python/healpix-geo" }
 
 [feature.affine.dependencies]
 affine = "*"
