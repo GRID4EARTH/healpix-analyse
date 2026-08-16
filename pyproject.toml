@@ -47,8 +47,8 @@ docs = [
 ]
 
 [project.urls]
-Documentation = "https://eopf-dggs.github.io/healpix-analyse/"
-Repository = "https://github.com/EOPF-DGGS/healpix-analyse"
+Documentation = "https://grid4earth.github.io/healpix-analyse/"
+Repository = "https://github.com/GRID4EARTH/healpix-analyse"
 
 [tool.setuptools.packages.find]
 include = [
