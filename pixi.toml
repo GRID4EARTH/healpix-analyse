@@ -1,5 +1,5 @@
 [workspace]
-authors = ["Jean-Marc Delouis"]
+authors = ["Jean-Marc Delouis", "Tina Odaka"]
 channels = ["conda-forge"]
 name = "healpix-analyse"
 platforms = ["linux-64"]
