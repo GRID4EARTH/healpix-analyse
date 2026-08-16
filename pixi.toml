@@ -16,9 +16,9 @@ pytorch = ">=2.0,<3"
 
 [pypi-dependencies]
 healpix-analyse= { path = ".", editable = true }
-# Temporary development pin for GRID4EARTH/healpix-geo#247. Replace this with
-# the first released version containing nested.neighbours before merging.
-healpix-geo = { git = "https://github.com/tinaok/healpix-geo.git", rev = "3115982b6719b2b44ea447eb035e493b7a2707c9", subdirectory = "python/healpix-geo" }
+# Validate against the shared upstream integration branch. Replace this with the
+# first released version containing nested.neighbours before merging.
+healpix-geo = { git = "https://github.com/GRID4EARTH/healpix-geo.git", branch = "integration", subdirectory = "python/healpix-geo" }
 
 [feature.affine.dependencies]
 affine = "*"
