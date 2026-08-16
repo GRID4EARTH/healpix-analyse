@@ -25,7 +25,7 @@ dependencies = [
   "numpy",
   "torch",
   "healpy",
-  "healpix-geo",
+  "healpix-geo>=0.2.2",
   "pyproj>=3.6",
 ]
 
@@ -53,4 +53,3 @@ include = [
 ]
 
 [tool.setuptools_scm]
-

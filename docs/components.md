@@ -291,21 +291,18 @@ For Torch input, outputs are returned on the original device.
 Connected-component operations are discrete and are therefore not
 differentiable.
 
-## Temporary topology backend
+## Topology backend
 
 Immediate HEALPix topology is currently obtained through a private
 `healpix_analyse._topology` helper.
 
-That helper temporarily uses:
+That helper uses the direction-preserving API:
 
 ```python
-healpy.get_all_neighbours(..., nest=True)
+healpix_geo.nested.neighbours(...)
 ```
 
-`healpy` is intentionally a temporary compatibility backend and is not
-intended to become the permanent topology implementation.
-
-The planned final architecture is:
+The topology architecture is:
 
 ```text
 healpix-analyse
@@ -320,6 +317,7 @@ healpix-geo
 CDSHEALPix
 ```
 
-Once direction-aware neighbour access is exposed by `healpix-geo`, the
-private backend can be replaced without changing the public
-connected-component API.
+The private adapter preserves the connected-component topology contract while
+`healpix-geo` provides deterministic directional positions and the `-1`
+sentinel for missing positions. The public connected-component API is
+unchanged.
