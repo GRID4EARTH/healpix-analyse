@@ -7,6 +7,8 @@ share exactly the same spatial semantics.
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,10 +23,80 @@ NeighbourhoodMethod = Literal[
 ]
 
 _WGS84 = Geod(ellps="WGS84")
+_GEOD_MAX_THREADS = 8
+_GEOD_PARALLEL_MIN_PAIRS = 100_000
 
 # Authalic radius of WGS84. Used only to convert a physical radius in metres
 # to an approximate angular radius for cone_coverage candidate generation.
 _WGS84_AUTHALIC_RADIUS_M = 6_371_007.1809
+_WGS84_SEMI_MAJOR_AXIS_M = 6_378_137.0
+_WGS84_FLATTENING = 1.0 / 298.257_223_563
+
+
+def _geod_thread_count(number_of_pairs: int) -> int:
+    """Choose an automatic worker count capped at eight threads."""
+    if number_of_pairs < _GEOD_PARALLEL_MIN_PAIRS:
+        return 1
+
+    return min(
+        _GEOD_MAX_THREADS,
+        os.cpu_count() or 1,
+        number_of_pairs,
+    )
+
+
+def _wgs84_distance(
+    lon1: np.ndarray,
+    lat1: np.ndarray,
+    lon2: np.ndarray,
+    lat2: np.ndarray,
+) -> np.ndarray:
+    """Compute exact WGS84 distances, using at most eight threads.
+
+    ``pyproj`` releases the GIL while PROJ evaluates inverse geodesics. Large
+    one-dimensional batches can therefore be split across native calls
+    without changing the underlying geodesic algorithm or result ordering.
+    Each worker owns its ``Geod`` instance to avoid sharing mutable wrapper
+    state between threads.
+    """
+    first_lon = np.asarray(lon1, dtype=np.float64)
+    first_lat = np.asarray(lat1, dtype=np.float64)
+    second_lon = np.asarray(lon2, dtype=np.float64)
+    second_lat = np.asarray(lat2, dtype=np.float64)
+
+    number_of_pairs = first_lon.size
+    workers = _geod_thread_count(number_of_pairs)
+    if workers == 1:
+        return _WGS84.inv(
+            first_lon,
+            first_lat,
+            second_lon,
+            second_lat,
+        )[2]
+
+    bounds = np.linspace(
+        0,
+        number_of_pairs,
+        workers + 1,
+        dtype=np.int64,
+    )
+
+    def evaluate(bounds_pair: tuple[int, int]) -> np.ndarray:
+        start, stop = bounds_pair
+        geod = Geod(ellps="WGS84")
+        return geod.inv(
+            first_lon[start:stop],
+            first_lat[start:stop],
+            second_lon[start:stop],
+            second_lat[start:stop],
+        )[2]
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        chunks = executor.map(
+            evaluate,
+            zip(bounds[:-1], bounds[1:], strict=True),
+        )
+        return np.concatenate(list(chunks))
 
 
 @dataclass(frozen=True)
@@ -54,6 +126,57 @@ class RelativeNeighbourhoodGeometry:
     azimuth_rad: np.ndarray
     east_offset_m: np.ndarray
     north_offset_m: np.ndarray
+
+
+@dataclass(frozen=True)
+class MetricNeighbourhoodGeometry:
+    """Minimal padded geometry for kernels that depend only on distance."""
+
+    center_ids: np.ndarray
+    neighbour_ids: np.ndarray
+    valid_mask: np.ndarray
+    distance_m: np.ndarray
+
+
+@dataclass(frozen=True)
+class CompactMetricNeighbourhoodGeometry:
+    """Unpadded distance geometry with CSR-style row offsets."""
+
+    center_ids: np.ndarray
+    neighbour_indices: np.ndarray
+    row_offsets: np.ndarray
+    distance_m: np.ndarray
+
+
+def _domain_index_dtype(number_of_centers: int) -> type[np.unsignedinteger]:
+    """Return the smallest practical dtype for domain-local indices."""
+    if number_of_centers <= np.iinfo(np.uint32).max:
+        return np.uint32
+    return np.uint64
+
+
+def _wgs84_ecef(
+    longitude_deg: np.ndarray,
+    latitude_deg: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert WGS84 geodetic coordinates to ECEF metres."""
+    longitude = np.deg2rad(longitude_deg)
+    latitude = np.deg2rad(latitude_deg)
+    eccentricity_squared = _WGS84_FLATTENING * (
+        2.0 - _WGS84_FLATTENING
+    )
+    sin_latitude = np.sin(latitude)
+    cos_latitude = np.cos(latitude)
+    prime_vertical_radius = _WGS84_SEMI_MAJOR_AXIS_M / np.sqrt(
+        1.0 - eccentricity_squared * sin_latitude * sin_latitude
+    )
+    return (
+        prime_vertical_radius * cos_latitude * np.cos(longitude),
+        prime_vertical_radius * cos_latitude * np.sin(longitude),
+        prime_vertical_radius
+        * (1.0 - eccentricity_squared)
+        * sin_latitude,
+    )
 
 
 def validate_neighbourhood(
@@ -462,15 +585,85 @@ def build_neighbourhoods(
     """Build a geometric neighbourhood for each HEALPix cell."""
     validate_neighbourhood(neighbourhood)
 
-    return [
-        _neighbourhood(
-            int(cell),
+    cells_array = np.asarray(cells, dtype=np.uint64)
+    if cells_array.size == 0:
+        return []
+
+    # Coordinate conversion has appreciable fixed overhead in healpix-geo.
+    # Convert all centres in one call, then retain the exact cone-coverage
+    # candidate generation used by the original implementation.
+    center_lon, center_lat = nested.healpix_to_lonlat(
+        cells_array,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    centers = list(zip(center_lon, center_lat, strict=True))
+    candidates = [
+        _cone_candidates(
+            (float(lon), float(lat)),
             radius,
             refinement_level,
-            neighbourhood=neighbourhood,
             ellipsoid=ellipsoid,
         )
-        for cell in cells
+        for lon, lat in centers
+    ]
+
+    if neighbourhood == "cone_coverage":
+        return candidates
+
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Cell-centre geodesic filtering currently supports "
+            "ellipsoid='WGS84' only."
+        )
+
+    counts = np.fromiter(
+        (candidate.size for candidate in candidates),
+        dtype=np.int64,
+        count=cells_array.size,
+    )
+    if not np.any(counts):
+        return candidates
+
+    flat_candidates = np.concatenate(candidates)
+
+    # Candidate IDs repeat heavily between adjacent centres. Resolve each
+    # distinct HEALPix centre once, then expand the coordinates without
+    # changing the candidate order supplied by cone_coverage.
+    unique_candidates, inverse = np.unique(
+        flat_candidates,
+        return_inverse=True,
+    )
+    unique_lon, unique_lat = nested.healpix_to_lonlat(
+        unique_candidates,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    candidate_lon = unique_lon[inverse]
+    candidate_lat = unique_lat[inverse]
+    repeated_lon = np.repeat(
+        np.asarray(center_lon, dtype=np.float64),
+        counts,
+    )
+    repeated_lat = np.repeat(
+        np.asarray(center_lat, dtype=np.float64),
+        counts,
+    )
+
+    distance = _wgs84_distance(
+        repeated_lon,
+        repeated_lat,
+        candidate_lon,
+        candidate_lat,
+    )
+    within_radius = distance <= radius
+
+    offsets = np.concatenate(
+        (np.array([0], dtype=np.int64), np.cumsum(counts))
+    )
+    return [
+        flat_candidates[start:stop][within_radius[start:stop]]
+        for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
     ]
 
 
@@ -536,6 +729,65 @@ def _cone_candidates(
     return np.asarray(cell_ids, dtype=np.uint64)
 
 
+def _cone_candidate_csr(
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    radius: float,
+    refinement_level: int,
+    *,
+    ellipsoid: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return cone candidates for many centres in CSR form.
+
+    Newer ``healpix-geo`` versions expose ``cone_coverage_many`` and avoid one
+    Python-to-extension call per centre.  Retain the scalar construction as a
+    compatibility fallback until that API is available in a released version.
+    """
+    center_lon = np.asarray(longitude, dtype=np.float64)
+    center_lat = np.asarray(latitude, dtype=np.float64)
+    radius_degrees = np.rad2deg(radius / _WGS84_AUTHALIC_RADIUS_M)
+    cone_coverage_many = getattr(nested, "cone_coverage_many", None)
+
+    if cone_coverage_many is not None:
+        centers = np.column_stack((center_lon, center_lat))
+        offsets, cell_ids, _, _ = cone_coverage_many(
+            centers,
+            radius_degrees,
+            refinement_level,
+            ellipsoid=ellipsoid,
+            flat=True,
+            num_threads=min(_GEOD_MAX_THREADS, os.cpu_count() or 1),
+        )
+        return (
+            np.asarray(offsets, dtype=np.int64),
+            np.asarray(cell_ids, dtype=np.uint64),
+        )
+
+    candidates = [
+        _cone_candidates(
+            (float(lon), float(lat)),
+            radius,
+            refinement_level,
+            ellipsoid=ellipsoid,
+        )
+        for lon, lat in zip(center_lon, center_lat, strict=True)
+    ]
+    candidate_counts = np.fromiter(
+        (candidate.size for candidate in candidates),
+        dtype=np.int64,
+        count=center_lon.size,
+    )
+    offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(candidate_counts))
+    )
+    flat_candidates = (
+        np.concatenate(candidates)
+        if candidates and offsets[-1]
+        else np.empty(0, dtype=np.uint64)
+    )
+    return offsets, flat_candidates
+
+
 def _filter_by_cell_center_distance(
     center: tuple[float, float],
     candidates: np.ndarray,
@@ -599,8 +851,347 @@ def relative_geometry_from_neighbourhoods(
         ellipsoid=ellipsoid,
     )
 
+
+def metric_geometry_from_neighbourhoods(
+    center_ids: np.ndarray,
+    neighbourhoods: list[np.ndarray],
+    refinement_level: int,
+    *,
+    ellipsoid: str = "WGS84",
+) -> MetricNeighbourhoodGeometry:
+    """Compute only the WGS84 distances required by radial kernels."""
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Metric neighbour geometry currently supports "
+            "ellipsoid='WGS84' only."
+        )
+
+    centers = np.asarray(center_ids, dtype=np.uint64)
+    neighbour_ids, valid_mask = _pad_neighbourhoods(neighbourhoods)
+    distance_m = np.full(neighbour_ids.shape, np.nan, dtype=np.float64)
+
+    if not np.any(valid_mask):
+        return MetricNeighbourhoodGeometry(
+            centers.copy(),
+            neighbour_ids,
+            valid_mask,
+            distance_m,
+        )
+
+    row_indices, column_indices = np.nonzero(valid_mask)
+    valid_neighbours = neighbour_ids[
+        row_indices,
+        column_indices,
+    ].astype(np.uint64, copy=False)
+
+    # Resolve each HEALPix centre once. Both arrays contain many repeated IDs
+    # on a dense patch, so this reduces conversion work and temporary memory.
+    all_ids = np.concatenate((centers, valid_neighbours))
+    unique_ids, inverse = np.unique(all_ids, return_inverse=True)
+    unique_lon, unique_lat = nested.healpix_to_lonlat(
+        unique_ids,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    center_inverse = inverse[:centers.size]
+    neighbour_inverse = inverse[centers.size:]
+
+    flat_distance_m = _wgs84_distance(
+        unique_lon[center_inverse[row_indices]],
+        unique_lat[center_inverse[row_indices]],
+        unique_lon[neighbour_inverse],
+        unique_lat[neighbour_inverse],
+    )
+    distance_m[row_indices, column_indices] = flat_distance_m
+
+    return MetricNeighbourhoodGeometry(
+        centers.copy(),
+        neighbour_ids,
+        valid_mask,
+        distance_m,
+    )
+
+
+def build_metric_neighbourhood_geometry(
+    cells: np.ndarray,
+    radius: float,
+    refinement_level: int,
+    *,
+    ellipsoid: str = "WGS84",
+) -> CompactMetricNeighbourhoodGeometry:
+    """Build domain-restricted metric geometry with one distance pass.
+
+    Candidate cells outside ``cells`` are discarded before coordinate lookup
+    and inverse geodesy. Coordinates are looked up from the already converted
+    domain centres, and the distances used for the radius cutoff are retained
+    directly in the returned geometry.
+    """
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Metric neighbour geometry currently supports "
+            "ellipsoid='WGS84' only."
+        )
+
+    centers = np.asarray(cells, dtype=np.uint64)
+    number_of_centers = centers.size
+    if number_of_centers == 0:
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.empty(0, dtype=np.int64),
+            np.zeros(1, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+        )
+
+    if radius == 0.0:
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.arange(
+                number_of_centers,
+                dtype=_domain_index_dtype(number_of_centers),
+            ),
+            np.arange(number_of_centers + 1, dtype=np.int64),
+            np.zeros(number_of_centers, dtype=np.float64),
+        )
+
+    center_lon, center_lat = nested.healpix_to_lonlat(
+        centers,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    candidate_offsets, flat_candidates = _cone_candidate_csr(
+        center_lon,
+        center_lat,
+        radius,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    candidate_counts = np.diff(candidate_offsets)
+    if not np.any(candidate_counts):
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.empty(0, dtype=np.int64),
+            np.zeros(number_of_centers + 1, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+        )
+
+    candidate_rows = np.repeat(
+        np.arange(number_of_centers, dtype=np.int64),
+        candidate_counts,
+    )
+
+    # All contributing neighbours must belong to the processing domain.
+    # Search the unique domain rather than sorting every repeated candidate.
+    domain_order = np.argsort(centers)
+    sorted_domain = centers[domain_order]
+    positions = np.searchsorted(sorted_domain, flat_candidates)
+    in_domain = positions < number_of_centers
+    possible = np.flatnonzero(in_domain)
+    in_domain[possible] = (
+        sorted_domain[positions[possible]] == flat_candidates[possible]
+    )
+
+    flat_candidates = flat_candidates[in_domain]
+    candidate_rows = candidate_rows[in_domain]
+    domain_positions = domain_order[positions[in_domain]]
+
+    distance_m = _wgs84_distance(
+        np.asarray(center_lon)[candidate_rows],
+        np.asarray(center_lat)[candidate_rows],
+        np.asarray(center_lon)[domain_positions],
+        np.asarray(center_lat)[domain_positions],
+    )
+    within_radius = distance_m <= radius
+    neighbour_rows = candidate_rows[within_radius]
+    neighbour_indices = domain_positions[within_radius]
+    flat_distance_m = distance_m[within_radius]
+
+    row_counts = np.bincount(
+        neighbour_rows,
+        minlength=number_of_centers,
+    )
+    row_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(row_counts))
+    )
+
+    return CompactMetricNeighbourhoodGeometry(
+        centers.copy(),
+        neighbour_indices.astype(
+            _domain_index_dtype(number_of_centers),
+            copy=False,
+        ),
+        row_offsets,
+        flat_distance_m,
+    )
+
+
+def build_metric_geometry_from_vectorized_ring(
+    cells: np.ndarray,
+    radius: float,
+    refinement_level: int,
+    *,
+    ring: int,
+    ellipsoid: str = "WGS84",
+    num_threads: int = 8,
+    max_candidate_pairs: int = 4_000_000,
+) -> CompactMetricNeighbourhoodGeometry:
+    """Experimentally build exact-cutoff geometry from batched ring candidates.
+
+    ``kth_neighbourhood`` generates candidates for many centres in one native
+    call. Domain filtering and an ECEF chord-distance lower bound remove cheap
+    false positives before the surviving pairs receive the same exact WGS84
+    inverse-geodesic cutoff as :func:`build_metric_neighbourhood_geometry`.
+
+    This helper is not used by the public filter path. The caller must choose
+    a ``ring`` that contains every cell centre within ``radius`` for all
+    requested locations. The exact cutoff removes false positives, but it
+    cannot recover a true neighbour omitted by an insufficient topological
+    ring. ``max_candidate_pairs`` bounds each temporary candidate matrix.
+    """
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Metric neighbour geometry currently supports "
+            "ellipsoid='WGS84' only."
+        )
+    ring = validate_ring(ring)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("'radius' must be finite and non-negative.")
+    if isinstance(num_threads, (bool, np.bool_)) or not isinstance(
+        num_threads,
+        (int, np.integer),
+    ):
+        raise TypeError("'num_threads' must be a positive integer.")
+    if int(num_threads) < 1:
+        raise ValueError("'num_threads' must be a positive integer.")
+    if (
+        isinstance(max_candidate_pairs, (bool, np.bool_))
+        or not isinstance(max_candidate_pairs, (int, np.integer))
+    ):
+        raise TypeError("'max_candidate_pairs' must be a positive integer.")
+    if int(max_candidate_pairs) < 1:
+        raise ValueError("'max_candidate_pairs' must be a positive integer.")
+
+    centers = np.asarray(cells)
+    if centers.ndim != 1:
+        raise ValueError("'cells' must be one-dimensional.")
+    if centers.dtype == np.bool_ or not np.issubdtype(
+        centers.dtype,
+        np.integer,
+    ):
+        raise TypeError("'cells' must contain integer HEALPix IDs.")
+    if np.any(centers < 0):
+        raise ValueError("'cells' must contain non-negative HEALPix IDs.")
+    centers = centers.astype(np.uint64, copy=False)
+    if np.unique(centers).size != centers.size:
+        raise ValueError("'cells' must not contain duplicate HEALPix IDs.")
+
+    number_of_centers = centers.size
+    index_dtype = _domain_index_dtype(number_of_centers)
+    if number_of_centers == 0:
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.empty(0, dtype=index_dtype),
+            np.zeros(1, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+        )
+    if radius == 0.0:
+        return CompactMetricNeighbourhoodGeometry(
+            centers.copy(),
+            np.arange(number_of_centers, dtype=index_dtype),
+            np.arange(number_of_centers + 1, dtype=np.int64),
+            np.zeros(number_of_centers, dtype=np.float64),
+        )
+
+    longitude, latitude = nested.healpix_to_lonlat(
+        centers,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    ecef_x, ecef_y, ecef_z = _wgs84_ecef(longitude, latitude)
+    domain_order = np.argsort(centers)
+    sorted_domain = centers[domain_order]
+    candidate_width = (2 * ring + 1) ** 2
+    chunk_size = max(1, int(max_candidate_pairs) // candidate_width)
+    workers = min(_GEOD_MAX_THREADS, int(num_threads))
+    radius_with_roundoff = radius * (1.0 + 1.0e-12)
+    chord_limit_squared = radius_with_roundoff**2
+
+    row_parts: list[np.ndarray] = []
+    index_parts: list[np.ndarray] = []
+    distance_parts: list[np.ndarray] = []
+
+    for start in range(0, number_of_centers, chunk_size):
+        stop = min(start + chunk_size, number_of_centers)
+        raw = nested.kth_neighbourhood(
+            centers[start:stop],
+            refinement_level,
+            ring,
+            num_threads=workers,
+        )
+        raw = np.asarray(raw)
+        flat_candidates = raw.reshape(-1)
+        candidate_rows = np.repeat(
+            np.arange(start, stop, dtype=np.int64),
+            raw.shape[1],
+        )
+        valid = flat_candidates >= 0
+        flat_candidates = flat_candidates[valid].astype(
+            np.uint64,
+            copy=False,
+        )
+        candidate_rows = candidate_rows[valid]
+
+        positions = np.searchsorted(sorted_domain, flat_candidates)
+        in_domain = positions < number_of_centers
+        possible = np.flatnonzero(in_domain)
+        in_domain[possible] = (
+            sorted_domain[positions[possible]]
+            == flat_candidates[possible]
+        )
+        candidate_rows = candidate_rows[in_domain]
+        domain_positions = domain_order[positions[in_domain]]
+
+        delta_x = ecef_x[candidate_rows] - ecef_x[domain_positions]
+        delta_y = ecef_y[candidate_rows] - ecef_y[domain_positions]
+        delta_z = ecef_z[candidate_rows] - ecef_z[domain_positions]
+        chord_candidate = (
+            delta_x * delta_x + delta_y * delta_y + delta_z * delta_z
+            <= chord_limit_squared
+        )
+        candidate_rows = candidate_rows[chord_candidate]
+        domain_positions = domain_positions[chord_candidate]
+
+        distance_m = _wgs84_distance(
+            longitude[candidate_rows],
+            latitude[candidate_rows],
+            longitude[domain_positions],
+            latitude[domain_positions],
+        )
+        within_radius = distance_m <= radius
+        row_parts.append(candidate_rows[within_radius])
+        index_parts.append(domain_positions[within_radius])
+        distance_parts.append(distance_m[within_radius])
+
+    neighbour_rows = np.concatenate(row_parts)
+    neighbour_indices = np.concatenate(index_parts)
+    flat_distance_m = np.concatenate(distance_parts)
+    row_counts = np.bincount(
+        neighbour_rows,
+        minlength=number_of_centers,
+    )
+    row_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(row_counts))
+    )
+    return CompactMetricNeighbourhoodGeometry(
+        centers.copy(),
+        neighbour_indices.astype(index_dtype, copy=False),
+        row_offsets,
+        flat_distance_m,
+    )
+
 __all__ = [
     "NeighbourhoodMethod",
+    "MetricNeighbourhoodGeometry",
+    "CompactMetricNeighbourhoodGeometry",
     "RelativeNeighbourhoodGeometry",
     "build_neighbourhoods",
     "build_relative_geometry",
@@ -609,4 +1200,7 @@ __all__ = [
     "validate_neighbourhood",
     "validate_ring",
     "relative_geometry_from_neighbourhoods",
+    "metric_geometry_from_neighbourhoods",
+    "build_metric_neighbourhood_geometry",
+    "build_metric_geometry_from_vectorized_ring",
 ]

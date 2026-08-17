@@ -157,8 +157,10 @@ from healpix_analyse.components import (
 )
 
 from healpix_analyse.radial_filter import (
+    configure_radial_filter_cache,
     gaussian_filter,
     radial_filter,
+    radial_filter_cache_info,
 )
 
 __all__ = [
@@ -233,6 +235,8 @@ __all__ = [
     # ------------------------------------------------------------------
     "radial_filter",
     "gaussian_filter",
+    "configure_radial_filter_cache",
+    "radial_filter_cache_info",
 
     # ------------------------------------------------------------------
     # HEALPix scalar-field gradients
