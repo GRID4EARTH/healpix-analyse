@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import healpix_analyse._topology as topology
 from healpix_analyse._topology import (
     nested_edge_neighbours,
     nested_neighbours,
@@ -22,6 +23,8 @@ def test_edge_neighbours_shape(level):
         neighbours.dtype,
         np.signedinteger,
     )
+    assert neighbours.dtype == np.int64
+    assert neighbours.flags.c_contiguous
 
 
 @pytest.mark.parametrize("level", [0, 1, 3, 6])
@@ -36,6 +39,98 @@ def test_full_neighbours_shape(level):
     )
 
     assert neighbours.shape == (cells.size, 8)
+    assert neighbours.dtype == np.int64
+    assert neighbours.flags.c_contiguous
+
+
+@pytest.mark.parametrize(
+    ("connectivity", "width"),
+    [
+        ("edge", 4),
+        ("edge_or_vertex", 8),
+    ],
+)
+def test_adapter_delegates_to_healpix_geo(
+    monkeypatch,
+    connectivity,
+    width,
+):
+    calls = []
+
+    def fake_neighbours(
+        cells,
+        depth,
+        *,
+        connectivity,
+        num_threads,
+    ):
+        calls.append(
+            (
+                cells.copy(),
+                depth,
+                connectivity,
+                num_threads,
+            )
+        )
+
+        return np.arange(
+            cells.size * width,
+            dtype=np.int64,
+        ).reshape(cells.size, width)
+
+    monkeypatch.setattr(
+        topology.healpix_geo_nested,
+        "neighbours",
+        fake_neighbours,
+    )
+
+    cells = np.array(
+        [0, 1, 2],
+        dtype=np.uint64,
+    )
+
+    result = nested_neighbours(
+        cells,
+        2,
+        connectivity=connectivity,
+    )
+
+    assert result.shape == (3, width)
+    assert len(calls) == 1
+    np.testing.assert_array_equal(
+        calls[0][0],
+        cells,
+    )
+    assert calls[0][1:] == (
+        2,
+        connectivity,
+        0,
+    )
+
+
+def test_adapter_rejects_unexpected_backend_shape(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        topology.healpix_geo_nested,
+        "neighbours",
+        lambda *args, **kwargs: np.empty(
+            (8, 2),
+            dtype=np.int64,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Unexpected shape",
+    ):
+        nested_neighbours(
+            np.array(
+                [0, 1],
+                dtype=np.uint64,
+            ),
+            2,
+        )
 
 
 @pytest.mark.parametrize("level", [0, 1, 3, 6])
@@ -166,7 +261,7 @@ def test_some_cells_have_seven_full_neighbours(level):
 
 
 def test_edge_selection_matches_healpy_documented_order():
-    """Lock the temporary healpy backend directional contract."""
+    """Compare the healpix-geo edge directions with the healpy reference."""
 
     import healpy as hp
 

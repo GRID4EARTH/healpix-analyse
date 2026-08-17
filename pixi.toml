@@ -18,7 +18,7 @@ healpy = ">=1.16"
 
 [pypi-dependencies]
 healpix-analyse= { path = ".", editable = true }
-# Validate against the shared upstream integration branch while developing PR #37.
+# Validate PR #37 and PR #42 against the shared upstream integration branch.
 # Keep pyproject.toml on the released dependency so normal installations are
 # not tied to an unreleased branch.
 healpix-geo = { git = "https://github.com/GRID4EARTH/healpix-geo.git", branch = "integration", subdirectory = "python/healpix-geo" }
