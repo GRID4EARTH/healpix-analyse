@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Changed
+- Connected-component topology now uses the direction-preserving
+  `healpix_geo.nested.neighbours` backend. A reproducible benchmark records
+  correctness checks, input dtype, threading mode and reference timings.
 - HEALPix-facing public APIs now take the Grid4Earth `level` directly and
   derive `nside = 2**level` internally. This applies to `HealPixConv`,
   `LargeConv`, `HealPixDown`, `HealPixUp`, `HEALPixSHT`, localized ALM

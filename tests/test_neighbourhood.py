@@ -12,16 +12,228 @@ where the Cartesian source operation is based on immediate/local pixels
 rather than on a prescribed physical radius.
 """
 
+import importlib
+
 import numpy as np
 import pytest
 from healpix_geo import nested
 
 from healpix_analyse._neighbourhood import (
+    build_metric_geometry_from_vectorized_ring,
+    build_metric_neighbourhood_geometry,
+    build_neighbourhoods,
     build_relative_geometry,
     build_ring_neighbourhoods,
+    metric_geometry_from_neighbourhoods,
     relative_geometry_from_neighbours,
     validate_ring,
 )
+
+
+def test_geod_thread_count_is_capped_at_eight(monkeypatch):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    monkeypatch.setattr(module, "_GEOD_PARALLEL_MIN_PAIRS", 1)
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 64)
+
+    assert module._geod_thread_count(1_000_000) == 8
+
+
+def test_cone_candidate_csr_uses_batched_api_with_at_most_eight_threads(
+    monkeypatch,
+):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    recorded = {}
+
+    def fake_many(centers, radius, depth, **kwargs):
+        recorded.update(
+            centers=centers,
+            radius=radius,
+            depth=depth,
+            kwargs=kwargs,
+        )
+        return (
+            np.array([0, 2, 3], dtype=np.uint64),
+            np.array([10, 11, 20], dtype=np.uint64),
+            np.full(3, depth, dtype=np.uint8),
+            np.zeros(3, dtype=bool),
+        )
+
+    def fail_scalar(*args, **kwargs):
+        raise AssertionError("scalar cone_coverage should not be called")
+
+    monkeypatch.setattr(module.nested, "cone_coverage_many", fake_many)
+    monkeypatch.setattr(module.nested, "cone_coverage", fail_scalar)
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 64)
+
+    offsets, candidates = module._cone_candidate_csr(
+        np.array([1.0, 2.0]),
+        np.array([3.0, 4.0]),
+        100.0,
+        20,
+        ellipsoid="WGS84",
+    )
+
+    np.testing.assert_array_equal(offsets, np.array([0, 2, 3]))
+    np.testing.assert_array_equal(candidates, np.array([10, 11, 20]))
+    np.testing.assert_array_equal(
+        recorded["centers"],
+        np.array([[1.0, 3.0], [2.0, 4.0]]),
+    )
+    assert recorded["depth"] == 20
+    assert recorded["kwargs"] == {
+        "ellipsoid": "WGS84",
+        "flat": True,
+        "num_threads": 8,
+    }
+
+
+def test_cone_candidate_csr_falls_back_to_scalar_api(monkeypatch):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    calls = []
+
+    def fake_scalar(center, radius, depth, **kwargs):
+        calls.append((center, radius, depth, kwargs))
+        first = int(center[0])
+        return (
+            np.array([first, first + 1], dtype=np.uint64),
+            np.full(2, depth, dtype=np.uint8),
+            np.zeros(2, dtype=bool),
+        )
+
+    monkeypatch.delattr(module.nested, "cone_coverage_many", raising=False)
+    monkeypatch.setattr(module.nested, "cone_coverage", fake_scalar)
+
+    offsets, candidates = module._cone_candidate_csr(
+        np.array([1.0, 3.0]),
+        np.array([2.0, 4.0]),
+        100.0,
+        20,
+        ellipsoid="WGS84",
+    )
+
+    np.testing.assert_array_equal(offsets, np.array([0, 2, 4]))
+    np.testing.assert_array_equal(candidates, np.array([1, 2, 3, 4]))
+    assert [call[0] for call in calls] == [(1.0, 2.0), (3.0, 4.0)]
+
+
+def test_parallel_wgs84_distance_is_bit_identical(monkeypatch):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    longitude = np.linspace(-179.0, 179.0, 257, dtype=np.float64)
+    latitude = np.linspace(-80.0, 80.0, 257, dtype=np.float64)
+
+    monkeypatch.setattr(module, "_GEOD_PARALLEL_MIN_PAIRS", 1_000_000)
+    serial = module._wgs84_distance(
+        longitude,
+        latitude,
+        longitude[::-1].copy(),
+        latitude[::-1].copy(),
+    )
+
+    monkeypatch.setattr(module, "_GEOD_PARALLEL_MIN_PAIRS", 1)
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 64)
+    parallel = module._wgs84_distance(
+        longitude,
+        latitude,
+        longitude[::-1].copy(),
+        latitude[::-1].copy(),
+    )
+
+    np.testing.assert_array_equal(parallel, serial)
+
+
+def test_fused_metric_geometry_matches_legacy_two_pass_pipeline():
+    refinement_level = 5
+    domain = build_ring_neighbourhoods(
+        np.array([1000], dtype=np.uint64),
+        refinement_level,
+        ring=2,
+        include_self=True,
+    )[0][::-1].copy()
+    radius_m = 500_000.0
+
+    neighbourhoods = build_neighbourhoods(
+        domain,
+        radius_m,
+        refinement_level,
+        neighbourhood="cell_center",
+        ellipsoid="WGS84",
+    )
+    legacy_neighbourhoods = [
+        neighbours[np.isin(neighbours, domain)]
+        for neighbours in neighbourhoods
+    ]
+    legacy = metric_geometry_from_neighbourhoods(
+        domain,
+        legacy_neighbourhoods,
+        refinement_level,
+    )
+
+    fused = build_metric_neighbourhood_geometry(
+        domain,
+        radius_m,
+        refinement_level,
+    )
+
+    legacy_counts = np.sum(legacy.valid_mask, axis=1)
+    legacy_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(legacy_counts))
+    )
+    np.testing.assert_array_equal(fused.center_ids, legacy.center_ids)
+    np.testing.assert_array_equal(
+        fused.center_ids[fused.neighbour_indices],
+        legacy.neighbour_ids[legacy.valid_mask],
+    )
+    np.testing.assert_array_equal(fused.row_offsets, legacy_offsets)
+    np.testing.assert_array_equal(
+        fused.distance_m,
+        legacy.distance_m[legacy.valid_mask],
+    )
+
+
+def test_vectorized_ring_geometry_matches_cone_geometry_when_ring_covers():
+    refinement_level = 5
+    domain = build_ring_neighbourhoods(
+        np.array([1000], dtype=np.uint64),
+        refinement_level,
+        ring=2,
+        include_self=True,
+    )[0][::-1].copy()
+    radius_m = 500_000.0
+
+    cone = build_metric_neighbourhood_geometry(
+        domain,
+        radius_m,
+        refinement_level,
+    )
+    vectorized = build_metric_geometry_from_vectorized_ring(
+        domain,
+        radius_m,
+        refinement_level,
+        ring=6,
+        num_threads=2,
+        max_candidate_pairs=150,
+    )
+
+    for row in range(domain.size):
+        cone_slice = slice(cone.row_offsets[row], cone.row_offsets[row + 1])
+        vectorized_slice = slice(
+            vectorized.row_offsets[row],
+            vectorized.row_offsets[row + 1],
+        )
+        cone_ids = domain[cone.neighbour_indices[cone_slice]]
+        vectorized_ids = domain[
+            vectorized.neighbour_indices[vectorized_slice]
+        ]
+        cone_order = np.argsort(cone_ids)
+        vectorized_order = np.argsort(vectorized_ids)
+        np.testing.assert_array_equal(
+            cone_ids[cone_order],
+            vectorized_ids[vectorized_order],
+        )
+        np.testing.assert_array_equal(
+            cone.distance_m[cone_slice][cone_order],
+            vectorized.distance_m[vectorized_slice][vectorized_order],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -770,4 +982,3 @@ def test_relative_geometry_rejects_non_wgs84_for_now():
             refinement_level=3,
             ellipsoid="GRS80",
         )
-

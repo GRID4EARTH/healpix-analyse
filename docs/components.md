@@ -291,21 +291,18 @@ For Torch input, outputs are returned on the original device.
 Connected-component operations are discrete and are therefore not
 differentiable.
 
-## Temporary topology backend
+## Topology backend
 
 Immediate HEALPix topology is currently obtained through a private
 `healpix_analyse._topology` helper.
 
-That helper temporarily uses:
+That helper uses the direction-preserving API:
 
 ```python
-healpy.get_all_neighbours(..., nest=True)
+healpix_geo.nested.neighbours(...)
 ```
 
-`healpy` is intentionally a temporary compatibility backend and is not
-intended to become the permanent topology implementation.
-
-The planned final architecture is:
+The topology architecture is:
 
 ```text
 healpix-analyse
@@ -320,6 +317,24 @@ healpix-geo
 CDSHEALPix
 ```
 
-Once direction-aware neighbour access is exposed by `healpix-geo`, the
-private backend can be replaced without changing the public
-connected-component API.
+The private adapter preserves the connected-component topology contract while
+`healpix-geo` provides deterministic directional positions and the `-1`
+sentinel for missing positions. The public connected-component API is
+unchanged.
+
+## Topology performance
+
+The `healpix-geo` backend reduces the cost of immediate-neighbour lookup for
+large arrays. At depth 12 in the checked-in reference benchmark, the new
+adapter is faster than the previous `healpy` adapter from 10,000 cells onward,
+with the largest gains observed for one million cells.
+
+These timings are machine-dependent reference measurements, not a performance
+guarantee. The adapter uses `num_threads=0`, so `healpix-geo` may select its
+automatic parallel path for sufficiently large inputs. The benchmark therefore
+also reports a one-thread backend measurement to make the contribution from
+parallel execution visible.
+
+The executable benchmark, measurement procedure, exact environment, input
+dtype and reference results are maintained in the repository's
+[`benchmarks` directory](https://github.com/GRID4EARTH/healpix-analyse/tree/main/benchmarks).

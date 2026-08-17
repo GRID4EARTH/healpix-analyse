@@ -5,15 +5,10 @@ This module contains immediate-neighbour topology used internally by
 
 Only NESTED HEALPix indexing is currently supported.
 
-Temporary backend
------------------
-The current implementation uses ``healpy.get_all_neighbours`` as a
-temporary compatibility backend.
-
-This dependency is deliberately isolated in this private module. Once
-``healpix-geo`` exposes direction-aware neighbours from its CDSHEALPix
-backend, this implementation can be replaced without changing the
-public ``healpix-analyse`` API.
+Backend
+-------
+Immediate topology is provided by the direction-preserving neighbour API
+in ``healpix-geo``, backed by CDSHEALPix.
 """
 
 from __future__ import annotations
@@ -21,6 +16,7 @@ from __future__ import annotations
 from typing import Literal
 
 import numpy as np
+from healpix_geo import nested as healpix_geo_nested
 from numpy.typing import ArrayLike, NDArray
 
 
@@ -38,7 +34,8 @@ Connectivity = Literal[
 # HEALPix directional convention
 # ---------------------------------------------------------------------------
 #
-# healpy.get_all_neighbours(..., nest=True) returns directions in this order:
+# healpix_geo.nested.neighbours(..., connectivity="edge_or_vertex") returns
+# directions in this order:
 #
 #     0: SW
 #     1: W
@@ -68,14 +65,6 @@ Connectivity = Literal[
 #
 # This provides the HEALPix analogues of Cartesian 4-connectivity and
 # 8-connectivity respectively.
-# ---------------------------------------------------------------------------
-
-_EDGE_INDICES = np.asarray(
-    [0, 2, 4, 6],
-    dtype=np.intp,
-)
-
-
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
@@ -155,74 +144,6 @@ def _npix(
     nside = 1 << refinement_level
 
     return 12 * nside * nside
-
-
-# ---------------------------------------------------------------------------
-# Temporary healpy backend
-# ---------------------------------------------------------------------------
-
-
-def _healpy_all_neighbours(
-    cells: NDArray[np.uint64],
-    refinement_level: int,
-) -> NDArray[np.int64]:
-    """Return the eight directional NESTED neighbour positions.
-
-    Notes
-    -----
-    ``healpy`` is intentionally only a temporary backend.
-
-    Once direction-aware neighbour access is exposed by ``healpix-geo``,
-    this function should be replaced by that implementation.
-    """
-
-    try:
-        import healpy as hp
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "HEALPix topology currently requires healpy as a temporary "
-            "compatibility backend. This dependency is intended to be "
-            "removed once direction-aware neighbours are exposed by "
-            "healpix-geo."
-        ) from exc
-
-    nside = 1 << refinement_level
-
-    # healpy's compiled neighbour ufunc expects signed integer pixel ids.
-    healpy_cells = cells.astype(
-        np.int64,
-        copy=False,
-    )
-
-    neighbours = np.asarray(
-        hp.get_all_neighbours(
-            nside,
-            healpy_cells,
-            nest=True,
-        ),
-        dtype=np.int64,
-    )
-
-    # healpy normally returns shape (8, N) for vector input and (8,) for
-    # scalar input. Normalize defensively to the vector representation.
-    if neighbours.ndim == 1:
-        neighbours = neighbours.reshape(
-            8,
-            1,
-        )
-
-    expected_shape = (
-        8,
-        cells.size,
-    )
-
-    if neighbours.shape != expected_shape:
-        raise RuntimeError(
-            "Unexpected shape returned by healpy.get_all_neighbours: "
-            f"{neighbours.shape}; expected {expected_shape}"
-        )
-
-    return neighbours
 
 
 # ---------------------------------------------------------------------------
@@ -321,18 +242,37 @@ def nested_neighbours(
             f"[0, {npix}) for refinement_level={refinement_level}"
         )
 
-    neighbours = _healpy_all_neighbours(
-        cells,
-        refinement_level,
+    neighbours = np.asarray(
+        healpix_geo_nested.neighbours(
+            cells,
+            refinement_level,
+            connectivity=connectivity,
+            num_threads=0,
+        ),
+        dtype=np.int64,
     )
 
-    if connectivity == "edge":
-        neighbours = neighbours[
-            _EDGE_INDICES
-        ]
+    width = (
+        4
+        if connectivity == "edge"
+        else 8
+    )
 
-    # Internal convention: one row per input HEALPix cell.
-    return neighbours.T.copy()
+    expected_shape = (
+        cells.size,
+        width,
+    )
+
+    if neighbours.shape != expected_shape:
+        raise RuntimeError(
+            "Unexpected shape returned by healpix_geo.nested.neighbours: "
+            f"{neighbours.shape}; expected {expected_shape}"
+        )
+
+    return np.ascontiguousarray(
+        neighbours,
+        dtype=np.int64,
+    )
 
 
 def nested_edge_neighbours(
@@ -347,11 +287,8 @@ def nested_edge_neighbours(
 
     Notes
     -----
-    This helper is private.
-
-    Its current healpy implementation is temporary and will eventually
-    be replaced by the corresponding ``healpix-geo`` / CDSHEALPix
-    topology primitive.
+    This helper is private. Immediate topology is provided by
+    ``healpix-geo`` / CDSHEALPix.
     """
 
     return nested_neighbours(
