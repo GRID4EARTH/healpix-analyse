@@ -737,55 +737,25 @@ def _cone_candidate_csr(
     *,
     ellipsoid: str,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return cone candidates for many centres in CSR form.
+    """Return compact candidates using the native batched GEO API.
 
-    Newer ``healpix-geo`` versions expose ``cone_coverage_many`` and avoid one
-    Python-to-extension call per centre.  Retain the scalar construction as a
-    compatibility fallback until that API is available in a released version.
+    Batched coverage is required: silently falling back to one scalar query
+    per cell would regress cold and uncached-repeat filtering performance.
     """
-    center_lon = np.asarray(longitude, dtype=np.float64)
-    center_lat = np.asarray(latitude, dtype=np.float64)
+    centers = np.column_stack((longitude, latitude)).astype(np.float64, copy=False)
     radius_degrees = np.rad2deg(radius / _WGS84_AUTHALIC_RADIUS_M)
-    cone_coverage_many = getattr(nested, "cone_coverage_many", None)
-
-    if cone_coverage_many is not None:
-        centers = np.column_stack((center_lon, center_lat))
-        offsets, cell_ids, _, _ = cone_coverage_many(
-            centers,
-            radius_degrees,
-            refinement_level,
-            ellipsoid=ellipsoid,
-            flat=True,
-            num_threads=min(_GEOD_MAX_THREADS, os.cpu_count() or 1),
-        )
-        return (
-            np.asarray(offsets, dtype=np.int64),
-            np.asarray(cell_ids, dtype=np.uint64),
-        )
-
-    candidates = [
-        _cone_candidates(
-            (float(lon), float(lat)),
-            radius,
-            refinement_level,
-            ellipsoid=ellipsoid,
-        )
-        for lon, lat in zip(center_lon, center_lat, strict=True)
-    ]
-    candidate_counts = np.fromiter(
-        (candidate.size for candidate in candidates),
-        dtype=np.int64,
-        count=center_lon.size,
+    cells, _, _ = nested.cone_coverage(
+        centers,
+        radius_degrees,
+        refinement_level,
+        ellipsoid=ellipsoid,
+        flat=True,
+        num_threads=min(_GEOD_MAX_THREADS, os.cpu_count() or 1),
     )
-    offsets = np.concatenate(
-        (np.zeros(1, dtype=np.int64), np.cumsum(candidate_counts))
+    return (
+        np.asarray(cells.offsets, dtype=np.int64),
+        np.asarray(cells.data, dtype=np.uint64),
     )
-    flat_candidates = (
-        np.concatenate(candidates)
-        if candidates and offsets[-1]
-        else np.empty(0, dtype=np.uint64)
-    )
-    return offsets, flat_candidates
 
 
 def _filter_by_cell_center_distance(
