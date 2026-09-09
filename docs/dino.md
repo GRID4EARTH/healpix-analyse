@@ -44,12 +44,42 @@ imagery cannot be expected to see through that.
 *The same synthetic scene at 52.3 N -- concentric rings plus a north-south /
 east-west cross. Left: `nested`. Right: `tangent`.*
 
-The price: it is an interpolation (bilinear by default), so the reordering is
-no longer exact and the tokens no longer coincide with HEALPix cells.
-`patch_lon` / `patch_lat` give their true positions and `patch_cell_id` the
-cell each falls in. The square grid also overruns the diamond-shaped block, so
-tiles at the edge of the domain never reach `coverage == 1`; interior tiles do,
-by drawing on the neighbouring cells.
+The image is sized to contain the whole cell, which is a parallelogram, so it
+is rectangular and a little larger than the cell: a 256-px nested block at
+52.3 N needs a 448 x 320 tangent image.
+
+**The output still tiles the sphere exactly.** The tokens sit on a square
+metric grid while the cells are parallelograms, so assigning each token to the
+cell it falls in would give some cells two tokens and others none -- a moire of
+holes on a map. The module goes the other way: it enumerates the cells of the
+token level inside each tile (they tile it exactly, by construction) and reads
+the token field at their positions. Every cell carries exactly one embedding,
+`patch_cell_id` is the complete set of children of the tiles, and
+`patch_lon` / `patch_lat` are the cell centres.
+
+The price: two resamplings (data to the tangent grid, tokens back to the
+cells), so nothing is exact any more. Tiles at the edge of the domain do not
+reach `coverage == 1`, since the rectangle draws on neighbouring cells that are
+missing there; interior tiles do.
+
+### `projection="percell"`
+
+One tangent plane **per output cell**. For every cell of `parent_level` a
+north-up image of `context_px` pixels is built, tangent at that cell's centre,
+and the embedding is the patch token holding the centre (`pooling="cls"` for
+the whole window instead). The window is centred exactly on the cell, in the
+cell's own frame, so nothing is interleaved and nothing is resampled back: this
+is the exact sliding window. `level - parent_level >= 4` no longer applies --
+the cell may be finer than a patch.
+
+`parent_level` is the output level here: one embedding per cell of that level,
+which is the original contract of the function.
+
+The cost is one forward pass per cell instead of one per tile -- for a
+4-million-cell scene with cells at `level - 3` that is 65 536 passes against 64,
+three orders of magnitude. Use `out_cells` to run it on a small area, compare
+against `projection="tangent"` with `over_sample`, and keep the cheap one for
+production if the difference does not matter for your task.
 
 ### `projection="nested"`
 

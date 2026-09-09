@@ -376,8 +376,8 @@ def tangent_grid_lonlat(
     ----------
     centre_lon, centre_lat : array [M]
         Tangent points, in degrees.
-    size : int
-        Side of the square grid, in pixels.
+    size : int or (int, int)
+        Side of the grid in pixels; a pair gives (rows, columns).
     gsd_rad : float
         Pixel spacing in tangent units (ground sampling / Earth radius).
     shift : (float, float)
@@ -386,15 +386,14 @@ def tangent_grid_lonlat(
 
     Returns
     -------
-    lon, lat : array [M, size, size]
+    lon, lat : array [M, rows, cols]
         Row 0 is the northernmost, column 0 the westernmost: the images are
         north-up and east-right, whatever the HEALPix face.
     """
-    c = (size - 1) / 2.0
-    idx = np.arange(size, dtype=np.float64)
-    xi = (idx - c + shift[1]) * gsd_rad                               # east, columns
-    eta = (c - idx + shift[0]) * gsd_rad                              # north, rows
-    ETA, XI = np.meshgrid(eta, xi, indexing="ij")                     # [size, size]
+    rows, cols = (size, size) if np.isscalar(size) else (int(size[0]), int(size[1]))
+    xi = (np.arange(cols, dtype=np.float64) - (cols - 1) / 2.0 + shift[1]) * gsd_rad
+    eta = ((rows - 1) / 2.0 - np.arange(rows, dtype=np.float64) + shift[0]) * gsd_rad
+    ETA, XI = np.meshgrid(eta, xi, indexing="ij")                     # [rows, cols]
     return offsets_to_lonlat(centre_lon, centre_lat, XI, ETA)
 
 
@@ -426,6 +425,66 @@ def offsets_to_lonlat(
     north = north.reshape(north.shape[0], *extra, 3)
     d = v0 + np.asarray(xi)[None, ..., None] * east + np.asarray(eta)[None, ..., None] * north
     return _vec_to_lonlat(d)
+
+
+def lonlat_to_offsets(
+    centre_lon: np.ndarray,
+    centre_lat: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Inverse of :func:`offsets_to_lonlat`: lon/lat to gnomonic offsets.
+
+    ``centre_*`` has shape ``[M]`` and ``lon`` / ``lat`` shape ``[M, ...]``;
+    the returned ``xi`` (east) and ``eta`` (north) have the shape of ``lon``.
+    """
+    centre_lon = np.atleast_1d(np.asarray(centre_lon, dtype=np.float64))
+    centre_lat = np.atleast_1d(np.asarray(centre_lat, dtype=np.float64))
+    v0 = _lonlat_to_vec(centre_lon, centre_lat)
+    east = np.stack([-v0[:, 1], v0[:, 0], np.zeros_like(v0[:, 0])], axis=1)
+    small = np.linalg.norm(east, axis=1) < 1e-12
+    east[small] = np.array([1.0, 0.0, 0.0])
+    east /= np.linalg.norm(east, axis=1, keepdims=True)
+    north = np.cross(v0, east)
+    north /= np.linalg.norm(north, axis=1, keepdims=True)
+
+    d = _lonlat_to_vec(np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64))
+    extra = (1,) * (d.ndim - 2)
+    v0 = v0.reshape(v0.shape[0], *extra, 3)
+    east = east.reshape(east.shape[0], *extra, 3)
+    north = north.reshape(north.shape[0], *extra, 3)
+    denom = (d * v0).sum(-1)
+    return (d * east).sum(-1) / denom, (d * north).sum(-1) / denom
+
+
+def parent_cover_px(
+    centre_ids: np.ndarray,
+    parent_level: int,
+    gsd_m: float,
+    *,
+    margin_px: int = 8,
+    radius: float = EARTH_RADIUS_M,
+) -> Tuple[int, int]:
+    """
+    Size (rows, columns) of the smallest tangent image covering every parent cell.
+
+    A HEALPix cell is a parallelogram, not a square, so a north-up image that
+    must contain it entirely is larger than the cell -- and rectangular.  Both
+    sides are rounded up to a multiple of the DINOv3 patch.
+    """
+    import healpy as hp
+
+    nside = 2 ** int(parent_level)
+    clon, clat = hp.pix2ang(nside, centre_ids, nest=True, lonlat=True)
+    corners = hp.boundaries(nside, centre_ids, step=4, nest=True)      # [M, 3, 16]
+    blon, blat = _vec_to_lonlat(np.transpose(corners, (0, 2, 1)))      # [M, 16]
+    xi, eta = lonlat_to_offsets(clon, clat, blon, blat)
+    px = gsd_m / radius
+    w = 2 * np.abs(xi).max() / px + margin_px
+    h = 2 * np.abs(eta).max() / px + margin_px
+    up = lambda v: int(DINOV3_PATCH * np.ceil(v / DINOV3_PATCH))
+    return up(h), up(w)
 
 
 def sample_healpix(
@@ -489,7 +548,7 @@ def tangent_tiles(
     level: int,
     parent_level: int,
     *,
-    tile_px: Optional[int] = None,
+    tile_px: Optional[Union[int, Tuple[int, int]]] = None,
     gsd_m: Optional[float] = None,
     shift: Tuple[float, float] = (0.0, 0.0),
     interpolation: str = "bilinear",
@@ -527,12 +586,17 @@ def tangent_tiles(
     if k < DINOV3_PATCH_LEVELS:
         raise ValueError(
             f"level - parent_level must be >= {DINOV3_PATCH_LEVELS}, got {k}")
-    S = int(tile_px) if tile_px is not None else (1 << k)
     gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level, radius)
-
     centre_ids = np.unique(ids >> (2 * k))
+    if tile_px is None:
+        H, W = parent_cover_px(centre_ids, parent_level, gsd, radius=radius)
+    elif np.isscalar(tile_px):
+        H = W = int(tile_px)
+    else:
+        H, W = (int(v) for v in tile_px)
+
     clon, clat = hp.pix2ang(2 ** int(parent_level), centre_ids, nest=True, lonlat=True)
-    lon, lat = tangent_grid_lonlat(clon, clat, S, gsd / radius, shift=shift, radius=radius)
+    lon, lat = tangent_grid_lonlat(clon, clat, (H, W), gsd / radius, shift=shift, radius=radius)
 
     vals, valid = sample_healpix(d, ids, level, lon, lat, interpolation=interpolation)
     M, C = centre_ids.size, d.shape[1]
@@ -541,7 +605,7 @@ def tangent_tiles(
     if fill == "mean":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
-            m = np.nanmean(vals.reshape(M, S * S, C), axis=1)
+            m = np.nanmean(vals.reshape(M, H * W, C), axis=1)
         m = np.where(np.isfinite(m), m, 0.0).astype(np.float32)
         bad = ~np.isfinite(vals)
         vals = np.where(bad, np.broadcast_to(m[:, None, None, :], vals.shape), vals)
@@ -661,6 +725,92 @@ class DINOEmbedding:
     tile_px: Optional[int] = None
 
 
+def _percell_embeddings(
+    d: np.ndarray,
+    ids: np.ndarray,
+    level: int,
+    out_cells: np.ndarray,
+    *,
+    token_level: int,
+    context_px: int,
+    gsd: float,
+    interpolation: str,
+    fill: str,
+    model: nn.Module,
+    mean: Sequence[float],
+    std: Sequence[float],
+    pooling: str,
+    batch_size: int,
+    dev: torch.device,
+    autocast: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    One tangent plane, and one embedding, per output cell.
+
+    For every cell of ``token_level`` a north-up image of ``context_px`` pixels
+    is built, tangent at that cell's centre, and passed through the backbone.
+    Nothing is interleaved and nothing is resampled back: the window is centred
+    exactly on the cell, in the cell's own frame.  The cost is one forward pass
+    per cell, against one per tile for the sliding-window mode -- three orders
+    of magnitude more on a typical scene -- so this is the reference to
+    validate against on a small area, not the production path.
+
+    Returns
+    -------
+    emb : float32 [Ncell, D]
+    coverage : float [Ncell]
+    """
+    import healpy as hp
+
+    lon0, lat0 = hp.pix2ang(2 ** int(token_level), out_cells, nest=True, lonlat=True)
+    mean_t = torch.tensor(mean, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
+    std_t = torch.tensor(std, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
+    use_ac = autocast and dev.type == "cuda"
+    g = context_px // DINOV3_PATCH                       # tokens per axis
+    centre_token = (g // 2) * g + (g // 2)               # patch holding the centre
+
+    out, cov = [], []
+    with torch.inference_mode():
+        for i in range(0, out_cells.size, batch_size):
+            lo, la = lon0[i:i + batch_size], lat0[i:i + batch_size]
+            lon, lat = tangent_grid_lonlat(lo, la, context_px, gsd / EARTH_RADIUS_M)
+            vals, valid = sample_healpix(d, ids, level, lon, lat,
+                                         interpolation=interpolation)
+            b, C = vals.shape[0], vals.shape[-1]
+            cov.append(valid.reshape(b, -1).mean(axis=1))
+            if fill == "mean":
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    m = np.nanmean(vals.reshape(b, -1, C), axis=1)
+                m = np.where(np.isfinite(m), m, 0.0).astype(np.float32)
+                vals = np.where(~np.isfinite(vals),
+                                np.broadcast_to(m[:, None, None, :], vals.shape), vals)
+            else:
+                vals = np.nan_to_num(vals, nan=0.0)
+
+            x = torch.from_numpy(np.ascontiguousarray(
+                np.transpose(vals, (0, 3, 1, 2)))).to(dev)
+            x = (x - mean_t) / std_t
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_ac):
+                cls, patches = _forward(model, x)
+            cls, patches = cls.float(), patches.float()
+            if pooling == "centre":
+                v = patches[:, centre_token]
+            elif pooling == "cls":
+                v = cls
+            elif pooling == "mean":
+                v = patches.mean(dim=1)
+            elif pooling == "cls+mean":
+                v = torch.cat([cls, patches.mean(dim=1)], dim=1)
+            else:
+                raise ValueError("pooling must be 'centre', 'cls', 'mean' or 'cls+mean'")
+            out.append(v.cpu().numpy())
+
+    if not out:
+        return np.zeros((0, 0), np.float32), np.zeros((0,), np.float32)
+    return np.concatenate(out).astype(np.float32), np.concatenate(cov)
+
+
 def GetDINOV3SAT(
     data: ArrayLike,
     cell_id: ArrayLike,
@@ -669,6 +819,8 @@ def GetDINOV3SAT(
     *,
     projection: str = "tangent",
     over_sample: int = 1,
+    context_px: int = 224,
+    out_cells: Optional[ArrayLike] = None,
     gsd_m: Optional[float] = None,
     tile_px: Optional[int] = None,
     interpolation: str = "bilinear",
@@ -701,10 +853,31 @@ def GetDINOV3SAT(
         two NESTED axes measure 10.6 m and 16.7 m with a 60.5 deg angle between
         them, so the "square" of the ``nested`` mode is really a parallelogram
         stretched by a factor 2.  A network trained on map-projected imagery
-        cannot be expected to see through that.  The price is a resampling
-        (bilinear by default) and tokens that no longer coincide exactly with
-        HEALPix cells -- ``patch_lon`` / ``patch_lat`` give their true
-        positions, ``patch_cell_id`` the cell each one falls in.
+        cannot be expected to see through that.  The image is sized to contain
+        the whole (parallelogram-shaped) cell, so it is rectangular and a
+        little larger than the cell.
+
+        The tokens sit on a square metric grid while the cells are
+        parallelograms, so the output is *not* built by assigning each token to
+        the cell it falls in -- that would leave some cells with two tokens and
+        others with none, a moire of holes on a map.  Instead the cells of the
+        token level inside each tile are enumerated and the token field is read
+        at their positions: every cell carries exactly one embedding, and the
+        output tiles the sphere without holes.  ``patch_lon`` / ``patch_lat``
+        are then the cell centres.  The price is a resampling, twice.
+
+    ``projection="percell"``
+        One tangent plane **per output cell**: for every cell of
+        ``parent_level`` a north-up image of ``context_px`` pixels is built,
+        tangent at that cell's centre, and the embedding is the patch token
+        holding the centre (or ``pooling="cls"`` for the whole window).  The
+        window is centred exactly on the cell, in the cell's own frame, so
+        nothing is interleaved and nothing is resampled back -- this is the
+        exact sliding window, and ``level - parent_level >= 4`` no longer
+        applies since the cell may be finer than a patch.  It costs one forward
+        pass per cell instead of one per tile, three orders of magnitude more on
+        a typical scene, so it is the reference to validate on a small area
+        (``out_cells``) rather than the production path.
 
     ``projection="nested"``
         The historical mode: the NESTED block is reshaped into an image, which
@@ -727,6 +900,13 @@ def GetDINOV3SAT(
         (256 px tiles, 16x16 patch tokens) is the natural choice.
     projection : {"tangent", "nested"}
         See above.
+    context_px : int
+        Side of the window in ``percell`` mode; a multiple of 16.  224 matches
+        the DINOv3 training size; smaller is cheaper but gives less context.
+    out_cells : int array, optional
+        Restrict ``percell`` mode to these cells instead of every cell of
+        ``parent_level`` present in the data.  The way to try it on a small
+        area before paying for the whole scene.
     over_sample : int
         Sliding-window factor, a power of two.  ``1`` (default) runs the
         patches side by side, exactly as the network does.  ``n`` runs the
@@ -736,8 +916,11 @@ def GetDINOV3SAT(
     gsd_m : float, optional
         Ground sampling of the tangent grid, in metres.  Defaults to the
         HEALPix native value ``sqrt(cell area)`` at ``level``.
-    tile_px : int, optional
-        Side of the images.  Defaults to ``2**(level - parent_level)``.
+    tile_px : int or (int, int), optional
+        Size of the images, ``(rows, columns)``.  In tangent mode the default
+        is the smallest multiple of 16 containing every parent cell (see
+        :func:`parent_cover_px`); in nested mode it is
+        ``2**(level - parent_level)``.
     interpolation : {"bilinear", "nearest"}
         Resampling onto the tangent grid.
     model : nn.Module, optional
@@ -749,9 +932,11 @@ def GetDINOV3SAT(
         Indices of the (R, G, B) bands in ``data`` -- Sentinel-2 B04, B03, B02.
     mean, std : sequence of 3 float
         Normalisation constants (SAT-493M defaults).
-    pooling : {"cls", "mean", "cls+mean"}
+    pooling : {"cls", "mean", "cls+mean", "centre"}
         Tile vector: CLS token, mean of the patch tokens, or their
-        concatenation (``2 * Ndino``).
+        concatenation (``2 * Ndino``).  In ``percell`` mode the default is the
+        patch token holding the cell centre (``"centre"``), which is what
+        describes the cell itself rather than its whole window.
     return_patches : bool
         Also return the patch tokens.
     min_coverage : float
@@ -771,10 +956,14 @@ def GetDINOV3SAT(
     DINOEmbedding
     """
     k = int(level) - int(parent_level)
-    if k < DINOV3_PATCH_LEVELS:
+    if k < 1:
+        raise ValueError("parent_level must be coarser than level")
+    if k < DINOV3_PATCH_LEVELS and projection != "percell":
         raise ValueError(
             f"level - parent_level must be >= {DINOV3_PATCH_LEVELS} "
-            f"(one DINOv3 patch = {DINOV3_PATCH} px), got {k}"
+            f"(one DINOv3 patch = {DINOV3_PATCH} px), got {k}. "
+            "projection='percell' has no such constraint: it centres a window "
+            "on every cell instead of tiling."
         )
     if len(bands) != 3:
         raise ValueError("DINOv3 SAT expects 3 bands (R, G, B)")
@@ -785,30 +974,71 @@ def GetDINOV3SAT(
         raise ValueError("over_sample must be a power of two (1, 2, 4, ...)")
     if n > DINOV3_PATCH:
         raise ValueError(f"over_sample must be <= {DINOV3_PATCH}")
-    if projection not in ("tangent", "nested"):
-        raise ValueError("projection must be 'tangent' or 'nested'")
+    if projection not in ("tangent", "nested", "percell"):
+        raise ValueError("projection must be 'tangent', 'nested' or 'percell'")
 
     d = _as_numpy(data)
     if d.ndim == 1:
         d = d[:, None]
     d = d[:, list(bands)]
     ids = _as_numpy(cell_id).astype(np.int64)
+    d, ids = _deduplicate(d, ids, duplicates)
+
+    # ---- one tangent plane per output cell --------------------------------
+    if projection == "percell":
+        if context_px % DINOV3_PATCH:
+            raise ValueError(f"context_px must be a multiple of {DINOV3_PATCH}")
+        gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level)
+        tl = int(parent_level)                      # the output level, one embedding each
+        cells = (np.unique(ids >> (2 * k)) if out_cells is None
+                 else np.unique(_as_numpy(out_cells).astype(np.int64)))
+
+        if model is None:
+            model = load_dinov3_sat(model_name, weights, device=device)
+        dev = next(model.parameters()).device if device is None else torch.device(device)
+        model = model.to(dev).eval()
+
+        emb, cov = _percell_embeddings(
+            d, ids, level, cells, token_level=tl, context_px=context_px, gsd=gsd,
+            interpolation=interpolation, fill=fill, model=model, mean=mean, std=std,
+            pooling=("centre" if pooling == "cls" else pooling),
+            batch_size=batch_size, dev=dev, autocast=autocast,
+        )
+        keep = cov >= float(min_coverage)
+        res = DINOEmbedding(
+            embedding=emb[keep], cell_id=cells[keep], parent_level=tl,
+            coverage=cov[keep], projection="percell", over_sample=1,
+            gsd_m=gsd, tile_px=(context_px, context_px),
+        )
+        # the same field is exposed through the patch_* names so that code
+        # written for the tiled modes keeps working unchanged
+        res.patch_embedding, res.patch_cell_id, res.patch_level = (
+            res.embedding, res.cell_id, tl)
+        import healpy as hp
+        res.patch_lon, res.patch_lat = hp.pix2ang(
+            2 ** tl, res.cell_id, nest=True, lonlat=True)
+        return res
 
     step = DINOV3_PATCH // n                       # window stride, in pixels
-    S = int(tile_px) if tile_px is not None else (1 << k)
-    if S % DINOV3_PATCH:
-        raise ValueError(f"tile_px must be a multiple of {DINOV3_PATCH}")
-
-    # ---- build the images ------------------------------------------------
     shifts = [(a * step, b * step) for a in range(n) for b in range(n)]
 
+    # ---- build the images ------------------------------------------------
     if projection == "tangent":
         gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level)
-        base = tangent_tiles(
-            d, ids, level, parent_level, tile_px=S, gsd_m=gsd,
+        all_centres = np.unique(ids >> (2 * k))
+        if tile_px is None:
+            H, W = parent_cover_px(all_centres, parent_level, gsd)
+        elif np.isscalar(tile_px):
+            H = W = int(tile_px)
+        else:
+            H, W = (int(v) for v in tile_px)
+        if H % DINOV3_PATCH or W % DINOV3_PATCH:
+            raise ValueError(f"tile_px must be a multiple of {DINOV3_PATCH}")
+
+        tiles0, centre_ids, _valid, coverage, _lon, _lat = tangent_tiles(
+            d, ids, level, parent_level, tile_px=(H, W), gsd_m=gsd,
             interpolation=interpolation, fill=fill, duplicates=duplicates,
         )
-        tiles0, centre_ids, _valid, coverage, _lon, _lat = base
         keep = coverage >= float(min_coverage)
         centre_ids, coverage = centre_ids[keep], coverage[keep]
         views = []
@@ -816,23 +1046,26 @@ def GetDINOV3SAT(
             if sh == (0.0, 0.0):
                 views.append(tiles0[keep])
             else:
-                t = tangent_tiles(
-                    d, ids, level, parent_level, tile_px=S, gsd_m=gsd, shift=sh,
+                views.append(tangent_tiles(
+                    d, ids, level, parent_level, tile_px=(H, W), gsd_m=gsd, shift=sh,
                     interpolation=interpolation, fill=fill, duplicates=duplicates,
-                )[0]
-                views.append(t[keep])
-        n_tok = S // DINOV3_PATCH                  # tokens per axis and per pass
+                )[0][keep])
+        tok_h, tok_w = H // DINOV3_PATCH, W // DINOV3_PATCH
     else:
+        S = int(tile_px) if tile_px is not None else (1 << k)
+        if S % DINOV3_PATCH:
+            raise ValueError(f"tile_px must be a multiple of {DINOV3_PATCH}")
         tiles0, centre_ids, _valid, coverage = nested_to_tiles(
             d, ids, level, parent_level, fill=fill, duplicates=duplicates
         )
         keep = coverage >= float(min_coverage)
         tiles0, centre_ids, coverage = tiles0[keep], centre_ids[keep], coverage[keep]
-        n_tok = S // DINOV3_PATCH - (1 if n > 1 else 0)
+        tok_h = tok_w = S // DINOV3_PATCH - (1 if n > 1 else 0)
         views = []
         for (dy, dx) in shifts:
-            w = DINOV3_PATCH * n_tok
-            views.append(np.ascontiguousarray(tiles0[:, :, dy:dy + w, dx:dx + w]))
+            h, w = DINOV3_PATCH * tok_h, DINOV3_PATCH * tok_w
+            views.append(np.ascontiguousarray(tiles0[:, :, dy:dy + h, dx:dx + w]))
+        H, W = S, S
 
     M = views[0].shape[0]
 
@@ -847,7 +1080,7 @@ def GetDINOV3SAT(
     use_ac = autocast and dev.type == "cuda"
 
     cls_sum, D = None, 0
-    tok = None                                     # [M, n*n_tok, n*n_tok, D]
+    tok = None                                     # [M, n*tok_h, n*tok_w, D]
     with torch.inference_mode():
         for v, (a, b) in zip(views, [(a, b) for a in range(n) for b in range(n)]):
             cls_out, patch_out = [], []
@@ -872,15 +1105,15 @@ def GetDINOV3SAT(
             cls_sum = c if cls_sum is None else cls_sum + c
             if return_patches and patch_out:
                 pt = torch.cat(patch_out).numpy()
-                if pt.shape[1] != n_tok * n_tok:
+                if pt.shape[1] != tok_h * tok_w:
                     raise RuntimeError(
-                        f"got {pt.shape[1]} patch tokens for a {n_tok}x{n_tok} grid; "
+                        f"got {pt.shape[1]} patch tokens for a {tok_h}x{tok_w} grid; "
                         "is the model patch size 16?"
                     )
                 D = pt.shape[-1]
                 if tok is None:
-                    tok = np.zeros((M, n_tok * n, n_tok * n, D), np.float32)
-                tok[:, a::n, b::n] = pt.reshape(M, n_tok, n_tok, D)
+                    tok = np.zeros((M, tok_h * n, tok_w * n, D), np.float32)
+                tok[:, a::n, b::n] = pt.reshape(M, tok_h, tok_w, D)
 
     embedding = (cls_sum / len(views)) if cls_sum is not None else np.zeros((0, 0), np.float32)
 
@@ -892,38 +1125,68 @@ def GetDINOV3SAT(
         projection=projection,
         over_sample=n,
         gsd_m=(gsd if projection == "tangent" else None),
-        tile_px=S,
+        tile_px=(H, W),
     )
     if not return_patches:
         return res
 
-    F = n_tok * n                                  # token grid side
     token_level = int(level) - DINOV3_PATCH_LEVELS + int(np.log2(n))
     res.patch_level = token_level
-    res.patch_embedding = (tok.reshape(-1, D) if tok is not None
-                           else np.zeros((0, 0), np.float32))
 
-    if projection == "tangent":
-        import healpy as hp
-        clon, clat = hp.pix2ang(2 ** int(parent_level), centre_ids, nest=True, lonlat=True)
-        c = (S - 1) / 2.0
-        pos = np.arange(F, dtype=np.float64) * step + (DINOV3_PATCH - 1) / 2.0
-        xi = (pos - c) * (gsd / EARTH_RADIUS_M)               # columns, east
-        eta = (c - pos) * (gsd / EARTH_RADIUS_M)              # rows, north
-        ETA, XI = np.meshgrid(eta, xi, indexing="ij")
-        lon, lat = offsets_to_lonlat(clon, clat, XI, ETA)     # [M, F, F]
-        res.patch_lon, res.patch_lat = lon.reshape(-1), lat.reshape(-1)
-        res.patch_cell_id = hp.ang2pix(2 ** token_level, res.patch_lon, res.patch_lat,
-                                       nest=True, lonlat=True).astype(np.int64)
-    else:
+    if projection == "nested":
+        Fh, Fw = tok_h * n, tok_w * n
         full = S * n // DINOV3_PATCH               # cells per axis at token_level
         off = int((DINOV3_PATCH - 1) / 2.0 // step)
-        f = np.arange(F) + off
-        col, row = np.meshgrid(f, f, indexing="xy")[0], np.meshgrid(f, f, indexing="ij")[0]
-        rel = xy_to_nested(col, (full - 1) - row)             # [F, F]
+        f = np.arange(Fh) + off
+        col = np.tile(f, (Fh, 1))
+        row = np.repeat(f[:, None], Fw, axis=1)
+        rel = xy_to_nested(col, (full - 1) - row)             # [Fh, Fw]
         shift_bits = 2 * (token_level - int(parent_level))
         res.patch_cell_id = ((centre_ids[:, None, None] << shift_bits) + rel[None]).reshape(-1)
+        res.patch_embedding = (tok.reshape(-1, D) if tok is not None
+                               else np.zeros((0, 0), np.float32))
+        return res
+
+    # Tangent mode: the tokens sit on a square metric grid while the HEALPix
+    # cells are parallelograms, so assigning each token to the cell it falls in
+    # gives some cells two tokens and others none -- a moire of holes on a map.
+    # Go the other way instead: enumerate the cells of ``token_level`` inside
+    # each tile (they tile it exactly, by construction) and read the token
+    # field at their positions.  Every cell then carries exactly one embedding
+    # and the output has no holes.
+    import healpy as hp
+
+    c_lev = token_level - int(parent_level)
+    child = ((centre_ids[:, None] << (2 * c_lev))
+             + np.arange(4 ** c_lev, dtype=np.int64)[None])          # [M, Nc]
+    lon, lat = hp.pix2ang(2 ** token_level, child.reshape(-1), nest=True, lonlat=True)
+    lon, lat = lon.reshape(child.shape), lat.reshape(child.shape)
+
+    clon, clat = hp.pix2ang(2 ** int(parent_level), centre_ids, nest=True, lonlat=True)
+    xi, eta = lonlat_to_offsets(clon, clat, lon, lat)                # [M, Nc]
+
+    px = gsd / EARTH_RADIUS_M
+    half = (DINOV3_PATCH - 1) / 2.0
+    col = (xi / px + (W - 1) / 2.0 - half) / step
+    row = ((H - 1) / 2.0 - eta / px - half) / step
+    outside = ((col < -0.5) | (col > tok_w * n - 0.5)
+               | (row < -0.5) | (row > tok_h * n - 0.5))
+    if outside.any():
+        warnings.warn(
+            f"{int(outside.sum())} of {outside.size} cells fall outside the tangent "
+            "image and take the nearest token; use a larger tile_px",
+            RuntimeWarning, stacklevel=2,
+        )
+    ci = np.clip(np.rint(col).astype(np.int64), 0, tok_w * n - 1)
+    ri = np.clip(np.rint(row).astype(np.int64), 0, tok_h * n - 1)
+
+    m = np.arange(child.shape[0])[:, None]
+    res.patch_embedding = (tok[m, ri, ci].reshape(-1, D) if tok is not None
+                           else np.zeros((0, 0), np.float32))
+    res.patch_cell_id = child.reshape(-1)
+    res.patch_lon, res.patch_lat = lon.reshape(-1), lat.reshape(-1)
     return res
+
 
 
 __all__ = [
@@ -938,6 +1201,8 @@ __all__ = [
     "offsets_to_lonlat",
     "sample_healpix",
     "healpix_gsd_m",
+    "lonlat_to_offsets",
+    "parent_cover_px",
     "nested_to_xy",
     "xy_to_nested",
     "SAT493M_MEAN",

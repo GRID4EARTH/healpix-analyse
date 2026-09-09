@@ -203,11 +203,16 @@ def main(argv=None):
     ap.add_argument("--model-name", default="dinov3_vitl16")
     ap.add_argument("--hf", action="store_true", help="load weights from Hugging Face instead")
     ap.add_argument("--fake", action="store_true", help="random backbone (no weights needed)")
-    ap.add_argument("--projection", default="tangent", choices=["tangent", "nested"],
+    ap.add_argument("--projection", default="tangent",
+                    choices=["tangent", "nested", "percell"],
                     help="'tangent' resamples every tile onto a north-up local tangent plane "
                          "(HEALPix cells have equal area but not equal shape: at 52 deg N the "
                          "nested image is stretched by 2 and sheared by 30 deg). 'nested' is "
-                         "the exact index reshaping, geometrically wrong away from the equator")
+                         "the exact index reshaping, geometrically wrong away from the equator). "
+                         "'percell' builds one tangent plane per output cell and one embedding "
+                         "each -- exact, and one forward pass per cell instead of per tile")
+    ap.add_argument("--context-px", type=int, default=224,
+                    help="window side in percell mode, a multiple of 16")
     ap.add_argument("--over-sample", type=int, default=1,
                     help="sliding-window factor, a power of two: the network runs n**2 times on "
                          "windows shifted by 16/n px, giving a token field n times denser")
@@ -323,15 +328,23 @@ def main(argv=None):
     # ---- embeddings -------------------------------------------------------
     parent_level = level - args.tile_levels
     n_tiles_total = np.unique(cell_id >> (2 * args.tile_levels)).size
-    n_tiles_max = cell_id.size // 4 ** args.tile_levels
-    n_patch = n_tiles_max * 4 ** (args.tile_levels - 4) * len(times)
-    gib = n_patch * 1024 * (2 if args.float16 else 4) / 2 ** 30
-    print(f"  tiles of {2 ** args.tile_levels} px at level {parent_level}, "
-          f"patch embeddings at level {level - 4}: up to {n_patch} vectors (~{gib:.1f} GiB)")
-    if gib > 4:
-        print("  [warn] that is a lot of memory; restrict the dates with --times a:b, "
-              "use --float16, or take larger tiles with --tile-levels")
-
+    if args.projection != "percell":
+        n_patch = (n_tiles_total * 4 ** (args.tile_levels - 4)
+                   * args.over_sample ** 2 * len(times))
+        gib = n_patch * 1024 * (2 if args.float16 else 4) / 2 ** 30
+        print(f"  tiles of {2 ** args.tile_levels} px at level {parent_level}, "
+              f"embeddings at level {level - 4 + int(np.log2(args.over_sample))}: "
+              f"{n_patch} vectors (~{gib:.1f} GiB)")
+        if gib > 4:
+            print("  [warn] that is a lot of memory; restrict the dates with --times a:b, "
+                  "use --float16, or take larger tiles with --tile-levels")
+    if args.projection == "percell":
+        n_pass = n_tiles_total * len(times)
+        print(f"  percell: {n_tiles_total} cells at level {level - args.tile_levels}, "
+              f"{n_pass} forward passes of {args.context_px}x{args.context_px} px "
+              f"({n_pass / 3600:.1f} h at 1 s each, {n_pass / 360000:.2f} h at 100/s)")
+        print("  [warn] that is one pass per cell; validate on a few dates, or use the "
+              "sliding window (--over-sample) for production")
     emb, pid, tid, cov_all = [], [], [], []
     failed = []
     for t in times:
@@ -349,6 +362,7 @@ def main(argv=None):
             duplicates=args.duplicates, device=args.device,
             projection=args.projection, over_sample=args.over_sample,
             gsd_m=args.gsd_m, interpolation=args.interpolation,
+            context_px=args.context_px,
         )
         if res.patch_embedding.shape[0] == 0:
             print(f"  t={t:3d}  no tile reaches min_coverage={args.min_coverage}"
@@ -360,13 +374,21 @@ def main(argv=None):
         n_tile = res.cell_id.size
         P = pe.shape[0] // n_tile
         blk = pe.reshape(n_tile, P, -1)
-        if t == times[0]:
-            grand = pe.mean(0)
-            frac = (((blk.mean(1) - grand) ** 2).sum() * P) / (((pe - grand) ** 2).sum() + 1e-12)
-            print(f"  variance carried by the per-tile mean token: {frac:.3f}"
-                  + ("  [the clusters would follow the tiles]" if frac > 0.5 else ""))
-        if "tile" in args.token_norm:
-            pe = (blk - blk.mean(axis=1, keepdims=True)).reshape(pe.shape)
+        if P == 1:
+            # percell mode: one token per tile, so there is no tile effect to
+            # measure and no per-tile mean to remove (it would zero everything)
+            if t == times[0] and "tile" in args.token_norm:
+                print("  [note] --token-norm 'tile' does not apply in percell mode "
+                      "(one token per cell); only the 'pc' part is used")
+        else:
+            if t == times[0]:
+                grand = pe.mean(0)
+                frac = ((((blk.mean(1) - grand) ** 2).sum() * P)
+                        / (((pe - grand) ** 2).sum() + 1e-12))
+                print(f"  variance carried by the per-tile mean token: {frac:.3f}"
+                      + ("  [the clusters would follow the tiles]" if frac > 0.5 else ""))
+            if "tile" in args.token_norm:
+                pe = (blk - blk.mean(axis=1, keepdims=True)).reshape(pe.shape)
         emb.append(pe.astype(np.float16 if args.float16 else np.float32))
         pid.append(res.patch_cell_id)
         tid.append(np.full(res.patch_cell_id.size, t, dtype=np.int32))

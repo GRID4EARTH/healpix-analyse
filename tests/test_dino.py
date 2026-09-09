@@ -203,10 +203,37 @@ def test_tangent_tiles_shapes_and_partial_sky():
     data = np.zeros((cell_id.size, 3), np.float32)
     tiles, ids, valid, cov, lon, lat = tangent_tiles(
         data, cell_id, level, parent_level, fill="nan")
-    assert tiles.shape == (2, 3, S, S) and lon.shape == (2, S, S)
+    H, W = tiles.shape[-2:]
+    assert tiles.shape == (2, 3, H, W) and lon.shape == (2, H, W)
+    assert H % 16 == 0 and W % 16 == 0
+    # the default image is sized to contain the whole parallelogram-shaped cell,
+    # so it is larger than the nested block and rectangular
+    assert H >= S and W >= S and (H, W) != (S, S)
     assert np.array_equal(ids, parents)
-    # a tangent square over a diamond-shaped block: the corners fall outside
-    assert 0.0 < cov.max() < 1.0
+    assert 0.0 < cov.max() < 1.0          # the cell does not fill the rectangle
+
+
+def test_tangent_output_tiles_the_cells_without_holes():
+    """Every cell of the token level must carry exactly one embedding."""
+    level, parent_level = 16, 10
+    k = level - parent_level
+    S = 2 ** k
+    parents = np.array([5, 6], dtype=np.int64)
+    cell_id = ((parents[:, None] << (2 * k)) + np.arange(S * S)[None]).reshape(-1)
+    rng = np.random.default_rng(5)
+    data = rng.uniform(0, 0.4, size=(cell_id.size, 3)).astype(np.float32)
+
+    for n in (1, 2):
+        res = GetDINOV3SAT(data, cell_id, level, parent_level, over_sample=n,
+                           model=_FakeDino(), return_patches=True, device="cpu")
+        tl = level - 4 + int(np.log2(n))
+        assert res.patch_level == tl
+        # exactly the children of every tile, once each: a complete tiling
+        expected = ((res.cell_id[:, None] << (2 * (tl - parent_level)))
+                    + np.arange(4 ** (tl - parent_level))[None]).reshape(-1)
+        assert np.array_equal(np.sort(res.patch_cell_id), np.sort(expected))
+        assert np.unique(res.patch_cell_id).size == res.patch_cell_id.size
+        assert res.patch_embedding.shape[0] == res.patch_cell_id.size
 
 
 def test_over_sample_interleaves_tokens():
@@ -249,12 +276,45 @@ def test_tangent_projection_end_to_end():
     res = GetDINOV3SAT(data, cell_id, level, parent_level, projection="tangent",
                        model=_FakeDino(), return_patches=True, device="cpu",
                        min_coverage=0.0)
-    G = S // 16
-    assert res.patch_embedding.shape[0] == res.cell_id.size * G * G
+    n_child = 4 ** (res.patch_level - parent_level)
+    assert res.patch_embedding.shape[0] == res.cell_id.size * n_child
     assert res.patch_lon is not None and res.patch_lat is not None
     assert res.patch_lon.shape == res.patch_cell_id.shape
-    # every token must fall in the cell its own position points at
+    # patch_lon / patch_lat are the centres of the cells they are reported for
     ref = healpy.ang2pix(2 ** res.patch_level, res.patch_lon, res.patch_lat,
                          nest=True, lonlat=True)
     assert np.array_equal(ref.astype(np.int64), res.patch_cell_id)
     assert res.projection == "tangent" and res.gsd_m > 0
+
+
+def test_percell_one_embedding_per_cell():
+    """projection='percell': one tangent plane and one embedding per output cell."""
+    level, parent_level = 16, 13            # cells of 8 px: smaller than a patch
+    parents = np.array([5], dtype=np.int64)
+    cell_id = ((parents[:, None] << 12) + np.arange(4 ** 6)[None]).reshape(-1)
+    rng = np.random.default_rng(6)
+    data = rng.uniform(0, 0.4, size=(cell_id.size, 3)).astype(np.float32)
+
+    res = GetDINOV3SAT(data, cell_id, level, parent_level, projection="percell",
+                       context_px=64, model=_FakeDino(), device="cpu", batch_size=32)
+    expected = np.unique(cell_id >> (2 * (level - parent_level)))
+    assert np.array_equal(np.sort(res.cell_id), expected)          # complete, no holes
+    assert res.embedding.shape[0] == expected.size
+    assert res.parent_level == parent_level and res.projection == "percell"
+    # the patch_* view mirrors the same field, for code written for the tiled modes
+    assert np.array_equal(res.patch_cell_id, res.cell_id)
+    assert res.patch_level == parent_level
+    # centres reported are the cell centres
+    ref = healpy.ang2pix(2 ** parent_level, res.patch_lon, res.patch_lat,
+                         nest=True, lonlat=True)
+    assert np.array_equal(ref.astype(np.int64), res.cell_id)
+
+    # a subset of cells can be requested explicitly
+    sub = expected[:7]
+    r2 = GetDINOV3SAT(data, cell_id, level, parent_level, projection="percell",
+                      context_px=64, out_cells=sub, model=_FakeDino(), device="cpu")
+    assert np.array_equal(r2.cell_id, sub)
+
+    # the tiled modes need level - parent_level >= 4; per-cell does not
+    with pytest.raises(ValueError, match="percell"):
+        GetDINOV3SAT(data, cell_id, level, parent_level, model=_FakeDino())
