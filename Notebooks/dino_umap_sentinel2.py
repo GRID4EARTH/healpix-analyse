@@ -12,7 +12,8 @@ Pipeline
 2. for every selected date, cut the NESTED domain into DINO tiles of
    ``2**tile_levels`` px and run DINOv3; keep the **patch tokens**, i.e. one
    1024-d vector per HEALPix cell of level ``level - 4`` (16 px = 160 m);
-3. UMAP (2-d) of the L2-normalised patch tokens, k-means in embedding space;
+3. UMAP of the L2-normalised patch tokens, then k-means **on the UMAP
+   coordinates** (--cluster-space dino to cluster the raw embeddings instead);
 4. figures: UMAP scatter coloured by cluster, and for a few dates the RGB
    scene next to the cluster map, drawn in lon/lat with ``healpix_plot``;
 5. a temporal-consistency score: fraction of dates on which a cell keeps its
@@ -222,6 +223,16 @@ def main(argv=None):
     ap.add_argument("--skip-failed", action="store_true",
                     help="skip a date that still fails after --retries instead of stopping")
     ap.add_argument("--umap-max", type=int, default=60000, help="max vectors for UMAP fit")
+    ap.add_argument("--cluster-space", default="umap", choices=["umap", "dino"],
+                    help="run k-means on the UMAP coordinates (default) or directly on the "
+                         "1024-d DINOv3 embeddings")
+    ap.add_argument("--umap-dim", type=int, default=2,
+                    help="UMAP components. 2 is what the scatter shows; 5-10 often clusters "
+                         "better while keeping the first two for display")
+    ap.add_argument("--umap-neighbors", type=int, default=30,
+                    help="UMAP n_neighbors: small = local detail, large = global structure")
+    ap.add_argument("--umap-min-dist", type=float, default=0.0,
+                    help="UMAP min_dist: 0.0 packs the groups tightly, which suits clustering")
     ap.add_argument("--n-show", type=int, default=4, help="dates shown as RGB/cluster maps")
     ap.add_argument("--out", default="dino_umap_out")
     ap.add_argument("--device", default=None)
@@ -319,12 +330,20 @@ def main(argv=None):
     z = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
     rng = np.random.default_rng(0)
     fit_idx = rng.choice(z.shape[0], size=min(args.umap_max, z.shape[0]), replace=False)
-    reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.1, metric="cosine", random_state=0)
+    reducer = umap.UMAP(n_components=max(2, args.umap_dim), n_neighbors=args.umap_neighbors,
+                        min_dist=args.umap_min_dist, metric="cosine", random_state=0)
     u_fit = reducer.fit_transform(z[fit_idx])
     u = reducer.transform(z) if z.shape[0] > fit_idx.size else u_fit
 
-    km = KMeans(n_clusters=args.clusters, n_init=10, random_state=0).fit(z[fit_idx])
-    label = km.predict(z)
+    # k-means on the UMAP coordinates by default: UMAP pulls apart the manifold,
+    # which k-means (spherical, equal-variance groups) cannot do on its own in
+    # the raw 1024-d space.  The price is that UMAP distorts global distances
+    # and is stochastic, so the groups depend on n_neighbors / min_dist / seed.
+    space = u if args.cluster_space == "umap" else z
+    km = KMeans(n_clusters=args.clusters, n_init=10, random_state=0).fit(space[fit_idx])
+    label = km.predict(space)
+    print(f"k-means in the {args.cluster_space} space "
+          f"({space.shape[1]}-d), K={args.clusters}")
     np.savez_compressed(os.path.join(args.out, "umap_labels.npz"), umap=u, label=label,
                         cell_id=pid, time=tid)
 
@@ -346,7 +365,8 @@ def main(argv=None):
     sub = rng.choice(u.shape[0], size=min(40000, u.shape[0]), replace=False)
     ax.scatter(u[sub, 0], u[sub, 1], c=label[sub], cmap=cmap, s=1.5, alpha=0.6,
                vmin=-0.5, vmax=cmap.N - 0.5)
-    ax.set_title(f"UMAP of DINOv3 SAT patch tokens (level {patch_level}), k-means k={args.clusters}")
+    ax.set_title(f"UMAP of DINOv3 SAT patch tokens (level {patch_level})\n"
+                 f"k-means K={args.clusters} in the {args.cluster_space} space")
     ax.set_xticks([]); ax.set_yticks([])
     fig.tight_layout()
     fig.savefig(os.path.join(args.out, "umap.png"), dpi=150)
