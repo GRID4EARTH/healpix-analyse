@@ -86,10 +86,15 @@ of ≈ 2.5 km and patch embeddings on level-15 cells (≈ 160 m).
 **Missing pixels.** A `parent_level` cell is rarely covered completely: pixels
 absent from `cell_id`, and NaN values, are replaced before the forward pass by
 the per-tile, per-band mean (`fill="mean"`) or by zero (`fill="zero"`).
-`coverage` reports the fraction of real pixels of each tile, and
-`min_coverage` drops the emptiest ones — set it to `0.5` or more when a scene
-has large gaps, since a tile that is mostly filler produces a meaningless
-embedding.
+`coverage` reports the fraction of real pixels of each tile.
+
+Filler is invented data, and DINOv3 embeds it like any other texture: a
+partly-empty tile produces an embedding that says as much about the filling
+strategy as about the ground, which pollutes any clustering built on top.
+**Use `min_coverage=1.0` to keep only complete tiles** — no missing cell, no
+NaN, hence no filler at all. That is the default of the example script. Lower
+it (0.9, 0.5) only when clouds would otherwise leave too few tiles, and expect
+the clusters to degrade accordingly.
 
 **Duplicate cell ids.** Data projected from another grid (UTM, swath, ...)
 regularly puts two source pixels in the same HEALPix cell, so the same id

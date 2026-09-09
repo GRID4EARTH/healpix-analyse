@@ -166,6 +166,24 @@ def plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistenc
     return fig
 
 
+def categorical_cmap(n: int):
+    """A discrete colormap with exactly ``n`` distinguishable colours."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+
+    if n <= 10:
+        colors = list(plt.get_cmap("tab10").colors)
+    elif n <= 20:
+        colors = list(plt.get_cmap("tab20").colors)
+    else:
+        colors = (list(plt.get_cmap("tab20").colors)
+                  + list(plt.get_cmap("tab20b").colors)
+                  + list(plt.get_cmap("tab20c").colors))
+        if n > len(colors):
+            colors = [tuple(c) for c in plt.get_cmap("gist_ncar")(np.linspace(0.02, 0.98, n))]
+    return ListedColormap(colors[:n])
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -185,8 +203,13 @@ def main(argv=None):
     ap.add_argument("--tile-levels", type=int, default=8,
                     help="DINO tile side = 2**tile_levels px (8 -> 256 px, 16x16 patches)")
     ap.add_argument("--times", default="all", help="'all', an int (first n dates) or 'a:b'")
-    ap.add_argument("--clusters", type=int, default=8)
-    ap.add_argument("--min-coverage", type=float, default=0.5)
+    ap.add_argument("--clusters", type=int, default=16,
+                    help="number of k-means groups")
+    ap.add_argument("--min-coverage", type=float, default=1.0,
+                    help="minimum fraction of usable pixels per parent tile. 1.0 (default) "
+                         "keeps only COMPLETE tiles: no missing cell and no NaN, so no filler "
+                         "value ever reaches the network. Lower it (0.9, 0.5) if too few tiles "
+                         "survive because of clouds")
     ap.add_argument("--duplicates", default="mean", choices=["mean", "first", "error"],
                     help="how to aggregate repeated cell ids in the store")
     ap.add_argument("--float16", action="store_true",
@@ -236,6 +259,7 @@ def main(argv=None):
 
     # ---- embeddings -------------------------------------------------------
     parent_level = level - args.tile_levels
+    n_tiles_total = np.unique(cell_id >> (2 * args.tile_levels)).size
     n_tiles_max = cell_id.size // 4 ** args.tile_levels
     n_patch = n_tiles_max * 4 ** (args.tile_levels - 4) * len(times)
     gib = n_patch * 1024 * (2 if args.float16 else 4) / 2 ** 30
@@ -262,19 +286,23 @@ def main(argv=None):
             duplicates=args.duplicates, device=args.device,
         )
         if res.patch_embedding.shape[0] == 0:
+            print(f"  t={t:3d}  no tile reaches min_coverage={args.min_coverage}", flush=True)
             continue
         emb.append(res.patch_embedding.astype(np.float16 if args.float16 else np.float32))
         pid.append(res.patch_cell_id)
         tid.append(np.full(res.patch_cell_id.size, t, dtype=np.int32))
         cov_all.append(res.coverage)
-        print(f"  t={t:3d}  tiles={res.cell_id.size:3d}  patches={res.patch_cell_id.size:6d}"
-              f"  coverage={res.coverage.mean():.2f}  [{time.time() - t0:.0f}s]")
+        print(f"  t={t:3d}  tiles={res.cell_id.size:3d}/{n_tiles_total}"
+              f"  patches={res.patch_cell_id.size:6d}"
+              f"  coverage={res.coverage.mean():.3f}  [{time.time() - t0:.0f}s]")
 
     if failed:
         print(f"[warn] {len(failed)} date(s) could not be read and were skipped: {failed}")
         times = [t for t in times if t not in failed]
     if not emb:
-        raise SystemExit("no date could be read; check the network or use --cache")
+        raise SystemExit(
+            f"no embedding was produced: no parent tile reached min_coverage="
+            f"{args.min_coverage} (lower it, e.g. --min-coverage 0.9), or no date could be read")
 
     emb = np.concatenate(emb)
     pid = np.concatenate(pid)
@@ -313,7 +341,7 @@ def main(argv=None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    cmap = plt.get_cmap("tab10" if args.clusters <= 10 else "tab20")
+    cmap = categorical_cmap(args.clusters)
     fig, ax = plt.subplots(figsize=(7, 6))
     sub = rng.choice(u.shape[0], size=min(40000, u.shape[0]), replace=False)
     ax.scatter(u[sub, 0], u[sub, 1], c=label[sub], cmap=cmap, s=1.5, alpha=0.6,
