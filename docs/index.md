@@ -254,6 +254,21 @@ Minkowski curves.
 
 ::::
 
+## Foundation-model embeddings
+
+::::{grid} 1 1 2 2
+:gutter: 2
+
+:::{grid-item-card} DINOv3 on HEALPix
+:link: dino
+:link-type: doc
+
+`GetDINOV3SAT`: exact NESTED-block to image reordering, DINOv3 SAT-493M
+tile and patch embeddings mapped back to HEALPix cells, licence notes.
+:::
+
+::::
+
 ## Resources
 
 - {doc}`healpix_sht` - Ring-based full-sky SHT optimised for HEALPix
@@ -316,6 +331,15 @@ neighbour_reduce
 directional_filter
 radial_filter
 gradient
+```
+
+```{toctree}
+---
+maxdepth: 2
+caption: Foundation-model embeddings
+hidden: true
+---
+dino
 ```
 
 ```{toctree}
