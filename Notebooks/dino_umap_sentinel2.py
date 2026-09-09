@@ -211,8 +211,10 @@ def main(argv=None):
                          "the exact index reshaping, geometrically wrong away from the equator). "
                          "'percell' builds one tangent plane per output cell and one embedding "
                          "each -- exact, and one forward pass per cell instead of per tile")
-    ap.add_argument("--context-px", type=int, default=224,
-                    help="window side in percell mode, a multiple of 16")
+    ap.add_argument("--context-px", type=int, default=None,
+                    help="window side in percell mode, a multiple of 16. Default: the cell's "
+                         "own footprint, which costs one token per output cell -- the same "
+                         "count as the tiled modes. Larger windows buy context at (m**2)")
     ap.add_argument("--over-sample", type=int, default=1,
                     help="sliding-window factor, a power of two: the network runs n**2 times on "
                          "windows shifted by 16/n px, giving a token field n times denser")
@@ -339,12 +341,15 @@ def main(argv=None):
             print("  [warn] that is a lot of memory; restrict the dates with --times a:b, "
                   "use --float16, or take larger tiles with --tile-levels")
     if args.projection == "percell":
-        n_pass = n_tiles_total * len(times)
-        print(f"  percell: {n_tiles_total} cells at level {level - args.tile_levels}, "
-              f"{n_pass} forward passes of {args.context_px}x{args.context_px} px "
-              f"({n_pass / 3600:.1f} h at 1 s each, {n_pass / 360000:.2f} h at 100/s)")
-        print("  [warn] that is one pass per cell; validate on a few dates, or use the "
-              "sliding window (--over-sample) for production")
+        cell_px = 16 * max(1, 2 ** (args.tile_levels - 4))
+        ctx = args.context_px if args.context_px is not None else cell_px
+        g = max(1, ctx // 16)
+        n_tok = n_tiles_total * g * g * len(times)
+        ref = n_tiles_total * (cell_px // 16) ** 2 * len(times)
+        print(f"  percell: {n_tiles_total} cells at level {level - args.tile_levels} "
+              f"(footprint {cell_px} px), window {ctx} px = {g}x{g} patches")
+        print(f"  {n_tok:,} tokens in total ({n_tok / max(ref, 1):.0f}x the tiled modes), "
+              f"{n_tiles_total * len(times):,} forward passes")
     emb, pid, tid, cov_all = [], [], [], []
     failed = []
     for t in times:

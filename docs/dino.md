@@ -75,11 +75,27 @@ the cell may be finer than a patch.
 `parent_level` is the output level here: one embedding per cell of that level,
 which is the original contract of the function.
 
-The cost is one forward pass per cell instead of one per tile -- for a
-4-million-cell scene with cells at `level - 3` that is 65 536 passes against 64,
-three orders of magnitude. Use `out_cells` to run it on a small area, compare
-against `projection="tangent"` with `over_sample`, and keep the cheap one for
-production if the difference does not matter for your task.
+It is one forward pass per cell, but each window is small, and with the
+default `context_px` -- the cell's own footprint -- the total number of tokens
+is simply the number of output cells: the same count the tiled modes produce.
+What is expensive is context. For level-21 data embedded at level 17
+(16 384 cells of 16 px):
+
+| window | patches | tokens in total | vs. tiled | ground seen |
+|---|---|---|---|---|
+| 16 px (default) | 1 x 1 | 16 384 | 1x | 50 m |
+| 48 px | 3 x 3 | 147 456 | 9x | 149 m |
+| 80 px | 5 x 5 | 409 600 | 25x | 249 m |
+| 224 px | 14 x 14 | 3 211 264 | 196x | 697 m |
+
+A 16-px window is one patch: the attention has nothing to attend to, so the
+embedding is close to the patch projection alone and loses what makes DINO
+useful. 48 or 80 px keeps the cost reasonable while giving the network a
+neighbourhood. The number of patches per axis is kept odd so that one token is
+centred exactly on the cell; an even request is raised by one patch.
+
+`out_cells` restricts the computation to a chosen set of cells, to try it on a
+small area first.
 
 ### `projection="nested"`
 

@@ -819,7 +819,7 @@ def GetDINOV3SAT(
     *,
     projection: str = "tangent",
     over_sample: int = 1,
-    context_px: int = 224,
+    context_px: Optional[int] = None,
     out_cells: Optional[ArrayLike] = None,
     gsd_m: Optional[float] = None,
     tile_px: Optional[int] = None,
@@ -874,10 +874,13 @@ def GetDINOV3SAT(
         window is centred exactly on the cell, in the cell's own frame, so
         nothing is interleaved and nothing is resampled back -- this is the
         exact sliding window, and ``level - parent_level >= 4`` no longer
-        applies since the cell may be finer than a patch.  It costs one forward
-        pass per cell instead of one per tile, three orders of magnitude more on
-        a typical scene, so it is the reference to validate on a small area
-        (``out_cells``) rather than the production path.
+        applies since the cell may be finer than a patch.
+
+        It costs one forward pass per cell, but each window is small: with the
+        default ``context_px`` -- the cell's own footprint -- the total number
+        of tokens equals the number of output cells, exactly what the tiled
+        modes produce, so this is affordable.  What is expensive is context: a
+        window ``m`` patches wide costs ``m**2`` tokens per cell.
 
     ``projection="nested"``
         The historical mode: the NESTED block is reshaped into an image, which
@@ -900,9 +903,15 @@ def GetDINOV3SAT(
         (256 px tiles, 16x16 patch tokens) is the natural choice.
     projection : {"tangent", "nested"}
         See above.
-    context_px : int
-        Side of the window in ``percell`` mode; a multiple of 16.  224 matches
-        the DINOv3 training size; smaller is cheaper but gives less context.
+    context_px : int, optional
+        Side of the window in ``percell`` mode, a multiple of 16.  The default
+        is the cell's own footprint, so the total number of tokens equals the
+        number of output cells -- the same count as the tiled modes.  A larger
+        window gives the network context, at a cost growing as
+        ``(context_px / cell)**2``: for cells of 16 px, 48 px costs 9 times
+        more and 224 px 196 times.  With a centred pooling an even number of
+        patches per axis leaves no token on the centre, so the value is raised
+        by one patch.
     out_cells : int array, optional
         Restrict ``percell`` mode to these cells instead of every cell of
         ``parent_level`` present in the data.  The way to try it on a small
@@ -986,8 +995,18 @@ def GetDINOV3SAT(
 
     # ---- one tangent plane per output cell --------------------------------
     if projection == "percell":
-        if context_px % DINOV3_PATCH:
+        # Default window: the cell's own footprint.  The total number of tokens
+        # is then the number of output cells -- the same count the tiled modes
+        # produce -- which is what makes per-cell inference affordable.
+        cell_px = DINOV3_PATCH * max(1, int(2 ** (k - DINOV3_PATCH_LEVELS)))
+        ctx = int(context_px) if context_px is not None else cell_px
+        if ctx % DINOV3_PATCH:
             raise ValueError(f"context_px must be a multiple of {DINOV3_PATCH}")
+        if pooling != "mean" and (ctx // DINOV3_PATCH) % 2 == 0:
+            # with an even number of patches per axis no token is centred on
+            # the cell; one more patch puts the centre token exactly on it
+            ctx += DINOV3_PATCH
+        context_px = ctx
         gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level)
         tl = int(parent_level)                      # the output level, one embedding each
         cells = (np.unique(ids >> (2 * k)) if out_cells is None
