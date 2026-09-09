@@ -34,8 +34,8 @@ Connectivity = Literal[
 # HEALPix directional convention
 # ---------------------------------------------------------------------------
 #
-# healpix_geo.nested.neighbours(..., connectivity="edge_or_vertex") returns
-# directions in this order:
+# The adapter preserves this direction order (rotating the GEO "all"
+# result, which starts with S, one column to the left):
 #
 #     0: SW
 #     1: W
@@ -246,7 +246,7 @@ def nested_neighbours(
         healpix_geo_nested.neighbours(
             cells,
             refinement_level,
-            connectivity=connectivity,
+            connectivity="all" if connectivity == "edge_or_vertex" else "edge",
             num_threads=0,
         ),
         dtype=np.int64,
@@ -268,6 +268,9 @@ def nested_neighbours(
             "Unexpected shape returned by healpix_geo.nested.neighbours: "
             f"{neighbours.shape}; expected {expected_shape}"
         )
+
+    if connectivity == "edge_or_vertex":
+        neighbours = np.roll(neighbours, -1, axis=1)
 
     return np.ascontiguousarray(
         neighbours,

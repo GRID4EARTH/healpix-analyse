@@ -25,7 +25,7 @@ dependencies = [
   "numpy",
   "torch",
   "healpy",
-  "healpix-geo",
+  "healpix-geo>=0.4.1",
   "pyproj>=3.6",
 ]
 
