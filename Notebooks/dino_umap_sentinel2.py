@@ -14,7 +14,7 @@ Pipeline
    1024-d vector per HEALPix cell of level ``level - 4`` (16 px = 160 m);
 3. UMAP (2-d) of the L2-normalised patch tokens, k-means in embedding space;
 4. figures: UMAP scatter coloured by cluster, and for a few dates the RGB
-   tile next to the cluster map (both reordered with ``nested_to_tiles``);
+   scene next to the cluster map, drawn in lon/lat with ``healpix_plot``;
 5. a temporal-consistency score: fraction of dates on which a cell keeps its
    majority label (a purely unsupervised sanity check).
 
@@ -24,8 +24,8 @@ Usage
     python dino_umap_sentinel2.py --fake              # no weights: random backbone, checks the plumbing only
     python dino_umap_sentinel2.py --hf                # weights from Hugging Face (needs `huggingface-cli login`)
 
-Requirements: healpix_analyse, xarray, zarr, umap-learn, scikit-learn,
-matplotlib, and the DINOv3 backbone (torch-hub clone of
+Requirements: healpix_analyse, healpix_plot, xarray, zarr, umap-learn,
+scikit-learn, matplotlib, cartopy, and the DINOv3 backbone (torch-hub clone of
 facebookresearch/dinov3 or `transformers`).  DINOv3 code and weights are
 distributed by Meta under the DINOv3 License (gated download); see
 docs/dino.md.
@@ -43,11 +43,7 @@ import torch
 import torch.nn as nn
 import xarray as xr
 
-from healpix_analyse.dino import (
-    GetDINOV3SAT,
-    load_dinov3_sat,
-    nested_to_tiles,
-)
+from healpix_analyse.dino import GetDINOV3SAT, load_dinov3_sat
 
 DEFAULT_ZARR = "https://data-taos.ifremer.fr/EGU25_CFOSAT/Sentinel2_test.zarr"
 RGB = ("b04", "b03", "b02")
@@ -92,19 +88,53 @@ def healpix_level(ds: xr.Dataset, default: int = 19) -> int:
     return default
 
 
+def cell_dim(ds: xr.Dataset) -> str:
+    """Name of the cell dimension: 'cell_ids' in the raw store, 'cells' after xdggs.decode."""
+    return ds["cell_ids"].dims[0]
+
+
 def rgb_at(ds: xr.Dataset, t: int) -> np.ndarray:
     """[N, 3] reflectances in [0, 1] (NaN kept) for date index ``t``."""
-    x = ds["Sentinel2"].isel(time=t).sel(bands=list(RGB)).transpose("cells", "bands").values
+    x = ds["Sentinel2"].isel(time=t).sel(bands=list(RGB)).transpose(cell_dim(ds), "bands").values
     x = x.astype(np.float32) / 10000.0
     x[np.isfinite(x)] = np.clip(x[np.isfinite(x)], 0.0, 1.0)
     return x
 
 
-def scene_tiles(values: np.ndarray, cell_id: np.ndarray, level: int, tile_levels: int):
-    """Reorder a scene into a few display tiles of ``2**tile_levels`` px."""
-    tiles, pids, valid, cov = nested_to_tiles(values, cell_id, level, level - tile_levels, fill="nan")
-    keep = cov > 0.2
-    return tiles[keep], pids[keep], valid[keep]
+def plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap):
+    """RGB scene, k-means labels and temporal consistency, drawn in lon/lat with healpix_plot."""
+    import cartopy.crs as ccrs
+    import healpix_plot
+    import matplotlib.pyplot as plt
+
+    grid_px = healpix_plot.HealpixGrid(level=level, indexing_scheme="nested", ellipsoid="WGS84")
+    grid_patch = healpix_plot.HealpixGrid(level=patch_level, indexing_scheme="nested", ellipsoid="WGS84")
+    n = len(show)
+    fig, axes = plt.subplots(n, 3, figsize=(15, 4.6 * n), squeeze=False,
+                             subplot_kw={"projection": ccrs.PlateCarree()}, layout="constrained")
+    for r, t in enumerate(show):
+        date = str(ds["time"].values[t])[:10]
+        rgb = rgb_at(ds, t)
+        hi = np.nanpercentile(rgb, 98)
+        healpix_plot.plot(cell_id, rgb, healpix_grid=grid_px, sampling_grid={"shape": 768},
+                          ax=axes[r, 0], rgb_clip=(0.0, float(max(hi, 1e-3))), axis_labels="none",
+                          title=f"{date}  RGB (level {level})")
+        m = tid == t
+        healpix_plot.plot(pid[m], label[m].astype(np.float32), healpix_grid=grid_patch,
+                          sampling_grid={"shape": 768}, ax=axes[r, 1], cmap=cmap,
+                          vmin=-0.5, vmax=cmap.N - 0.5, axis_labels="none",
+                          title=f"k-means labels (level {patch_level})")
+        if r == 0:
+            mp = healpix_plot.plot(uniq, consistency.astype(np.float32), healpix_grid=grid_patch,
+                                   sampling_grid={"shape": 768}, ax=axes[r, 2], cmap="magma",
+                                   vmin=0, vmax=1, axis_labels="none",
+                                   title="temporal consistency of the label")
+            fig.colorbar(mp, ax=axes[r, 2], shrink=0.8)
+        else:
+            axes[r, 2].set_axis_off()
+        for a in axes[r, :2]:
+            a.gridlines(draw_labels=False, linewidth=0.3)
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +144,10 @@ def scene_tiles(values: np.ndarray, cell_id: np.ndarray, level: int, tile_levels
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--zarr", default=DEFAULT_ZARR)
-    ap.add_argument("--weights", default=None, help="DINOv3 SAT-493M .pth (torch-hub route)")
+    ap.add_argument("--weights", default=None,
+                    help="DINOv3 SAT-493M .pth (local path or personalised download URL). "
+                         "Required unless --fake/--hf: the weights are gated, request them on "
+                         "https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/")
     ap.add_argument("--repo", default="facebookresearch/dinov3",
                     help="torch-hub repo or local clone of facebookresearch/dinov3")
     ap.add_argument("--model-name", default="dinov3_vitl16")
@@ -149,6 +182,8 @@ def main(argv=None):
     print(f"store: {args.zarr}\n  level {level}, {cell_id.size} cells, {len(times)}/{n_time} dates")
 
     # ---- model ------------------------------------------------------------
+    if not args.fake and not args.hf and args.weights is None:
+        ap.error("--weights is required (gated DINOv3 SAT-493M checkpoint); use --fake to test without it")
     if args.fake:
         model = FakeDino()
         print("  backbone: FakeDino (random weights; plumbing test only)")
@@ -227,37 +262,7 @@ def main(argv=None):
     plt.close(fig)
 
     show = times[:: max(1, len(times) // args.n_show)][: args.n_show]
-    disp_levels = args.tile_levels + 1           # display tiles = 2 DINO tiles wide
-    rows = []
-    for t in show:
-        rgb = rgb_at(ds, t)
-        rgb_tiles, disp_pids, _ = scene_tiles(rgb, cell_id, level, disp_levels)
-        m = tid == t
-        lab_tiles, lab_pids, lab_valid = scene_tiles(
-            label[m].astype(np.float32), pid[m], patch_level, disp_levels - 4)
-        rows.append((t, rgb_tiles, disp_pids, lab_tiles, lab_pids, lab_valid))
-
-    n_tiles = max(len(r[2]) for r in rows)
-    fig, axes = plt.subplots(2 * len(rows), n_tiles, figsize=(3.2 * n_tiles, 6.4 * len(rows)),
-                             squeeze=False)
-    for r, (t, rgb_tiles, disp_pids, lab_tiles, lab_pids, lab_valid) in enumerate(rows):
-        date = str(ds["time"].values[t])[:10]
-        for j in range(n_tiles):
-            a_rgb, a_lab = axes[2 * r, j], axes[2 * r + 1, j]
-            a_rgb.set_axis_off(); a_lab.set_axis_off()
-            if j >= len(disp_pids):
-                continue
-            img = np.transpose(rgb_tiles[j], (1, 2, 0))
-            p = np.nanpercentile(img, 98)
-            a_rgb.imshow(np.clip(np.nan_to_num(img) / max(p, 1e-3), 0, 1))
-            a_rgb.set_title(f"{date}  tile {disp_pids[j]} (L{level - disp_levels})", fontsize=8)
-            jj = np.where(lab_pids == disp_pids[j])[0]
-            if jj.size:
-                lab = lab_tiles[jj[0], 0]
-                lab = np.ma.masked_where(~lab_valid[jj[0]], lab)
-                a_lab.imshow(lab, cmap=cmap, vmin=-0.5, vmax=cmap.N - 0.5, interpolation="nearest")
-            a_lab.set_title(f"k-means labels (L{patch_level})", fontsize=8)
-    fig.tight_layout()
+    fig = plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap)
     fig.savefig(os.path.join(args.out, "cluster_maps.png"), dpi=150)
     plt.close(fig)
 

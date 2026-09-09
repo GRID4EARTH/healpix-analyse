@@ -306,12 +306,21 @@ def load_dinov3_sat(
     device = torch.device(device) if device is not None else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
+    if weights is None and source != "hf":
+        raise ValueError(
+            "DINOv3 SAT-493M weights are gated and are not downloaded automatically. "
+            "Without `weights`, torch-hub would fall back to the *web* (LVD-1689M) "
+            "checkpoint, which is a different model and is also gated (HTTP 403).\n"
+            "Request access on https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/ "
+            "(accept the DINOv3 License), download e.g. "
+            "dinov3_vitl16_pretrain_sat493m-<hash>.pth, and pass its local path (or the "
+            "personalised download URL) as `weights`."
+        )
     errors = []
     if source in ("auto", "hub"):
         try:
             src = "local" if (repo.startswith((".", "/", "~")) or ":" in repo[:3]) else "github"
-            kw = {"weights": weights} if weights is not None else {}
-            model = torch.hub.load(repo, model_name, source=src, **kw)
+            model = torch.hub.load(repo, model_name, source=src, weights=weights)
             return model.eval().to(device)
         except Exception as e:                         # noqa: BLE001
             errors.append(f"hub: {e!r}")

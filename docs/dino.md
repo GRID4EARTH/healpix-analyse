@@ -94,6 +94,51 @@ is negligible at the scale of a 16 px patch.
 
 ---
 
+## Getting the weights (required step)
+
+The SAT-493M checkpoints are **gated**: `healpix-analyse` never downloads
+them, and calling `GetDINOV3SAT` / `load_dinov3_sat` without `weights`
+raises an error on purpose. Without it, torch-hub would silently fall back to
+the *web* checkpoint (`lvd1689m`, a different model) and fail with
+`HTTP Error 403: Forbidden` anyway.
+
+**Route A — torch-hub (recommended)**
+
+1. Request access on Meta's DINOv3 download page,
+   <https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/>,
+   and accept the **DINOv3 License**. You receive personalised download URLs
+   by e-mail (they expire after a few days).
+2. Download the satellite ViT-L/16 checkpoint,
+   `dinov3_vitl16_pretrain_sat493m-<hash>.pth` (≈ 1.2 GB), and copy it to the
+   machine where you run the code (e.g. Datarmor).
+3. Pass its path as `weights`:
+
+   ```python
+   model = load_dinov3_sat("dinov3_vitl16",
+                           weights="/path/to/dinov3_vitl16_pretrain_sat493m-<hash>.pth")
+   ```
+
+   or, for the example script,
+   `python Notebooks/dino_umap_sentinel2.py --weights /path/to/dinov3_vitl16_pretrain_sat493m-<hash>.pth`.
+
+   `weights` also accepts the personalised URL directly. The DINOv3 code is
+   fetched by `torch.hub` from `facebookresearch/dinov3` on first use (cached in
+   `~/.cache/torch/hub/`); on a machine without internet access, clone that
+   repository and pass its path as `repo=` / `--repo`.
+
+**Route B — Hugging Face**
+
+1. Accept the licence on the model page
+   <https://huggingface.co/facebook/dinov3-vitl16-pretrain-sat493m>.
+2. `pip install transformers` and `huggingface-cli login`.
+3. `load_dinov3_sat("dinov3_vitl16", source="hf")` or
+   `python Notebooks/dino_umap_sentinel2.py --hf`.
+
+To test the pipeline without any weights, use `--fake` (random backbone: the
+embeddings are meaningless, only the HEALPix plumbing is exercised).
+
+---
+
 ## Example
 
 ```python
@@ -113,8 +158,9 @@ res.patch_embedding.shape  # (M*256, 1024)  one per level-15 cell -> res.patch_c
 
 `Notebooks/dino_umap_sentinel2.py` runs this on all 88 dates of the demo
 store, projects the patch tokens with UMAP, clusters them with k-means and
-draws the cluster maps next to the RGB tiles (unsupervised classification
-test). `--fake` runs the whole pipeline with a random backbone when the
+draws the cluster maps next to the RGB scene in lon/lat with `healpix_plot`
+(unsupervised classification test; needs `healpix-plot`, `cartopy`, `umap-learn`,
+`scikit-learn`). `--fake` runs the whole pipeline with a random backbone when the
 weights are not available.
 
 ---
