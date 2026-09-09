@@ -81,6 +81,30 @@ of ≈ 2.5 km and patch embeddings on level-15 cells (≈ 160 m).
 
 ---
 
+## Missing pixels, duplicate cells and memory
+
+**Missing pixels.** A `parent_level` cell is rarely covered completely: pixels
+absent from `cell_id`, and NaN values, are replaced before the forward pass by
+the per-tile, per-band mean (`fill="mean"`) or by zero (`fill="zero"`).
+`coverage` reports the fraction of real pixels of each tile, and
+`min_coverage` drops the emptiest ones — set it to `0.5` or more when a scene
+has large gaps, since a tile that is mostly filler produces a meaningless
+embedding.
+
+**Duplicate cell ids.** Data projected from another grid (UTM, swath, ...)
+regularly puts two source pixels in the same HEALPix cell, so the same id
+appears twice in `cell_id`. Such rows are averaged (NaN-aware) with a
+`RuntimeWarning`; `duplicates="first"` keeps the first occurrence and
+`duplicates="error"` restores a hard failure.
+
+**Memory.** Patch tokens are numerous: a level-19 store cut into 256 px tiles
+gives one 1024-d vector per level-15 cell *and per date*. For a 4-million-cell
+store over 88 dates that is about 5.9 GiB in float32. Restrict the dates,
+store them as float16, or take larger tiles — the example script prints the
+estimate before starting and warns above 4 GiB.
+
+---
+
 ## Orientation and geometry
 
 Inside a HEALPix base face the local axes are rotated by 45° with respect to

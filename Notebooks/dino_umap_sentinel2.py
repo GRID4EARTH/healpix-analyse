@@ -158,6 +158,10 @@ def main(argv=None):
     ap.add_argument("--times", default="all", help="'all', an int (first n dates) or 'a:b'")
     ap.add_argument("--clusters", type=int, default=8)
     ap.add_argument("--min-coverage", type=float, default=0.5)
+    ap.add_argument("--duplicates", default="mean", choices=["mean", "first", "error"],
+                    help="how to aggregate repeated cell ids in the store")
+    ap.add_argument("--float16", action="store_true",
+                    help="store the patch embeddings as float16 (halves the memory)")
     ap.add_argument("--umap-max", type=int, default=60000, help="max vectors for UMAP fit")
     ap.add_argument("--n-show", type=int, default=4, help="dates shown as RGB/cluster maps")
     ap.add_argument("--out", default="dino_umap_out")
@@ -196,17 +200,26 @@ def main(argv=None):
 
     # ---- embeddings -------------------------------------------------------
     parent_level = level - args.tile_levels
+    n_tiles_max = cell_id.size // 4 ** args.tile_levels
+    n_patch = n_tiles_max * 4 ** (args.tile_levels - 4) * len(times)
+    gib = n_patch * 1024 * (2 if args.float16 else 4) / 2 ** 30
+    print(f"  tiles of {2 ** args.tile_levels} px at level {parent_level}, "
+          f"patch embeddings at level {level - 4}: up to {n_patch} vectors (~{gib:.1f} GiB)")
+    if gib > 4:
+        print("  [warn] that is a lot of memory; restrict the dates with --times a:b, "
+              "use --float16, or take larger tiles with --tile-levels")
+
     emb, pid, tid, cov_all = [], [], [], []
     for t in times:
         rgb = rgb_at(ds, t)
         res = GetDINOV3SAT(
             rgb, cell_id, level, parent_level,
             model=model, return_patches=True, min_coverage=args.min_coverage,
-            device=args.device,
+            duplicates=args.duplicates, device=args.device,
         )
         if res.patch_embedding.shape[0] == 0:
             continue
-        emb.append(res.patch_embedding.astype(np.float32))
+        emb.append(res.patch_embedding.astype(np.float16 if args.float16 else np.float32))
         pid.append(res.patch_cell_id)
         tid.append(np.full(res.patch_cell_id.size, t, dtype=np.int32))
         cov_all.append(res.coverage)

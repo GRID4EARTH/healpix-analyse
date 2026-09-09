@@ -128,6 +128,50 @@ def _as_numpy(x: ArrayLike) -> np.ndarray:
     return np.asarray(x)
 
 
+def _deduplicate(
+    d: np.ndarray,
+    ids: np.ndarray,
+    how: str = "mean",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Collapse repeated cell ids.
+
+    Data projected from another grid (UTM, swath, ...) onto HEALPix regularly
+    contains a few cells hit by more than one source pixel.  Rather than
+    rejecting such an input, the duplicated rows are averaged (NaN-aware), or
+    the first occurrence is kept.
+    """
+    uniq_ids, inv = np.unique(ids, return_inverse=True)
+    n_dup = ids.shape[0] - uniq_ids.shape[0]
+    if n_dup == 0:
+        return d, ids
+    if how == "error":
+        raise ValueError(
+            f"cell_id contains {n_dup} duplicate ids "
+            "(pass duplicates='mean' or 'first' to aggregate them)"
+        )
+    warnings.warn(
+        f"cell_id contains {n_dup} duplicate ids out of {ids.shape[0]}; "
+        f"aggregating with duplicates={how!r}",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    if how == "first":
+        _, first = np.unique(ids, return_index=True)
+        return d[first], uniq_ids
+    if how != "mean":
+        raise ValueError("duplicates must be 'mean', 'first' or 'error'")
+
+    finite = np.isfinite(d)
+    acc = np.zeros((uniq_ids.shape[0], d.shape[1]), dtype=np.float64)
+    cnt = np.zeros((uniq_ids.shape[0], d.shape[1]), dtype=np.int64)
+    np.add.at(acc, inv, np.where(finite, d, 0.0))
+    np.add.at(cnt, inv, finite)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = np.where(cnt > 0, acc / cnt, np.nan).astype(np.float32)
+    return out, uniq_ids
+
+
 def nested_to_tiles(
     data: ArrayLike,
     cell_id: ArrayLike,
@@ -135,6 +179,7 @@ def nested_to_tiles(
     parent_level: int,
     *,
     fill: str = "mean",
+    duplicates: str = "mean",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Reorder a NESTED HEALPix dataset into square tiles, one per
@@ -155,6 +200,11 @@ def nested_to_tiles(
         Value given to the pixels of a tile that are absent from ``cell_id``
         (or NaN): the per-tile, per-band mean of the available pixels,
         zero, or NaN.
+    duplicates : {"mean", "first", "error"}
+        What to do when the same cell id appears several times, which happens
+        when data projected from another grid puts two source pixels in the
+        same HEALPix cell: average them (NaN-aware), keep the first one, or
+        raise.
 
     Returns
     -------
@@ -187,6 +237,8 @@ def nested_to_tiles(
     if ids.shape != (d.shape[0],):
         raise ValueError("cell_id must have shape [N] matching data")
 
+    d, ids = _deduplicate(d, ids, duplicates)
+
     parent = ids >> (2 * k)
     parent_ids, tile_idx = np.unique(parent, return_inverse=True)
     rel = ids - (parent_ids[tile_idx] << (2 * k))
@@ -197,9 +249,6 @@ def nested_to_tiles(
     M, C = parent_ids.shape[0], d.shape[1]
     tiles = np.full((M, S, S, C), np.nan, dtype=np.float32)
     valid = np.zeros((M, S, S), dtype=bool)
-
-    if np.unique(np.stack([tile_idx, row, col], axis=1), axis=0).shape[0] != ids.shape[0]:
-        raise ValueError("cell_id contains duplicates")
 
     tiles[tile_idx, row, col] = d
     valid[tile_idx, row, col] = np.isfinite(d).all(axis=1)
@@ -402,6 +451,7 @@ def GetDINOV3SAT(
     return_patches: bool = False,
     min_coverage: float = 0.0,
     fill: str = "mean",
+    duplicates: str = "mean",
     batch_size: int = 16,
     device: Optional[Union[str, torch.device]] = None,
     autocast: bool = True,
@@ -445,6 +495,8 @@ def GetDINOV3SAT(
         Drop tiles whose fraction of available pixels is below this value.
     fill : {"mean", "zero"}
         How missing pixels are filled before normalisation.
+    duplicates : {"mean", "first", "error"}
+        How repeated cell ids are aggregated (see :func:`nested_to_tiles`).
     batch_size : int
     device : str or torch.device, optional
     autocast : bool
@@ -474,7 +526,7 @@ def GetDINOV3SAT(
     d = d[:, list(bands)]
 
     tiles, parent_ids, _valid, coverage = nested_to_tiles(
-        d, cell_id, level, parent_level, fill=fill
+        d, cell_id, level, parent_level, fill=fill, duplicates=duplicates
     )
     keep = coverage >= float(min_coverage)
     tiles, parent_ids, coverage = tiles[keep], parent_ids[keep], coverage[keep]
