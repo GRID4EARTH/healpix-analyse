@@ -101,7 +101,7 @@ def test_get_dinov3sat_shapes_with_fake_backbone():
     data = rng.uniform(0, 0.4, size=(cell_id.size, 4)).astype(np.float32)   # 4 bands
 
     res = GetDINOV3SAT(
-        data, cell_id, level, parent_level,
+        data, cell_id, level, parent_level, projection="nested",
         model=_FakeDino(), bands=(2, 1, 0), return_patches=True,
         pooling="cls+mean", device="cpu", batch_size=1,
     )
@@ -121,3 +121,140 @@ def test_get_dinov3sat_shapes_with_fake_backbone():
 def test_get_dinov3sat_rejects_small_tiles():
     with pytest.raises(ValueError):
         GetDINOV3SAT(np.zeros((4, 3)), np.arange(4), 10, 8, model=_FakeDino())
+
+
+def test_duplicate_cell_ids_are_aggregated():
+    """Projected data may hit the same cell twice; duplicates are averaged, not rejected."""
+    level, parent_level = 10, 8
+    cell_id = np.array([0, 1, 1, 2, 3], dtype=np.int64)
+    data = np.array([[1.0], [2.0], [4.0], [np.nan], [5.0]], np.float32)
+
+    with pytest.warns(RuntimeWarning, match="duplicate"):
+        tiles, pids, valid, cov = nested_to_tiles(data, cell_id, level, parent_level, fill="nan")
+    assert pids.tolist() == [0]
+    assert tiles.shape == (1, 1, 4, 4)
+    # cell 1 -> (x, y) = (1, 0) -> row 3, col 1; mean of 2 and 4
+    assert tiles[0, 0, 3, 1] == 3.0
+    assert valid.sum() == 3                       # cells 0, 1, 3 (cell 2 is NaN)
+    assert np.isclose(cov[0], 3 / 16)
+
+    with pytest.warns(RuntimeWarning):
+        tiles_first, _, _, _ = nested_to_tiles(
+            data, cell_id, level, parent_level, fill="nan", duplicates="first")
+    assert tiles_first[0, 0, 3, 1] == 2.0
+
+    with pytest.raises(ValueError, match="duplicate"):
+        nested_to_tiles(data, cell_id, level, parent_level, duplicates="error")
+
+
+# ---------------------------------------------------------------------------
+# Tangent-plane projection and sliding-window oversampling
+# ---------------------------------------------------------------------------
+
+def test_healpix_cells_are_not_square():
+    """The premise of the tangent mode: equal area, unequal shape."""
+    from healpix_analyse.dino import EARTH_RADIUS_M, nested_to_xy, xy_to_nested
+    level, nside = 19, 2 ** 19
+    p = healpy.ang2pix(nside, 10.55, 52.31, nest=True, lonlat=True)
+    face = p // (nside * nside)
+    x, y = nested_to_xy(np.array([p - face * nside * nside]))
+    v = lambda dx, dy: np.array(healpy.pix2vec(
+        nside, face * nside * nside + int(xy_to_nested(np.array([x[0] + dx]),
+                                                       np.array([y[0] + dy]))[0]), nest=True))
+    v0 = v(0, 0)
+    dx_m = np.linalg.norm((v(1, 0) - v0) * EARTH_RADIUS_M)
+    dy_m = np.linalg.norm((v(0, 1) - v0) * EARTH_RADIUS_M)
+    assert dy_m / dx_m > 1.5          # ~1.57 at this latitude: strongly anisotropic
+
+
+def test_tangent_grid_is_north_up_and_metric():
+    from healpix_analyse.dino import EARTH_RADIUS_M, healpix_gsd_m, tangent_grid_lonlat
+    gsd = healpix_gsd_m(19)
+    lon, lat = tangent_grid_lonlat([10.55], [52.31], 9, gsd / EARTH_RADIUS_M)
+    assert lat[0, 0, 4] > lat[0, 8, 4]                       # north is up
+    assert lon[0, 4, 8] > lon[0, 4, 0]                       # east is right
+    # the step really is the requested ground sampling, in both directions
+    d_north = np.radians(lat[0, 3, 4] - lat[0, 4, 4]) * EARTH_RADIUS_M
+    d_east = (np.radians(lon[0, 4, 5] - lon[0, 4, 4])
+              * np.cos(np.radians(lat[0, 4, 4])) * EARTH_RADIUS_M)
+    assert abs(d_north - gsd) < 0.02 * gsd
+    assert abs(d_east - gsd) < 0.02 * gsd
+
+
+def test_sample_healpix_recovers_a_known_field():
+    """Sampling a smooth field on the tangent grid must match its analytic value."""
+    from healpix_analyse.dino import healpix_gsd_m, sample_healpix, tangent_grid_lonlat
+    level, nside = 8, 2 ** 8
+    cells = np.arange(12 * nside * nside, dtype=np.int64)
+    lon_c, lat_c = healpy.pix2ang(nside, cells, nest=True, lonlat=True)
+    field = np.sin(np.radians(lat_c))[:, None].astype(np.float32)
+    lon, lat = tangent_grid_lonlat([30.0], [20.0], 8, healpix_gsd_m(level) / 6371000.0)
+    vals, valid = sample_healpix(field, cells, level, lon, lat)
+    assert valid.all()
+    assert np.allclose(vals[..., 0], np.sin(np.radians(lat)), atol=1e-5)
+
+
+def test_tangent_tiles_shapes_and_partial_sky():
+    from healpix_analyse.dino import tangent_tiles
+    level, parent_level = 12, 8
+    S = 2 ** (level - parent_level)
+    parents = np.array([100, 101], dtype=np.int64)
+    cell_id = ((parents[:, None] << 8) + np.arange(256)[None]).reshape(-1)
+    data = np.zeros((cell_id.size, 3), np.float32)
+    tiles, ids, valid, cov, lon, lat = tangent_tiles(
+        data, cell_id, level, parent_level, fill="nan")
+    assert tiles.shape == (2, 3, S, S) and lon.shape == (2, S, S)
+    assert np.array_equal(ids, parents)
+    # a tangent square over a diamond-shaped block: the corners fall outside
+    assert 0.0 < cov.max() < 1.0
+
+
+def test_over_sample_interleaves_tokens():
+    """over_sample=2 must give a 2x denser token field, with the shifted passes
+    interleaved rather than averaged."""
+    level, parent_level = 16, 10
+    k = level - parent_level
+    S = 2 ** k
+    parents = np.array([5], dtype=np.int64)
+    cell_id = ((parents[:, None] << (2 * k)) + np.arange(S * S)[None]).reshape(-1)
+    rng = np.random.default_rng(3)
+    data = rng.uniform(0, 0.4, size=(cell_id.size, 3)).astype(np.float32)
+    model = _FakeDino()
+
+    r1 = GetDINOV3SAT(data, cell_id, level, parent_level, projection="nested",
+                      model=model, return_patches=True, device="cpu")
+    r2 = GetDINOV3SAT(data, cell_id, level, parent_level, projection="nested",
+                      over_sample=2, model=model, return_patches=True, device="cpu")
+    assert r1.patch_level == level - 4
+    assert r2.patch_level == level - 3                    # one level finer
+    g1 = int(np.sqrt(r1.patch_embedding.shape[0]))
+    g2 = int(np.sqrt(r2.patch_embedding.shape[0]))
+    assert g2 == 2 * (g1 - 1)                             # 2x denser, minus the crop border
+    assert r2.patch_cell_id.size == r2.patch_embedding.shape[0]
+    assert np.unique(r2.patch_cell_id).size == r2.patch_cell_id.size
+
+    with pytest.raises(ValueError, match="power of two"):
+        GetDINOV3SAT(data, cell_id, level, parent_level, over_sample=3, model=model)
+
+
+def test_tangent_projection_end_to_end():
+    level, parent_level = 16, 10
+    k = level - parent_level
+    S = 2 ** k
+    parents = np.array([5, 6], dtype=np.int64)
+    cell_id = ((parents[:, None] << (2 * k)) + np.arange(S * S)[None]).reshape(-1)
+    rng = np.random.default_rng(4)
+    data = rng.uniform(0, 0.4, size=(cell_id.size, 3)).astype(np.float32)
+
+    res = GetDINOV3SAT(data, cell_id, level, parent_level, projection="tangent",
+                       model=_FakeDino(), return_patches=True, device="cpu",
+                       min_coverage=0.0)
+    G = S // 16
+    assert res.patch_embedding.shape[0] == res.cell_id.size * G * G
+    assert res.patch_lon is not None and res.patch_lat is not None
+    assert res.patch_lon.shape == res.patch_cell_id.shape
+    # every token must fall in the cell its own position points at
+    ref = healpy.ang2pix(2 ** res.patch_level, res.patch_lon, res.patch_lat,
+                         nest=True, lonlat=True)
+    assert np.array_equal(ref.astype(np.int64), res.patch_cell_id)
+    assert res.projection == "tangent" and res.gsd_m > 0

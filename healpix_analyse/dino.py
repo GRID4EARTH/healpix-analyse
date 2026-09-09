@@ -326,6 +326,234 @@ def tile_grid_cell_ids(
 # Model loading
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Local tangent plane
+#
+# HEALPix cells have equal area but not equal shape: inside a base face the two
+# NESTED axes are neither orthogonal nor of equal length, and the distortion
+# grows with latitude.  At 52 deg N and level 19 the two steps measure 10.6 m
+# and 16.7 m with a 60.5 deg angle between them -- a square in NESTED index
+# space is a parallelogram on the ground, stretched by a factor 2 and sheared by
+# 30 deg.  Feeding that to a network trained on ordinary map-projected imagery
+# costs more than the resampling needed to avoid it, hence the tangent-plane
+# mode: every tile is resampled onto a north-up gnomonic grid of constant
+# ground sampling, exactly as ``fft_local.LocalFFT`` does for the local FFT.
+# ---------------------------------------------------------------------------
+
+EARTH_RADIUS_M: float = 6371000.0
+
+
+def healpix_gsd_m(level: int, radius: float = EARTH_RADIUS_M) -> float:
+    """Square root of the HEALPix cell area at ``level``, in metres."""
+    return float(radius * np.sqrt(np.pi / 3.0) / (2 ** int(level)))
+
+
+def _lonlat_to_vec(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    lo, la = np.radians(lon), np.radians(lat)
+    return np.stack([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)], axis=-1)
+
+
+def _vec_to_lonlat(v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    v = v / np.linalg.norm(v, axis=-1, keepdims=True)
+    return np.degrees(np.arctan2(v[..., 1], v[..., 0])) % 360.0, np.degrees(
+        np.arcsin(np.clip(v[..., 2], -1.0, 1.0))
+    )
+
+
+def tangent_grid_lonlat(
+    centre_lon: np.ndarray,
+    centre_lat: np.ndarray,
+    size: int,
+    gsd_rad: float,
+    *,
+    shift: Tuple[float, float] = (0.0, 0.0),
+    radius: float = EARTH_RADIUS_M,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Longitude / latitude of north-up gnomonic grids centred on given points.
+
+    Parameters
+    ----------
+    centre_lon, centre_lat : array [M]
+        Tangent points, in degrees.
+    size : int
+        Side of the square grid, in pixels.
+    gsd_rad : float
+        Pixel spacing in tangent units (ground sampling / Earth radius).
+    shift : (float, float)
+        Extra offset of the grid origin, in pixels (row, column).  Used by the
+        sliding-window oversampling.
+
+    Returns
+    -------
+    lon, lat : array [M, size, size]
+        Row 0 is the northernmost, column 0 the westernmost: the images are
+        north-up and east-right, whatever the HEALPix face.
+    """
+    c = (size - 1) / 2.0
+    idx = np.arange(size, dtype=np.float64)
+    xi = (idx - c + shift[1]) * gsd_rad                               # east, columns
+    eta = (c - idx + shift[0]) * gsd_rad                              # north, rows
+    ETA, XI = np.meshgrid(eta, xi, indexing="ij")                     # [size, size]
+    return offsets_to_lonlat(centre_lon, centre_lat, XI, ETA)
+
+
+def offsets_to_lonlat(
+    centre_lon: np.ndarray,
+    centre_lat: np.ndarray,
+    xi: np.ndarray,
+    eta: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Gnomonic offsets (east ``xi``, north ``eta``, in tangent units) to lon/lat.
+
+    ``xi`` and ``eta`` are broadcast against the ``[M]`` tangent points, giving
+    ``[M, *xi.shape]`` outputs.
+    """
+    centre_lon = np.atleast_1d(np.asarray(centre_lon, dtype=np.float64))
+    centre_lat = np.atleast_1d(np.asarray(centre_lat, dtype=np.float64))
+    v0 = _lonlat_to_vec(centre_lon, centre_lat)
+    east = np.stack([-v0[:, 1], v0[:, 0], np.zeros_like(v0[:, 0])], axis=1)
+    small = np.linalg.norm(east, axis=1) < 1e-12
+    east[small] = np.array([1.0, 0.0, 0.0])
+    east /= np.linalg.norm(east, axis=1, keepdims=True)
+    north = np.cross(v0, east)
+    north /= np.linalg.norm(north, axis=1, keepdims=True)
+
+    extra = (1,) * np.ndim(xi)
+    v0 = v0.reshape(v0.shape[0], *extra, 3)
+    east = east.reshape(east.shape[0], *extra, 3)
+    north = north.reshape(north.shape[0], *extra, 3)
+    d = v0 + np.asarray(xi)[None, ..., None] * east + np.asarray(eta)[None, ..., None] * north
+    return _vec_to_lonlat(d)
+
+
+def sample_healpix(
+    data: np.ndarray,
+    cell_id: np.ndarray,
+    level: int,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    *,
+    interpolation: str = "bilinear",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Sample a partial-sky NESTED HEALPix map at arbitrary lon/lat.
+
+    Cells absent from ``cell_id`` and non-finite values are treated as missing:
+    the interpolation weights are renormalised over the available neighbours,
+    and the returned mask is False where nothing was available.
+
+    Returns
+    -------
+    values : float32 array [..., C]
+    valid : bool array [...]
+    """
+    import healpy as hp
+
+    nside = 2 ** int(level)
+    shape = np.shape(lon)
+    lon = np.asarray(lon, dtype=np.float64).reshape(-1)
+    lat = np.asarray(lat, dtype=np.float64).reshape(-1)
+
+    if interpolation == "nearest":
+        pix = hp.ang2pix(nside, lon, lat, nest=True, lonlat=True)[None]    # [1, P]
+        wgt = np.ones_like(pix, dtype=np.float64)
+    elif interpolation == "bilinear":
+        pix, wgt = hp.get_interp_weights(nside, lon, lat, nest=True, lonlat=True)
+    else:
+        raise ValueError("interpolation must be 'bilinear' or 'nearest'")
+
+    order = np.argsort(cell_id)
+    sorted_ids = cell_id[order]
+    pos = np.searchsorted(sorted_ids, pix)
+    pos = np.clip(pos, 0, sorted_ids.size - 1)
+    present = sorted_ids[pos] == pix
+    src = order[pos]                                                   # [K, P]
+
+    vals = np.where(present[..., None], data[src], 0.0)                # [K, P, C]
+    finite = present[..., None] & np.isfinite(data[src])
+    w = np.where(finite, wgt[..., None], 0.0)
+    tot = w.sum(axis=0)                                                # [P, C]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = np.where(tot > 0, (w * np.nan_to_num(vals)).sum(axis=0) / tot, np.nan)
+
+    valid = (tot > 0).all(axis=-1)
+    return (out.astype(np.float32).reshape(*shape, data.shape[1]),
+            valid.reshape(shape))
+
+
+def tangent_tiles(
+    data: ArrayLike,
+    cell_id: ArrayLike,
+    level: int,
+    parent_level: int,
+    *,
+    tile_px: Optional[int] = None,
+    gsd_m: Optional[float] = None,
+    shift: Tuple[float, float] = (0.0, 0.0),
+    interpolation: str = "bilinear",
+    fill: str = "mean",
+    duplicates: str = "mean",
+    radius: float = EARTH_RADIUS_M,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Resample the data onto north-up tangent-plane images, one per tile centre.
+
+    Tile centres are the HEALPix cells of ``parent_level`` present in the data;
+    each image is a square of ``tile_px`` pixels at a constant ground sampling,
+    so its shape is right whatever the local HEALPix distortion.  Unlike
+    :func:`nested_to_tiles` the images may overlap and are not restricted to
+    the content of one NESTED block.
+
+    Returns
+    -------
+    tiles : float32 [M, C, S, S]
+    centre_ids : int64 [M]        NESTED ids of the tile centres
+    valid : bool [M, S, S]
+    coverage : float [M]
+    lon, lat : float64 [M, S, S]  geographic position of every pixel
+    """
+    import healpy as hp
+
+    d = _as_numpy(data)
+    if d.ndim == 1:
+        d = d[:, None]
+    d = d.astype(np.float32, copy=False)
+    ids = _as_numpy(cell_id).astype(np.int64)
+    d, ids = _deduplicate(d, ids, duplicates)
+
+    k = int(level) - int(parent_level)
+    if k < DINOV3_PATCH_LEVELS:
+        raise ValueError(
+            f"level - parent_level must be >= {DINOV3_PATCH_LEVELS}, got {k}")
+    S = int(tile_px) if tile_px is not None else (1 << k)
+    gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level, radius)
+
+    centre_ids = np.unique(ids >> (2 * k))
+    clon, clat = hp.pix2ang(2 ** int(parent_level), centre_ids, nest=True, lonlat=True)
+    lon, lat = tangent_grid_lonlat(clon, clat, S, gsd / radius, shift=shift, radius=radius)
+
+    vals, valid = sample_healpix(d, ids, level, lon, lat, interpolation=interpolation)
+    M, C = centre_ids.size, d.shape[1]
+    coverage = valid.reshape(M, -1).mean(axis=1)
+
+    if fill == "mean":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            m = np.nanmean(vals.reshape(M, S * S, C), axis=1)
+        m = np.where(np.isfinite(m), m, 0.0).astype(np.float32)
+        bad = ~np.isfinite(vals)
+        vals = np.where(bad, np.broadcast_to(m[:, None, None, :], vals.shape), vals)
+    elif fill == "zero":
+        vals = np.nan_to_num(vals, nan=0.0)
+    elif fill != "nan":
+        raise ValueError("fill must be 'mean', 'zero' or 'nan'")
+
+    tiles = np.ascontiguousarray(np.transpose(vals, (0, 3, 1, 2)))     # [M, C, S, S]
+    return tiles, centre_ids, valid, coverage, lon, lat
+
+
 def load_dinov3_sat(
     model_name: str = "dinov3_vitl16",
     weights: Optional[str] = None,
@@ -356,15 +584,7 @@ def load_dinov3_sat(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     if weights is None and source != "hf":
-        raise ValueError(
-            "DINOv3 SAT-493M weights are gated and are not downloaded automatically. "
-            "Without `weights`, torch-hub would fall back to the *web* (LVD-1689M) "
-            "checkpoint, which is a different model and is also gated (HTTP 403).\n"
-            "Request access on https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/ "
-            "(accept the DINOv3 License), download e.g. "
-            "dinov3_vitl16_pretrain_sat493m-<hash>.pth, and pass its local path (or the "
-            "personalised download URL) as `weights`."
-        )
+        raise ValueError("DINOv3 SAT-493M weights are gated; pass `weights`.")
     errors = []
     if source in ("auto", "hub"):
         try:
@@ -433,6 +653,12 @@ class DINOEmbedding:
     patch_embedding: Optional[np.ndarray] = None
     patch_cell_id: Optional[np.ndarray] = None
     patch_level: Optional[int] = None
+    patch_lon: Optional[np.ndarray] = None
+    patch_lat: Optional[np.ndarray] = None
+    projection: str = "tangent"
+    over_sample: int = 1
+    gsd_m: Optional[float] = None
+    tile_px: Optional[int] = None
 
 
 def GetDINOV3SAT(
@@ -441,6 +667,11 @@ def GetDINOV3SAT(
     level: int,
     parent_level: int,
     *,
+    projection: str = "tangent",
+    over_sample: int = 1,
+    gsd_m: Optional[float] = None,
+    tile_px: Optional[int] = None,
+    interpolation: str = "bilinear",
     model: Optional[nn.Module] = None,
     weights: Optional[str] = None,
     model_name: str = "dinov3_vitl16",
@@ -459,10 +690,27 @@ def GetDINOV3SAT(
     """
     DINOv3 SAT-493M embeddings of NESTED HEALPix data.
 
-    Every HEALPix cell of ``parent_level`` that has at least one pixel in
-    ``cell_id`` becomes one square image of side ``2**(level - parent_level)``
-    pixels (see :func:`nested_to_tiles`), which is passed *unchanged* to the
-    DINOv3 backbone.
+    Every HEALPix cell of ``parent_level`` present in ``cell_id`` gives one
+    square image, which is passed to an unmodified DINOv3 backbone.  How that
+    image is built is the important choice:
+
+    ``projection="tangent"`` (default)
+        The image is resampled onto a north-up gnomonic plane tangent at the
+        cell centre, with a constant ground sampling.  Shapes are then correct:
+        HEALPix cells have equal area but not equal shape, and at 52 deg N the
+        two NESTED axes measure 10.6 m and 16.7 m with a 60.5 deg angle between
+        them, so the "square" of the ``nested`` mode is really a parallelogram
+        stretched by a factor 2.  A network trained on map-projected imagery
+        cannot be expected to see through that.  The price is a resampling
+        (bilinear by default) and tokens that no longer coincide exactly with
+        HEALPix cells -- ``patch_lon`` / ``patch_lat`` give their true
+        positions, ``patch_cell_id`` the cell each one falls in.
+
+    ``projection="nested"``
+        The historical mode: the NESTED block is reshaped into an image, which
+        is exact in index space and free of resampling, and every token maps
+        onto exactly one cell of ``level - 4``.  Geometrically wrong away from
+        the equator; kept for comparison.
 
     Parameters
     ----------
@@ -474,9 +722,24 @@ def GetDINOV3SAT(
     level : int
         Resolution of ``data``.
     parent_level : int
-        Resolution of the DINO tiles; ``level - parent_level >= 4`` is
-        required (one DINO patch is 16 px = 4 HEALPix levels).  The natural
-        choice is ``level - 8`` (256 px tiles, 16x16 patch tokens).
+        Resolution of the tile centres; ``level - parent_level >= 4`` is
+        required (one DINO patch is 16 px = 4 HEALPix levels).  ``level - 8``
+        (256 px tiles, 16x16 patch tokens) is the natural choice.
+    projection : {"tangent", "nested"}
+        See above.
+    over_sample : int
+        Sliding-window factor, a power of two.  ``1`` (default) runs the
+        patches side by side, exactly as the network does.  ``n`` runs the
+        network ``n**2`` times on windows shifted by ``16 / n`` pixels and
+        interleaves the tokens, giving a token field ``n`` times denser in each
+        direction, at ``level - 4 + log2(n)``.  Cost grows as ``n**2``.
+    gsd_m : float, optional
+        Ground sampling of the tangent grid, in metres.  Defaults to the
+        HEALPix native value ``sqrt(cell area)`` at ``level``.
+    tile_px : int, optional
+        Side of the images.  Defaults to ``2**(level - parent_level)``.
+    interpolation : {"bilinear", "nearest"}
+        Resampling onto the tangent grid.
     model : nn.Module, optional
         A backbone already loaded with :func:`load_dinov3_sat`.  When
         ``None`` the model is loaded from ``weights`` / ``model_name``.
@@ -490,9 +753,10 @@ def GetDINOV3SAT(
         Tile vector: CLS token, mean of the patch tokens, or their
         concatenation (``2 * Ndino``).
     return_patches : bool
-        Also return the patch tokens, one per cell at ``level - 4``.
+        Also return the patch tokens.
     min_coverage : float
-        Drop tiles whose fraction of available pixels is below this value.
+        Drop tiles whose fraction of usable pixels is below this value; 1.0
+        keeps only the complete ones.
     fill : {"mean", "zero"}
         How missing pixels are filled before normalisation.
     duplicates : {"mean", "first", "error"}
@@ -505,9 +769,6 @@ def GetDINOV3SAT(
     Returns
     -------
     DINOEmbedding
-        ``result.embedding`` has shape ``[M, Ndino]`` where ``M`` is the
-        number of ``parent_level`` tiles kept and ``result.cell_id`` gives
-        their NESTED ids.
     """
     k = int(level) - int(parent_level)
     if k < DINOV3_PATCH_LEVELS:
@@ -519,19 +780,63 @@ def GetDINOV3SAT(
         raise ValueError("DINOv3 SAT expects 3 bands (R, G, B)")
     if fill == "nan":
         raise ValueError("fill='nan' cannot be fed to the network")
+    n = int(over_sample)
+    if n < 1 or (n & (n - 1)):
+        raise ValueError("over_sample must be a power of two (1, 2, 4, ...)")
+    if n > DINOV3_PATCH:
+        raise ValueError(f"over_sample must be <= {DINOV3_PATCH}")
+    if projection not in ("tangent", "nested"):
+        raise ValueError("projection must be 'tangent' or 'nested'")
 
     d = _as_numpy(data)
     if d.ndim == 1:
         d = d[:, None]
     d = d[:, list(bands)]
+    ids = _as_numpy(cell_id).astype(np.int64)
 
-    tiles, parent_ids, _valid, coverage = nested_to_tiles(
-        d, cell_id, level, parent_level, fill=fill, duplicates=duplicates
-    )
-    keep = coverage >= float(min_coverage)
-    tiles, parent_ids, coverage = tiles[keep], parent_ids[keep], coverage[keep]
-    M = tiles.shape[0]
+    step = DINOV3_PATCH // n                       # window stride, in pixels
+    S = int(tile_px) if tile_px is not None else (1 << k)
+    if S % DINOV3_PATCH:
+        raise ValueError(f"tile_px must be a multiple of {DINOV3_PATCH}")
 
+    # ---- build the images ------------------------------------------------
+    shifts = [(a * step, b * step) for a in range(n) for b in range(n)]
+
+    if projection == "tangent":
+        gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level)
+        base = tangent_tiles(
+            d, ids, level, parent_level, tile_px=S, gsd_m=gsd,
+            interpolation=interpolation, fill=fill, duplicates=duplicates,
+        )
+        tiles0, centre_ids, _valid, coverage, _lon, _lat = base
+        keep = coverage >= float(min_coverage)
+        centre_ids, coverage = centre_ids[keep], coverage[keep]
+        views = []
+        for sh in shifts:
+            if sh == (0.0, 0.0):
+                views.append(tiles0[keep])
+            else:
+                t = tangent_tiles(
+                    d, ids, level, parent_level, tile_px=S, gsd_m=gsd, shift=sh,
+                    interpolation=interpolation, fill=fill, duplicates=duplicates,
+                )[0]
+                views.append(t[keep])
+        n_tok = S // DINOV3_PATCH                  # tokens per axis and per pass
+    else:
+        tiles0, centre_ids, _valid, coverage = nested_to_tiles(
+            d, ids, level, parent_level, fill=fill, duplicates=duplicates
+        )
+        keep = coverage >= float(min_coverage)
+        tiles0, centre_ids, coverage = tiles0[keep], centre_ids[keep], coverage[keep]
+        n_tok = S // DINOV3_PATCH - (1 if n > 1 else 0)
+        views = []
+        for (dy, dx) in shifts:
+            w = DINOV3_PATCH * n_tok
+            views.append(np.ascontiguousarray(tiles0[:, :, dy:dy + w, dx:dx + w]))
+
+    M = views[0].shape[0]
+
+    # ---- forward ---------------------------------------------------------
     if model is None:
         model = load_dinov3_sat(model_name, weights, device=device)
     dev = next(model.parameters()).device if device is None else torch.device(device)
@@ -539,51 +844,85 @@ def GetDINOV3SAT(
 
     mean_t = torch.tensor(mean, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
     std_t = torch.tensor(std, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
-
-    cls_out, patch_out = [], []
     use_ac = autocast and dev.type == "cuda"
-    with torch.inference_mode():
-        for i in range(0, M, batch_size):
-            x = torch.from_numpy(tiles[i:i + batch_size]).to(dev)
-            x = (x - mean_t) / std_t
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_ac):
-                cls, patches = _forward(model, x)
-            cls, patches = cls.float(), patches.float()
-            if pooling == "cls":
-                v = cls
-            elif pooling == "mean":
-                v = patches.mean(dim=1)
-            elif pooling == "cls+mean":
-                v = torch.cat([cls, patches.mean(dim=1)], dim=1)
-            else:
-                raise ValueError("pooling must be 'cls', 'mean' or 'cls+mean'")
-            cls_out.append(v.cpu())
-            if return_patches:
-                patch_out.append(patches.cpu())
 
-    D = cls_out[0].shape[1] if cls_out else 0
-    embedding = torch.cat(cls_out).numpy() if cls_out else np.zeros((0, D), np.float32)
+    cls_sum, D = None, 0
+    tok = None                                     # [M, n*n_tok, n*n_tok, D]
+    with torch.inference_mode():
+        for v, (a, b) in zip(views, [(a, b) for a in range(n) for b in range(n)]):
+            cls_out, patch_out = [], []
+            for i in range(0, M, batch_size):
+                x = torch.from_numpy(v[i:i + batch_size]).to(dev)
+                x = (x - mean_t) / std_t
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_ac):
+                    cls, patches = _forward(model, x)
+                cls, patches = cls.float(), patches.float()
+                if pooling == "cls":
+                    val = cls
+                elif pooling == "mean":
+                    val = patches.mean(dim=1)
+                elif pooling == "cls+mean":
+                    val = torch.cat([cls, patches.mean(dim=1)], dim=1)
+                else:
+                    raise ValueError("pooling must be 'cls', 'mean' or 'cls+mean'")
+                cls_out.append(val.cpu())
+                if return_patches:
+                    patch_out.append(patches.cpu())
+            c = torch.cat(cls_out).numpy() if cls_out else np.zeros((0, 0), np.float32)
+            cls_sum = c if cls_sum is None else cls_sum + c
+            if return_patches and patch_out:
+                pt = torch.cat(patch_out).numpy()
+                if pt.shape[1] != n_tok * n_tok:
+                    raise RuntimeError(
+                        f"got {pt.shape[1]} patch tokens for a {n_tok}x{n_tok} grid; "
+                        "is the model patch size 16?"
+                    )
+                D = pt.shape[-1]
+                if tok is None:
+                    tok = np.zeros((M, n_tok * n, n_tok * n, D), np.float32)
+                tok[:, a::n, b::n] = pt.reshape(M, n_tok, n_tok, D)
+
+    embedding = (cls_sum / len(views)) if cls_sum is not None else np.zeros((0, 0), np.float32)
 
     res = DINOEmbedding(
         embedding=embedding,
-        cell_id=parent_ids,
+        cell_id=centre_ids,
         parent_level=int(parent_level),
         coverage=coverage,
+        projection=projection,
+        over_sample=n,
+        gsd_m=(gsd if projection == "tangent" else None),
+        tile_px=S,
     )
-    if return_patches:
-        patch_level = int(level) - DINOV3_PATCH_LEVELS
-        grid = tile_grid_cell_ids(parent_ids, parent_level, patch_level)   # [M, G, G]
-        if patch_out:
-            p = torch.cat(patch_out).numpy()                                 # [M, G*G, D]
-            if p.shape[1] != grid.shape[1] * grid.shape[2]:
-                raise RuntimeError(
-                    "unexpected number of patch tokens; is the model patch size 16?"
-                )
-            res.patch_embedding = p.reshape(-1, p.shape[-1])
-        else:
-            res.patch_embedding = np.zeros((0, D), np.float32)
-        res.patch_cell_id = grid.reshape(-1)
-        res.patch_level = patch_level
+    if not return_patches:
+        return res
+
+    F = n_tok * n                                  # token grid side
+    token_level = int(level) - DINOV3_PATCH_LEVELS + int(np.log2(n))
+    res.patch_level = token_level
+    res.patch_embedding = (tok.reshape(-1, D) if tok is not None
+                           else np.zeros((0, 0), np.float32))
+
+    if projection == "tangent":
+        import healpy as hp
+        clon, clat = hp.pix2ang(2 ** int(parent_level), centre_ids, nest=True, lonlat=True)
+        c = (S - 1) / 2.0
+        pos = np.arange(F, dtype=np.float64) * step + (DINOV3_PATCH - 1) / 2.0
+        xi = (pos - c) * (gsd / EARTH_RADIUS_M)               # columns, east
+        eta = (c - pos) * (gsd / EARTH_RADIUS_M)              # rows, north
+        ETA, XI = np.meshgrid(eta, xi, indexing="ij")
+        lon, lat = offsets_to_lonlat(clon, clat, XI, ETA)     # [M, F, F]
+        res.patch_lon, res.patch_lat = lon.reshape(-1), lat.reshape(-1)
+        res.patch_cell_id = hp.ang2pix(2 ** token_level, res.patch_lon, res.patch_lat,
+                                       nest=True, lonlat=True).astype(np.int64)
+    else:
+        full = S * n // DINOV3_PATCH               # cells per axis at token_level
+        off = int((DINOV3_PATCH - 1) / 2.0 // step)
+        f = np.arange(F) + off
+        col, row = np.meshgrid(f, f, indexing="xy")[0], np.meshgrid(f, f, indexing="ij")[0]
+        rel = xy_to_nested(col, (full - 1) - row)             # [F, F]
+        shift_bits = 2 * (token_level - int(parent_level))
+        res.patch_cell_id = ((centre_ids[:, None, None] << shift_bits) + rel[None]).reshape(-1)
     return res
 
 
@@ -594,6 +933,11 @@ __all__ = [
     "nested_to_tiles",
     "tiles_to_nested",
     "tile_grid_cell_ids",
+    "tangent_tiles",
+    "tangent_grid_lonlat",
+    "offsets_to_lonlat",
+    "sample_healpix",
+    "healpix_gsd_m",
     "nested_to_xy",
     "xy_to_nested",
     "SAT493M_MEAN",

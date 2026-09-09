@@ -9,25 +9,78 @@
 ## Overview
 
 `GetDINOV3SAT` computes DINOv3 (SAT-493M) embeddings of Sentinel-2-like data
-stored on a NESTED HEALPix grid, **without modifying the network**.
+stored on a NESTED HEALPix grid, **without modifying the network**. Each
+HEALPix cell of `parent_level` gives one square image; the images go through an
+unmodified backbone and the patch tokens come back attached to positions on the
+sphere.
 
-The trick is purely combinatorial. In the NESTED scheme a cell of
-`parent_level` contains exactly `4**(level - parent_level)` cells of `level`,
-stored contiguously and ordered by a Morton (Z-order) code of their local
-face coordinates `(x, y)`. A NESTED block is therefore an *exact* square image
-of side `S = 2**(level - parent_level)` pixels, with no resampling. The image
-is fed to DINOv3 as is, and every 16 × 16 patch token maps back to one
-HEALPix cell of `level - 4`.
+How that image is built is the decisive choice, and there are two modes.
+
+### `projection="tangent"` (default)
+
+Each tile is resampled onto a north-up gnomonic plane tangent at the cell
+centre, at a constant ground sampling -- the construction `fft_local.LocalFFT`
+already uses for the local FFT.
+
+This is not a refinement, it is a correctness fix. HEALPix cells have equal
+**area** but not equal **shape**: inside a base face the two NESTED axes are
+neither orthogonal nor of equal length, and the distortion grows with latitude.
+
+| latitude | nested step x | nested step y | angle(x, y) | anisotropy |
+|---|---|---|---|---|
+| 0 deg | 12.52 m | 12.52 m | 99.3 deg | 1.18 |
+| 30 deg | 12.48 m | 12.48 m | 82.9 deg | 1.13 |
+| **52.3 deg** | **10.63 m** | **16.72 m** | **60.5 deg** | **2.05** |
+| 70 deg | 10.23 m | 16.88 m | 63.5 deg | 2.03 |
+
+(at level 19; the ratios do not depend on the level.) At the latitude of the
+demo store, the "square" image of the `nested` mode is really a parallelogram
+stretched by a factor 2 and sheared by 30 degrees: a circle on the ground
+arrives as a tilted ellipse. A network trained on ordinary map-projected
+imagery cannot be expected to see through that.
+
+![nested versus tangent](_static/dino_tangent_vs_nested.png)
+
+*The same synthetic scene at 52.3 N -- concentric rings plus a north-south /
+east-west cross. Left: `nested`. Right: `tangent`.*
+
+The price: it is an interpolation (bilinear by default), so the reordering is
+no longer exact and the tokens no longer coincide with HEALPix cells.
+`patch_lon` / `patch_lat` give their true positions and `patch_cell_id` the
+cell each falls in. The square grid also overruns the diamond-shaped block, so
+tiles at the edge of the domain never reach `coverage == 1`; interior tiles do,
+by drawing on the neighbouring cells.
+
+### `projection="nested"`
+
+The purely combinatorial mode. A cell of `parent_level` contains exactly
+`4**(level - parent_level)` cells of `level`, stored contiguously and ordered
+by a Morton (Z-order) code of their local face coordinates, so a NESTED block
+*is* a square image of side `S = 2**(level - parent_level)`, with no
+resampling, and every 16 x 16 patch token maps back to exactly one cell of
+`level - 4`. Exact in index space, wrong in geometry away from the equator.
+Kept so the two can be compared.
 
 ```
-level 19 cells  ──nested_to_tiles──▶  tiles [M, 3, 256, 256]  ──DINOv3──▶  CLS  [M, 1024]           (one per level-11 cell)
-                                                                          patches [M·256, 1024]     (one per level-15 cell)
+level 19 cells  --tangent_tiles-->  tiles [M, 3, 256, 256]  --DINOv3-->  CLS [M, 1024]         (one per level-11 cell)
+                                                                        patches [M*256, 1024]  (one per 160 m patch)
 ```
 
-Compared with running DINOv3 on UTM tiles, embeddings live directly on the
-sphere: they are seamless across tiles of the same face, hierarchical
-(`level - 4`, `parent_level`) for free, and comparable across dates and
-orbits because the grid never changes.
+### `over_sample` -- sliding window
+
+By default the 16 x 16 patches are laid side by side, exactly as the network
+does. `over_sample=n` (a power of two) runs the network `n**2` times on windows
+shifted by `16 / n` pixels and **interleaves** the tokens -- they do not
+overlap in the output, each lands at a distinct position -- giving a token
+field `n` times denser in each direction, at `level - 4 + log2(n)`. Cost grows
+as `n**2`. In tangent mode the shift is applied to the projection grid, so
+nothing is lost at the borders; in nested mode the shifted window is cropped
+from the tile, which costs one patch of border and leaves the token centre half
+a cell off the cell it is reported in.
+
+Compared with running DINOv3 on UTM tiles, the embeddings live directly on the
+sphere: hierarchical for free, and comparable across dates and orbits because
+the grid never changes.
 
 ---
 
@@ -107,6 +160,33 @@ gives one 1024-d vector per level-15 cell *and per date*. For a 4-million-cell
 store over 88 dates that is about 5.9 GiB in float32. Restrict the dates,
 store them as float16, or take larger tiles — the example script prints the
 estimate before starting and warns above 4 GiB.
+
+---
+
+## The tile effect
+
+A ViT's attention is global: every patch token attends to the whole tile. So a
+tile-wide radiometric offset — thin cloud, cirrus shadow, sun angle — lands in
+*every* token of that tile. Cluster the tokens and you get one cluster per tile,
+with the tile boundaries plainly visible on the map. This is not a HEALPix
+artefact; it would happen with any tiling.
+
+`GetDINOV3SAT` returns the tokens as the network produced them and does not
+correct this, because the right correction depends on what you are after. Three
+options, applied by the example script and notebook:
+
+- subtract each tile's mean token (`--token-norm tile`, the default there).
+  Effective, but it makes the description *relative to each tile*: a fully
+  forested tile and a fully urban one become comparable, so genuine
+  tile-scale differences are lost too;
+- drop the leading principal components (`--token-norm pc`), gentler, since the
+  first one usually carries illumination;
+- use larger tiles (`--tile-levels 10`), which leaves fewer boundaries.
+
+Measure before you correct: the script prints the fraction of token variance
+carried by the per-tile mean, and §5 of the notebook does the same. Above ~0.5,
+any clustering will follow the tiling. A hazy date will always produce tokens
+dominated by the haze — picking a clear date is the first remedy.
 
 ---
 

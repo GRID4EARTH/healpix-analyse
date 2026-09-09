@@ -12,6 +12,8 @@ Pipeline
 2. for every selected date, cut the NESTED domain into DINO tiles of
    ``2**tile_levels`` px and run DINOv3; keep the **patch tokens**, i.e. one
    1024-d vector per HEALPix cell of level ``level - 4`` (16 px = 160 m);
+2b. by default every tile is resampled onto a local tangent plane, so the
+   shapes are right (--projection nested for the raw index reshaping);
 3. UMAP of the L2-normalised patch tokens, then k-means **on the UMAP
    coordinates** (--cluster-space dino to cluster the raw embeddings instead);
 4. figures: UMAP scatter coloured by cluster, and for a few dates the RGB
@@ -201,6 +203,20 @@ def main(argv=None):
     ap.add_argument("--model-name", default="dinov3_vitl16")
     ap.add_argument("--hf", action="store_true", help="load weights from Hugging Face instead")
     ap.add_argument("--fake", action="store_true", help="random backbone (no weights needed)")
+    ap.add_argument("--projection", default="tangent", choices=["tangent", "nested"],
+                    help="'tangent' resamples every tile onto a north-up local tangent plane "
+                         "(HEALPix cells have equal area but not equal shape: at 52 deg N the "
+                         "nested image is stretched by 2 and sheared by 30 deg). 'nested' is "
+                         "the exact index reshaping, geometrically wrong away from the equator")
+    ap.add_argument("--over-sample", type=int, default=1,
+                    help="sliding-window factor, a power of two: the network runs n**2 times on "
+                         "windows shifted by 16/n px, giving a token field n times denser")
+    ap.add_argument("--gsd-m", type=float, default=None,
+                    help="ground sampling of the tangent grid in metres (default: HEALPix native)")
+    ap.add_argument("--interpolation", default="bilinear", choices=["bilinear", "nearest"])
+    ap.add_argument("--scan-dates", action="store_true",
+                    help="only rank the dates by cloudiness and exit, so a clear scene can be "
+                         "picked; each date is still downloaded once (use --cache)")
     ap.add_argument("--tile-levels", type=int, default=8,
                     help="DINO tile side = 2**tile_levels px (8 -> 256 px, 16x16 patches)")
     ap.add_argument("--times", default="all", help="'all', an int (first n dates) or 'a:b'")
@@ -223,6 +239,14 @@ def main(argv=None):
     ap.add_argument("--skip-failed", action="store_true",
                     help="skip a date that still fails after --retries instead of stopping")
     ap.add_argument("--umap-max", type=int, default=60000, help="max vectors for UMAP fit")
+    ap.add_argument("--token-norm", default="tile", choices=["none", "tile", "pc", "tile+pc"],
+                    help="a ViT sees the whole tile through global attention, so a tile-wide "
+                         "radiometric offset (haze, illumination) ends up in every one of its "
+                         "tokens and the clusters follow the tiles. 'tile' subtracts each "
+                         "tile's mean token (the fix, at the price of making the description "
+                         "relative to each tile), 'pc' drops the leading principal components")
+    ap.add_argument("--drop-pc", type=int, default=1,
+                    help="principal components dropped when --token-norm contains 'pc'")
     ap.add_argument("--cluster-space", default="umap", choices=["umap", "dino"],
                     help="run k-means on the UMAP coordinates (default) or directly on the "
                          "1024-d DINOv3 embeddings")
@@ -254,6 +278,34 @@ def main(argv=None):
     else:
         times = list(range(min(int(args.times), n_time)))
     print(f"store: {args.zarr}\n  level {level}, {cell_id.size} cells, {len(times)}/{n_time} dates")
+
+    # ---- optional: rank the dates by cloudiness and stop --------------------
+    if args.scan_dates:
+        rows = []
+        for t in times:
+            try:
+                x = rgb_at(ds, t, cache=args.cache, retries=args.retries)
+            except Exception as exc:                                # noqa: BLE001
+                print(f"  t={t:3d}  unreadable: {type(exc).__name__}", flush=True)
+                continue
+            ok = np.isfinite(x).all(axis=1)
+            v = x[ok]
+            # thin cloud and haze are bright AND grey; blue is raised the most
+            bright_grey = float((v.min(axis=1) > 0.18).mean())
+            blue_excess = float(v[:, 2].mean() - v[:, 0].mean())
+            rows.append((t, str(ds["time"].values[t])[:10], v[:, 0].mean(),
+                         bright_grey, blue_excess, 1.0 - ok.mean()))
+            print(f"  t={t:3d} {rows[-1][1]}  bright-grey {bright_grey:.3f}  "
+                  f"blue-excess {blue_excess:+.4f}  nan {rows[-1][5]:.3f}", flush=True)
+        rows.sort(key=lambda r: (r[3], r[4]))
+        print("\nclearest first (bright-grey fraction, then blue excess):")
+        print(f"{'t':>4} {'date':>12} {'bright-grey':>12} {'blue-excess':>12} {'nan':>7}")
+        for t, dt, _m, bg, be, nn in rows[:15]:
+            print(f"{t:4d} {dt:>12} {bg:12.3f} {be:+12.4f} {nn:7.3f}")
+        print("\nThese are proxies, not a cloud mask: bright-grey counts pixels that are both "
+              "bright and unsaturated, blue-excess is raised by haze. Look at the best few "
+              "with the notebook before trusting them.")
+        return 0
 
     # ---- model ------------------------------------------------------------
     if not args.fake and not args.hf and args.weights is None:
@@ -295,11 +347,27 @@ def main(argv=None):
             rgb, cell_id, level, parent_level,
             model=model, return_patches=True, min_coverage=args.min_coverage,
             duplicates=args.duplicates, device=args.device,
+            projection=args.projection, over_sample=args.over_sample,
+            gsd_m=args.gsd_m, interpolation=args.interpolation,
         )
         if res.patch_embedding.shape[0] == 0:
-            print(f"  t={t:3d}  no tile reaches min_coverage={args.min_coverage}", flush=True)
+            print(f"  t={t:3d}  no tile reaches min_coverage={args.min_coverage}"
+                  + ("  [in tangent mode the square grid overruns the diamond-shaped block, "
+                     "so tiles at the edge of the domain never reach 1.0]"
+                     if args.projection == "tangent" else ""), flush=True)
             continue
-        emb.append(res.patch_embedding.astype(np.float16 if args.float16 else np.float32))
+        pe = res.patch_embedding.astype(np.float32)
+        n_tile = res.cell_id.size
+        P = pe.shape[0] // n_tile
+        blk = pe.reshape(n_tile, P, -1)
+        if t == times[0]:
+            grand = pe.mean(0)
+            frac = (((blk.mean(1) - grand) ** 2).sum() * P) / (((pe - grand) ** 2).sum() + 1e-12)
+            print(f"  variance carried by the per-tile mean token: {frac:.3f}"
+                  + ("  [the clusters would follow the tiles]" if frac > 0.5 else ""))
+        if "tile" in args.token_norm:
+            pe = (blk - blk.mean(axis=1, keepdims=True)).reshape(pe.shape)
+        emb.append(pe.astype(np.float16 if args.float16 else np.float32))
         pid.append(res.patch_cell_id)
         tid.append(np.full(res.patch_cell_id.size, t, dtype=np.int32))
         cov_all.append(res.coverage)
@@ -318,7 +386,7 @@ def main(argv=None):
     emb = np.concatenate(emb)
     pid = np.concatenate(pid)
     tid = np.concatenate(tid)
-    patch_level = level - 4
+    patch_level = res.patch_level          # level - 4 + log2(over_sample)
     print(f"embeddings: {emb.shape}  (one per level-{patch_level} cell and date)")
     np.savez_compressed(os.path.join(args.out, "patch_embeddings.npz"),
                         embedding=emb, cell_id=pid, time=tid, patch_level=patch_level)
@@ -327,7 +395,13 @@ def main(argv=None):
     import umap
     from sklearn.cluster import KMeans
 
-    z = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+    z = emb.astype(np.float32)
+    if "pc" in args.token_norm:
+        from sklearn.decomposition import PCA
+        pc = PCA(n_components=args.drop_pc, random_state=0).fit(z)
+        z = z - pc.inverse_transform(pc.transform(z))
+        print(f"dropped the first {args.drop_pc} principal component(s)")
+    z = z / (np.linalg.norm(z, axis=1, keepdims=True) + 1e-8)
     rng = np.random.default_rng(0)
     fit_idx = rng.choice(z.shape[0], size=min(args.umap_max, z.shape[0]), replace=False)
     reducer = umap.UMAP(n_components=max(2, args.umap_dim), n_neighbors=args.umap_neighbors,
