@@ -93,15 +93,44 @@ def cell_dim(ds: xr.Dataset) -> str:
     return ds["cell_ids"].dims[0]
 
 
-def rgb_at(ds: xr.Dataset, t: int) -> np.ndarray:
-    """[N, 3] reflectances in [0, 1] (NaN kept) for date index ``t``."""
-    x = ds["Sentinel2"].isel(time=t).sel(bands=list(RGB)).transpose(cell_dim(ds), "bands").values
+def rgb_at(ds: xr.Dataset, t: int, *, cache: str | None = None, retries: int = 5) -> np.ndarray:
+    """
+    [N, 3] reflectances in [0, 1] (NaN kept) for date index ``t``.
+
+    One date is a single zarr chunk of a few hundred MB pulled over HTTP, and
+    the server does drop connections, so the read is retried with an
+    exponential back-off.  With ``cache``, each date is kept locally as float16
+    so that a re-run (or the figures) never downloads it twice.
+    """
+    fname = os.path.join(cache, f"rgb_{t:04d}.npy") if cache else None
+    if fname is not None and os.path.exists(fname):
+        return np.load(fname).astype(np.float32)
+
+    delay = 2.0
+    for attempt in range(1, retries + 1):
+        try:
+            x = (ds["Sentinel2"].isel(time=t).sel(bands=list(RGB))
+                 .transpose(cell_dim(ds), "bands").values)
+            break
+        except Exception as exc:                                    # noqa: BLE001
+            if attempt == retries:
+                raise
+            print(f"  [retry {attempt}/{retries - 1}] t={t}: "
+                  f"{type(exc).__name__}: {exc}; waiting {delay:.0f}s", flush=True)
+            time.sleep(delay)
+            delay *= 2
+
     x = x.astype(np.float32) / 10000.0
-    x[np.isfinite(x)] = np.clip(x[np.isfinite(x)], 0.0, 1.0)
+    finite = np.isfinite(x)
+    x[finite] = np.clip(x[finite], 0.0, 1.0)
+    if fname is not None:
+        os.makedirs(cache, exist_ok=True)
+        np.save(fname, x.astype(np.float16))
     return x
 
 
-def plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap):
+def plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap,
+              cache=None):
     """RGB scene, k-means labels and temporal consistency, drawn in lon/lat with healpix_plot."""
     import cartopy.crs as ccrs
     import healpix_plot
@@ -114,7 +143,7 @@ def plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistenc
                              subplot_kw={"projection": ccrs.PlateCarree()}, layout="constrained")
     for r, t in enumerate(show):
         date = str(ds["time"].values[t])[:10]
-        rgb = rgb_at(ds, t)
+        rgb = rgb_at(ds, t, cache=cache)
         hi = np.nanpercentile(rgb, 98)
         healpix_plot.plot(cell_id, rgb, healpix_grid=grid_px, sampling_grid={"shape": 768},
                           ax=axes[r, 0], rgb_clip=(0.0, float(max(hi, 1e-3))), axis_labels="none",
@@ -162,6 +191,13 @@ def main(argv=None):
                     help="how to aggregate repeated cell ids in the store")
     ap.add_argument("--float16", action="store_true",
                     help="store the patch embeddings as float16 (halves the memory)")
+    ap.add_argument("--cache", default=None,
+                    help="directory where each date is kept locally (float16), so an "
+                         "interrupted run resumes without downloading it again")
+    ap.add_argument("--retries", type=int, default=5,
+                    help="attempts per date before giving up (the store is served over HTTP)")
+    ap.add_argument("--skip-failed", action="store_true",
+                    help="skip a date that still fails after --retries instead of stopping")
     ap.add_argument("--umap-max", type=int, default=60000, help="max vectors for UMAP fit")
     ap.add_argument("--n-show", type=int, default=4, help="dates shown as RGB/cluster maps")
     ap.add_argument("--out", default="dino_umap_out")
@@ -210,8 +246,16 @@ def main(argv=None):
               "use --float16, or take larger tiles with --tile-levels")
 
     emb, pid, tid, cov_all = [], [], [], []
+    failed = []
     for t in times:
-        rgb = rgb_at(ds, t)
+        try:
+            rgb = rgb_at(ds, t, cache=args.cache, retries=args.retries)
+        except Exception as exc:                                    # noqa: BLE001
+            if not args.skip_failed:
+                raise
+            print(f"  [skip] t={t}: {type(exc).__name__}: {exc}", flush=True)
+            failed.append(t)
+            continue
         res = GetDINOV3SAT(
             rgb, cell_id, level, parent_level,
             model=model, return_patches=True, min_coverage=args.min_coverage,
@@ -225,6 +269,12 @@ def main(argv=None):
         cov_all.append(res.coverage)
         print(f"  t={t:3d}  tiles={res.cell_id.size:3d}  patches={res.patch_cell_id.size:6d}"
               f"  coverage={res.coverage.mean():.2f}  [{time.time() - t0:.0f}s]")
+
+    if failed:
+        print(f"[warn] {len(failed)} date(s) could not be read and were skipped: {failed}")
+        times = [t for t in times if t not in failed]
+    if not emb:
+        raise SystemExit("no date could be read; check the network or use --cache")
 
     emb = np.concatenate(emb)
     pid = np.concatenate(pid)
@@ -275,7 +325,8 @@ def main(argv=None):
     plt.close(fig)
 
     show = times[:: max(1, len(times) // args.n_show)][: args.n_show]
-    fig = plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap)
+    fig = plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap,
+                    cache=args.cache)
     fig.savefig(os.path.join(args.out, "cluster_maps.png"), dpi=150)
     plt.close(fig)
 

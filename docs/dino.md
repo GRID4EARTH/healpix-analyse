@@ -180,6 +180,22 @@ res.embedding.shape        # (M, 1024)   one per level-11 cell
 res.patch_embedding.shape  # (M*256, 1024)  one per level-15 cell -> res.patch_cell_id
 ```
 
+### Reading the demo store reliably
+
+One date of the demo store is a single zarr chunk of a few hundred MB served
+over plain HTTP, and the server does drop connections
+(`aiohttp ServerDisconnectedError`). The example script therefore retries each
+date with an exponential back-off (`--retries`, 5 by default), can keep every
+date locally as float16 (`--cache DIR`) so an interrupted run resumes without
+downloading it again, and can carry on past a date that never arrives
+(`--skip-failed`). A robust first run:
+
+```bash
+python Notebooks/dino_umap_sentinel2.py \
+    --weights /path/to/dinov3_vitl16_pretrain_sat493m-<hash>.pth \
+    --times 0:10 --cache ~/s2_cache --skip-failed
+```
+
 `Notebooks/dino_umap_sentinel2.py` runs this on all 88 dates of the demo
 store, projects the patch tokens with UMAP, clusters them with k-means and
 draws the cluster maps next to the RGB scene in lon/lat with `healpix_plot`
