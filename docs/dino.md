@@ -185,6 +185,13 @@ res.embedding.shape        # (M, 1024)   one per level-11 cell
 res.patch_embedding.shape  # (M*256, 1024)  one per level-15 cell -> res.patch_cell_id
 ```
 
+`Notebooks/dino_tuning_single_date.ipynb` is the companion notebook: one date,
+every parameter exposed at the top, and the expensive steps (download, forward
+pass) separated from the cheap ones, so `K` can be re-tuned by re-running a
+single cell. It also shows the tiles as the network sees them, a PCA of the
+patch tokens (the standard check that the features mean anything at all), and a
+comparison against a k-means on colour alone.
+
 ### Reading the demo store reliably
 
 One date of the demo store is a single zarr chunk of a few hundred MB served
