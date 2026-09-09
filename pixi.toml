@@ -20,7 +20,7 @@ healpy = ">=1.16"
 healpix-analyse= { path = ".", editable = true }
 # Native batched cone_coverage is required to preserve filtering performance.
 # Replace this validation pin only with a release containing that API.
-healpix-geo = { git = "https://github.com/tinaok/healpix-geo.git", rev = "508ef39850a7bb0e8e07b0360ca7a9a5326d69d5", subdirectory = "healpix-geo-python" }
+healpix-geo = { git = "https://github.com/tinaok/healpix-geo.git", rev = "5a43c343d2f5940ae87a730fbedb856e0256ef4a", subdirectory = "healpix-geo-python" }
 
 [feature.affine.dependencies]
 affine = "*"

@@ -43,3 +43,8 @@ Rust Clippyはworkspace/all-targets/-D warningsで成功。git diff --checkも�
 検証後、GEO PR #292へ同じファイル内容を取り込み、ANALYSEのPixi依存先を
 `508ef39850a7bb0e8e07b0360ca7a9a5326d69d5` に更新した。
 元のPR #252を祖先に持ち、追加修正コミットは `2209051`。
+
+公開前の追加確認で、GEOのnum_threads=0にも最大8スレッド制限を適用する補正を追加した。
+ANALYSEの計測経路は8を明示しており、この補正で変わらない。
+最終公開GEOコミットは `5a43c343d2f5940ae87a730fbedb856e0256ef4a`。
+最終リリースビルドでGEO69件＋ANALYSE408件、計477件成功、21件skip。
