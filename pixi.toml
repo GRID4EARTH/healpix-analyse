@@ -21,6 +21,32 @@ healpix-geo = "*"
 [feature.affine.dependencies]
 affine = "*"
 
+# --- DINOv3 embeddings (healpix_analyse.dino) -------------------------------
+# The backbone is fetched at run time from Meta's distribution and is governed
+# by the DINOv3 License; the SAT-493M weights are gated (see docs/dino.md).
+# Only what the DINOv3 code needs to import is declared here.
+[feature.dino.dependencies]
+termcolor = "*"
+
+[feature.dino-hf.dependencies]
+transformers = ">=4.40"
+
+# --- the Sentinel-2 example and the tuning notebook -------------------------
+[feature.examples.dependencies]
+xarray = ">=2024.1"
+zarr = ">=2.18"
+dask = "*"
+fsspec = "*"
+aiohttp = "*"
+scikit-learn = ">=1.3"
+umap-learn = ">=0.5"
+matplotlib-base = ">=3.7,<4"
+cartopy = ">=0.22"
+
+[feature.examples.pypi-dependencies]
+# not published on PyPI, hence the git source
+healpix-plot = { git = "https://github.com/GRID4EARTH/healpix-plot" }
+
 [feature.test.dependencies]
 pytest = "*"
 pytest-cov = "*"
@@ -54,5 +80,8 @@ isort = "*"
 
 
 [environments]
-default = ["test", "dev", "affine"]
+default = ["test", "dev", "affine", "dino", "examples"]
 docs = ["docs"]
+# a lighter environment when only the embeddings are needed
+dino = ["dino", "examples"]
+dino-hf = ["dino", "dino-hf", "examples"]

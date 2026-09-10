@@ -37,6 +37,7 @@ healpix_analyse/
 ├── fft_conv.py           # FFT-accelerated large-kernel local convolution
 ├── convol.py             # Gauge-equivariant spherical convolution (HealPixConv)
 ├── large_conv.py         # Multiresolution large-receptive-field convolution
+├── dino.py               # DINOv3 SAT-493M embeddings of NESTED blocks (backbone loaded at run time, DINOv3 License)
 ├── down.py               # Resolution reduction (HealPixDown)
 ├── up.py                 # Resolution increase (HealPixUp)
 ├── decomp.py             # Exact local multiscale pyramid (HealPixDecomp)
