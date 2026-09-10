@@ -34,6 +34,47 @@ test = [
   "pytest>=8",
 ]
 
+# DINOv3 embeddings -- healpix_analyse.dino
+#
+# The backbone is neither vendored nor redistributed here: it is fetched at run
+# time from Meta's own distribution and is governed by the DINOv3 License, and
+# the SAT-493M weights are gated (see docs/dino.md).  What is listed below is
+# only what that code needs to import on this side.
+dino = [
+  "termcolor",              # imported by the facebookresearch/dinov3 hub code
+]
+
+# Alternative to the torch-hub route: load the weights from Hugging Face
+dino-hf = [
+  "transformers>=4.40",
+]
+
+# Notebooks/dino_umap_sentinel2.py and Notebooks/dino_tuning_single_date.ipynb
+examples = [
+  "termcolor",
+  # reading the Sentinel-2 HEALPix demo store, served as zarr over plain HTTP
+  "xarray>=2024.1",
+  "zarr>=2.18",
+  "dask[array]",
+  "fsspec",
+  "aiohttp",
+  # unsupervised classification and figures
+  "umap-learn>=0.5",
+  "scikit-learn>=1.3",
+  "matplotlib>=3.7",
+  "cartopy>=0.22",
+  # healpix-plot is not published on PyPI, so it cannot be listed here without
+  # making this project impossible to upload to PyPI.  Install it separately:
+  #     pip install git+https://github.com/GRID4EARTH/healpix-plot
+  # (pixi.toml declares it as a git dependency, so `pixi install` gets it.)
+]
+
+# Running the notebooks
+notebooks = [
+  "jupyterlab>=4",
+  "ipykernel",
+]
+
 docs = [
   "sphinx>=7.0",
   "pydata-sphinx-theme>=0.15",

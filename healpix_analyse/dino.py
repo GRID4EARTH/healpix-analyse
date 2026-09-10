@@ -39,6 +39,7 @@ Dependencies: numpy, torch, and either the ``dinov3`` torch-hub repo
 
 from __future__ import annotations
 
+import re
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple, Union
@@ -667,7 +668,24 @@ def load_dinov3_sat(
             return model.eval().to(device)
         except Exception as e:                         # noqa: BLE001
             errors.append(f"hf: {e!r}")
-    raise RuntimeError("Could not load DINOv3: " + " | ".join(errors))
+    # A missing ancillary package is by far the most common failure: the DINOv3
+    # hub code imports a few helpers of its own.  Say which one, and how to fix
+    # it, rather than leaving the caller with a generic message.
+    missing = []
+    for e in errors:
+        m = re.search(r"No module named '([^']+)'", e)
+        if m and m.group(1) not in missing:
+            missing.append(m.group(1))
+    hint = ""
+    if missing:
+        deps = [m for m in missing if m != "transformers"]
+        if deps:
+            hint = ("\nThe DINOv3 code needs a package that is not installed here: "
+                    f"pip install {' '.join(deps)}  (then restart the kernel)")
+        elif missing == ["transformers"]:
+            hint = ("\nThe Hugging Face route needs: pip install transformers  "
+                    "(or use the torch-hub route with `weights=<path to the .pth>`)")
+    raise RuntimeError("Could not load DINOv3: " + " | ".join(errors) + hint)
 
 
 def _forward(model: nn.Module, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
