@@ -27,6 +27,8 @@ dependencies = [
   "healpy",
   "healpix-geo",
   "pyproj>=3.6",
+  "termcolor",
+  "umap-learn",
 ]
 
 [project.optional-dependencies]
