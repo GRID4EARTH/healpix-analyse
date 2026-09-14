@@ -33,8 +33,10 @@ same base face and rotated for the polar faces, which is a mild nuisance for
 a satellite backbone (no gravity direction) and should be handled by
 rotation augmentations when fine-tuning.
 
-Dependencies: numpy, torch, and either the ``dinov3`` torch-hub repo
-(``facebookresearch/dinov3``) or ``transformers`` (HF weights).
+Dependencies: numpy, torch, ``healpix-geo`` (the GRID4EARTH HEALPix library --
+``healpy`` is deliberately not used anywhere in this package), and either the
+``dinov3`` torch-hub repo (``facebookresearch/dinov3``) or ``transformers``
+(HF weights).
 """
 
 from __future__ import annotations
@@ -66,7 +68,123 @@ _HF_SAT_IDS = {
 
 
 # ---------------------------------------------------------------------------
-# Morton (Z-order) helpers -- pure integer arithmetic, no healpy needed
+# HEALPix primitives -- healpix-geo (GRID4EARTH), never healpy
+# ---------------------------------------------------------------------------
+#
+# ``healpix_geo.nested`` is the reference implementation used across the
+# GRID4EARTH suite.  It takes a *depth* (what we call ``level``) rather than an
+# ``nside``, wants ``uint64`` cell ids, and returns degrees.  The thin wrappers
+# below are the only place where that convention is spelled out, so the rest of
+# the module stays readable.
+
+from healpix_geo import nested as _hpx          # noqa: E402
+
+# Radius healpix-geo uses for its spherical cartesian coordinates; we only ever
+# want unit vectors, so the value itself never leaks out of `_pix2vec`.
+_SPHERE_R = 6370997.0
+
+
+def _as_ids(ids: np.ndarray) -> np.ndarray:
+    """Cell ids in the ``uint64`` form healpix-geo expects."""
+    return np.ascontiguousarray(np.asarray(ids), dtype=np.uint64)
+
+
+def _unmask(a, fill):
+    """
+    Plain ndarray out of whatever healpix-geo returned.
+
+    Several healpix-geo functions return a masked array (``marray``) so that
+    absent neighbours or stencil corners can be flagged; ``fill`` is what those
+    entries become here -- ``-1`` for an id, ``0.0`` for a weight, which is what
+    the rest of this module already treats as "nothing there".
+    """
+    mask = getattr(a, "mask", None)
+    data = np.asarray(getattr(a, "data", a))
+    if mask is None:
+        return data
+    return np.where(np.asarray(mask), fill, data)
+
+
+def _pix2ang(level: int, ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Cell centres as (lon, lat) in degrees."""
+    lon, lat = _hpx.healpix_to_lonlat(_as_ids(ids), int(level))
+    return np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64)
+
+
+def _ang2pix(level: int, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """NESTED cell id containing each (lon, lat), in degrees."""
+    lon = np.asarray(lon, dtype=np.float64)
+    lat = np.asarray(lat, dtype=np.float64)
+    shape = np.broadcast(lon, lat).shape
+    ids = _hpx.lonlat_to_healpix(
+        np.ascontiguousarray(np.broadcast_to(lon, shape).reshape(-1)),
+        np.ascontiguousarray(np.broadcast_to(lat, shape).reshape(-1)),
+        int(level),
+    )
+    return np.asarray(ids, dtype=np.int64).reshape(shape)
+
+
+def _pix2vec(level: int, ids: np.ndarray) -> np.ndarray:
+    """Cell centres as **unit** 3-D vectors, shape ``[3, ...]``."""
+    x, y, z = _hpx.healpix_to_cartesian(_as_ids(ids), int(level))
+    return np.stack([np.asarray(x), np.asarray(y), np.asarray(z)]) / _SPHERE_R
+
+
+def _boundaries_lonlat(level: int, ids: np.ndarray, step: int = 4
+                       ) -> Tuple[np.ndarray, np.ndarray]:
+    """Cell outlines as (lon, lat) in degrees, shape ``[M, 4 * step]``."""
+    lon, lat = _hpx.vertices(_as_ids(ids), int(level), step=int(step))
+    return (_unmask(lon, np.nan).astype(np.float64),
+            _unmask(lat, np.nan).astype(np.float64))
+
+
+def _interp_weights(level: int, lon: np.ndarray, lat: np.ndarray
+                    ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Bilinear interpolation stencil: ids and weights, both shape ``[4, P]``.
+
+    The transpose is the only difference from healpix-geo's ``[P, 4]``; it keeps
+    the "one row per stencil corner" layout the sampling code is written around.
+    """
+    ids, wgt = _hpx.bilinear_interpolation(
+        np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64), int(level)
+    )
+    return (_unmask(ids, -1).astype(np.int64).T,
+            _unmask(wgt, 0.0).astype(np.float64).T)
+
+
+def _neighbours(level: int, ids: np.ndarray) -> np.ndarray:
+    """The (up to) eight neighbours of each cell, shape ``[8, N]``, -1 if absent."""
+    nb = _hpx.neighbours(_as_ids(ids), int(level), connectivity="all")
+    return _unmask(nb, -1).astype(np.int64).T
+
+
+# Public names for the HEALPix primitives, so that notebooks and scripts built
+# on this module never have to reach for healpy either.
+
+def cell_centres_lonlat(level: int, cell_id: np.ndarray
+                        ) -> Tuple[np.ndarray, np.ndarray]:
+    """Centres of NESTED cells at ``level``, as (lon, lat) in degrees."""
+    return _pix2ang(level, cell_id)
+
+
+def cells_at_lonlat(level: int, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """NESTED cell ids at ``level`` containing the given (lon, lat), in degrees."""
+    return _ang2pix(level, lon, lat)
+
+
+def cell_vectors(level: int, cell_id: np.ndarray) -> np.ndarray:
+    """Unit vectors of the cell centres, shape ``[3, N]``."""
+    return _pix2vec(level, cell_id)
+
+
+def cell_neighbours(level: int, cell_id: np.ndarray) -> np.ndarray:
+    """The eight NESTED neighbours of each cell, shape ``[8, N]``; -1 where absent."""
+    return _neighbours(level, cell_id)
+
+
+# ---------------------------------------------------------------------------
+# Morton (Z-order) helpers -- pure integer arithmetic
 # ---------------------------------------------------------------------------
 
 _M1 = np.int64(0x5555555555555555)
@@ -474,12 +592,8 @@ def parent_cover_px(
     must contain it entirely is larger than the cell -- and rectangular.  Both
     sides are rounded up to a multiple of the DINOv3 patch.
     """
-    import healpy as hp
-
-    nside = 2 ** int(parent_level)
-    clon, clat = hp.pix2ang(nside, centre_ids, nest=True, lonlat=True)
-    corners = hp.boundaries(nside, centre_ids, step=4, nest=True)      # [M, 3, 16]
-    blon, blat = _vec_to_lonlat(np.transpose(corners, (0, 2, 1)))      # [M, 16]
+    clon, clat = _pix2ang(parent_level, centre_ids)
+    blon, blat = _boundaries_lonlat(parent_level, centre_ids, step=4)   # [M, 16]
     xi, eta = lonlat_to_offsets(clon, clat, blon, blat)
     px = gsd_m / radius
     w = 2 * np.abs(xi).max() / px + margin_px
@@ -509,18 +623,15 @@ def sample_healpix(
     values : float32 array [..., C]
     valid : bool array [...]
     """
-    import healpy as hp
-
-    nside = 2 ** int(level)
     shape = np.shape(lon)
     lon = np.asarray(lon, dtype=np.float64).reshape(-1)
     lat = np.asarray(lat, dtype=np.float64).reshape(-1)
 
     if interpolation == "nearest":
-        pix = hp.ang2pix(nside, lon, lat, nest=True, lonlat=True)[None]    # [1, P]
+        pix = _ang2pix(level, lon, lat)[None]                              # [1, P]
         wgt = np.ones_like(pix, dtype=np.float64)
     elif interpolation == "bilinear":
-        pix, wgt = hp.get_interp_weights(nside, lon, lat, nest=True, lonlat=True)
+        pix, wgt = _interp_weights(level, lon, lat)                        # [4, P]
     else:
         raise ValueError("interpolation must be 'bilinear' or 'nearest'")
 
@@ -574,8 +685,6 @@ def tangent_tiles(
     coverage : float [M]
     lon, lat : float64 [M, S, S]  geographic position of every pixel
     """
-    import healpy as hp
-
     d = _as_numpy(data)
     if d.ndim == 1:
         d = d[:, None]
@@ -584,9 +693,10 @@ def tangent_tiles(
     d, ids = _deduplicate(d, ids, duplicates)
 
     k = int(level) - int(parent_level)
-    if k < DINOV3_PATCH_LEVELS:
-        raise ValueError(
-            f"level - parent_level must be >= {DINOV3_PATCH_LEVELS}, got {k}")
+    if k < 1:
+        # this is a resampler, not a DINO entry point: the 4-level minimum is
+        # GetDINOV3SAT's business, not this function's
+        raise ValueError("parent_level must be coarser than level")
     gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level, radius)
     centre_ids = np.unique(ids >> (2 * k))
     if tile_px is None:
@@ -596,7 +706,7 @@ def tangent_tiles(
     else:
         H, W = (int(v) for v in tile_px)
 
-    clon, clat = hp.pix2ang(2 ** int(parent_level), centre_ids, nest=True, lonlat=True)
+    clon, clat = _pix2ang(parent_level, centre_ids)
     lon, lat = tangent_grid_lonlat(clon, clat, (H, W), gsd / radius, shift=shift, radius=radius)
 
     vals, valid = sample_healpix(d, ids, level, lon, lat, interpolation=interpolation)
@@ -778,9 +888,7 @@ def _percell_embeddings(
     emb : float32 [Ncell, D]
     coverage : float [Ncell]
     """
-    import healpy as hp
-
-    lon0, lat0 = hp.pix2ang(2 ** int(token_level), out_cells, nest=True, lonlat=True)
+    lon0, lat0 = _pix2ang(token_level, out_cells)
     mean_t = torch.tensor(mean, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
     std_t = torch.tensor(std, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
     use_ac = autocast and dev.type == "cuda"
@@ -1051,9 +1159,7 @@ def GetDINOV3SAT(
         # written for the tiled modes keeps working unchanged
         res.patch_embedding, res.patch_cell_id, res.patch_level = (
             res.embedding, res.cell_id, tl)
-        import healpy as hp
-        res.patch_lon, res.patch_lat = hp.pix2ang(
-            2 ** tl, res.cell_id, nest=True, lonlat=True)
+        res.patch_lon, res.patch_lat = _pix2ang(tl, res.cell_id)
         return res
 
     step = DINOV3_PATCH // n                       # window stride, in pixels
@@ -1191,15 +1297,13 @@ def GetDINOV3SAT(
     # each tile (they tile it exactly, by construction) and read the token
     # field at their positions.  Every cell then carries exactly one embedding
     # and the output has no holes.
-    import healpy as hp
-
     c_lev = token_level - int(parent_level)
     child = ((centre_ids[:, None] << (2 * c_lev))
              + np.arange(4 ** c_lev, dtype=np.int64)[None])          # [M, Nc]
-    lon, lat = hp.pix2ang(2 ** token_level, child.reshape(-1), nest=True, lonlat=True)
+    lon, lat = _pix2ang(token_level, child.reshape(-1))
     lon, lat = lon.reshape(child.shape), lat.reshape(child.shape)
 
-    clon, clat = hp.pix2ang(2 ** int(parent_level), centre_ids, nest=True, lonlat=True)
+    clon, clat = _pix2ang(parent_level, centre_ids)
     xi, eta = lonlat_to_offsets(clon, clat, lon, lat)                # [M, Nc]
 
     px = gsd / EARTH_RADIUS_M
@@ -1242,6 +1346,10 @@ __all__ = [
     "parent_cover_px",
     "nested_to_xy",
     "xy_to_nested",
+    "cell_centres_lonlat",
+    "cells_at_lonlat",
+    "cell_vectors",
+    "cell_neighbours",
     "SAT493M_MEAN",
     "SAT493M_STD",
 ]

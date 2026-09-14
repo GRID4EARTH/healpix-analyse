@@ -24,7 +24,7 @@ classifiers = [
 dependencies = [
   "numpy",
   "torch",
-  "healpy",
+  # HEALPix geometry comes from the GRID4EARTH suite, not from healpy
   "healpix-geo",
   "pyproj>=3.6",
 ]
@@ -52,12 +52,14 @@ dino-hf = [
 # Notebooks/dino_umap_sentinel2.py and Notebooks/dino_tuning_single_date.ipynb
 examples = [
   "termcolor",
-  # reading the Sentinel-2 HEALPix demo store, served as zarr over plain HTTP
+  # reading the GRID4EARTH Sentinel-2 products, served as zarr over plain HTTP
+  # (https://data.grid4earth.eu/legacy/sentinel-2-l2a/<PRODUCT>.zarr)
   "xarray>=2024.1",
   "zarr>=2.18",
   "dask[array]",
   "fsspec",
   "aiohttp",
+  "obstore>=0.3",           # preferred HTTP opener, as in GRID4EARTH/egu26-demos
   # unsupervised classification and figures
   "umap-learn>=0.5",
   "scikit-learn>=1.3",

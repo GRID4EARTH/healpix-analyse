@@ -19,16 +19,45 @@ from healpix_analyse.dino import (
     xy_to_nested,
 )
 
-healpy = pytest.importorskip("healpy")
+nested_geo = pytest.importorskip("healpix_geo.nested")
+
+# Thin wrappers over healpix-geo, so the tests read like the module they check
+# (healpy is deliberately not a dependency of this package).
 
 
-def test_xy_roundtrip_matches_healpy():
-    """nested_to_xy must follow the HEALPix nest2xyf bit convention."""
-    nside = 2 ** 10
+def _lonlat(level, ids):
+    lon, lat = nested_geo.healpix_to_lonlat(
+        np.asarray(ids, dtype=np.uint64).reshape(-1), int(level))
+    return np.asarray(lon), np.asarray(lat)
+
+
+def _cells(level, lon, lat):
+    ids = nested_geo.lonlat_to_healpix(
+        np.atleast_1d(np.asarray(lon, dtype=np.float64)),
+        np.atleast_1d(np.asarray(lat, dtype=np.float64)), int(level))
+    ids = np.asarray(ids, dtype=np.int64)
+    return ids if np.ndim(lon) else ids[0]
+
+
+def _vecs(level, ids):
+    """Unit vectors of the cell centres, shape [3, N]."""
+    x, y, z = nested_geo.healpix_to_cartesian(
+        np.atleast_1d(np.asarray(ids, dtype=np.uint64)), int(level))
+    v = np.stack([np.asarray(x), np.asarray(y), np.asarray(z)])
+    return v / np.linalg.norm(v, axis=0)
+
+
+def test_xy_roundtrip_matches_healpix_geo():
+    """nested_to_xy must follow the HEALPix base-cell-coordinate bit convention."""
+    level = 10
+    nside = 2 ** level
     rng = np.random.default_rng(0)
     pix = rng.integers(0, 12 * nside * nside, size=5000, dtype=np.int64)
-    x_ref, y_ref, face = healpy.pix2xyf(nside, pix, nest=True)
-    rel = pix - face.astype(np.int64) * nside * nside
+    face, x_ref, y_ref = nested_geo.healpix_to_base_cell_coordinates(
+        pix.astype(np.uint64), level)
+    x_ref = np.asarray(x_ref, dtype=np.int64)
+    y_ref = np.asarray(y_ref, dtype=np.int64)
+    rel = pix - np.asarray(face, dtype=np.int64) * nside * nside
     x, y = nested_to_xy(rel)
     assert np.array_equal(x, x_ref)
     assert np.array_equal(y, y_ref)
@@ -60,7 +89,7 @@ def test_tiles_roundtrip_and_orientation():
 
     # North corner (max x, max y) must be the top-right pixel of the tile.
     grid = tile_grid_cell_ids(pids, parent_level, level)
-    lat = healpy.pix2ang(nside, grid[0].reshape(-1), nest=True, lonlat=True)[1]
+    lat = _lonlat(level, grid[0].reshape(-1))[1]
     lat = lat.reshape(S, S)
     assert lat[0, S - 1] == lat.max()
     assert lat[S - 1, 0] == lat.min()
@@ -155,12 +184,13 @@ def test_healpix_cells_are_not_square():
     """The premise of the tangent mode: equal area, unequal shape."""
     from healpix_analyse.dino import EARTH_RADIUS_M, nested_to_xy, xy_to_nested
     level, nside = 19, 2 ** 19
-    p = healpy.ang2pix(nside, 10.55, 52.31, nest=True, lonlat=True)
+    p = _cells(level, 10.55, 52.31)
     face = p // (nside * nside)
     x, y = nested_to_xy(np.array([p - face * nside * nside]))
-    v = lambda dx, dy: np.array(healpy.pix2vec(
-        nside, face * nside * nside + int(xy_to_nested(np.array([x[0] + dx]),
-                                                       np.array([y[0] + dy]))[0]), nest=True))
+    def v(dx, dy):
+        rel = int(xy_to_nested(np.array([x[0] + dx]), np.array([y[0] + dy]))[0])
+        return _vecs(level, face * nside * nside + rel)[:, 0]
+
     v0 = v(0, 0)
     dx_m = np.linalg.norm((v(1, 0) - v0) * EARTH_RADIUS_M)
     dy_m = np.linalg.norm((v(0, 1) - v0) * EARTH_RADIUS_M)
@@ -186,7 +216,7 @@ def test_sample_healpix_recovers_a_known_field():
     from healpix_analyse.dino import healpix_gsd_m, sample_healpix, tangent_grid_lonlat
     level, nside = 8, 2 ** 8
     cells = np.arange(12 * nside * nside, dtype=np.int64)
-    lon_c, lat_c = healpy.pix2ang(nside, cells, nest=True, lonlat=True)
+    lon_c, lat_c = _lonlat(level, cells)
     field = np.sin(np.radians(lat_c))[:, None].astype(np.float32)
     lon, lat = tangent_grid_lonlat([30.0], [20.0], 8, healpix_gsd_m(level) / 6371000.0)
     vals, valid = sample_healpix(field, cells, level, lon, lat)
@@ -281,8 +311,7 @@ def test_tangent_projection_end_to_end():
     assert res.patch_lon is not None and res.patch_lat is not None
     assert res.patch_lon.shape == res.patch_cell_id.shape
     # patch_lon / patch_lat are the centres of the cells they are reported for
-    ref = healpy.ang2pix(2 ** res.patch_level, res.patch_lon, res.patch_lat,
-                         nest=True, lonlat=True)
+    ref = _cells(res.patch_level, res.patch_lon, res.patch_lat)
     assert np.array_equal(ref.astype(np.int64), res.patch_cell_id)
     assert res.projection == "tangent" and res.gsd_m > 0
 
@@ -305,8 +334,7 @@ def test_percell_one_embedding_per_cell():
     assert np.array_equal(res.patch_cell_id, res.cell_id)
     assert res.patch_level == parent_level
     # centres reported are the cell centres
-    ref = healpy.ang2pix(2 ** parent_level, res.patch_lon, res.patch_lat,
-                         nest=True, lonlat=True)
+    ref = _cells(parent_level, res.patch_lon, res.patch_lat)
     assert np.array_equal(ref.astype(np.int64), res.cell_id)
 
     # a subset of cells can be requested explicitly

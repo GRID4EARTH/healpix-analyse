@@ -3,12 +3,12 @@ DINOv3 SAT-493M embeddings of Sentinel-2 HEALPix data + UMAP / k-means
 ======================================================================
 
 Unsupervised-classification smoke test of :func:`healpix_analyse.dino.GetDINOV3SAT`
-on the GRID4EARTH Sentinel-2 HEALPix demo store (level 19, NESTED,
-bands b02/b03/b04/b08, 88 dates, tile T32UPC).
+on the GRID4EARTH Sentinel-2 HEALPix products (public bucket, NESTED; one zarr
+per acquisition, the HEALPix level being a group -- see g4e_source.py).
 
 Pipeline
 --------
-1. open the zarr store, take the RGB bands (b04, b03, b02), scale DN/10000;
+1. open the products, take the RGB bands (b04, b03, b02), scale DN/10000;
 2. for every selected date, cut the NESTED domain into DINO tiles of
    ``2**tile_levels`` px and run DINOv3; keep the **patch tokens**, i.e. one
    1024-d vector per HEALPix cell of level ``level - 4`` (16 px = 160 m);
@@ -47,9 +47,9 @@ import torch.nn as nn
 import xarray as xr
 
 from healpix_analyse.dino import GetDINOV3SAT, load_dinov3_sat
-
-DEFAULT_ZARR = "https://data-taos.ifremer.fr/EGU25_CFOSAT/Sentinel2_test.zarr"
-RGB = ("b04", "b03", "b02")
+from g4e_source import (                      # sibling module, see its docstring
+    G4E_L2A, G4E_PRODUCTS, RGB, ProductSeries, TimeSeriesStore,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,68 +71,7 @@ class FakeDino(nn.Module):
         return {"x_norm_clstoken": p.mean(1), "x_norm_patchtokens": p}
 
 
-def open_store(url: str) -> xr.Dataset:
-    """Open the (zarr v2) store with either zarr 2.x or zarr 3.x."""
-    try:
-        return xr.open_zarr(url, zarr_format=2)
-    except TypeError:
-        return xr.open_zarr(url)
-
-
-def healpix_level(ds: xr.Dataset, default: int = 19) -> int:
-    a = ds["cell_ids"].attrs
-    if "level" in a:
-        return int(a["level"])
-    if "resolution" in a:
-        return int(a["resolution"])
-    if "nside" in a:
-        return int(np.log2(int(a["nside"])))
-    print(f"[warn] no level attribute on cell_ids, assuming level {default}")
-    return default
-
-
-def cell_dim(ds: xr.Dataset) -> str:
-    """Name of the cell dimension: 'cell_ids' in the raw store, 'cells' after xdggs.decode."""
-    return ds["cell_ids"].dims[0]
-
-
-def rgb_at(ds: xr.Dataset, t: int, *, cache: str | None = None, retries: int = 5) -> np.ndarray:
-    """
-    [N, 3] reflectances in [0, 1] (NaN kept) for date index ``t``.
-
-    One date is a single zarr chunk of a few hundred MB pulled over HTTP, and
-    the server does drop connections, so the read is retried with an
-    exponential back-off.  With ``cache``, each date is kept locally as float16
-    so that a re-run (or the figures) never downloads it twice.
-    """
-    fname = os.path.join(cache, f"rgb_{t:04d}.npy") if cache else None
-    if fname is not None and os.path.exists(fname):
-        return np.load(fname).astype(np.float32)
-
-    delay = 2.0
-    for attempt in range(1, retries + 1):
-        try:
-            x = (ds["Sentinel2"].isel(time=t).sel(bands=list(RGB))
-                 .transpose(cell_dim(ds), "bands").values)
-            break
-        except Exception as exc:                                    # noqa: BLE001
-            if attempt == retries:
-                raise
-            print(f"  [retry {attempt}/{retries - 1}] t={t}: "
-                  f"{type(exc).__name__}: {exc}; waiting {delay:.0f}s", flush=True)
-            time.sleep(delay)
-            delay *= 2
-
-    x = x.astype(np.float32) / 10000.0
-    finite = np.isfinite(x)
-    x[finite] = np.clip(x[finite], 0.0, 1.0)
-    if fname is not None:
-        os.makedirs(cache, exist_ok=True)
-        np.save(fname, x.astype(np.float16))
-    return x
-
-
-def plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap,
+def plot_maps(src, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap,
               cache=None):
     """RGB scene, k-means labels and temporal consistency, drawn in lon/lat with healpix_plot."""
     import cartopy.crs as ccrs
@@ -145,8 +84,8 @@ def plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistenc
     fig, axes = plt.subplots(n, 3, figsize=(15, 4.6 * n), squeeze=False,
                              subplot_kw={"projection": ccrs.PlateCarree()}, layout="constrained")
     for r, t in enumerate(show):
-        date = str(ds["time"].values[t])[:10]
-        rgb = rgb_at(ds, t, cache=cache)
+        date = src.dates[t]
+        rgb = src.rgb(t, cache=cache)
         hi = np.nanpercentile(rgb, 98)
         healpix_plot.plot(cell_id, rgb, healpix_grid=grid_px, sampling_grid={"shape": 768},
                           ax=axes[r, 0], rgb_clip=(0.0, float(max(hi, 1e-3))), axis_labels="none",
@@ -193,7 +132,16 @@ def categorical_cmap(n: int):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--zarr", default=DEFAULT_ZARR)
+    ap.add_argument("--source", default="g4e",
+                    help="'g4e' for the GRID4EARTH products (default), or the URL of a "
+                         "single store holding a time dimension")
+    ap.add_argument("--products", nargs="+", default=list(G4E_PRODUCTS),
+                    help="Sentinel-2 product ids, without the .zarr suffix")
+    ap.add_argument("--collection", default=G4E_L2A,
+                    help="directory holding the products in the bucket")
+    ap.add_argument("--level", type=int, default=17,
+                    help="HEALPix level, i.e. the group under measurements/reflectance")
+    ap.add_argument("--bands", nargs=3, default=list(RGB), metavar=("R", "G", "B"))
     ap.add_argument("--weights", default=None,
                     help="DINOv3 SAT-493M .pth (local path or personalised download URL). "
                          "Required unless --fake/--hf: the weights are gated, request them on "
@@ -273,10 +221,13 @@ def main(argv=None):
     t0 = time.time()
 
     # ---- data -------------------------------------------------------------
-    ds = open_store(args.zarr)
-    level = healpix_level(ds)
-    cell_id = ds["cell_ids"].values.astype(np.int64)
-    n_time = ds.sizes["time"]
+    if args.source == "g4e":
+        src = ProductSeries(args.products, level=args.level,
+                            base=args.collection, bands=args.bands)
+    else:
+        src = TimeSeriesStore(args.source, bands=args.bands)
+    level, cell_id = src.level, src.cell_id
+    n_time = len(src.dates)
     if args.times == "all":
         times = list(range(n_time))
     elif ":" in args.times:
@@ -284,14 +235,15 @@ def main(argv=None):
         times = list(range(int(a or 0), int(b or n_time)))
     else:
         times = list(range(min(int(args.times), n_time)))
-    print(f"store: {args.zarr}\n  level {level}, {cell_id.size} cells, {len(times)}/{n_time} dates")
+    print(f"source: {args.source}\n  level {level}, {cell_id.size} cells, "
+          f"{len(times)}/{n_time} dates")
 
     # ---- optional: rank the dates by cloudiness and stop --------------------
     if args.scan_dates:
         rows = []
         for t in times:
             try:
-                x = rgb_at(ds, t, cache=args.cache, retries=args.retries)
+                x = src.rgb(t, cache=args.cache, retries=args.retries)
             except Exception as exc:                                # noqa: BLE001
                 print(f"  t={t:3d}  unreadable: {type(exc).__name__}", flush=True)
                 continue
@@ -300,7 +252,7 @@ def main(argv=None):
             # thin cloud and haze are bright AND grey; blue is raised the most
             bright_grey = float((v.min(axis=1) > 0.18).mean())
             blue_excess = float(v[:, 2].mean() - v[:, 0].mean())
-            rows.append((t, str(ds["time"].values[t])[:10], v[:, 0].mean(),
+            rows.append((t, src.dates[t], v[:, 0].mean(),
                          bright_grey, blue_excess, 1.0 - ok.mean()))
             print(f"  t={t:3d} {rows[-1][1]}  bright-grey {bright_grey:.3f}  "
                   f"blue-excess {blue_excess:+.4f}  nan {rows[-1][5]:.3f}", flush=True)
@@ -354,7 +306,7 @@ def main(argv=None):
     failed = []
     for t in times:
         try:
-            rgb = rgb_at(ds, t, cache=args.cache, retries=args.retries)
+            rgb = src.rgb(t, cache=args.cache, retries=args.retries)
         except Exception as exc:                                    # noqa: BLE001
             if not args.skip_failed:
                 raise
@@ -383,8 +335,8 @@ def main(argv=None):
             # percell mode: one token per tile, so there is no tile effect to
             # measure and no per-tile mean to remove (it would zero everything)
             if t == times[0] and "tile" in args.token_norm:
-                print("  [note] --token-norm 'tile' does not apply in percell mode "
-                      "(one token per cell); only the 'pc' part is used")
+                print("  [note] one token per tile here, so --token-norm 'tile' would "
+                      "zero everything; only the 'pc' part is applied")
         else:
             if t == times[0]:
                 grand = pe.mean(0)
@@ -474,7 +426,7 @@ def main(argv=None):
     plt.close(fig)
 
     show = times[:: max(1, len(times) // args.n_show)][: args.n_show]
-    fig = plot_maps(ds, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap,
+    fig = plot_maps(src, cell_id, level, show, pid, tid, label, patch_level, consistency, uniq, cmap,
                     cache=args.cache)
     fig.savefig(os.path.join(args.out, "cluster_maps.png"), dpi=150)
     plt.close(fig)
