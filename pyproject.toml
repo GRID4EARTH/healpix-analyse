@@ -27,6 +27,8 @@ dependencies = [
   # HEALPix geometry comes from the GRID4EARTH suite, not from healpy
   "healpix-geo",
   "pyproj>=3.6",
+  "termcolor",
+  "umap-learn",
 ]
 
 [project.optional-dependencies]
