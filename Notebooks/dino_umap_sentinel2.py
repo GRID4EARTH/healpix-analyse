@@ -46,7 +46,7 @@ import torch
 import torch.nn as nn
 import xarray as xr
 
-from healpix_analyse.dino import GetDINOV3SAT, load_dinov3_sat
+from healpix_analyse.dino import GetDINOV3SAT, load_dinov3_sat, set_ellipsoid
 from g4e_source import (                      # sibling module, see its docstring
     G4E_L2A, G4E_PRODUCTS, RGB, ProductSeries, TimeSeriesStore,
 )
@@ -226,6 +226,8 @@ def main(argv=None):
                             base=args.collection, bands=args.bands)
     else:
         src = TimeSeriesStore(args.source, bands=args.bands)
+    # the store's own ellipsoid drives every cell <-> lon/lat conversion
+    set_ellipsoid(getattr(src, "ellipsoid", "sphere"))
     level, cell_id = src.level, src.cell_id
     n_time = len(src.dates)
     if args.times == "all":

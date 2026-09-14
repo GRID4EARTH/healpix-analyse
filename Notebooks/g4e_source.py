@@ -7,9 +7,12 @@ Layout (docs/bucket-layout.md of GRID4EARTH/project-guidelines).  The `public`
 directory of the `grid4earth` OVH bucket is served at
 ``https://data.grid4earth.eu``::
 
-    legacy/sentinel-2-l2a/<PRODUCT_ID>.zarr
-    legacy/sentinel-2-l1c/<PRODUCT_ID>.zarr
-    eopf-mirror/...            reprocessed/...            auxiliary/...
+    converted/sentinel-2-l2a/<PRODUCT_ID>.zarr     <- the HEALPix products
+    auxiliary/...   eopf-mirror/...   reprocessed/...   legacy/...
+
+Note the ``converted/`` prefix: ``legacy/`` holds the untouched originals and,
+as of September 2026, serves nothing for Sentinel-2 (every key 404s).  The
+HEALPix conversions are under ``converted/``.
 
 Inside a product the HEALPix level is a **group**, not a dimension::
 
@@ -44,8 +47,8 @@ import xarray as xr
 # The public directory of the grid4earth bucket
 G4E_BASE = "https://data.grid4earth.eu"
 
-# Sentinel-2 L2A products listed in the bucket layout
-G4E_L2A = f"{G4E_BASE}/legacy/sentinel-2-l2a"
+# Sentinel-2 L2A HEALPix conversions
+G4E_L2A = f"{G4E_BASE}/converted/sentinel-2-l2a"
 G4E_PRODUCTS = (
     "S2B_MSIL2A_20250522T105619_N0511_R094_20250522T121018",
     "S2C_MSIL2A_20250527T105641_N0511_R094_20250527T165313",
@@ -53,6 +56,10 @@ G4E_PRODUCTS = (
 
 RGB = ("b04", "b03", "b02")          # Sentinel-2 red, green, blue at 10 m
 REFLECTANCE_SCALE = 10000.0          # L2A digital numbers -> reflectance
+
+# Levels published per product (the `multiscales` convention lists them in
+# `measurements/reflectance/zarr.json`); 17 is the coarsest and the cheapest.
+G4E_LEVELS = (17, 19, 20)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +108,26 @@ def cell_ids_of(ds: xr.Dataset) -> np.ndarray:
         if name in ds.coords or name in ds.variables:
             return np.asarray(ds[name].values).astype(np.int64)
     raise KeyError(f"no cell id coordinate in {list(ds.coords)}")
+
+
+def ellipsoid_of(ds: xr.Dataset, default: str = "sphere") -> str:
+    """
+    Reference ellipsoid declared by the store, from the ``dggs`` attributes.
+
+    EOPF HEALPix products say ``wgs84``; assuming a sphere instead displaces
+    every cell centre by up to ~0.2 degrees of latitude, so this is worth
+    reading rather than guessing.
+    """
+    for attrs in (ds.attrs, *(ds[n].attrs for n in ("cell_ids", "cells", "cell_id")
+                              if n in ds.coords or n in ds.variables)):
+        dggs = attrs.get("dggs")
+        if isinstance(dggs, dict):
+            ell = dggs.get("ellipsoid")
+            if isinstance(ell, dict) and ell.get("name"):
+                return str(ell["name"])
+            if isinstance(ell, str):
+                return ell
+    return default
 
 
 def level_of(ds: xr.Dataset, fallback: Optional[int] = None) -> int:
@@ -208,12 +235,14 @@ class ProductSeries(_Source):
         if self.level != level:
             print(f"[warn] group says level {level}, the store says {self.level}")
         self.cell_id = cell_ids_of(ds)
+        self.ellipsoid = ellipsoid_of(ds)
         available = band_names(ds)
         missing = [b for b in self.bands if b not in available]
         if missing:
             raise KeyError(f"bands {missing} are not in the store; it has {available}")
         print(f"{len(self.products)} products, level {self.level}, "
-              f"{self.cell_id.size} cells, bands {available}")
+              f"{self.cell_id.size} cells, bands {available}, "
+              f"ellipsoid {self.ellipsoid}")
 
     @staticmethod
     def _date(product: str) -> str:
@@ -251,6 +280,7 @@ class TimeSeriesStore(_Source):
         self.var, self.bands = var, list(bands)
         self.level = level_of(self.ds, fallback=level)
         self.cell_id = cell_ids_of(self.ds)
+        self.ellipsoid = ellipsoid_of(self.ds)
         self.dates = [str(d)[:10] for d in self.ds["time"].values]
 
     def _read(self, i: int) -> np.ndarray:

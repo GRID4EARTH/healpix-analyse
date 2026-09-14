@@ -109,12 +109,17 @@ is negligible at the scale of a 16 px patch.
 The public part of the OVH `grid4earth` bucket is served at
 <https://data.grid4earth.eu> (see `docs/bucket-layout.md` of
 [GRID4EARTH/project-guidelines](https://github.com/GRID4EARTH/project-guidelines)).
-Only the `public` directory is readable without credentials, so every URL
-starts with one of `legacy/`, `eopf-mirror/`, `reprocessed/`, `auxiliary/`:
+Only the `public` directory is readable without credentials, and the proxy
+maps it to the root of the domain, so every URL starts with one of
+`converted/`, `auxiliary/`, `eopf-mirror/`, `reprocessed/`, `legacy/`:
 
 ```
-https://data.grid4earth.eu/legacy/sentinel-2-l2a/<PRODUCT_ID>.zarr
+https://data.grid4earth.eu/converted/sentinel-2-l2a/<PRODUCT_ID>.zarr
 ```
+
+The prefix is `converted/`, not `legacy/`: `legacy/` holds the untouched
+originals and, as of September 2026, serves nothing for Sentinel-2. The
+HEALPix conversions live under `converted/`.
 
 Two things differ from a classic data cube:
 
@@ -122,7 +127,14 @@ Two things differ from a classic data cube:
   `<PRODUCT_ID>.zarr/measurements/reflectance/<level>` — so one store holds
   one acquisition at several levels;
 - **one product = one acquisition**: a time series is a *list of products*,
-  not a `time` axis.
+  not a `time` axis;
+- the stores are **zarr v3** (`zarr.json`, no `.zgroup`), publish levels 17,
+  19 and 20, hold `b02`/`b03`/`b04` on a `cells` dimension with a `cell_ids`
+  coordinate, and declare their **reference ellipsoid as WGS84**. That last
+  point is not cosmetic: reading those cell ids as if they were on a sphere
+  displaces every centre by up to ~0.2° of latitude. `ProductSeries` reads the
+  declaration and the examples pass it to `set_ellipsoid` before computing
+  anything.
 
 `Notebooks/g4e_source.py` wraps this: `ProductSeries` opens the products
 (obstore + `zarr.storage.ObjectStore` when installed, fsspec otherwise) and

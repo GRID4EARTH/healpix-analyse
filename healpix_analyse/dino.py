@@ -79,9 +79,37 @@ _HF_SAT_IDS = {
 
 from healpix_geo import nested as _hpx          # noqa: E402
 
-# Radius healpix-geo uses for its spherical cartesian coordinates; we only ever
-# want unit vectors, so the value itself never leaks out of `_pix2vec`.
-_SPHERE_R = 6370997.0
+# Reference ellipsoid used for every cell <-> lon/lat conversion.
+#
+# It is NOT cosmetic: a HEALPix cell id means a different patch of ground on the
+# sphere and on WGS84, and the difference reaches ~0.2 degrees of latitude in
+# mid-latitudes -- tens of kilometres, far more than a tile.  EOPF HEALPix
+# products declare their ellipsoid in the `dggs` attributes of the level group
+# (GRID4EARTH Sentinel-2 says "wgs84"); read it from the store and set it here
+# before computing anything, or pass it to :func:`set_ellipsoid`.
+HEALPIX_ELLIPSOID: str = "sphere"
+
+
+def set_ellipsoid(name: str) -> str:
+    """
+    Choose the reference ellipsoid ("sphere", "wgs84", ...) and return the old one.
+
+    Call it once, with whatever the store's ``dggs.ellipsoid.name`` says, before
+    any embedding is computed.
+    """
+    from healpix_geo import ellipsoid as _ell
+
+    # healpix-geo's names are case-sensitive ("WGS84"), while stores spell the
+    # same thing in lower case ("wgs84"); accept either.
+    for candidate in (str(name), str(name).upper(), str(name).lower()):
+        try:
+            _ell.resolve(candidate)
+        except Exception:                      # noqa: BLE001
+            continue
+        global HEALPIX_ELLIPSOID
+        previous, HEALPIX_ELLIPSOID = HEALPIX_ELLIPSOID, candidate
+        return previous
+    raise ValueError(f"unknown ellipsoid {name!r}; try 'sphere' or 'WGS84'")
 
 
 def _as_ids(ids: np.ndarray) -> np.ndarray:
@@ -107,7 +135,8 @@ def _unmask(a, fill):
 
 def _pix2ang(level: int, ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Cell centres as (lon, lat) in degrees."""
-    lon, lat = _hpx.healpix_to_lonlat(_as_ids(ids), int(level))
+    lon, lat = _hpx.healpix_to_lonlat(_as_ids(ids), int(level),
+                                      ellipsoid=HEALPIX_ELLIPSOID)
     return np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64)
 
 
@@ -120,20 +149,26 @@ def _ang2pix(level: int, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
         np.ascontiguousarray(np.broadcast_to(lon, shape).reshape(-1)),
         np.ascontiguousarray(np.broadcast_to(lat, shape).reshape(-1)),
         int(level),
+        ellipsoid=HEALPIX_ELLIPSOID,
     )
     return np.asarray(ids, dtype=np.int64).reshape(shape)
 
 
 def _pix2vec(level: int, ids: np.ndarray) -> np.ndarray:
     """Cell centres as **unit** 3-D vectors, shape ``[3, ...]``."""
-    x, y, z = _hpx.healpix_to_cartesian(_as_ids(ids), int(level))
-    return np.stack([np.asarray(x), np.asarray(y), np.asarray(z)]) / _SPHERE_R
+    x, y, z = _hpx.healpix_to_cartesian(_as_ids(ids), int(level),
+                                        ellipsoid=HEALPIX_ELLIPSOID)
+    v = np.stack([np.asarray(x), np.asarray(y), np.asarray(z)])
+    # healpix-geo returns metres on the chosen ellipsoid, whose radius varies
+    # with latitude; normalise rather than dividing by a constant.
+    return v / np.linalg.norm(v, axis=0)
 
 
 def _boundaries_lonlat(level: int, ids: np.ndarray, step: int = 4
                        ) -> Tuple[np.ndarray, np.ndarray]:
     """Cell outlines as (lon, lat) in degrees, shape ``[M, 4 * step]``."""
-    lon, lat = _hpx.vertices(_as_ids(ids), int(level), step=int(step))
+    lon, lat = _hpx.vertices(_as_ids(ids), int(level), step=int(step),
+                             ellipsoid=HEALPIX_ELLIPSOID)
     return (_unmask(lon, np.nan).astype(np.float64),
             _unmask(lat, np.nan).astype(np.float64))
 
@@ -147,7 +182,8 @@ def _interp_weights(level: int, lon: np.ndarray, lat: np.ndarray
     the "one row per stencil corner" layout the sampling code is written around.
     """
     ids, wgt = _hpx.bilinear_interpolation(
-        np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64), int(level)
+        np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64), int(level),
+        ellipsoid=HEALPIX_ELLIPSOID,
     )
     return (_unmask(ids, -1).astype(np.int64).T,
             _unmask(wgt, 0.0).astype(np.float64).T)
@@ -1350,6 +1386,7 @@ __all__ = [
     "cells_at_lonlat",
     "cell_vectors",
     "cell_neighbours",
+    "set_ellipsoid",
     "SAT493M_MEAN",
     "SAT493M_STD",
 ]
