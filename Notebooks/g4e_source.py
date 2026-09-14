@@ -133,16 +133,16 @@ def ellipsoid_of(ds: xr.Dataset, default: str = "sphere") -> str:
 def level_of(ds: xr.Dataset, fallback: Optional[int] = None) -> int:
     """HEALPix level, from the cell-id attributes or from the dataset attributes."""
     sources = []
-    for name in ("cell_ids", "cells", "cell_id"):
-        if name in ds.coords or name in ds.variables:
-            sources.append(dict(ds[name].attrs))
-    sources.append(dict(ds.attrs))
-    dggs = ds.attrs.get("dggs")
-    if isinstance(dggs, dict):
-        sources.append(dggs)
+    for attrs in (ds.attrs, *(ds[n].attrs for n in ("cell_ids", "cells", "cell_id")
+                              if n in ds.coords or n in ds.variables)):
+        sources.append(dict(attrs))
+        dggs = attrs.get("dggs")                # the EOPF `dggs` convention nests it
+        if isinstance(dggs, dict):
+            sources.append(dggs)
 
     for a in sources:
-        for key in ("level", "resolution", "depth"):
+        # `refinement_level` is what the zarr `dggs` convention calls it
+        for key in ("refinement_level", "level", "resolution", "depth"):
             if key in a:
                 return int(a[key])
         if "nside" in a:
@@ -153,10 +153,20 @@ def level_of(ds: xr.Dataset, fallback: Optional[int] = None) -> int:
     return int(fallback)
 
 
+# Variables that live on the cell dimension but are not measurements.
+_NOT_A_BAND = {"cell_ids", "cells", "cell_id", "spatial_ref", "crs"}
+
+
 def band_names(ds: xr.Dataset) -> list:
-    """Data variables defined on the cell dimension alone -- the bands."""
+    """
+    Data variables defined on the cell dimension alone -- the bands.
+
+    The cell-id array is often stored as a plain variable rather than a
+    coordinate, so it has to be excluded explicitly or it is reported as a band.
+    """
     d = cell_dim(ds)
-    return [str(v) for v in ds.data_vars if ds[v].dims == (d,)]
+    return [str(v) for v in ds.data_vars
+            if ds[v].dims == (d,) and str(v) not in _NOT_A_BAND]
 
 
 # ---------------------------------------------------------------------------
