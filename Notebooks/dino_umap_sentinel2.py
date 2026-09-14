@@ -404,6 +404,7 @@ def main(argv=None):
 
     # temporal consistency: does a cell keep its majority label across dates?
     uniq, inv = np.unique(pid, return_inverse=True)
+    inv = np.asarray(inv).ravel()      # numpy >= 2 may return (N, 1)
     counts = np.zeros((uniq.size, args.clusters), np.int64)
     np.add.at(counts, (inv, label), 1)
     consistency = counts.max(1) / counts.sum(1)

@@ -297,6 +297,7 @@ def _deduplicate(
     the first occurrence is kept.
     """
     uniq_ids, inv = np.unique(ids, return_inverse=True)
+    inv = np.asarray(inv).ravel()      # numpy >= 2 may return the input shape
     n_dup = ids.shape[0] - uniq_ids.shape[0]
     if n_dup == 0:
         return d, ids
@@ -396,6 +397,7 @@ def nested_to_tiles(
 
     parent = ids >> (2 * k)
     parent_ids, tile_idx = np.unique(parent, return_inverse=True)
+    tile_idx = np.asarray(tile_idx).ravel()      # numpy >= 2 may return (N, 1)
     rel = ids - (parent_ids[tile_idx] << (2 * k))
     x, y = nested_to_xy(rel)
     row = (S - 1) - y
