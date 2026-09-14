@@ -231,7 +231,7 @@ class ProductSeries(_Source):
 
     tag = "g4e"
 
-    def __init__(self, products: Sequence[str] = G4E_PRODUCTS, level: int = 17,
+    def __init__(self, products: Sequence[str] = G4E_PRODUCTS, level: int = 20,
                  base: str = G4E_L2A, bands: Sequence[str] = RGB,
                  group_fmt: str = "measurements/reflectance/{level}"):
         self.products = [str(p).removesuffix(".zarr") for p in products]
@@ -298,7 +298,7 @@ class TimeSeriesStore(_Source):
                 .transpose(cell_dim(self.ds), "bands").values)
 
 
-def make_source(spec: str, *, level: int = 17, products: Sequence[str] = G4E_PRODUCTS,
+def make_source(spec: str, *, level: int = 20, products: Sequence[str] = G4E_PRODUCTS,
                 bands: Sequence[str] = RGB, base: str = G4E_L2A) -> _Source:
     """``spec`` is "g4e" for the GRID4EARTH products, or the URL of a single store."""
     if spec == "g4e":

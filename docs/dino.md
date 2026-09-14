@@ -145,15 +145,15 @@ in [0, 1], NaN where missing, with retries and an optional on-disk cache.
 from g4e_source import ProductSeries, G4E_PRODUCTS
 from healpix_analyse.dino import GetDINOV3SAT, load_dinov3_sat
 
-src = ProductSeries(G4E_PRODUCTS, level=17)   # measurements/reflectance/17
+src = ProductSeries(G4E_PRODUCTS, level=20)   # measurements/reflectance/20
 rgb = src.rgb(0)                              # [N, 3] float32, R,G,B = b04,b03,b02
 
 model = load_dinov3_sat("dinov3_vitl16", weights="dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth")
-res = GetDINOV3SAT(rgb, src.cell_id, level=src.level, parent_level=13,
+res = GetDINOV3SAT(rgb, src.cell_id, level=src.level, parent_level=12,
                    projection="percell", model=model, min_coverage=1.0)
 
-res.embedding.shape        # (M, 1024)   exactly one per level-13 cell, no hole
-res.cell_id.shape          # (M,)        the level-13 NESTED ids
+res.embedding.shape        # (M, 1024)   exactly one per level-12 cell, no hole
+res.cell_id.shape          # (M,)        the level-12 NESTED ids
 ```
 
 `Notebooks/dino_umap_sentinel2.py` runs this over the products, projects the
@@ -161,8 +161,8 @@ tokens with UMAP, clusters the UMAP coordinates with k-means and draws the
 cluster maps next to the RGB tiles (unsupervised classification test):
 
 ```
-python Notebooks/dino_umap_sentinel2.py --source g4e --level 17 \
-       --parent-level 13 --projection percell --clusters 16
+python Notebooks/dino_umap_sentinel2.py --source g4e --level 20 \
+       --parent-level 12 --projection percell --clusters 16
 ```
 
 `--fake` runs the whole pipeline with a random backbone when the weights are

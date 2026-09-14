@@ -139,7 +139,7 @@ def main(argv=None):
                     help="Sentinel-2 product ids, without the .zarr suffix")
     ap.add_argument("--collection", default=G4E_L2A,
                     help="directory holding the products in the bucket")
-    ap.add_argument("--level", type=int, default=17,
+    ap.add_argument("--level", type=int, default=20,
                     help="HEALPix level, i.e. the group under measurements/reflectance")
     ap.add_argument("--bands", nargs=3, default=list(RGB), metavar=("R", "G", "B"))
     ap.add_argument("--weights", default=None,

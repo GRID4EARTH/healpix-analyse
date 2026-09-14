@@ -745,8 +745,23 @@ def tangent_tiles(
     clon, clat = _pix2ang(parent_level, centre_ids)
     lon, lat = tangent_grid_lonlat(clon, clat, (H, W), gsd / radius, shift=shift, radius=radius)
 
-    vals, valid = sample_healpix(d, ids, level, lon, lat, interpolation=interpolation)
     M, C = centre_ids.size, d.shape[1]
+
+    # Sample tile by tile rather than in one call: the bilinear stencil costs
+    # 4 ids + 4 weights per output pixel, so a whole level-20 scene at once
+    # needs gigabytes, while the result is only [M, H, W, C].  `chunk` bounds
+    # the temporaries to a few tens of MB whatever the scene size.
+    # ~2e6 sampled points per pass: the stencil costs about 64 bytes per point
+    # (4 ids + 4 weights) before the values are even gathered, so this keeps the
+    # temporaries near 100 MB instead of several GB on a full level-20 scene.
+    chunk = max(1, 2_000_000 // max(1, H * W))
+    vals = np.empty((M, H, W, C), dtype=np.float32)
+    valid = np.empty((M, H, W), dtype=bool)
+    for a in range(0, M, chunk):
+        b_ = min(a + chunk, M)
+        vals[a:b_], valid[a:b_] = sample_healpix(
+            d, ids, level, lon[a:b_], lat[a:b_], interpolation=interpolation)
+
     coverage = valid.reshape(M, -1).mean(axis=1)
 
     if fill == "mean":
