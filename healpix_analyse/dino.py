@@ -698,7 +698,7 @@ def tangent_tiles(
     level: int,
     parent_level: int,
     *,
-    tile_px: Optional[Union[int, Tuple[int, int]]] = None,
+    tile_px: Optional[Union[int, str, Tuple[int, int]]] = None,
     gsd_m: Optional[float] = None,
     shift: Tuple[float, float] = (0.0, 0.0),
     interpolation: str = "bilinear",
@@ -738,6 +738,15 @@ def tangent_tiles(
     gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level, radius)
     centre_ids = np.unique(ids >> (2 * k))
     if tile_px is None:
+        # Square, 2**k px: the same pixel count per side as the NESTED block the
+        # tile replaces, so the two geometries are directly comparable and the
+        # image keeps the shape a ViT was trained on.  `tile_px="cover"` asks
+        # instead for the smallest (generally rectangular) image containing the
+        # whole parent diamond -- useful to inspect a cell, wasteful for DINO.
+        H = W = 2 ** k
+    elif isinstance(tile_px, str):
+        if tile_px != "cover":
+            raise ValueError("tile_px must be an int, a (rows, cols) pair or 'cover'")
         H, W = parent_cover_px(centre_ids, parent_level, gsd, radius=radius)
     elif np.isscalar(tile_px):
         H = W = int(tile_px)
@@ -1223,6 +1232,10 @@ def GetDINOV3SAT(
         gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level)
         all_centres = np.unique(ids >> (2 * k))
         if tile_px is None:
+            H = W = 2 ** k                 # square, 2**k px (see `tangent_tiles`)
+        elif isinstance(tile_px, str):
+            if tile_px != "cover":
+                raise ValueError("tile_px must be an int, a (rows, cols) pair or 'cover'")
             H, W = parent_cover_px(all_centres, parent_level, gsd)
         elif np.isscalar(tile_px):
             H = W = int(tile_px)

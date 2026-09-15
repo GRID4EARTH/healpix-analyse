@@ -55,7 +55,20 @@ G4E_PRODUCTS = (
 )
 
 RGB = ("b04", "b03", "b02")          # Sentinel-2 red, green, blue at 10 m
-REFLECTANCE_SCALE = 1.0          # L2A digital numbers -> reflectance
+
+# How raw band values are turned into something a ViT can eat.
+#
+#   "robust"       per band: centre on the median, scale by the 2-98 percentile
+#                  spread, squash with tanh.  Scene-adaptive, so it does not care
+#                  whether the store holds digital numbers, reflectance, or
+#                  anything else, and a cloud or a specular glint saturates
+#                  smoothly instead of crushing the rest of the histogram.
+#   "reflectance"  the L2A convention: divide by 10000 and clip to [0, 1].
+#                  Correct only if the store really holds DN x 10000.
+#   "none"         raw values, for when you want to do it yourself.
+SCALING = "robust"
+REFLECTANCE_SCALE = 10000.0
+TANH_GAIN = 2.0                      # how hard "robust" squashes the tails
 
 # Levels published per product (the `multiscales` convention lists them in
 # `measurements/reflectance/zarr.json`); 17 is the coarsest and the cheapest.
@@ -169,6 +182,48 @@ def band_names(ds: xr.Dataset) -> list:
             if ds[v].dims == (d,) and str(v) not in _NOT_A_BAND]
 
 
+def normalise(x: np.ndarray, how: str = SCALING, *, gain: float = TANH_GAIN) -> np.ndarray:
+    """
+    Turn raw band values ``[N, C]`` into something in [0, 1], NaN preserved.
+
+    ``"robust"`` (the default) works per band and adapts to the scene::
+
+        z = (x - median) / (p98 - p2)
+        out = (1 + tanh(gain * z)) / 2
+
+    The median and the percentile spread are computed on the finite values only.
+    Nothing is clipped: `tanh` compresses the tails instead, so a bright cloud
+    saturates gently rather than being flattened onto 1.0 together with
+    everything else above the threshold -- which is what a hard clip does, and
+    what made the fixed 1/10000 scaling throw away most of the contrast when the
+    store did not hold the digital numbers it assumed.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim == 1:
+        x = x[:, None]
+    if how == "none":
+        return x
+    if how == "reflectance":
+        out = x / REFLECTANCE_SCALE
+        finite = np.isfinite(out)
+        out[finite] = np.clip(out[finite], 0.0, 1.0)
+        return out
+    if how != "robust":
+        raise ValueError("scaling must be 'robust', 'reflectance' or 'none'")
+
+    out = np.empty_like(x)
+    for c in range(x.shape[1]):
+        col = x[:, c]
+        good = col[np.isfinite(col)]
+        if good.size == 0:
+            out[:, c] = col
+            continue
+        lo, med, hi = np.percentile(good, [2.0, 50.0, 98.0])
+        spread = max(float(hi - lo), 1e-6)
+        out[:, c] = 0.5 * (1.0 + np.tanh(gain * (col - med) / spread))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # sources
 # ---------------------------------------------------------------------------
@@ -183,11 +238,27 @@ class _Source:
     def _read(self, i: int) -> np.ndarray:              # pragma: no cover
         raise NotImplementedError
 
+    def cache_name(self, i: int) -> str:
+        """
+        File name for the cached reflectances of step ``i``.
+
+        The HEALPix level and the band list are part of the name: without them a
+        cache written at one level is silently reused at another, and the arrays
+        no longer match ``cell_id``.
+        """
+        bands = "-".join(str(b) for b in getattr(self, "bands", ()))
+        how = getattr(self, "scaling", SCALING)
+        return f"{self.tag}_l{int(self.level)}_{bands}_{how}_{i:04d}.npy"
+
     def rgb(self, i: int, *, cache: Optional[str] = None, retries: int = 5) -> np.ndarray:
         """[N, 3] reflectances in [0, 1] for time step ``i``; NaN where missing."""
-        fname = os.path.join(cache, f"{self.tag}_{i:04d}.npy") if cache else None
+        fname = os.path.join(cache, self.cache_name(i)) if cache else None
         if fname is not None and os.path.exists(fname):
-            return np.load(fname).astype(np.float32)
+            x = np.load(fname).astype(np.float32)
+            if x.shape[0] == self.cell_id.size:
+                return x
+            print(f"  [cache] {fname} a {x.shape[0]} lignes pour {self.cell_id.size} "
+                  "cellules : ignore et relu depuis le store")
 
         delay = 2.0
         for attempt in range(1, retries + 1):
@@ -202,11 +273,7 @@ class _Source:
                 time.sleep(delay)
                 delay *= 2
 
-        x = np.asarray(x, dtype=np.float32)
-        if np.nanmax(x) > 1.5:                          # digital numbers, not reflectance
-            x = x / REFLECTANCE_SCALE
-        finite = np.isfinite(x)
-        x[finite] = np.clip(x[finite], 0.0, 1.0)
+        x = normalise(np.asarray(x, dtype=np.float32), getattr(self, "scaling", SCALING))
         if fname is not None:
             os.makedirs(cache, exist_ok=True)
             np.save(fname, x.astype(np.float16))
@@ -233,10 +300,12 @@ class ProductSeries(_Source):
 
     def __init__(self, products: Sequence[str] = G4E_PRODUCTS, level: int = 20,
                  base: str = G4E_L2A, bands: Sequence[str] = RGB,
-                 group_fmt: str = "measurements/reflectance/{level}"):
+                 group_fmt: str = "measurements/reflectance/{level}",
+                 scaling: str = SCALING):
         self.products = [str(p).removesuffix(".zarr") for p in products]
         self.base = base.rstrip("/")
         self.bands = list(bands)
+        self.scaling = scaling
         self.group = group_fmt.format(level=level)
         self.dates = [self._date(p) for p in self.products]
 
@@ -288,6 +357,7 @@ class TimeSeriesStore(_Source):
                  var: str = "Sentinel2", level: Optional[int] = None):
         self.ds = open_zarr_group(url)
         self.var, self.bands = var, list(bands)
+        self.scaling = SCALING
         self.level = level_of(self.ds, fallback=level)
         self.cell_id = cell_ids_of(self.ds)
         self.ellipsoid = ellipsoid_of(self.ds)

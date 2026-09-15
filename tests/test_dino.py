@@ -236,11 +236,15 @@ def test_tangent_tiles_shapes_and_partial_sky():
     H, W = tiles.shape[-2:]
     assert tiles.shape == (2, 3, H, W) and lon.shape == (2, H, W)
     assert H % 16 == 0 and W % 16 == 0
-    # the default image is sized to contain the whole parallelogram-shaped cell,
-    # so it is larger than the nested block and rectangular
-    assert H >= S and W >= S and (H, W) != (S, S)
+    # the default image is square and 2**k px: same shape as the nested block
+    assert (H, W) == (S, S)
+    # "cover" asks for the smallest image containing the whole parallelogram,
+    # which is larger than the nested block and generally rectangular
+    Hc, Wc = tangent_tiles(data, cell_id, level, parent_level,
+                           tile_px="cover", fill="nan")[0].shape[-2:]
+    assert Hc >= S and Wc >= S and (Hc, Wc) != (S, S)
     assert np.array_equal(ids, parents)
-    assert 0.0 < cov.max() < 1.0          # the cell does not fill the rectangle
+    assert 0.0 < cov.max() <= 1.0
 
 
 def test_tangent_output_tiles_the_cells_without_holes():
