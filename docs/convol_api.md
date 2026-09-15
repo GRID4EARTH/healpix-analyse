@@ -189,5 +189,3 @@ Buffer size = 4 × 4 × 196 608 × 25 × 4 bytes (float32) ≈ 750 MB
 For very large nside, consider reducing G or kernel_sz, or using
 `torch.float16` for the buffers.
 
----
-

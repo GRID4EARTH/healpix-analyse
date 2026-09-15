@@ -39,7 +39,7 @@ R_total[k, g] = R_gauge(α_g)  @  Rz(φ_k)  @  Ry(θ_k)
 ```
 
 where `R_gauge(α_g)` is the Rodrigues rotation around the surface normal
-`n_k` by the gauge angle `α_g` (see [the section](#5-gauge-types-and-singularities)).
+`n_k` by the gauge angle `α_g` (see {doc}`convol_doc`).
 
 Each stencil point is then rotated to its position on the sphere around
 pixel `k`:
@@ -138,6 +138,4 @@ outside the patch (zeroed), stencil points with no valid neighbour (fall
 back to the centre pixel), and zero-sum weight columns (assign weight 1 to
 the first present neighbour). All G gauges are processed in a single
 `searchsorted` call over the full `[G · 4 · K · P]` index array.
-
----
 

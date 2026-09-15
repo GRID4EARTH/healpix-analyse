@@ -108,5 +108,3 @@ to be computed exactly with a standard 1-D FFT.
 At `nside=64` (lmax=191), the ring-based approach performs ~255 Legendre
 summations instead of ~49 000 — a factor of ~192 reduction.
 
----
-

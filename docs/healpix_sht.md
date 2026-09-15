@@ -299,5 +299,3 @@ class SpectralLayer(torch.nn.Module):
         return self.sht.alm2map(alm)        # synthesis
 ```
 
----
-
