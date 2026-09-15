@@ -37,6 +37,7 @@ pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 | Build an exactly invertible multiscale pyramid | `HealPixDecomp` | {doc}`decomp` |
 | Get divergence and curl at every scale | `divcurl` | {doc}`divcurl` |
 | Move data between HEALPix levels or domains | `resample` | {doc}`resample_healpix` |
+| Bilinearly interpolate a map at arbitrary lon/lat (identical to `healpy`) | `get_interp_val`, `get_interp_weights` | {doc}`healpix_interp` |
 | FFT a local patch as if it were flat | `LocalFFT` | {doc}`fft_local` |
 | Convolve a patch with a big kernel, via FFT | `HealPixFFTConv` | {doc}`fft_conv` |
 | Pick the right power-spectrum helper (and know which are still in development) | `powerspectra`, `powerspectra_lonlat`, `ps` | {doc}`powerspectra` |
@@ -96,6 +97,7 @@ up
 decomp
 divcurl
 resample_healpix
+healpix_interp
 ```
 
 ```{toctree}

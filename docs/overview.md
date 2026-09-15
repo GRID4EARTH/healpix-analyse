@@ -38,6 +38,14 @@ reconstructs the original map exactly, masks included, and `divcurl` reads
 divergence and curl off every level of that pyramid. `resample` moves data
 between levels and between partial-sky domains, and to and from lat/lon.
 
+**Point interpolation.** `healpix_interp` bilinearly interpolates a map (or
+just returns cells and weights) at arbitrary lon/lat. For `ellipsoid="sphere"`
+it is a direct NumPy port of `healpy`'s own RING-scheme algorithm, validated
+to return identical pixels and float64-precision-identical weights — see
+{doc}`healpix_interp` for the exact-equivalence guarantee and how it was
+checked. Non-spherical ellipsoids (`WGS84`, etc., no `healpy` equivalent) go
+through `healpix_geo.nested.bilinear_interpolation` instead.
+
 **Local flat-sky analysis.** Over a small patch the sphere is flat enough to use
 a plain 2D FFT. `fft_local` (`LocalFFT`) builds the local tangent plane and the
 FFT on top of it, with CUDA and autograd, and its own `.ps()` method reduces
