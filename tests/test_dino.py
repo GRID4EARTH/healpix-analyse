@@ -236,8 +236,12 @@ def test_tangent_tiles_shapes_and_partial_sky():
     H, W = tiles.shape[-2:]
     assert tiles.shape == (2, 3, H, W) and lon.shape == (2, H, W)
     assert H % 16 == 0 and W % 16 == 0
-    # the default image is square and 2**k px: same shape as the nested block
-    assert (H, W) == (S, S)
+    # the default image is square, a power of two, and large enough to contain
+    # the whole parent cell -- so bigger than the equal-area 2**k block
+    assert H == W and H > S and (H & (H - 1)) == 0
+    # "exact" is the equal-area square, same shape as the nested block
+    assert tangent_tiles(data, cell_id, level, parent_level,
+                         tile_px="exact", fill="nan")[0].shape[-2:] == (S, S)
     # "cover" asks for the smallest image containing the whole parallelogram,
     # which is larger than the nested block and generally rectangular
     Hc, Wc = tangent_tiles(data, cell_id, level, parent_level,

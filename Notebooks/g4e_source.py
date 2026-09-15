@@ -58,17 +58,21 @@ RGB = ("b04", "b03", "b02")          # Sentinel-2 red, green, blue at 10 m
 
 # How raw band values are turned into something a ViT can eat.
 #
-#   "robust"       per band: centre on the median, scale by the 2-98 percentile
-#                  spread, squash with tanh.  Scene-adaptive, so it does not care
-#                  whether the store holds digital numbers, reflectance, or
-#                  anything else, and a cloud or a specular glint saturates
-#                  smoothly instead of crushing the rest of the histogram.
-#   "reflectance"  the L2A convention: divide by 10000 and clip to [0, 1].
-#                  Correct only if the store really holds DN x 10000.
-#   "none"         raw values, for when you want to do it yourself.
-SCALING = "robust"
+#   "reflectance"  the L2A convention: divide by REFLECTANCE_SCALE.  Fixed, so
+#                  the same physical value maps to the same number in every
+#                  product, every tile and every date -- which is what the
+#                  classification needs, since it compares patches across the
+#                  whole dataset.
+#   "percentile"   linear rescale by the 2-98 percentile spread, computed ONCE
+#                  on the first product read and then reused unchanged for every
+#                  other product.  Use it when the store's units are unknown.
+#   "none"         raw values.
+#
+# There is deliberately no per-tile and no per-product normalisation: any
+# statistic recomputed per tile makes two identical patches in different tiles
+# land on different numbers, and the clustering that follows compares them.
+SCALING = "reflectance"
 REFLECTANCE_SCALE = 10000.0
-TANH_GAIN = 2.0                      # how hard "robust" squashes the tails
 
 # Levels published per product (the `multiscales` convention lists them in
 # `measurements/reflectance/zarr.json`); 17 is the coarsest and the cheapest.
@@ -182,21 +186,33 @@ def band_names(ds: xr.Dataset) -> list:
             if ds[v].dims == (d,) and str(v) not in _NOT_A_BAND]
 
 
-def normalise(x: np.ndarray, how: str = SCALING, *, gain: float = TANH_GAIN) -> np.ndarray:
+def band_stats(x: np.ndarray, lo_p: float = 2.0, hi_p: float = 98.0):
+    """Per-band (offset, scale) from the finite values -- the "percentile" mode."""
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim == 1:
+        x = x[:, None]
+    off, sca = [], []
+    for c in range(x.shape[1]):
+        good = x[:, c][np.isfinite(x[:, c])]
+        if good.size == 0:
+            off.append(0.0); sca.append(1.0); continue
+        lo, hi = np.percentile(good, [lo_p, hi_p])
+        off.append(float(lo)); sca.append(max(float(hi - lo), 1e-6))
+    return np.array(off, np.float32), np.array(sca, np.float32)
+
+
+def normalise(x: np.ndarray, how: str = SCALING, *, stats=None) -> np.ndarray:
     """
-    Turn raw band values ``[N, C]`` into something in [0, 1], NaN preserved.
+    Turn raw band values ``[N, C]`` into model input, NaN preserved.
 
-    ``"robust"`` (the default) works per band and adapts to the scene::
+    The transform is **affine and fixed**: the same raw value always gives the
+    same number, whatever tile or product it came from.  Nothing is squashed and
+    nothing is clipped -- a bright roof stays brighter than a bright field
+    instead of being flattened onto the same 1.0, and DINOv3's own mean/std
+    normalisation handles the rest.
 
-        z = (x - median) / (p98 - p2)
-        out = (1 + tanh(gain * z)) / 2
-
-    The median and the percentile spread are computed on the finite values only.
-    Nothing is clipped: `tanh` compresses the tails instead, so a bright cloud
-    saturates gently rather than being flattened onto 1.0 together with
-    everything else above the threshold -- which is what a hard clip does, and
-    what made the fixed 1/10000 scaling throw away most of the contrast when the
-    store did not hold the digital numbers it assumed.
+    ``stats`` is the ``(offset, scale)`` pair for the "percentile" mode; pass the
+    one computed on the first product so every product shares it.
     """
     x = np.asarray(x, dtype=np.float32)
     if x.ndim == 1:
@@ -204,24 +220,11 @@ def normalise(x: np.ndarray, how: str = SCALING, *, gain: float = TANH_GAIN) -> 
     if how == "none":
         return x
     if how == "reflectance":
-        out = x / REFLECTANCE_SCALE
-        finite = np.isfinite(out)
-        out[finite] = np.clip(out[finite], 0.0, 1.0)
-        return out
-    if how != "robust":
-        raise ValueError("scaling must be 'robust', 'reflectance' or 'none'")
-
-    out = np.empty_like(x)
-    for c in range(x.shape[1]):
-        col = x[:, c]
-        good = col[np.isfinite(col)]
-        if good.size == 0:
-            out[:, c] = col
-            continue
-        lo, med, hi = np.percentile(good, [2.0, 50.0, 98.0])
-        spread = max(float(hi - lo), 1e-6)
-        out[:, c] = 0.5 * (1.0 + np.tanh(gain * (col - med) / spread))
-    return out
+        return x / REFLECTANCE_SCALE
+    if how == "percentile":
+        off, sca = band_stats(x) if stats is None else stats
+        return (x - off[None, :]) / sca[None, :]
+    raise ValueError("scaling must be 'reflectance', 'percentile' or 'none'")
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +276,28 @@ class _Source:
                 time.sleep(delay)
                 delay *= 2
 
-        x = normalise(np.asarray(x, dtype=np.float32), getattr(self, "scaling", SCALING))
+        x = np.asarray(x, dtype=np.float32)
+        how = getattr(self, "scaling", SCALING)
+        # Les unites du store ne sont declarees nulle part : on les montre.  Une
+        # echelle fausse ne se voit pas sur un affichage (qui etire en
+        # percentiles) mais aplatit l'image vue par le reseau, et les tokens ne
+        # portent alors plus que leur position.
+        _raw = np.percentile(x[np.isfinite(x)], [2, 50, 98]) if np.isfinite(x).any() else [np.nan]*3
+        print(f"  valeurs brutes   p2 {_raw[0]:.4g}  mediane {_raw[1]:.4g}  p98 {_raw[2]:.4g}")
+        if how == "percentile" and getattr(self, "_stats", None) is None:
+            # computed once, on the first product read, then reused for all the
+            # others: the embeddings of two dates have to live on the same scale
+            self._stats = band_stats(x)
+            print(f"  [percentile] offset {np.round(self._stats[0], 1)} "
+                  f"echelle {np.round(self._stats[1], 1)} (fige pour toute la serie)")
+        x = normalise(x, how, stats=getattr(self, "_stats", None))
+        _n = np.percentile(x[np.isfinite(x)], [2, 50, 98]) if np.isfinite(x).any() else [np.nan]*3
+        print(f"  apres '{how}'     p2 {_n[0]:.4g}  mediane {_n[1]:.4g}  p98 {_n[2]:.4g}")
+        if np.isfinite(_n).all() and (_n[2] - _n[0]) < 0.02:
+            print("  /!\\ dynamique quasi nulle : l'image vue par DINOv3 est plate, "
+                  "ses tokens ne porteront que leur position.\n"
+                  "      SCALING est probablement inadapte aux unites du store "
+                  "(essaie 'percentile', ou 'none' si les donnees sont deja en reflectance).")
         if fname is not None:
             os.makedirs(cache, exist_ok=True)
             np.save(fname, x.astype(np.float16))
@@ -306,6 +330,7 @@ class ProductSeries(_Source):
         self.base = base.rstrip("/")
         self.bands = list(bands)
         self.scaling = scaling
+        self._stats = None
         self.group = group_fmt.format(level=level)
         self.dates = [self._date(p) for p in self.products]
 
@@ -358,6 +383,7 @@ class TimeSeriesStore(_Source):
         self.ds = open_zarr_group(url)
         self.var, self.bands = var, list(bands)
         self.scaling = SCALING
+        self._stats = None
         self.level = level_of(self.ds, fallback=level)
         self.cell_id = cell_ids_of(self.ds)
         self.ellipsoid = ellipsoid_of(self.ds)

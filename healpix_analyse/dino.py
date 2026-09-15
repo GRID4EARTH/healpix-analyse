@@ -692,6 +692,25 @@ def sample_healpix(
             valid.reshape(shape))
 
 
+def pow2_cover_px(centre_ids: np.ndarray, parent_level: int, gsd_m: float,
+                  *, margin_px: int = 8, radius: float = EARTH_RADIUS_M) -> int:
+    """
+    Side of the smallest **square power-of-two** image containing every parent cell.
+
+    A HEALPix cell and a square of the same area cannot contain one another: a
+    square of side ``2**k`` px has exactly the cell's area, so roughly a fifth of
+    the cell always falls outside it.  Those cells then have no token of their
+    own.  Doubling the side fixes it and keeps the shape a ViT expects.
+    """
+    H, W = parent_cover_px(centre_ids, parent_level, gsd_m, margin_px=margin_px,
+                           radius=radius)
+    need = max(int(H), int(W))
+    side = DINOV3_PATCH
+    while side < need:
+        side *= 2
+    return side
+
+
 def tangent_tiles(
     data: ArrayLike,
     cell_id: ArrayLike,
@@ -738,16 +757,20 @@ def tangent_tiles(
     gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level, radius)
     centre_ids = np.unique(ids >> (2 * k))
     if tile_px is None:
-        # Square, 2**k px: the same pixel count per side as the NESTED block the
-        # tile replaces, so the two geometries are directly comparable and the
-        # image keeps the shape a ViT was trained on.  `tile_px="cover"` asks
-        # instead for the smallest (generally rectangular) image containing the
-        # whole parent diamond -- useful to inspect a cell, wasteful for DINO.
-        H = W = 2 ** k
+        # Square and a power of two -- the shape a ViT expects -- and large
+        # enough to contain the whole parent cell, so that every cell of the
+        # block has a token of its own instead of borrowing its neighbour's.
+        # "exact" gives 2**k px (equal area, ~20% of the cell falls outside),
+        # "cover" the smallest rectangle containing it.
+        H = W = pow2_cover_px(centre_ids, parent_level, gsd, radius=radius)
     elif isinstance(tile_px, str):
-        if tile_px != "cover":
-            raise ValueError("tile_px must be an int, a (rows, cols) pair or 'cover'")
-        H, W = parent_cover_px(centre_ids, parent_level, gsd, radius=radius)
+        if tile_px == "exact":
+            H = W = 2 ** k
+        elif tile_px == "cover":
+            H, W = parent_cover_px(centre_ids, parent_level, gsd, radius=radius)
+        else:
+            raise ValueError("tile_px must be an int, a (rows, cols) pair, "
+                             "'exact' or 'cover'")
     elif np.isscalar(tile_px):
         H = W = int(tile_px)
     else:
@@ -822,11 +845,21 @@ def load_dinov3_sat(
     )
     if weights is None and source != "hf":
         raise ValueError("DINOv3 SAT-493M weights are gated; pass `weights`.")
+    # A path that looks like a checkpoint but is not there fails deep inside the
+    # hub code with an unhelpful message; say it plainly instead.
+    if isinstance(weights, str) and weights.endswith(".pth"):
+        import os
+        if not os.path.exists(os.path.expanduser(weights)):
+            raise FileNotFoundError(f"checkpoint not found: {weights}")
     errors = []
     if source in ("auto", "hub"):
         try:
             src = "local" if (repo.startswith((".", "/", "~")) or ":" in repo[:3]) else "github"
             model = torch.hub.load(repo, model_name, source=src, weights=weights)
+            # torch.hub prints "Using cache found in .../facebookresearch_dinov3_main"
+            # about the *source code* it cached, never about the weights; say which
+            # checkpoint was actually loaded so the two are not confused.
+            print(f"DINOv3 {model_name}: poids charges depuis {weights}")
             return model.eval().to(device)
         except Exception as e:                         # noqa: BLE001
             errors.append(f"hub: {e!r}")
@@ -1232,11 +1265,15 @@ def GetDINOV3SAT(
         gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level)
         all_centres = np.unique(ids >> (2 * k))
         if tile_px is None:
-            H = W = 2 ** k                 # square, 2**k px (see `tangent_tiles`)
+            H = W = pow2_cover_px(all_centres, parent_level, gsd)
         elif isinstance(tile_px, str):
-            if tile_px != "cover":
-                raise ValueError("tile_px must be an int, a (rows, cols) pair or 'cover'")
-            H, W = parent_cover_px(all_centres, parent_level, gsd)
+            if tile_px == "exact":
+                H = W = 2 ** k
+            elif tile_px == "cover":
+                H, W = parent_cover_px(all_centres, parent_level, gsd)
+            else:
+                raise ValueError("tile_px must be an int, a (rows, cols) pair, "
+                                 "'exact' or 'cover'")
         elif np.isscalar(tile_px):
             H = W = int(tile_px)
         else:
@@ -1410,6 +1447,7 @@ __all__ = [
     "healpix_gsd_m",
     "lonlat_to_offsets",
     "parent_cover_px",
+    "pow2_cover_px",
     "nested_to_xy",
     "xy_to_nested",
     "cell_centres_lonlat",
