@@ -18,6 +18,7 @@ import torch.nn as nn
 
 from healpix_analyse.down import HealPixDown
 from healpix_analyse.up import HealPixUp
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -60,6 +61,39 @@ class HealPixPyramid(Sequence[ArrayLike]):
     def images(self) -> tuple[ArrayLike, ...]:
         """Alias for :attr:`bands`."""
         return self.bands
+
+
+@dataclass(frozen=True)
+class HealPixWeightedPyramid:
+    """Paired analysis of confidence-weighted data and confidence weights.
+
+    Returned by :meth:`HealPixDecomp.compute_weighted`.  ``q`` is the pyramid
+    obtained by running the *same* linear analysis (:class:`HealPixDown`/
+    :class:`HealPixUp` chain) on ``weights * x`` (with missing values replaced
+    by zero), and ``m`` is the pyramid obtained by running that identical
+    analysis on ``weights`` alone.  Because the analysis operator ``W`` is
+    data-independent, ``q`` and ``m`` share ``cell_ids``/``levels`` band for
+    band.
+
+    The detail bands of ``m`` are *signed correction terms*, not per-band
+    confidences: they are not bounded in ``[0, 1]`` and must not be clipped,
+    thresholded, or divided into individually.  Only a full synthesis of both
+    channels followed by a single division -- performed by
+    :meth:`HealPixDecomp.invert` when given a ``HealPixWeightedPyramid``, or
+    by a kernel-pyramid convolution applied identically to both channels --
+    recovers a valid normalized result.
+    """
+
+    q: HealPixPyramid
+    m: HealPixPyramid
+
+    @property
+    def cell_ids(self) -> tuple[np.ndarray, ...]:
+        return self.q.cell_ids
+
+    @property
+    def levels(self) -> tuple[int, ...]:
+        return self.q.levels
 
 
 def _as_numpy_ids(cell_ids, *, level: int) -> np.ndarray:
@@ -161,7 +195,7 @@ class HealPixDecomp(nn.Module):
         self.Jmax = requested_jmax
         self.n_scales = n_scales
         self.n_bands = n_scales + 1
-        self.ellipsoid = str(ellipsoid)
+        self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
         self.weight_norm = str(weight_norm)
         self.up_norm = str(up_norm)
         self.dtype = dtype
@@ -282,15 +316,17 @@ class HealPixDecomp(nn.Module):
             return restored.detach().cpu().numpy()
         return restored
 
-    def compute(self, data: ArrayLike) -> HealPixPyramid:
-        """Decompose a map into fine-to-coarse details and one coarse map.
+    def _analyze(self, current: torch.Tensor) -> list[torch.Tensor]:
+        """Run the fine-to-coarse analysis recursion on a prepared tensor.
 
-        The returned object is list-like and contains ``n_scales + 1`` images.
-        Arbitrary leading dimensions are supported, for example ``[B,C,N]``.
+        ``current`` must already be shaped ``[..., n_pixels]`` in the input's
+        *external* NESTED order.  Returns bands in each scale's own internal
+        (sorted) cell-id order, fine to coarse, matching
+        :attr:`cell_ids_per_scale`. This is the shared core used by both
+        :meth:`compute` and :meth:`compute_weighted`, so the identical linear
+        operator ``W`` is applied whatever channel (data or weights) is
+        passed in.
         """
-        current, leading_shape, is_numpy = self._prepare_map(
-            data, expected_size=self.n_pixels, name="data"
-        )
         current = current.index_select(-1, self._input_sort)
         bands: list[torch.Tensor] = []
 
@@ -304,6 +340,34 @@ class HealPixDecomp(nn.Module):
             bands.append(current - prediction)
             current = coarse
         bands.append(current)
+        return bands
+
+    def _synthesize(self, prepared: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Run the coarse-to-fine synthesis recursion.
+
+        ``prepared`` must be ``n_bands`` tensors in each scale's internal
+        (sorted) cell-id order (as returned by :meth:`_analyze`). Returns a
+        tensor still in that finest scale's internal order -- callers apply
+        ``index_select(-1, self._input_unsort)`` to restore external order.
+        """
+        current = prepared[-1]
+        for j in range(self.n_scales - 1, -1, -1):
+            prediction, fine_ids = self.up_layers[j](current)
+            if not np.array_equal(fine_ids, self.cell_ids_per_scale[j]):
+                raise RuntimeError(f"Up returned inconsistent cell_ids at scale {j}")
+            current = prepared[j] + prediction
+        return current
+
+    def compute(self, data: ArrayLike) -> HealPixPyramid:
+        """Decompose a map into fine-to-coarse details and one coarse map.
+
+        The returned object is list-like and contains ``n_scales + 1`` images.
+        Arbitrary leading dimensions are supported, for example ``[B,C,N]``.
+        """
+        current, leading_shape, is_numpy = self._prepare_map(
+            data, expected_size=self.n_pixels, name="data"
+        )
+        bands = self._analyze(current)
 
         restored_bands = tuple(
             self._restore_band(
@@ -316,6 +380,69 @@ class HealPixDecomp(nn.Module):
             cell_ids=self.cell_ids,
             levels=self.levels,
         )
+
+    def compute_weighted(
+        self, data: ArrayLike, weights: Optional[ArrayLike] = None
+    ) -> HealPixWeightedPyramid:
+        """Decompose a map that may contain NaN/missing values.
+
+        Non-finite entries of ``data`` (and, when given, non-finite or
+        implicitly-absent entries of ``weights``) are treated as missing.
+        ``weights`` defaults to a 0/1 confidence mask built from
+        ``isfinite(data)`` when omitted, i.e. plain unweighted missing-data
+        handling.
+
+        Internally this runs the *same* analysis operator ``W`` (the stored
+        Down/Up chain) on ``q = weights * data`` (missing values zeroed) and
+        on ``m = weights`` (also zeroed at missing positions), and returns
+        both resulting pyramids paired in a :class:`HealPixWeightedPyramid`.
+        Reconstruct with :meth:`invert`, which performs the single division
+        ``S(q) / S(m)`` after synthesis, per the normalized-convolution
+        convention -- never divide the two pyramids band by band.
+
+        The boolean missing/valid decision itself carries no gradient (as
+        with any masking based on ``isfinite``); the surviving finite values
+        of ``data``/``weights`` remain differentiable.
+        """
+        tensor, leading_shape, is_numpy = self._prepare_map(
+            data, expected_size=self.n_pixels, name="data"
+        )
+        finite_data = torch.isfinite(tensor)
+        if weights is None:
+            valid = finite_data
+            m = finite_data.to(dtype=self.dtype)
+        else:
+            wtensor, wshape, w_is_numpy = self._prepare_map(
+                weights, expected_size=self.n_pixels, name="weights"
+            )
+            if wshape != leading_shape:
+                raise ValueError(
+                    "weights must have the same leading shape as data; got "
+                    f"{wshape} vs {leading_shape}"
+                )
+            valid = finite_data & torch.isfinite(wtensor)
+            m = torch.where(valid, wtensor, torch.zeros_like(wtensor))
+            is_numpy = is_numpy or w_is_numpy
+
+        x_safe = torch.where(valid, tensor, torch.zeros_like(tensor))
+        q = x_safe * m
+
+        q_bands = self._analyze(q)
+        m_bands = self._analyze(m)
+
+        def _restore_all(bands: list[torch.Tensor]) -> tuple[ArrayLike, ...]:
+            return tuple(
+                self._restore_band(band, leading_shape=leading_shape, is_numpy=is_numpy)
+                for band in bands
+            )
+
+        q_pyramid = HealPixPyramid(
+            bands=_restore_all(q_bands), cell_ids=self.cell_ids, levels=self.levels
+        )
+        m_pyramid = HealPixPyramid(
+            bands=_restore_all(m_bands), cell_ids=self.cell_ids, levels=self.levels
+        )
+        return HealPixWeightedPyramid(q=q_pyramid, m=m_pyramid)
 
     def forward(self, data: ArrayLike) -> HealPixPyramid:
         """Alias for :meth:`compute`, enabling normal ``nn.Module`` usage."""
@@ -368,23 +495,64 @@ class HealPixDecomp(nn.Module):
         assert leading_shape is not None
         return prepared, leading_shape, all_numpy
 
-    def invert(self, decomposition: Union[HealPixPyramid, Sequence[ArrayLike]]) -> ArrayLike:
-        """Reconstruct the original map from multiscale coefficients."""
+    def invert(
+        self,
+        decomposition: Union[HealPixPyramid, HealPixWeightedPyramid, Sequence[ArrayLike]],
+        *,
+        restore_mask: bool = True,
+        eps: float = 1e-8,
+    ) -> ArrayLike:
+        """Reconstruct the original map from multiscale coefficients.
+
+        Given a plain :class:`HealPixPyramid` (or a bare sequence of bands),
+        this is the exact algebraic reverse of :meth:`compute`, unaffected by
+        ``restore_mask``/``eps``.
+
+        Given a :class:`HealPixWeightedPyramid` (from :meth:`compute_weighted`),
+        both channels are synthesized with the *same* Up chain and combined
+        with a single division ``y = S(q) / S(m)`` -- never per-band. Output
+        pixels whose synthesized weight ``S(m)`` falls at or below ``eps``
+        have no reliable support; when ``restore_mask`` is True (default)
+        they are set to NaN, otherwise to 0.
+        """
+        if isinstance(decomposition, HealPixWeightedPyramid):
+            return self._invert_weighted(decomposition, restore_mask=restore_mask, eps=eps)
+
         prepared, leading_shape, all_numpy = self._prepare_decomposition(
             decomposition
         )
-
-        current = prepared[-1]
-        for j in range(self.n_scales - 1, -1, -1):
-            prediction, fine_ids = self.up_layers[j](current)
-            if not np.array_equal(fine_ids, self.cell_ids_per_scale[j]):
-                raise RuntimeError(f"Up returned inconsistent cell_ids at scale {j}")
-            current = prepared[j] + prediction
-
+        current = self._synthesize(prepared)
         current = current.index_select(-1, self._input_unsort)
         return self._restore_band(
             current, leading_shape=leading_shape, is_numpy=all_numpy
         )
+
+    def _invert_weighted(
+        self,
+        weighted: HealPixWeightedPyramid,
+        *,
+        restore_mask: bool,
+        eps: float,
+    ) -> ArrayLike:
+        q_prepared, leading_shape, q_is_numpy = self._prepare_decomposition(weighted.q)
+        m_prepared, m_leading_shape, m_is_numpy = self._prepare_decomposition(weighted.m)
+        if m_leading_shape != leading_shape:
+            raise ValueError(
+                "q and m pyramids of a HealPixWeightedPyramid must share the "
+                f"same leading shape; got {leading_shape} vs {m_leading_shape}"
+            )
+        is_numpy = q_is_numpy or m_is_numpy
+
+        q_syn = self._synthesize(q_prepared).index_select(-1, self._input_unsort)
+        m_syn = self._synthesize(m_prepared).index_select(-1, self._input_unsort)
+
+        valid = m_syn > eps
+        safe_m = torch.where(valid, m_syn, torch.ones_like(m_syn))
+        y = q_syn / safe_m
+        fill = float("nan") if restore_mask else 0.0
+        y = torch.where(valid, y, torch.full_like(y, fill))
+
+        return self._restore_band(y, leading_shape=leading_shape, is_numpy=is_numpy)
 
     def expand(
         self,
@@ -431,4 +599,4 @@ class HealPixDecomp(nn.Module):
         )
 
 
-__all__ = ["HealPixDecomp", "HealPixPyramid"]
+__all__ = ["HealPixDecomp", "HealPixPyramid", "HealPixWeightedPyramid"]
