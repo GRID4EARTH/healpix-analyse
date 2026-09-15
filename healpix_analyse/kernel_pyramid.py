@@ -189,6 +189,7 @@ class HealPixKernelPyramid:
         singularity_lonlat=None,
         ref_direction=None,
         bands: Optional[Sequence[int]] = None,
+        ellipsoid: str = "sphere",
         dtype: Optional[torch.dtype] = None,
         device=None,
     ) -> "HealPixKernelPyramid":
@@ -197,9 +198,7 @@ class HealPixKernelPyramid:
         Parameters
         ----------
         decomp : HealPixDecomp
-            The pyramid whose bands this kernel pyramid will act on. Its
-            ``ellipsoid`` should be ``"sphere"`` for a true-sphere kernel
-            pyramid (see the caveat in ``HealPixKernelPyramid.ellipsoid_warning``).
+            The pyramid whose bands this kernel pyramid will act on.
         kernel : KernelFn
             ``fn(rho_pix, phi_rad) -> weight``, evaluated once per band on
             that band's own stencil geometry (see :func:`_stencil_pixel_polar`).
@@ -211,6 +210,14 @@ class HealPixKernelPyramid:
         bands : sequence of int, optional
             Restrict construction to these band indices (0 = finest detail,
             ``decomp.n_scales`` = coarse residual). Defaults to every band.
+        ellipsoid : str, default "sphere"
+            Geometry passed to every band's ``HealPixConv``. This module
+            defaults to the true sphere (see the module docstring, section
+            A.5), which is *not* the same convention some real data stores
+            use -- e.g. EOPF HEALPix products declare ``"wgs84"``. Pass the
+            same ellipsoid the data (and ``decomp``, if it uses one other
+            than its own default) actually use, or geometry is silently
+            mislabeled.
         """
         if compact_kernel_sz < 1 or compact_kernel_sz % 2 == 0:
             raise ValueError("compact_kernel_sz must be a positive odd integer")
@@ -240,7 +247,7 @@ class HealPixKernelPyramid:
                 singularity_lonlat=singularity_lonlat,
                 ref_direction=ref_direction,
                 cell_ids=cell_ids,
-                ellipsoid="sphere",
+                ellipsoid=ellipsoid,
                 dtype=dtype,
                 device=device,
             )
@@ -267,6 +274,7 @@ class HealPixKernelPyramid:
         n_excitations: int = 4,
         seed: int = 0,
         ridge: float = 1e-6,
+        ellipsoid: str = "sphere",
         dtype: Optional[torch.dtype] = None,
         device=None,
     ) -> "HealPixKernelPyramid":
@@ -317,7 +325,7 @@ class HealPixKernelPyramid:
                 level=level_j, in_channels=1, out_channels=1,
                 kernel_sz=compact_kernel_sz, n_gauges=1, gauge_type=gauge_type,
                 cell_ids=cell_ids if decomp.partial else None,
-                ellipsoid="sphere", dtype=dtype, device=device,
+                ellipsoid=ellipsoid, dtype=dtype, device=device,
             )
 
             n_probes_j = min(n_probes, n)
