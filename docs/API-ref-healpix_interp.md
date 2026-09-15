@@ -1,7 +1,6 @@
 # `healpix_interp` — API reference
 
 > **Module** `healpix_analyse.healpix_interp`  
-> **Parts** [1 · Quickstart](healpix_interp_1_quickstart.md) · [2 · Mathematics](healpix_interp_2_mathematics.md) · **3 · API reference**
 
 ---
 
