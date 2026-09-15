@@ -145,6 +145,49 @@ own `Down`/`Up` geometry; mixing `ellipsoid="WGS84"` in `decomp` with the
 kernel pyramid's `"sphere"` stencils silently mislabels an ellipsoidal
 distance as a spherical one and is not currently checked automatically.
 
+The ellipsoid name is resolved case-insensitively: `healpix_geo`'s own
+registry is case-sensitive (it accepts `"WGS84"` and `"sphere"` but rejects
+`"wgs84"` or `"SPHERE"` outright), and real data sources do not all agree on
+a casing — EOPF/GRID4EARTH Sentinel-2 products, for example, declare
+`ellipsoid="wgs84"` (lowercase). Every constructor here that takes an
+`ellipsoid` argument (`HealPixConv`, `HealPixDown`/`HealPixUp`,
+`HealPixDecomp`, `HealPixKernelPyramid.from_kernel`/`calibrate`, and the
+`validation` module) canonicalizes it once at construction time
+(`healpix_analyse._ellipsoid.canonicalize_ellipsoid`), so `"wgs84"`,
+`"WGS84"`, and `"Wgs84"` all resolve to the same geometry — you no longer
+need to re-case a store's own reported ellipsoid string by hand.
+
+### A.6 Multiple channels (e.g. RGB)
+
+`HealPixKernelPyramid.from_kernel`/`calibrate` accept a `channels` argument
+(default 1) to filter several co-registered scalar fields — e.g. R, G, B —
+through the same fixed kernel pyramid in a single call. This builds one
+`in_channels=out_channels=channels` `HealPixConv` per band whose
+`[channels, channels, P]` kernel is zero off the diagonal: every channel is
+filtered independently with the *identical* profile, with **no**
+cross-channel mixing (confirmed in
+`tests/test_kernel_pyramid.py::test_channels_are_independent_no_cross_channel_mixing`).
+It requires `n_gauges=1` — the general multi-gauge, multi-channel case is
+not supported.
+
+This exists to fix a real shape pitfall, not just for convenience. Passing
+a `[C, N]` array (e.g. `rgb.T`) straight to a *`channels=1`* kernel pyramid
+relies on `HealPixConv`'s ambiguous 2-D input convention, which treats a
+`[B, N]` array as `B` independent 1-channel samples — so it silently works
+numerically (each of the `C` "batch" rows is filtered independently, which
+happens to be exactly what you want for independent channels), but
+`HealPixConv` never squeezes a 2-D input's output back to 2-D, so the
+result comes back `[C, 1, N]`, not `[C, N]` — breaking a plain `.T` round
+trip downstream (see `tests/test_kernel_pyramid.py::test_channels_output_shape_matches_input_no_spurious_axis`
+for the regression test, and the `HealPixKernelPyramid.apply` docstring for
+the exact mechanism). Building the kernel pyramid with `channels=C` instead
+gives you the numerically identical result (see
+`tests/test_pyramid_conv.py::test_multichannel_matches_running_channels_separately`)
+with the shape you actually asked for. `HealPixPyramidConv.forward` needs
+no changes for this — it passes `x` straight through to
+`HealPixDecomp.compute_weighted`/`invert` (which already support arbitrary
+leading dimensions), and only `HealPixKernelPyramid.apply` needed the fix.
+
 ---
 
 ## B. Implementation notes
@@ -158,8 +201,10 @@ distance as a spherical one and is not currently checked automatically.
   `compute`/`invert`'s pre-existing behavior on finite data is unchanged —
   covered by `tests/test_decomp_weighted.py::test_plain_compute_invert_unaffected`.
 - **`healpix_analyse.kernel_pyramid.HealPixKernelPyramid`**: one
-  `HealPixConv(in_channels=1, out_channels=1, ...)` per band, with a fixed
-  (`requires_grad=False`) kernel set via `HealPixConv.set_kernel`. Built
+  `HealPixConv(in_channels=out_channels=channels, ...)` per band (`channels`
+  defaults to 1), with a fixed (`requires_grad=False`) kernel set via
+  `HealPixConv.set_kernel`, block-diagonal across channels when
+  `channels>1` — see [Section A.6](#a-6-multiple-channels-eg-rgb). Built
   either analytically (`from_kernel`, evaluating a Python callable on the
   exact stencil geometry) or by least-squares calibration against a
   reference operator (`calibrate`, see [Section D](#d-calibration-how-it-works-and-its-limits)).
@@ -213,11 +258,12 @@ from healpix_analyse.kernel_pyramid import (
 kp = HealPixKernelPyramid.from_kernel(
     decomp, kernel, compact_kernel_sz=5, gauge_type="phi", n_gauges=1,
     singularity_lonlat=None, ref_direction=None, bands=None,
-    dtype=None, device=None,
+    channels=1, ellipsoid="sphere", dtype=None, device=None,
 )
 kp = HealPixKernelPyramid.calibrate(
     decomp, reference_fn, compact_kernel_sz=5, gauge_type="phi",
     n_probes=128, n_excitations=4, seed=0, ridge=1e-6,
+    channels=1, ellipsoid="sphere",
 )
 conv_bands = kp.apply(bands)   # apply each band's kernel; no synthesis
 
@@ -379,8 +425,12 @@ worked around):
    `S(B_K m̃)` in `mode="normalized"`, which is not a meaningful confidence
    value; use `mode="signed"` for signed kernels on fully finite data
    instead.
-5. **`ellipsoid` consistency is not auto-checked.** See
-   [Section A.5](#a-5-true-sphere-vs-ellipsoid).
+5. **`ellipsoid` consistency across `decomp`/kernel pyramid is not
+   auto-checked** (using `"sphere"` for one and `"WGS84"` for the other is
+   still a silent mislabeling) — see [Section A.5](#a-5-true-sphere-vs-ellipsoid).
+   The *casing* of a given ellipsoid name is handled automatically as of
+   this revision (`"wgs84"`/`"WGS84"`/`"Wgs84"` all resolve the same way);
+   only mixing genuinely different ellipsoids remains unchecked.
 6. **No memory-chunked/streaming internals beyond per-band processing.**
    Each band is processed as one dense tensor; very large single bands are
    not further chunked internally.
@@ -389,6 +439,11 @@ worked around):
    loop over `P` taps × `n_excitations` per band, each a full
    `HealPixConv` forward pass) — fine for offline calibration at moderate
    `compact_kernel_sz`, not intended as a hot path.
+9. **Multi-channel (`channels>1`) requires `n_gauges=1`.** The general
+   multi-gauge, multi-channel case (`[G, C, C, P]` with `G>1`) is not
+   supported — see [Section A.6](#a-6-multiple-channels-eg-rgb). Every
+   channel also shares the *same* kernel profile (block-diagonal, identical
+   diagonal blocks); per-channel-distinct profiles are not supported.
 
 ---
 

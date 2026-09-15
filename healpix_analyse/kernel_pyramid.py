@@ -156,6 +156,19 @@ def _stencil_pixel_polar(kernel_sz: int, nside: int) -> tuple[np.ndarray, np.nda
     return rho_pix, dphi
 
 
+def _block_diagonal_kernel(w: np.ndarray, channels: int) -> np.ndarray:
+    """``[P]`` taps -> ``[channels, channels, P]``, zero off the diagonal.
+
+    Every channel gets the identical profile ``w``; there is no cross-channel
+    mixing (this is what "block-diagonal across channels" means here).
+    """
+    P = w.shape[0]
+    W = np.zeros((channels, channels, P), dtype=np.float64)
+    idx = np.arange(channels)
+    W[idx, idx, :] = w[None, :]
+    return W
+
+
 @dataclass
 class HealPixKernelPyramid:
     """One fixed, non-learnable :class:`HealPixConv` per pyramid band.
@@ -168,7 +181,22 @@ class HealPixKernelPyramid:
     :meth:`HealPixDecomp.compute`/:meth:`~HealPixDecomp.compute_weighted` and
     :meth:`~HealPixDecomp.invert`.
 
-    This is a **block-diagonal** approximation -- see the module docstring.
+    This is a **block-diagonal** approximation -- see the module docstring
+    (block-diagonal *across pyramid bands*; see also ``channels`` below for
+    the unrelated, additional sense in which multi-channel kernels here are
+    block-diagonal *across channels*).
+
+    Multiple channels (``channels > 1``, e.g. 3 for RGB) are supported as an
+    explicit second, independent block-diagonal structure: one
+    ``in_channels=channels, out_channels=channels`` :class:`HealPixConv` per
+    band, whose ``[channels, channels, P]`` kernel is zero off the diagonal
+    -- i.e. every channel is filtered independently with the *same* profile,
+    with no cross-channel mixing. This is deliberately not full
+    ``HealPixConv`` generality (a dense ``[C_out, C_in, P]`` kernel, or
+    per-channel gauge counts) -- the point is only to filter several
+    co-registered scalar fields (e.g. R, G, B) through the same fixed
+    kernel pyramid in one call, cheaply and without the shape pitfall
+    documented on :meth:`apply`.
     """
 
     decomp: HealPixDecomp
@@ -176,6 +204,7 @@ class HealPixKernelPyramid:
     kernel_sz: int
     gauge_type: str
     n_gauges: int
+    channels: int = 1
 
     @classmethod
     def from_kernel(
@@ -189,6 +218,7 @@ class HealPixKernelPyramid:
         singularity_lonlat=None,
         ref_direction=None,
         bands: Optional[Sequence[int]] = None,
+        channels: int = 1,
         ellipsoid: str = "sphere",
         dtype: Optional[torch.dtype] = None,
         device=None,
@@ -210,6 +240,19 @@ class HealPixKernelPyramid:
         bands : sequence of int, optional
             Restrict construction to these band indices (0 = finest detail,
             ``decomp.n_scales`` = coarse residual). Defaults to every band.
+        channels : int, default 1
+            Number of independent scalar channels each band's kernel will
+            act on (e.g. 3 for RGB), built as an ``in_channels=out_channels=
+            channels`` ``HealPixConv`` per band whose kernel is block-diagonal
+            across channels -- the same profile applied to every channel with
+            no cross-channel mixing (see the class docstring). Requires
+            ``n_gauges=1`` (not checked against ``n_gauges`` passed here
+            unless ``channels>1``, in which case a value other than 1 raises,
+            since the general ``[G, C, C, P]`` case with ``G>1`` cannot be
+            reshaped back to a plain ``[channels, N]`` band -- a currently
+            unaddressed limitation, not a silent approximation). Pass data
+            shaped ``[..., channels, N]`` to :meth:`~healpix_analyse.pyramid_conv.HealPixPyramidConv.forward`
+            (see :meth:`apply`).
         ellipsoid : str, default "sphere"
             Geometry passed to every band's ``HealPixConv``. This module
             defaults to the true sphere (see the module docstring, section
@@ -217,10 +260,20 @@ class HealPixKernelPyramid:
             use -- e.g. EOPF HEALPix products declare ``"wgs84"``. Pass the
             same ellipsoid the data (and ``decomp``, if it uses one other
             than its own default) actually use, or geometry is silently
-            mislabeled.
+            mislabeled. Accepted case-insensitively (canonicalized against
+            ``healpix_geo``'s own registry).
         """
         if compact_kernel_sz < 1 or compact_kernel_sz % 2 == 0:
             raise ValueError("compact_kernel_sz must be a positive odd integer")
+        channels = int(channels)
+        if channels < 1:
+            raise ValueError("channels must be a positive integer")
+        if channels > 1 and n_gauges != 1:
+            raise ValueError(
+                "channels > 1 requires n_gauges == 1 (multi-gauge, "
+                "multi-channel kernels are not supported here -- see the "
+                "class docstring)"
+            )
         dtype = dtype or decomp.dtype
         device = device if device is not None else decomp.device
         band_indices = range(decomp.n_bands) if bands is None else list(bands)
@@ -239,8 +292,8 @@ class HealPixKernelPyramid:
             cell_ids = decomp.cell_ids_per_scale[j] if decomp.partial else None
             conv = HealPixConv(
                 level=level_j,
-                in_channels=1,
-                out_channels=1,
+                in_channels=channels,
+                out_channels=channels,
                 kernel_sz=compact_kernel_sz,
                 n_gauges=n_gauges,
                 gauge_type=gauge_type,
@@ -251,7 +304,7 @@ class HealPixKernelPyramid:
                 dtype=dtype,
                 device=device,
             )
-            conv.set_kernel(w[None, None, :], requires_grad=False)
+            conv.set_kernel(_block_diagonal_kernel(w, channels), requires_grad=False)
             convs[j] = conv
 
         return cls(
@@ -260,6 +313,7 @@ class HealPixKernelPyramid:
             kernel_sz=compact_kernel_sz,
             gauge_type=gauge_type,
             n_gauges=n_gauges,
+            channels=channels,
         )
 
     @classmethod
@@ -274,6 +328,7 @@ class HealPixKernelPyramid:
         n_excitations: int = 4,
         seed: int = 0,
         ridge: float = 1e-6,
+        channels: int = 1,
         ellipsoid: str = "sphere",
         dtype: Optional[torch.dtype] = None,
         device=None,
@@ -306,7 +361,17 @@ class HealPixKernelPyramid:
         a ``[len(cell_ids)]`` map -- i.e. it should already be
         restricted/consistent with this decomposition's own geometry
         (masks, units, gauge) for a fair comparison.
+
+        ``channels``, as in :meth:`from_kernel`: the single scalar profile
+        fitted per band is replicated block-diagonally across ``channels``
+        independent channels (no cross-channel mixing); fitting itself is
+        always done against a scalar reference (one profile per channel, not
+        one fit per channel), so ``reference_fn`` need not know about
+        channels at all.
         """
+        channels = int(channels)
+        if channels < 1:
+            raise ValueError("channels must be a positive integer")
         rng = np.random.default_rng(seed)
         dtype = dtype or decomp.dtype
         device = device if device is not None else decomp.device
@@ -350,21 +415,76 @@ class HealPixKernelPyramid:
             b = np.concatenate(b_rows, axis=0)
             reg = ridge * np.eye(P)
             w_fit, *_ = np.linalg.lstsq(A.T @ A + reg, A.T @ b, rcond=None)
-            conv.set_kernel(w_fit[None, None, :].astype(np.float32), requires_grad=False)
+
+            if channels == 1:
+                conv.set_kernel(w_fit[None, None, :].astype(np.float32), requires_grad=False)
+            else:
+                # Refit was against a single-channel probing conv (the
+                # reference is scalar); rebuild a channels x channels
+                # block-diagonal conv to hold the fitted profile.
+                conv = HealPixConv(
+                    level=level_j, in_channels=channels, out_channels=channels,
+                    kernel_sz=compact_kernel_sz, n_gauges=1, gauge_type=gauge_type,
+                    cell_ids=cell_ids if decomp.partial else None,
+                    ellipsoid=ellipsoid, dtype=dtype, device=device,
+                )
+                conv.set_kernel(_block_diagonal_kernel(w_fit, channels), requires_grad=False)
             convs[j] = conv
 
         return cls(
             decomp=decomp, convs=tuple(convs), kernel_sz=compact_kernel_sz,
-            gauge_type=gauge_type, n_gauges=1,
+            gauge_type=gauge_type, n_gauges=1, channels=channels,
         )
 
     def apply(self, bands: Sequence) -> tuple:
-        """Apply each band's fixed kernel to the matching pyramid band."""
+        """Apply each band's fixed kernel to the matching pyramid band.
+
+        With ``channels=1`` (the default), each ``band`` is passed straight
+        to its ``HealPixConv`` -- see that class's own ``forward`` for its
+        exact input/output shape convention, including a known asymmetry: a
+        2-D ``[B, N]`` input always returns a 3-D ``[B, 1, N]`` output, never
+        squeezed back to 2-D. This method does not paper over that, so a
+        band shaped ``[C, N]`` used as a poor-man's channel batch (e.g. RGB
+        packed as ``[3, N]``) comes back ``[3, 1, N]``, not ``[3, N]`` --
+        build the kernel pyramid with ``channels=3`` instead (see the class
+        docstring) to get real, correctly shaped multi-channel support.
+
+        With ``channels>1``, each ``band`` must be shaped ``[..., channels,
+        N]``; this method reshapes it to the ``[B, channels, N]`` its
+        ``HealPixConv`` (built with matching ``in_channels=out_channels=
+        channels``) actually expects, applies it, and reshapes the result
+        back to ``[..., channels, N]`` -- any leading batch dims are
+        otherwise untouched.
+        """
         if len(bands) != len(self.convs):
             raise ValueError(
                 f"Expected {len(self.convs)} bands, got {len(bands)}"
             )
-        return tuple(conv(band) for conv, band in zip(self.convs, bands))
+        if self.channels == 1:
+            return tuple(conv(band) for conv, band in zip(self.convs, bands))
+        return tuple(
+            self._apply_multichannel(conv, band)
+            for conv, band in zip(self.convs, bands)
+        )
+
+    def _apply_multichannel(self, conv: HealPixConv, band):
+        is_numpy = isinstance(band, np.ndarray)
+        t = torch.as_tensor(band) if is_numpy else band
+        if t.ndim < 2 or t.shape[-2] != self.channels:
+            raise ValueError(
+                f"With channels={self.channels}, each band must have shape "
+                f"[..., {self.channels}, N]; got {tuple(t.shape)}"
+            )
+        n = t.shape[-1]
+        batch_shape = tuple(t.shape[:-2])
+        b = 1
+        for s in batch_shape:
+            b *= int(s)
+        y3 = conv(t.reshape(b, self.channels, n))  # [b, channels, n] (n_gauges == 1)
+        y = y3.reshape(*batch_shape, self.channels, n)
+        if is_numpy:
+            y = y.detach().cpu().numpy()
+        return y
 
 
 __all__ = [

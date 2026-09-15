@@ -39,6 +39,8 @@ import numpy as np
 import healpix_geo
 from scipy.spatial import cKDTree
 
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
+
 IsoKernelFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 
@@ -54,7 +56,8 @@ def smooth_test_field(cell_ids: np.ndarray, level: int, ellipsoid: str = "sphere
     reported separately rather than folded into one number.
     """
     lon_deg, lat_deg = healpix_geo.nested.healpix_to_lonlat(
-        np.asarray(cell_ids, dtype=np.int64).tolist(), level, ellipsoid=ellipsoid
+        np.asarray(cell_ids, dtype=np.int64).tolist(), level,
+        ellipsoid=canonicalize_ellipsoid(ellipsoid),
     )
     lon = np.radians(np.asarray(lon_deg, dtype=np.float64))
     lat = np.radians(np.asarray(lat_deg, dtype=np.float64))
@@ -63,7 +66,7 @@ def smooth_test_field(cell_ids: np.ndarray, level: int, ellipsoid: str = "sphere
 
 def _pixel_unit_vectors(cell_ids: np.ndarray, level: int, ellipsoid: str) -> np.ndarray:
     lon_deg, lat_deg = healpix_geo.nested.healpix_to_lonlat(
-        cell_ids.tolist(), level, ellipsoid=ellipsoid
+        cell_ids.tolist(), level, ellipsoid=canonicalize_ellipsoid(ellipsoid)
     )
     lon = np.radians(np.asarray(lon_deg, dtype=np.float64))
     lat = np.radians(np.asarray(lat_deg, dtype=np.float64))

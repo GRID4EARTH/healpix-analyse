@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import healpix_geo
 from pyproj import Transformer
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -178,7 +179,7 @@ class HealPixDown(nn.Module):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device)
         self.dtype = dtype
-        self.ellipsoid = ellipsoid
+        self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
         # ---- Grid4Earth level -> internal HEALPix nside ----
         if isinstance(level, bool) or int(level) != level or int(level) < 1:

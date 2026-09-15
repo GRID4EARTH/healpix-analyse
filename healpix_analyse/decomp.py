@@ -18,6 +18,7 @@ import torch.nn as nn
 
 from healpix_analyse.down import HealPixDown
 from healpix_analyse.up import HealPixUp
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -194,7 +195,7 @@ class HealPixDecomp(nn.Module):
         self.Jmax = requested_jmax
         self.n_scales = n_scales
         self.n_bands = n_scales + 1
-        self.ellipsoid = str(ellipsoid)
+        self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
         self.weight_norm = str(weight_norm)
         self.up_norm = str(up_norm)
         self.dtype = dtype
