@@ -39,6 +39,7 @@ pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 | Move data between HEALPix levels or domains | `resample` | {doc}`resample_healpix` |
 | FFT a local patch as if it were flat | `LocalFFT` | {doc}`fft_local` |
 | Convolve a patch with a big kernel, via FFT | `HealPixFFTConv` | {doc}`fft_conv` |
+| Pick the right power-spectrum helper (and know which are still in development) | `powerspectra`, `powerspectra_lonlat`, `ps` | {doc}`powerspectra` |
 | Average / take the median over a physical radius | `neighbour_reduce` | {doc}`neighbour_reduce` |
 | Filter by metric distance, or with a Gaussian | `radial_filter` | {doc}`radial_filter` |
 | Filter by azimuth (sun, shadow, wind) | `directional_filter` | {doc}`directional_filter` |
@@ -105,6 +106,7 @@ hidden: true
 ---
 fft_local
 fft_conv
+powerspectra
 ```
 
 ```{toctree}
