@@ -161,6 +161,22 @@ from healpix_analyse.radial_filter import (
     radial_filter,
 )
 
+# ---------------------------------------------------------------------------
+# Foundation-model embeddings (DINOv3 SAT-493M on NESTED blocks)
+#
+# The backbone is loaded at run time from Meta's own distribution and is
+# subject to the DINOv3 License; nothing of it is vendored here (see
+# docs/dino.md).
+# ---------------------------------------------------------------------------
+
+from healpix_analyse.dino import (
+    GetDINOV3SAT,
+    DINOEmbedding,
+    load_dinov3_sat,
+    nested_to_tiles,
+    tiles_to_nested,
+)
+
 __all__ = [
     # ------------------------------------------------------------------
     # Multi-resolution operators
@@ -249,4 +265,13 @@ __all__ = [
     "component_area",
     "healpix_cell_area",
     "remove_small_components",
+
+    # ------------------------------------------------------------------
+    # DINOv3 embeddings of NESTED blocks
+    # ------------------------------------------------------------------
+    "GetDINOV3SAT",
+    "DINOEmbedding",
+    "load_dinov3_sat",
+    "nested_to_tiles",
+    "tiles_to_nested",
 ]

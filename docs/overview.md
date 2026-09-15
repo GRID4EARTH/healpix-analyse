@@ -1,88 +1,111 @@
 # Overview
 
-**healpix-analyse** provides a set of tools for analysing signals defined on
-HEALPix spherical grids, with a focus on Earth Observation (EO) data.
+`healpix-analyse` is a toolkit for analysing signals stored on HEALPix grids,
+aimed at Earth Observation data. This page is the map: what each module is for,
+and the few conventions that hold everywhere.
 
-All operators are implemented in PyTorch and are fully differentiable through
-`torch.autograd`, making them suitable for deep learning pipelines as well as
-classical data analysis.
+## What the modules do
 
-## Package structure
+**Spherical harmonics.** `healpix_sht` is the fast path for a full-sky HEALPix
+map: a ring-based transform for spin-0, spin-1 and spin-2 fields, with power
+spectra. `alm_latlon` does the same for *any* iso-latitude grid — ERA5, a
+regular lat/lon grid, a Gaussian grid — so you can compare a model and an
+observation without regridding either. `alm` holds the coefficients themselves.
 
-| Module | Description |
-|---|---|
-| `healpix_analyse.alm` | Local complex spherical harmonic coefficients (`AlmCoeffs`, `AlmTransform`) |
-| `healpix_analyse.alm_latlon` | SHT for arbitrary iso-latitude grids (ERA5, regular lat/lon, HEALPix) |
-| `healpix_analyse.healpix_sht` | Ring-based full-sky SHT optimised for HEALPix (spin-0, spin-1, spin-2) |
-| `healpix_analyse.fft_local` | Gnomonic local 2D FFT/IFFT with CUDA and autograd support (`LocalFFT`) |
-| `healpix_analyse.fft_conv` | FFT-accelerated large-kernel local convolution (`HealPixFFTConv`) |
-| `healpix_analyse.convol` | Gauge-equivariant spherical convolution (`HealPixConv`) |
-| `healpix_analyse.large_conv` | Multiresolution large-receptive-field convolution (`LargeConv`) |
-| `healpix_analyse.decomp` | Exact local multiscale decomposition for masked maps (`HealPixDecomp`) |
-| `healpix_analyse.divcurl` | Gauge-aware divergence and curl at every pyramid scale |
-| `healpix_analyse.down` | HEALPix resolution reduction — smooth or max-pool (`HealPixDown`) |
-| `healpix_analyse.up` | HEALPix resolution increase — adjoint of smooth downsampling (`HealPixUp`) |
-| `healpix_analyse.powerspectra` | Isotropic 1D power spectrum on HEALPix patches |
-| `healpix_analyse.powerspectra_lonlat` | Power spectrum on irregular lon/lat grids |
-| `healpix_analyse.healpix_interp` | Bilinear interpolation on HEALPix (NESTED) |
-| `healpix_analyse.make_rectangle` | Build rectangular HEALPix patches from bounding boxes |
-| `healpix_analyse.resample` | HEALPix level/domain resampling and regular lat/lon conversion |
+**Convolution and scale.** `convol` (`HealPixConv`) is a gauge-equivariant
+convolution: a fixed stencil transported over the sphere so that the result does
+not depend on how the pixel grid happens to be oriented. `large_conv` reaches a
+wide receptive field cheaply, by coarsening, convolving small, and refining
+again. `down` and `up` are those two halves on their own — smooth or max-pool
+coarsening, and its adjoint. `decomp` turns them into a multiscale pyramid that
+reconstructs the original map exactly, masks included, and `divcurl` reads
+divergence and curl off every level of that pyramid. `resample` moves data
+between levels and between partial-sky domains, and to and from lat/lon.
 
-## Design principles
+**Local flat-sky analysis.** Over a small patch the sphere is flat enough to use
+a plain 2D FFT. `fft_local` (`LocalFFT`) builds the local tangent plane and the
+FFT on top of it, with CUDA and autograd; `fft_conv` uses it to convolve with
+kernels too large for a stencil; `powerspectra` reduces the result to an
+isotropic 1D spectrum.
 
-**Differentiable by default.** All hot-path operations (`torch.fft`, `einsum`,
-`index_select`, sparse matrix-vector products) are supported by PyTorch autograd.
-Geometry tables (Legendre polynomials, interpolation weights, phase matrices) are
-precomputed once and stored as non-gradient buffers.
+**Neighbourhood operators.** These work in *metres on WGS84*, not in pixels, so
+their meaning does not drift with latitude. `neighbour_reduce` takes means,
+medians, extrema and counts over a physical radius; `radial_filter` weights by
+distance (including a Gaussian); `directional_filter` weights by azimuth;
+`gradient` gives East/North derivatives and directional derivatives.
 
-**Numpy and Torch interoperability.** Every operator accepts both `np.ndarray`
-and `torch.Tensor` inputs and returns the same type. Shape `[N]` (single map)
-and `[B, N]` (batch of maps) are both supported throughout.
+**Morphology and topology.** `morphology` dilates and erodes masks on the NESTED
+neighbour graph; `components` labels connected regions and measures their area;
+`minkowski` computes area, perimeter and Euler characteristic, differentiably,
+for single or multiple thresholds.
 
-**Full-sky and partial-sky.** Operators like `HealPixDown`, `HealPixUp`, and
-`HealPixConv` work on the full sphere or on arbitrary partial-sky patches defined
-by a set of NESTED pixel indices (`cell_ids`).
+**Foundation-model embeddings.** `dino` (`GetDINOV3SAT`) runs an unmodified
+DINOv3 SAT-493M backbone on HEALPix data and maps every token back to a HEALPix
+cell. See {doc}`dino`, and read its licence section before publishing results.
 
-**Consistent mathematical conventions.** All SHT modules follow the standard
-orthonormal convention (identical to `healpy`):
+## Conventions that hold everywhere
+
+**Differentiable by default.** The hot paths are `torch.fft`, `einsum`,
+`index_select` and sparse products — all supported by autograd. Geometry tables
+(Legendre polynomials, interpolation weights, phase matrices) are computed once
+and stored as non-gradient buffers.
+
+**NumPy or Torch, single map or batch.** Every operator accepts `np.ndarray` and
+`torch.Tensor` and returns the same type it was given. Shapes `[N]` and `[B, N]`
+both work.
+
+**Full-sky or partial-sky.** Operators take either a complete map or an
+arbitrary set of NESTED cell ids, so you can work on one scene without padding
+it out to the whole sphere.
+
+**Geometry comes from `healpix-geo`.** Cell centres, vertices, neighbours and
+ellipsoidal distances are the GRID4EARTH library's, not `healpy`'s.
+
+**One SHT convention**, orthonormal, the same one `healpy` and the CMB
+literature use:
 
 $$a_{\ell m} = \int f(\theta, \varphi)\, Y_{\ell m}^*(\theta, \varphi)\, d\Omega$$
 
 $$C_\ell = \frac{1}{2\ell+1} \left[ |a_{\ell 0}|^2 + 2 \sum_{m=1}^{\ell} |a_{\ell m}|^2 \right]$$
 
-## Quick example
+## A first example
+
+An angular power spectrum of a full-sky map, going through `alm_latlon` so that
+the same code would work on an ERA5 grid:
 
 ```python
 import numpy as np
-import healpy as hp
+from healpix_geo import nested
 from healpix_analyse.alm_latlon import build_rings_from_latlon, anafast_latlon
 
-nside = 64
-npix  = 12 * nside**2
-lmax  = 3 * nside
+depth = 6                              # HEALPix level, nside = 64
+npix  = 12 * 4 ** depth
+lmax  = 3 * 2 ** depth
 
-# Random test map
-im = np.random.randn(npix)
+im = np.random.randn(npix)             # the map to analyse, NESTED order
 
-# Build ring structure from HEALPix coordinates
-theta, phi = hp.pix2ang(nside, np.arange(npix))
+# Where the cells are: healpix-geo returns degrees, the transform wants radians
+lon, lat = nested.healpix_to_lonlat(np.arange(npix, dtype=np.uint64), depth)
+theta, phi = np.radians(90.0 - lat), np.radians(lon)
+
+# Group the cells into iso-latitude rings, then transform
 ring_theta, ring_phi_list, ring_counts, sort_idx = build_rings_from_latlon(
     theta, phi, convention="colatitude_rad"
 )
-
-# Compute angular power spectrum
 cl = anafast_latlon(
     im[sort_idx], ring_theta, ring_phi_list, ring_counts,
     lmax=lmax, quadrature="equal_area",
 )
-
-print(cl.shape)   # torch.Size([193])
+print(cl.shape)                        # torch.Size([193])
 ```
 
-## Relationship to `healpix-geo`
+On a full-sky HEALPix map specifically, {doc}`healpix_sht` does this faster.
 
-`healpix-analyse` builds on top of
-[healpix-geo](https://healpix-geo.readthedocs.io/) for pixel coordinate
-conversions and ellipsoidal geometry. Where `healpix-geo` focuses on
-**where** pixels are, `healpix-analyse` focuses on **what you do** with
-the signal values stored in those pixels.
+## Where this sits
+
+[healpix-geo](https://healpix-geo.readthedocs.io/) locates cells;
+`healpix-analyse` analyses their values;
+[healpix-plot](https://github.com/GRID4EARTH/healpix-plot) draws them;
+[healpix-convert](https://github.com/GRID4EARTH/healpix-convert) and
+[healpix-resample](https://github.com/GRID4EARTH/healpix-resample) bring other
+data onto the grid. All are part of GRID4EARTH.

@@ -302,8 +302,10 @@ That helper temporarily uses:
 healpy.get_all_neighbours(..., nest=True)
 ```
 
-`healpy` is intentionally a temporary compatibility backend and is not
-intended to become the permanent topology implementation.
+That call is a leftover compatibility shim, not the intended design: the rest
+of the package takes its topology from `healpix-geo`
+(`nested.neighbours(..., connectivity="all")`), and this helper is expected to
+follow.
 
 The planned final architecture is:
 
