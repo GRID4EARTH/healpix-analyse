@@ -38,6 +38,14 @@ reconstructs the original map exactly, masks included, and `divcurl` reads
 divergence and curl off every level of that pyramid. `resample` moves data
 between levels and between partial-sky domains, and to and from lat/lon.
 
+`kernel_pyramid`/`pyramid_conv` (`HealPixKernelPyramid`, `HealPixPyramidConv`)
+add a fourth, NaN/weight-aware option: one small, fixed `HealPixConv` kernel
+per `decomp` band, applied identically to a data and a confidence channel and
+combined with a single division after synthesis. This is a **block-diagonal**
+approximation of the true (inter-band-coupled) target operator — see
+{doc}`pyramid_convolution` for exactly what that means, its measured accuracy,
+and what it does not do.
+
 **Point interpolation.** `healpix_interp` bilinearly interpolates a map (or
 just returns cells and weights) at arbitrary lon/lat. For `ellipsoid="sphere"`
 it is a direct NumPy port of `healpy`'s own RING-scheme algorithm, validated
@@ -79,6 +87,7 @@ cell. See {doc}`dino`, and read its licence section before publishing results.
 | Large learned kernel on one local image (e.g. a wide filter on a Sentinel-2 tile) | `HealPixFFTConv` | One local patch (≤10° by default) | Yes | No | Fast for large kernels; not worth it for small ones |
 | Wide receptive field under a memory budget, full sphere or a large patch | `LargeConv` | Full sphere or large patch | Yes (compact kernel) | Yes (internal `HealPixConv`) | O(K/4^L · compact_kernel²) — cheap |
 | Smoothing / pooling with no learned weights, pyramid building block | `HealPixDown` / `HealPixUp` | Full sphere or patch | No | n/a | Sparse operator, cheap |
+| Masked/NaN-aware multiscale filtering (block-diagonal per-band kernel) | `HealPixKernelPyramid` + `HealPixPyramidConv` | Full sphere or patch | Optional (analytic or calibrated) | Yes (per band) | O(K·compact_kernel²) per band |
 | Isotropic physical filter, scale given in metres | `radial_filter` / `gaussian_filter` | Full sphere or patch | No (user kernel, fixed) | n/a | Depends on neighbourhood size |
 | Directional physical filter (distance + real-world bearing) | `directional_filter` | Full sphere or patch | No | n/a | Same |
 | Unweighted local reduction (mean / median / min / max / count) | `neighbour_reduce` | Full sphere or patch | No | n/a | Cheapest |

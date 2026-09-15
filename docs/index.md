@@ -35,6 +35,7 @@ pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 | Convolve with a large kernel, cheaply | `LargeConv` | {doc}`large_conv` |
 | Change resolution (coarser / finer) | `HealPixDown`, `HealPixUp` | {doc}`down`, {doc}`up` |
 | Build an exactly invertible multiscale pyramid | `HealPixDecomp` | {doc}`decomp` |
+| Convolve masked/NaN data with a compact multiscale kernel pyramid | `HealPixKernelPyramid`, `HealPixPyramidConv` | {doc}`pyramid_convolution` |
 | Get divergence and curl at every scale | `divcurl` | {doc}`divcurl` |
 | Move data between HEALPix levels or domains | `resample` | {doc}`resample_healpix` |
 | Bilinearly interpolate a map at arbitrary lon/lat (identical to `healpy`) | `get_interp_val`, `get_interp_weights` | {doc}`healpix_interp` |
@@ -95,6 +96,7 @@ large_conv
 down
 up
 decomp
+pyramid_convolution
 divcurl
 resample_healpix
 healpix_interp

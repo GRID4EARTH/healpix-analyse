@@ -50,7 +50,19 @@ from healpix_analyse.fft_conv import HealPixFFTConv
 from healpix_analyse.decomp import (
     HealPixDecomp,
     HealPixPyramid,
+    HealPixWeightedPyramid,
 )
+
+from healpix_analyse.kernel_pyramid import (
+    HealPixKernelPyramid,
+    kernel_gaussian,
+    kernel_exponential,
+    kernel_lorentzian,
+    kernel_beta,
+    kernel_anisotropic_gaussian,
+)
+
+from healpix_analyse.pyramid_conv import HealPixPyramidConv
 
 from healpix_analyse.divcurl import (
     HealPixDivCurl,
@@ -187,6 +199,14 @@ __all__ = [
     "HealPixFFTConv",
     "HealPixDecomp",
     "HealPixPyramid",
+    "HealPixWeightedPyramid",
+    "HealPixKernelPyramid",
+    "HealPixPyramidConv",
+    "kernel_gaussian",
+    "kernel_exponential",
+    "kernel_lorentzian",
+    "kernel_beta",
+    "kernel_anisotropic_gaussian",
     "HealPixDivCurl",
     "HealPixMultiScaleDivCurl",
     "HealPixDivCurlPyramid",
