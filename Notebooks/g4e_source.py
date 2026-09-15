@@ -55,7 +55,7 @@ G4E_PRODUCTS = (
 )
 
 RGB = ("b04", "b03", "b02")          # Sentinel-2 red, green, blue at 10 m
-REFLECTANCE_SCALE = 10000.0          # L2A digital numbers -> reflectance
+REFLECTANCE_SCALE = 1.0          # L2A digital numbers -> reflectance
 
 # Levels published per product (the `multiscales` convention lists them in
 # `measurements/reflectance/zarr.json`); 17 is the coarsest and the cheapest.

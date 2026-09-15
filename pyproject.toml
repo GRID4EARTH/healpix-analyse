@@ -29,6 +29,7 @@ dependencies = [
   "pyproj>=3.6",
   "termcolor",
   "umap-learn",
+  "healpix-plot",
 ]
 
 [project.optional-dependencies]
