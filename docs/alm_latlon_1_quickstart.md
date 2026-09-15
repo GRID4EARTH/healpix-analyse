@@ -39,6 +39,13 @@ Every use of `alm_latlon` follows the same pattern regardless of the grid type:
 
 ## Example 1 — HEALPix pixels (validation against healpy)
 
+```{note}
+`healpy` appears here, and only here, because this example exists to
+cross-check our spectrum against a reference implementation. It is not a
+dependency of `healpix-analyse`: every other example takes its geometry
+from `healpix-geo`.
+```
+
 The simplest way to check correctness is to use HEALPix pixel coordinates.
 
 ```python
@@ -175,13 +182,16 @@ or further processing):
 
 ```python
 from healpix_analyse.alm_latlon import map2alm_latlon
-import numpy as np, healpy as hp
+import numpy as np
+from healpix_geo import nested
 
-nside = 32
-im    = np.random.randn(12 * nside**2)
-lmax  = 3 * nside
+depth = 5                                  # nside = 32
+npix  = 12 * 4 ** depth
+im    = np.random.randn(npix)
+lmax  = 3 * 2 ** depth
 
-theta, phi = hp.pix2ang(nside, np.arange(12 * nside**2))
+lon, lat = nested.healpix_to_lonlat(np.arange(npix, dtype=np.uint64), depth)
+theta, phi = np.radians(90.0 - lat), np.radians(lon)
 ring_theta, ring_phi_list, ring_counts, sort_idx = build_rings_from_latlon(
     theta, phi, convention="colatitude_rad"
 )
@@ -209,13 +219,16 @@ measures the truncation error introduced by the finite `lmax`.
 
 ```python
 from healpix_analyse.alm_latlon import map2alm_latlon, alm2map_latlon
-import numpy as np, healpy as hp
+import numpy as np
+from healpix_geo import nested
 
-nside = 32
-lmax  = 3 * nside
-im    = np.random.randn(12 * nside**2)
+depth = 5                                  # nside = 32
+npix  = 12 * 4 ** depth
+lmax  = 3 * 2 ** depth
+im    = np.random.randn(npix)
 
-theta, phi = hp.pix2ang(nside, np.arange(12 * nside**2))
+lon, lat = nested.healpix_to_lonlat(np.arange(npix, dtype=np.uint64), depth)
+theta, phi = np.radians(90.0 - lat), np.radians(lon)
 ring_theta, ring_phi_list, ring_counts, sort_idx = build_rings_from_latlon(
     theta, phi, convention="colatitude_rad"
 )
@@ -246,18 +259,20 @@ All transform functions support a leading batch dimension, so you can process
 many maps in a single call:
 
 ```python
-import numpy as np, healpy as hp
+import numpy as np
+from healpix_geo import nested
 from healpix_analyse.alm_latlon import build_rings_from_latlon, anafast_latlon
 
-nside  = 64
-B      = 50    # number of maps
-lmax   = 3 * nside
-npix   = 12 * nside**2
+depth = 6                                  # nside = 64
+B     = 50                                 # number of maps
+lmax  = 3 * 2 ** depth
+npix  = 12 * 4 ** depth
 
 # Batch of B independent maps, shape [B, npix]
 im_batch = np.random.randn(B, npix)
 
-theta, phi = hp.pix2ang(nside, np.arange(npix))
+lon, lat = nested.healpix_to_lonlat(np.arange(npix, dtype=np.uint64), depth)
+theta, phi = np.radians(90.0 - lat), np.radians(lon)
 ring_theta, ring_phi_list, ring_counts, sort_idx = build_rings_from_latlon(
     theta, phi, convention="colatitude_rad"
 )
@@ -283,15 +298,18 @@ cl_mean = cl_batch.mean(dim=0)
 
 ```python
 from healpix_analyse.alm_latlon import build_rings_from_latlon, grid_summary
-import numpy as np, healpy as hp
+import numpy as np
+from healpix_geo import nested
 
-nside = 128
-theta, phi = hp.pix2ang(nside, np.arange(12 * nside**2))
+depth = 7                                  # nside = 128
+npix  = 12 * 4 ** depth
+lon, lat = nested.healpix_to_lonlat(np.arange(npix, dtype=np.uint64), depth)
+theta, phi = np.radians(90.0 - lat), np.radians(lon)
 ring_theta, ring_phi_list, ring_counts, _ = build_rings_from_latlon(
     theta, phi, convention="colatitude_rad"
 )
 
-info = grid_summary(ring_theta, ring_phi_list, ring_counts, lmax=3*nside)
+info = grid_summary(ring_theta, ring_phi_list, ring_counts, lmax=3 * 2 ** depth)
 ```
 
 Example output:

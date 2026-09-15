@@ -1,279 +1,60 @@
-# healpix-analyse: Spherical Analysis on HEALPix
+# healpix-analyse
 
-`healpix-analyse` is a Python toolkit for analysing signals defined on HEALPix spherical grids,
-with a focus on Earth Observation (EO) data. All operators are implemented in PyTorch and are
-fully differentiable through `torch.autograd`.
+Signal analysis on HEALPix grids, for Earth Observation.
 
-## Why healpix-analyse?
+`healpix-analyse` answers the question *what do you do with the values stored in
+HEALPix cells*: spherical harmonic transforms and power spectra, convolutions
+and multiscale pyramids, local flat-sky FFTs, neighbourhood filters, morphology,
+and foundation-model embeddings. Its companion
+[healpix-geo](https://healpix-geo.readthedocs.io/) answers the other question —
+*where* those cells are.
 
-Where [healpix-geo](https://healpix-geo.readthedocs.io/) focuses on **where** pixels are,
-`healpix-analyse` focuses on **what you do** with the signal values stored in those pixels:
-spherical harmonic transforms, power spectra, gauge-equivariant convolutions, and multi-resolution
-up/downsampling operators.
-
-## Install
-
-::::{tab-set}
-
-:::{tab-item} pip (from GitHub)
+Every operator is written in PyTorch, accepts NumPy arrays or tensors, works on
+the full sphere or on a partial-sky set of NESTED cells, and is differentiable
+through `torch.autograd`.
 
 ```bash
 pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 ```
 
-:::
-
-:::{tab-item} From source
-
-```bash
-git clone git@github.com:GRID4EARTH/healpix-analyse.git
-cd healpix-analyse
-pip install -e .
-```
-
-:::
-
-:::{tab-item} pixi
-
-```bash
-pixi install
-```
-
-:::
-
-::::
-
-## Start
-
-::::{grid} 1 1 2 2
-:gutter: 2
-
-:::{grid-item-card} Overview
-:link: overview
-:link-type: doc
-
-Package structure, design principles and quick example.
-:::
-
-:::{grid-item-card} Installation
-:link: installation
-:link-type: doc
-
-Requirements, install options and verification.
-:::
-
-:::{grid-item-card} API Reference
-:link: autoapi/index
-:link-type: doc
-
-Auto-generated documentation of all classes and functions.
-:::
-
-:::{grid-item-card} Changelog
-:link: changelog
-:link-type: doc
-
-Version history and release notes.
-:::
-
-::::
-
-## Spherical harmonics
-
-::::{grid} 1 1 3 3
-:gutter: 2
-
-:::{grid-item-card} Quickstart
-:link: alm_latlon_1_quickstart
-:link-type: doc
-
-Get started with spherical harmonic transforms on arbitrary grids.
-:::
-
-:::{grid-item-card} Mathematics
-:link: alm_latlon_2_mathematics
-:link-type: doc
-
-Conventions, quadrature rules, and mathematical details.
-:::
-
-:::{grid-item-card} API details
-:link: alm_latlon_3_api
-:link-type: doc
-
-Full API reference for `alm_latlon`.
-:::
-
-::::
-
-## Convolution & multi-resolution
-
-::::{grid} 1 1 3 3
-:gutter: 2
-
-:::{grid-item-card} HealPixConv
-:link: convol_doc
-:link-type: doc
-
-Gauge-equivariant spherical convolution on HEALPix.
-:::
-
-:::{grid-item-card} HealPixDown
-:link: down
-:link-type: doc
-
-Resolution reduction: smooth or max-pool downsampling.
-:::
-
-:::{grid-item-card} HealPixUp
-:link: up
-:link-type: doc
-
-Resolution increase: adjoint of smooth downsampling.
-:::
-
-:::{grid-item-card} LargeConv
-:link: large_conv
-:link-type: doc
-
-Large effective kernels through matched Down, compact convolution and Up.
-:::
-
-:::{grid-item-card} HealPixDecomp
-:link: decomp
-:link-type: doc
-
-Exactly reconstructing local multiscale pyramids for masked HEALPix maps.
-:::
-
-:::{grid-item-card} Multiscale div/curl
-:link: divcurl
-:link-type: doc
-
-Gauge-aware local velocity derivatives at every HEALPix pyramid scale.
-:::
-
-:::{grid-item-card} HEALPix resampling
-:link: resample_healpix
-:link-type: doc
-
-Local Up/Down conversion between full or partial NESTED domains.
-:::
-
-::::
-
-## Local flat-sky analysis
-
-::::{grid} 1 1 2 2
-:gutter: 2
-
-:::{grid-item-card} Local 2D FFT
-:link: fft_local
-:link-type: doc
-
-Gnomonic projection, fast FFT/IFFT, CUDA, autograd and power-spectrum guidance.
-:::
-
-:::{grid-item-card} FFT convolution
-:link: fft_conv
-:link-type: doc
-
-Fast zero-padded large kernels on local HEALPix patches.
-:::
-
-:::{grid-item-card} Sentinel-2 FFT notebook
-:link: external_notebooks/fft_sentinel2_test
-:link-type: doc
-
-Real B04/B08 reflectance, reconstruction metrics and local radial spectra.
-:::
-
-:::{grid-item-card} Neighbourhood reductions
-:link: neighbour_reduce
-:link-type: doc
-
-Mean, median, extrema, counts and mask reductions over
-physical HEALPix neighbourhoods, including partial-domain semantics.
-:::
-
-:::{grid-item-card} Radial and Gaussian filters
-:link: radial_filter
-:link-type: doc
-
-Metric radial and Gaussian filtering on HEALPix using physical
-WGS84 distances and shared weighted-neighbour aggregation.
-:::
-
-
-:::{grid-item-card} Directional filtering
-:link: directional_filter
-:link-type: doc
-
-Geographical azimuth-dependent filtering over physical WGS84 HEALPix neighbourhoods.
-:::
-
-:::{grid-item-card} Scalar-field gradients
-:link: gradient
-:link-type: doc
-
-Geographic East/North gradients and directional derivatives over
-immediate HEALPix neighbourhoods using WGS84 relative geometry.
-:::
-
-::::
-
-## Morphology & topology
-
-::::{grid} 1 1 3 3
-:gutter: 2
-
-:::{grid-item-card} Binary morphology
-:link: morphology
-:link-type: doc
-
-Binary dilation and erosion on nested HEALPix grids using
-WGS84 geodesic cell-centre or cone-coverage neighbourhoods.
-:::
-
-:::{grid-item-card} Connected components
-:link: components
-:link-type: doc
-
-Connected-component labelling, component size and physical area,
-and small-region filtering on NESTED HEALPix topology.
-:::
-
-:::{grid-item-card} Minkowski functionals
-:link: minkowski
-:link-type: doc
-
-Differentiable area, perimeter and Euler characteristic for 2D images.
-Supports scalar, per-image and spatial thresholds, and multi-threshold
-Minkowski curves.
-:::
-
-::::
-
-## Foundation-model embeddings
-
-::::{grid} 1 1 2 2
-:gutter: 2
-
-:::{grid-item-card} DINOv3 on HEALPix
-:link: dino
-:link-type: doc
-
-`GetDINOV3SAT`: exact NESTED-block to image reordering, DINOv3 SAT-493M
-tile and patch embeddings mapped back to HEALPix cells, licence notes.
-:::
-
-::::
-
-## Resources
-
-- {doc}`healpix_sht` - Ring-based full-sky SHT optimised for HEALPix
-- {doc}`overview` - Design principles and package map
-- {doc}`autoapi/index` - Full API reference
+## Start here
+
+1. {doc}`installation` — install it, and the extras for the examples.
+2. {doc}`overview` — what each module is for, in one line each.
+3. Pick your task in the table below.
+
+## Find the page you need
+
+| You want to… | Use | Page |
+|---|---|---|
+| Compute a power spectrum on the full sphere | `HEALPixSHT` | {doc}`healpix_sht` |
+| …on ERA5, a lat/lon grid, or any iso-latitude grid | `alm_latlon` | {doc}`alm_latlon_1_quickstart` |
+| Understand the SHT conventions and quadrature | — | {doc}`alm_latlon_2_mathematics` |
+| Convolve a map, equivariantly, on the sphere | `HealPixConv` | {doc}`convol_doc` |
+| Split a flow into divergence and curl | `uv_to_curl_div` | {doc}`healpix_sht` |
+| Convolve with a large kernel, cheaply | `LargeConv` | {doc}`large_conv` |
+| Change resolution (coarser / finer) | `HealPixDown`, `HealPixUp` | {doc}`down`, {doc}`up` |
+| Build an exactly invertible multiscale pyramid | `HealPixDecomp` | {doc}`decomp` |
+| Get divergence and curl at every scale | `divcurl` | {doc}`divcurl` |
+| Move data between HEALPix levels or domains | `resample` | {doc}`resample_healpix` |
+| FFT a local patch as if it were flat | `LocalFFT` | {doc}`fft_local` |
+| Convolve a patch with a big kernel, via FFT | `HealPixFFTConv` | {doc}`fft_conv` |
+| Average / take the median over a physical radius | `neighbour_reduce` | {doc}`neighbour_reduce` |
+| Filter by metric distance, or with a Gaussian | `radial_filter` | {doc}`radial_filter` |
+| Filter by azimuth (sun, shadow, wind) | `directional_filter` | {doc}`directional_filter` |
+| Take East/North gradients | `gradient` | {doc}`gradient` |
+| Dilate or erode a mask | `morphology` | {doc}`morphology` |
+| Label connected regions, measure their area | `components` | {doc}`components` |
+| Measure area, perimeter, Euler characteristic | `minkowski` | {doc}`minkowski` |
+| Embed Sentinel-2 with DINOv3 | `GetDINOV3SAT` | {doc}`dino` |
+
+For the signature of any function, see the {doc}`API reference <autoapi/index>`.
+
+## Worked examples
+
+- {doc}`Sentinel-2 local FFT <external_notebooks/fft_sentinel2_test>` — real
+  B04/B08 reflectance, reconstruction metrics, local radial spectra.
+- {doc}`notebooks/index` — the full notebook gallery.
 
 ```{toctree}
 ---
@@ -295,6 +76,8 @@ alm_latlon_1_quickstart
 alm_latlon_2_mathematics
 alm_latlon_3_api
 healpix_sht
+healpix_sht_api
+healpix_sht_maths
 ```
 
 ```{toctree}
@@ -304,9 +87,14 @@ caption: Convolution & multi-resolution
 hidden: true
 ---
 convol_doc
+convol_api
+convol_internals
+large_conv
 down
 up
-large_conv
+decomp
+divcurl
+resample_healpix
 ```
 
 ```{toctree}
@@ -316,21 +104,23 @@ caption: Local flat-sky analysis
 hidden: true
 ---
 fft_local
+fft_conv
 ```
 
 ```{toctree}
 ---
 maxdepth: 2
-caption: Morphology & topology
+caption: Filters, morphology & topology
 hidden: true
 ---
+neighbour_reduce
+radial_filter
+directional_filter
+directional_filter_migration
+gradient
 morphology
 components
 minkowski
-neighbour_reduce
-directional_filter
-radial_filter
-gradient
 ```
 
 ```{toctree}

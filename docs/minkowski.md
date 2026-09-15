@@ -247,7 +247,7 @@ $\chi(\mathbb{S}^2) = 2 / N_{\text{pix}}$ (the Euler characteristic of the
 sphere, properly normalised).
 
 The adjacency graph is **precomputed once** with `build_healpix_adjacency`
-(requires healpy) and then reused across all differentiable forward passes.
+and then reused across all differentiable forward passes.
 
 ### `build_healpix_adjacency`
 
@@ -326,7 +326,7 @@ level = 6
 nside = 2**level
 B     = 4
 
-# ── One-time setup (uses healpy, not differentiable) ─────────────────────
+# ── One-time setup (geometry only, not differentiable) ───────────────────
 edges, triangles = build_healpix_adjacency(level, nest=True, device="cpu")
 print(f"Edges: {edges.shape}, Triangles: {triangles.shape}")
 
@@ -347,8 +347,9 @@ curves = minkowski_curves_healpix(img, edges, triangles, thresholds)
 # curves['W0'].shape == [4, 16]
 
 # ── Partial sky ───────────────────────────────────────────────────────────
-import healpy as hp
-patch = hp.query_disc(nside, hp.ang2vec(np.pi/2, 0.), np.radians(20.), nest=True)
+from healpix_geo import nested
+patch = nested.cone_coverage((0.0, 0.0), 20.0, level)
+patch = np.asarray(getattr(patch, "data", patch), dtype=np.int64).reshape(-1)
 edges_p, tri_p = build_healpix_adjacency(level, cell_ids=patch, nest=True)
 
 img_patch = torch.rand(B, len(patch), requires_grad=True)

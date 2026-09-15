@@ -166,14 +166,14 @@ print(y_batch.shape) # (8, 49152)
 ### Partial sky
 
 ```python
-import healpy as hp
 import numpy as np
+from healpix_geo import nested
 from healpix_analyse.up import HealPixUp
 
-nside_coarse = 32;  level_coarse = 5   # nside = 2**5
-patch_coarse = hp.query_disc(
-    nside_coarse, hp.ang2vec(np.pi/2, 0.), np.radians(20.), nest=True
-)
+level_coarse = 5                # nside = 2**5
+patch_coarse = nested.cone_coverage((0.0, 0.0), 20.0, level_coarse)
+patch_coarse = np.asarray(getattr(patch_coarse, "data", patch_coarse),
+                          dtype=np.int64).reshape(-1)
 
 up = HealPixUp(level=level_coarse, cell_ids=patch_coarse)
 
