@@ -153,6 +153,27 @@ The pyramid retains the NESTED cell identifiers at every scale and works on
 irregular masked domains such as ocean fields bounded by coastlines. See the
 [multiscale decomposition documentation](docs/decomp.md).
 
+### Convolution with a wide kernel
+
+```python
+import numpy as np
+from healpix_analyse import HealPixWideConv
+
+conv = HealPixWideConv.from_radial(
+    lambda r: np.exp(-r / 500.0),        # r in metres
+    level=17, n=64, lon=2.3198, lat=48.8704, Jmax=6,
+)
+y = conv(x, cell_ids)                    # x: [N] or [..., N] -> same shape
+```
+
+A kernel tens of pixels wide does not fit in a compact stencil. `HealPixWideConv`
+decomposes the field into a Laplacian pyramid, convolves each band with its own
+small (5x5) kernel — fitted automatically from the kernel you supplied — and
+synthesizes. The kernel can be given as an image on the HEALPix lattice, as a
+function of `x, y` or of `r` in metres, or as a metric raster resampled onto the
+cells' true positions. See the
+[wide-kernel convolution documentation](docs/wide_convolution.md).
+
 ### Multiscale divergence and curl
 
 ```python

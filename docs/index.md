@@ -33,15 +33,14 @@ pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 | Convolve a map, equivariantly, on the sphere | `HealPixConv` | {doc}`convol_doc` |
 | Split a flow into divergence and curl | `uv_to_curl_div` | {doc}`healpix_sht` |
 | Convolve with a large kernel, cheaply | `LargeConv` | {doc}`large_conv` |
+| Convolve with a wide kernel given as an image, a formula in metres or a raster | `HealPixWideConv` | {doc}`wide_convolution` |
+| Filter at every scale with one kernel per band | `HealPixPyramidConv` | {doc}`pyramid_convolution` |
 | Change resolution (coarser / finer) | `HealPixDown`, `HealPixUp` | {doc}`down`, {doc}`up` |
 | Build an exactly invertible multiscale pyramid | `HealPixDecomp` | {doc}`decomp` |
-| Convolve masked/NaN data with a compact multiscale kernel pyramid | `HealPixKernelPyramid`, `HealPixPyramidConv` | {doc}`pyramid_convolution` |
 | Get divergence and curl at every scale | `divcurl` | {doc}`divcurl` |
 | Move data between HEALPix levels or domains | `resample` | {doc}`resample_healpix` |
-| Bilinearly interpolate a map at arbitrary lon/lat (identical to `healpy`) | `get_interp_val`, `get_interp_weights` | {doc}`healpix_interp` |
 | FFT a local patch as if it were flat | `LocalFFT` | {doc}`fft_local` |
 | Convolve a patch with a big kernel, via FFT | `HealPixFFTConv` | {doc}`fft_conv` |
-| Pick the right power-spectrum helper (and know which are still in development) | `powerspectra`, `powerspectra_lonlat`, `ps` | {doc}`powerspectra` |
 | Average / take the median over a physical radius | `neighbour_reduce` | {doc}`neighbour_reduce` |
 | Filter by metric distance, or with a Gaussian | `radial_filter` | {doc}`radial_filter` |
 | Filter by azimuth (sun, shadow, wind) | `directional_filter` | {doc}`directional_filter` |
@@ -93,13 +92,13 @@ convol_doc
 convol_api
 convol_internals
 large_conv
+wide_convolution
+pyramid_convolution
 down
 up
 decomp
-pyramid_convolution
 divcurl
 resample_healpix
-healpix_interp
 ```
 
 ```{toctree}
@@ -110,7 +109,6 @@ hidden: true
 ---
 fft_local
 fft_conv
-powerspectra
 ```
 
 ```{toctree}

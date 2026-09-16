@@ -15,6 +15,13 @@ below.
 
 ---
 
+> **Looking for “I have one wide kernel and I want to convolve with it”?**
+> That is [`docs/wide_convolution.md`](wide_convolution.md) and
+> `HealPixWideConv`: you give the kernel as an image, a formula in metres or
+> a raster, and it derives the per-band kernels itself. This page documents
+> the lower-level pair it is built on — analytic per-band profiles,
+> multi-channel kernels, and NaN/weight-aware filtering.
+
 ## Quick start
 
 ```python
@@ -61,6 +68,7 @@ build `kernel_pyramid` above — nowhere else:
 | **Multiple co-registered channels at once** (e.g. RGB) | `channels=C` | `from_kernel(..., channels=C)` — see [§A.6](#a-6-multiple-channels-eg-rgb) |
 | **Anisotropy** (direction-dependent response) | a `kernel(rho_pix, phi)` that actually depends on `phi`, plus `gauge_type` | `from_kernel(..., gauge_type=...)` — see [§A.4](#a-4-anisotropy-and-gauges) |
 | A kernel **fit to data** instead of an analytic formula | `HealPixKernelPyramid.calibrate(...)` instead of `.from_kernel(...)` | see [§D](#d-calibration-how-it-works-and-its-limits) |
+| A **wide, slowly-decaying analytic target** (Lorentzian/power-law tail) decomposed into small kernels across all bands, defined once at J=0 | `HealPixKernelPyramid.calibrate_joint(decomp, target_kernel, ...)` | see [§D.1](#d-1-calibrate-joint-decomposing-one-wide-kernel-across-bands) |
 | `mode="normalized"` (NaN/weight-aware) vs. `"signed"` (no masking, allows negative kernels) | `mode=` | `HealPixPyramidConv(decomp, kernel_pyramid, mode=...)` |
 | **Where** the kernel is defined (once, at the finest band, vs. re-derived per band) | `weights_from_finest_band` (default `True`) | `from_kernel(..., weights_from_finest_band=True)` — see [§A.1bis](#a-1bis-one-kernel-at-j-0-not-one-per-band) |
 
@@ -401,10 +409,49 @@ resolution*. Two things follow, both confirmed by
   meaningfully close the gap (`test_calibrate_on_a_much_wider_target_does_not_silently_claim_success`,
   measured ≈76% RMS residual — this is printed, not asserted tight, on
   purpose). Reproducing a wide target well from a cascade of small per-band
-  kernels requires *joint*, cross-band least-squares optimization (this is
-  the actual contribution of Farbman/Fattal/Lischinski 2011) — that is
-  **not implemented here**; see
-  [Relation to "Convolution Pyramids" and honest scope](#relation-to-convolution-pyramids-and-honest-scope).
+  kernels requires *joint*, cross-band least-squares optimization — see
+  `calibrate_joint`, next.
+
+### D.1 `calibrate_joint`: decomposing one wide kernel across bands
+
+`HealPixKernelPyramid.calibrate_joint(decomp, target_kernel, ...)` fits
+*every* band's `P` taps **together**, in one least-squares solve, against a
+single wide target kernel defined once at the finest resolution
+(`decomp.levels[0]`) — not `calibrate`'s independent per-band fits. The
+design matrix is built by probing the real, composed pipeline: for each
+band `j` and tap `p`, a one-hot kernel is placed on that tap alone (every
+other band's contribution held at zero), the map is reconstructed through
+the *actual* `HealPixDecomp.invert`, and the response at a set of random
+probe pixels becomes that column of the design matrix — so the fit
+"knows" about the true inter-band coupling the block-diagonal `apply()`
+itself will later exploit (each band's kernel only has to supply what the
+pyramid's own geometric coarsening does not already contribute).
+
+Measured (`test_calibrate_joint_decomposes_a_wide_kernel_across_bands`,
+level=5, `Jmax=3`, `compact_kernel_sz=5` throughout, target =
+`kernel_lorentzian(scale_pix=6)`, brute-force reference `kernel_sz=25`):
+
+| Method | Same target | rel RMS (smooth field) |
+|---|---|---|
+| `calibrate` (single band, band 0 alone) | Lorentzian σ=6px | **≈87%** |
+| `calibrate_joint` (4 bands, jointly) | Lorentzian σ=6px | **≈3.2%** |
+
+Same wide target, same per-band kernel size — the only difference is
+fitting all bands together against the real reconstructed output instead
+of each band alone against the target evaluated at its own resolution.
+White-noise excitation (harder, see the smooth-vs-noise discussion in
+Section E) measured ≈10% rel RMS for the same fit.
+
+**Requires a full-sphere `HealPixDecomp`** (`cell_ids=None`) for the fit
+itself (an unambiguous "external" pixel order is needed to compare against
+the direct reference on the same footprint); the resulting
+`HealPixKernelPyramid` can still be used afterwards on a partial-domain
+decomposition, same as `from_kernel`'s. Reach is still bounded by
+`decomp.Jmax` — a target wider than the coarsest band's own reach cannot
+be represented regardless of how well the taps are fit; see
+[Relation to "Convolution Pyramids" and honest scope](#relation-to-convolution-pyramids-and-honest-scope)
+for how this relates to (and differs from) the cited paper's own
+construction.
 
 ---
 
@@ -488,10 +535,14 @@ worked around):
 1. **Block-diagonal only.** No inter-band coupling is modeled or corrected
    for; see [Section A.1](#a-1-the-target-operator-and-what-a-pyramid-can-and-cannot-give-you-for-free)
    and [Section D](#d-calibration-how-it-works-and-its-limits).
-2. **`calibrate` is single-band, not joint.** It cannot make a compact
-   per-band kernel reproduce an arbitrarily wide target; a genuine
-   multi-level joint calibration (the actual contribution of the cited
-   1  2011 paper) is not implemented.
+2. **`calibrate` is single-band, not joint** — it cannot make a compact
+   per-band kernel reproduce an arbitrarily wide target on its own. Use
+   `calibrate_joint` ([Section D.1](#d-1-calibrate-joint-decomposing-one-wide-kernel-across-bands))
+   for that: a genuine multi-band joint least-squares fit against one wide
+   target, measured to cut the residual from ≈87% to ≈3% on the same
+   target and per-band kernel size. `calibrate_joint` itself only supports
+   `channels=1` and a full-sphere `decomp` for the fit — both currently
+   unaddressed limitations, not silent approximations.
 3. **No automated anisotropic/gauge validation oracle.** The independent
    reference in `healpix_analyse.validation` only supports isotropic
    kernels (see its module docstring for why); anisotropic kernels are
@@ -526,20 +577,30 @@ worked around):
 
 ## Relation to "Convolution Pyramids" and honest scope
 
-This module is **inspired by**, but does not claim to reproduce, Z.
+This module is **inspired by**, but does not claim to reproduce exactly, Z.
 Farbman, R. Fattal, D. Lischinski, *"Convolution Pyramids"*, ACM
 Transactions on Graphics 30(4), 2011. The cited paper's core technique —
-jointly optimizing every pyramid level's kernel by least squares so that
-the *cascade* reproduces one global target operator (their examples include
-large-radius blurs and gradient-domain/Poisson-type operators) — is
-explicitly **not implemented** here. What this module provides instead:
+jointly optimizing every pyramid level's kernel so that the *cascade*
+reproduces one global target operator — is what `calibrate_joint`
+([Section D.1](#d-1-calibrate-joint-decomposing-one-wide-kernel-across-bands))
+now does too, but by a different, more general and less precise route:
+direct numerical least-squares against a brute-force reference, evaluated
+by probing the real `HealPixDecomp`/`HealPixConv` machinery, rather than
+the paper's closed-form, boundary-matched derivations for specific kernel
+families (large-radius blurs, gradient-domain/Poisson-type operators).
+`calibrate_joint` can in principle fit *any* profile the direct oracle can
+evaluate, at the cost of no closed-form accuracy guarantee — every claim
+about it in this document is an empirical measurement on a specific
+target/level/`Jmax`, not a general bound, and should be re-measured for a
+materially different kernel family or pyramid depth. What this module
+provides in total:
 
 - an exact-reconstruction pyramid (`HealPixDecomp`, pre-existing) reused
   as-is;
-- a **block-diagonal**, per-band-only kernel pyramid, built either
-  analytically from a chosen kernel family or by **independent per-band**
-  least-squares calibration (not the joint, cross-band optimization of the
-  cited paper);
+- a **block-diagonal**, per-band-only kernel pyramid, built analytically
+  from a chosen kernel family (`from_kernel`), by **independent per-band**
+  least-squares calibration (`calibrate`), or by **joint, cross-band**
+  least-squares calibration against one wide target (`calibrate_joint`);
 - correct NaN/weight propagation through that block-diagonal pyramid with
   the standard single-division-after-synthesis normalized-convolution
   convention.
