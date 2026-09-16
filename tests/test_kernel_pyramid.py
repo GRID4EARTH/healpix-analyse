@@ -126,6 +126,48 @@ def test_larger_kernel_is_not_worse_than_smaller_kernel(capsys):
     assert errs[7] <= errs[5] * 1.5  # generous margin; the point is no blow-up
 
 
+def test_weights_from_finest_band_are_shared_identically_across_bands():
+    """Default construction (``weights_from_finest_band=True``): the kernel
+    is realized once, on band 0's stencil, and every coarser band's
+    HealPixConv must carry that exact same discrete tap vector -- not an
+    independent re-evaluation of the profile on its own (slightly
+    different) real HEALPix geometry. This is the literal fix for "on doit
+    donner le kernel a la resolution J=0 et il doit construire une
+    pyramide": one realization, reused, rather than one per band.
+    """
+    level = 5
+    decomp = HealPixDecomp(level=level, ellipsoid="sphere", dtype=torch.float64, Jmax=3)
+    kp = HealPixKernelPyramid.from_kernel(
+        decomp, kernel_gaussian(1.2), compact_kernel_sz=5, dtype=torch.float64,
+    )
+    # Compare via the taps actually bound into each band's HealPixConv.
+    taps = [conv.weight.detach().cpu().numpy() for conv in kp.convs]
+    for j in range(1, len(taps)):
+        assert np.array_equal(taps[0], taps[j]), (
+            f"band {j} kernel taps differ from band 0's -- weights must be "
+            "shared, not resampled, under the default weights_from_finest_band=True"
+        )
+
+
+def test_weights_from_finest_band_false_restores_per_band_resampling():
+    """Explicit opt-out: with weights_from_finest_band=False, coarser bands
+    may (and, on real HEALPix geometry, typically do) carry taps that
+    differ slightly from band 0's -- the previous default behaviour,
+    kept available for comparison.
+    """
+    level = 5
+    decomp = HealPixDecomp(level=level, ellipsoid="sphere", dtype=torch.float64, Jmax=3)
+    kp = HealPixKernelPyramid.from_kernel(
+        decomp, kernel_gaussian(1.2), compact_kernel_sz=5, dtype=torch.float64,
+        weights_from_finest_band=False,
+    )
+    taps = [conv.weight.detach().cpu().numpy() for conv in kp.convs]
+    # Not asserting inequality (geometry differences could in principle be
+    # exactly zero for some band pairs) -- this just documents that nothing
+    # forces equality in this mode, by construction of the code path taken.
+    assert len(taps) == decomp.n_bands
+
+
 def test_kernel_pyramid_geometry_matches_decomp_bands():
     level = 4
     decomp = HealPixDecomp(level=level, ellipsoid="sphere", dtype=torch.float64, Jmax=2)

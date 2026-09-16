@@ -62,6 +62,7 @@ build `kernel_pyramid` above — nowhere else:
 | **Anisotropy** (direction-dependent response) | a `kernel(rho_pix, phi)` that actually depends on `phi`, plus `gauge_type` | `from_kernel(..., gauge_type=...)` — see [§A.4](#a-4-anisotropy-and-gauges) |
 | A kernel **fit to data** instead of an analytic formula | `HealPixKernelPyramid.calibrate(...)` instead of `.from_kernel(...)` | see [§D](#d-calibration-how-it-works-and-its-limits) |
 | `mode="normalized"` (NaN/weight-aware) vs. `"signed"` (no masking, allows negative kernels) | `mode=` | `HealPixPyramidConv(decomp, kernel_pyramid, mode=...)` |
+| **Where** the kernel is defined (once, at the finest band, vs. re-derived per band) | `weights_from_finest_band` (default `True`) | `from_kernel(..., weights_from_finest_band=True)` — see [§A.1bis](#a-1bis-one-kernel-at-j-0-not-one-per-band) |
 
 None of this lives in `HealPixPyramidConv` itself — it only *applies* the
 kernel pyramid it is given (`decomp.compute_weighted` → per-band kernel →
@@ -100,6 +101,46 @@ approximation of `B`, one small compact `HealPixConv` kernel acting
 independently on each band, with **no cross-band terms**. This is a
 deliberate simplification whose approximation error must be *measured*, not
 assumed — see [Section E](#e-validation-results-and-honest-limits).
+
+### A.1bis One kernel, at J=0 — not one per band
+
+`from_kernel` takes a single continuous profile, `kernel(rho_pix, phi_rad)`,
+and by default (`weights_from_finest_band=True`) samples it **exactly once**,
+on band 0's (the finest band's) own discrete stencil — then reuses that
+identical tap vector, unchanged, to build every coarser band's `HealPixConv`.
+The pyramid is *constructed from* one kernel given at the finest resolution;
+it is not `n_bands` independent recomputations of "the same" kernel on each
+band's own resolution.
+
+This matters because real HEALPix pixel geometry is not perfectly
+self-similar across `nside` the way an idealized flat/Cartesian grid's
+would be (nearest-neighbour angular spacing varies slightly with position
+and with resolution). Re-evaluating the profile fresh at each band's own
+`nside` — the previous default, still available as
+`weights_from_finest_band=False` for comparison — means two bands
+nominally carrying "the same" kernel can end up with slightly different
+discrete taps for reasons that have nothing to do with the kernel itself.
+Sharing one realization removes that spurious source of band-to-band
+drift.
+
+Note this is deliberately *not* the literal `B = W K S` composition from
+§A.1 pushed down to "compute `K` once, then derive every band from it via
+the decomp's own analysis/synthesis chain". That composition, worked
+through with `S W = I`, collapses completely:
+
+```text
+y = S B W x = S (W K S) W x = (S W) K (S W) x = K x
+```
+
+i.e. the multiscale structure cancels out and the pipeline degenerates to
+one ordinary, single-scale convolution with `K` at the finest resolution —
+useless for the hole-filling use case this pyramid exists for, since only
+`K`'s own compact support could then reach across a hole (see §A.2). The
+block-diagonal, per-band structure (§A.1) is what keeps the bands' own
+information distinct so a coarser band can actually reach further; sharing
+its weights across bands (this section) only removes an *incidental*
+source of band-to-band inconsistency in how that per-band kernel gets
+discretized, without reintroducing the collapse above.
 
 ### A.2 NaN/weight propagation and normalized convolution
 
