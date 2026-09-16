@@ -47,6 +47,31 @@ y, support = pconv(x, return_support=True)
 [examples/pyramid_conv_quickstart.py](../examples/pyramid_conv_quickstart.py)
 for a runnable, slightly more complete version of this example.
 
+### Where do I define my convolution?
+
+Everything about *what the convolution does* is set in the two lines that
+build `kernel_pyramid` above — nowhere else:
+
+| I want to change... | Set this | Where |
+|---|---|---|
+| The kernel's **shape** (Gaussian, exponential, ...) | which `kernel_*` factory you pass, e.g. `kernel_gaussian` vs. `kernel_exponential`/`kernel_lorentzian`/`kernel_beta`/`kernel_anisotropic_gaussian` (all in `healpix_analyse.kernel_pyramid`), or your own `kernel(rho_pix, phi) -> weight` callable | 1st argument of `HealPixKernelPyramid.from_kernel(decomp, KERNEL, ...)` |
+| The kernel's **width/scale** | the factory's own scale parameter — usually `sigma_pix`, but check the factory's docstring, it isn't always named that | inside the `KERNEL` call, e.g. `kernel_gaussian(sigma_pix=1.2)` |
+| The kernel's **footprint size** (how many taps) | `compact_kernel_sz` (odd; 5 is the usual default) | `from_kernel(..., compact_kernel_sz=5)` |
+| **How far** the filter can reach (into a hole, or a domain's own edge — see §A.2) | `Jmax` on the `HealPixDecomp` the kernel pyramid is built from | `HealPixDecomp(..., Jmax=...)` |
+| **Multiple co-registered channels at once** (e.g. RGB) | `channels=C` | `from_kernel(..., channels=C)` — see [§A.6](#a-6-multiple-channels-eg-rgb) |
+| **Anisotropy** (direction-dependent response) | a `kernel(rho_pix, phi)` that actually depends on `phi`, plus `gauge_type` | `from_kernel(..., gauge_type=...)` — see [§A.4](#a-4-anisotropy-and-gauges) |
+| A kernel **fit to data** instead of an analytic formula | `HealPixKernelPyramid.calibrate(...)` instead of `.from_kernel(...)` | see [§D](#d-calibration-how-it-works-and-its-limits) |
+| `mode="normalized"` (NaN/weight-aware) vs. `"signed"` (no masking, allows negative kernels) | `mode=` | `HealPixPyramidConv(decomp, kernel_pyramid, mode=...)` |
+
+None of this lives in `HealPixPyramidConv` itself — it only *applies* the
+kernel pyramid it is given (`decomp.compute_weighted` → per-band kernel →
+`decomp.invert`); it has no parameters of its own beyond `mode`.
+
+In `Notebooks/pyramid_conv_sentinel2_test.ipynb`, all of the above are
+collected as plain variables at the top (§1: `KERNEL_SHAPE`, `SIGMA_PIX`,
+`COMPACT_KERNEL_SZ`, `JMAX`, `N_CHANNELS`, `GAUGE_TYPE`) precisely so they
+don't need to be hunted down inside §3's actual construction code.
+
 ---
 
 ## A. Mathematical foundations
@@ -156,6 +181,17 @@ a casing — EOPF/GRID4EARTH Sentinel-2 products, for example, declare
 (`healpix_analyse._ellipsoid.canonicalize_ellipsoid`), so `"wgs84"`,
 `"WGS84"`, and `"Wgs84"` all resolve to the same geometry — you no longer
 need to re-case a store's own reported ellipsoid string by hand.
+
+**This canonicalization is scoped to this package's own constructors.** A
+bare `healpix_geo` call written directly in your own code (e.g.
+`healpix_geo.nested.healpix_to_lonlat(..., ellipsoid=src.ellipsoid)`), or a
+call into a *different* package that does its own ellipsoid resolution
+(e.g. `healpix_plot.HealpixGrid(..., ellipsoid=src.ellipsoid)`), does **not**
+go through `healpix_analyse`'s canonicalization and will still reject a
+lowercase `"wgs84"` from a store. Wrap the value yourself in that case:
+`healpix_analyse._ellipsoid.canonicalize_ellipsoid(src.ellipsoid)` — see
+`Notebooks/pyramid_conv_sentinel2_test.ipynb` §6 and §8 for two real
+examples of exactly this.
 
 ### A.6 Multiple channels (e.g. RGB)
 
