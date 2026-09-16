@@ -175,6 +175,214 @@ class HealPixWideConv:
         self._cache: dict = {}        # domain key -> fitted state
         self._last_key: Optional[str] = None
 
+    # -- alternative ways of specifying the kernel ------------------------
+
+    @staticmethod
+    def lattice_offsets_m(level: int, lon: float, lat: float, n: int, *,
+                          r_earth: float = 6371008.8):
+        """Metric offsets of the ``(2n+1, 2n+1)`` lattice around ``(lon, lat)``.
+
+        Returns ``(x_m, y_m)``, each ``(2n+1, 2n+1)``: the position of every
+        lattice cell in a local east/north frame centred on the cell that
+        contains ``(lon, lat)``, in metres, using an azimuthal-equidistant
+        projection (so ``hypot(x_m, y_m)`` is the exact great-circle distance).
+
+        This is where the HEALPix deformation becomes visible and usable: the
+        ``(i, j)`` lattice is **not** a square metric grid -- its axes are
+        neither orthogonal nor equally scaled, and how much they are sheared
+        depends on latitude. Anything defined in metres (a function of
+        ``x, y``, a raster with a pixel size in metres) must be evaluated at
+        these positions rather than indexed by ``(i, j)``.
+
+        Parameters
+        ----------
+        level : int
+        lon, lat : float
+            Reference point, degrees. The lattice is centred on the cell
+            containing it.
+        n : int
+            Half-size; the returned arrays are ``(2n+1, 2n+1)``.
+        r_earth : float, default 6371008.8
+            Sphere radius used to turn angles into metres.
+        """
+        centre = int(np.asarray(hgn.lonlat_to_healpix([float(lon)], [float(lat)], level))[0])
+        face, i_c, j_c = [
+            int(v[0]) for v in hgn.healpix_to_base_cell_coordinates([centre], level)
+        ]
+        side = 2 ** level
+        d = np.arange(-n, n + 1)
+        dj, di = np.meshgrid(d, d, indexing="ij")           # rows = j, cols = i
+        ti, tj = (i_c + di).ravel(), (j_c + dj).ravel()
+        on_face = (ti >= 0) & (ti < side) & (tj >= 0) & (tj < side)
+        if not on_face.all():
+            raise ValueError(
+                f"the {2*n+1}x{2*n+1} lattice around (lon={lon}, lat={lat}) runs off base "
+                f"face {face} (centre at i={i_c}, j={j_c} of {side}); use a smaller n or a "
+                "reference point further from the face edge"
+            )
+        cells = hgn.base_cell_coordinates_to_healpix(
+            np.full(ti.size, face), ti, tj, level
+        ).astype(np.int64)
+
+        clon, clat = [float(v[0]) for v in hgn.healpix_to_lonlat([centre], level)]
+        plon, plat = [np.asarray(v) for v in hgn.healpix_to_lonlat(cells.tolist(), level)]
+        lo, la = np.radians(plon), np.radians(plat)
+        lo0, la0 = np.radians(clon), np.radians(clat)
+
+        v = np.stack([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)])
+        east = np.array([-np.sin(lo0), np.cos(lo0), 0.0])
+        north = np.array([-np.sin(la0) * np.cos(lo0), -np.sin(la0) * np.sin(lo0), np.cos(la0)])
+        up = np.array([np.cos(la0) * np.cos(lo0), np.cos(la0) * np.sin(lo0), np.sin(la0)])
+
+        e, nn, u = east @ v, north @ v, up @ v
+        rho = r_earth * np.arccos(np.clip(u, -1.0, 1.0))     # exact great-circle distance
+        norm = np.hypot(e, nn)
+        scale = np.divide(rho, norm, out=np.zeros_like(rho), where=norm > 0)
+        shape = (2 * n + 1, 2 * n + 1)
+        return (e * scale).reshape(shape), (nn * scale).reshape(shape)
+
+    @classmethod
+    def from_function(cls, fn, level: int, n: int, lon: float, lat: float, *,
+                      r_earth: float = 6371008.8, **kwargs) -> "HealPixWideConv":
+        """Build from a kernel defined as ``fn(x_m, y_m)``, metres.
+
+        ``fn`` is evaluated at each lattice cell's true metric offset from the
+        centre (see :meth:`lattice_offsets_m`), so a kernel written in metres
+        keeps its intended physical shape even though the ``(i, j)`` lattice
+        it lands on is sheared.
+
+        Parameters
+        ----------
+        fn : callable
+            ``fn(x_m, y_m) -> weight``, applied element-wise to two
+            ``(2n+1, 2n+1)`` arrays (east and north offsets, metres).
+        level, n, lon, lat
+            As for :meth:`lattice_offsets_m`.
+        **kwargs
+            Passed to the constructor (``Jmax``, ``compact_kernel_sz``, ...).
+
+        Examples
+        --------
+        >>> conv = HealPixWideConv.from_function(                  # doctest: +SKIP
+        ...     lambda x, y: np.exp(-np.hypot(x, y) / 500.0),      # 500 m e-folding
+        ...     level=17, n=64, lon=2.3198, lat=48.8704, Jmax=6)
+        """
+        x_m, y_m = cls.lattice_offsets_m(level, lon, lat, n, r_earth=r_earth)
+        kernel_image = np.asarray(fn(x_m, y_m), dtype=np.float64)
+        if kernel_image.shape != x_m.shape:
+            raise ValueError(
+                f"fn must return an array shaped like its inputs {x_m.shape}; "
+                f"got {kernel_image.shape}"
+            )
+        return cls(kernel_image, level, **kwargs)
+
+    @classmethod
+    def from_radial(cls, fn, level: int, n: int, lon: float, lat: float, *,
+                    r_earth: float = 6371008.8, **kwargs) -> "HealPixWideConv":
+        """Build from an isotropic kernel given as ``fn(r_m)``, metres.
+
+        The common case: the kernel depends only on the distance to its own
+        centre. ``r`` is the exact great-circle distance in metres from the
+        centre cell to each lattice cell (see :meth:`lattice_offsets_m`), so
+        the kernel is isotropic **on the ground**, not in pixel indices --
+        which in the polar caps is a materially different object, since one
+        step along ``i`` and one along ``j`` are not the same number of metres
+        there.
+
+        Parameters
+        ----------
+        fn : callable
+            ``fn(r_m) -> weight``, applied element-wise to a ``(2n+1, 2n+1)``
+            array of distances in metres.
+        level, n, lon, lat
+            As for :meth:`lattice_offsets_m`.
+        **kwargs
+            Passed to the constructor (``Jmax``, ``compact_kernel_sz``, ...).
+
+        Examples
+        --------
+        >>> conv = HealPixWideConv.from_radial(                    # doctest: +SKIP
+        ...     lambda r: np.exp(-r / 500.0),                      # 500 m e-folding
+        ...     level=17, n=64, lon=2.3198, lat=48.8704, Jmax=6)
+        """
+        x_m, y_m = cls.lattice_offsets_m(level, lon, lat, n, r_earth=r_earth)
+        r_m = np.hypot(x_m, y_m)
+        kernel_image = np.asarray(fn(r_m), dtype=np.float64)
+        if kernel_image.shape != r_m.shape:
+            raise ValueError(
+                f"fn must return an array shaped like its input {r_m.shape}; "
+                f"got {kernel_image.shape}"
+            )
+        return cls(kernel_image, level, **kwargs)
+
+    @classmethod
+    def from_grid(cls, grid, pixel_size_m, level: int, n: int, lon: float, lat: float, *,
+                  fill: float = 0.0, r_earth: float = 6371008.8,
+                  **kwargs) -> "HealPixWideConv":
+        """Build from a kernel given as a **square raster in metres**.
+
+        ``grid`` is a regular raster whose pixels are ``pixel_size_m`` metres
+        apart, centred on its own middle pixel. It is **bilinearly
+        interpolated** onto the lattice cells' true metric positions (see
+        :meth:`lattice_offsets_m`), which is what accounts for the HEALPix
+        deformation: dropping such a raster straight onto ``(i, j)`` indices
+        would silently shear it, because the lattice is not a square metric
+        grid.
+
+        Parameters
+        ----------
+        grid : array-like, 2-D
+            The kernel raster, ``grid[b, a]`` at ``(x, y) = ((a - cx) * sx,
+            (b - cy) * sy)`` metres from its centre. Any shape; odd sides put
+            the centre exactly on a pixel.
+        pixel_size_m : float or (float, float)
+            Raster spacing in metres, ``sx`` or ``(sx, sy)``.
+        level, n, lon, lat
+            As for :meth:`lattice_offsets_m`. ``n`` sets the size of the
+            HEALPix-side kernel image the raster is resampled onto; make it
+            large enough to cover the raster's own extent.
+        fill : float, default 0.0
+            Value for lattice cells falling outside the raster.
+        """
+        g = np.asarray(_as_numpy(grid), dtype=np.float64)
+        if g.ndim != 2:
+            raise ValueError(f"grid must be 2-D; got shape {g.shape}")
+        sx, sy = (pixel_size_m, pixel_size_m) if np.isscalar(pixel_size_m) else pixel_size_m
+        sx, sy = float(sx), float(sy)
+        if sx <= 0 or sy <= 0:
+            raise ValueError("pixel_size_m must be positive")
+
+        x_m, y_m = cls.lattice_offsets_m(level, lon, lat, n, r_earth=r_earth)
+        ny, nx = g.shape
+        # fractional pixel coordinates of each query point in the raster
+        fx = x_m / sx + (nx - 1) / 2.0
+        fy = y_m / sy + (ny - 1) / 2.0
+
+        x0 = np.floor(fx).astype(np.int64)
+        y0 = np.floor(fy).astype(np.int64)
+        tx, ty = fx - x0, fy - y0
+        inside = (x0 >= 0) & (x0 + 1 < nx) & (y0 >= 0) & (y0 + 1 < ny)
+        xi = np.clip(x0, 0, nx - 2)
+        yi = np.clip(y0, 0, ny - 2)
+
+        kernel_image = (
+            g[yi, xi] * (1 - tx) * (1 - ty)
+            + g[yi, xi + 1] * tx * (1 - ty)
+            + g[yi + 1, xi] * (1 - tx) * ty
+            + g[yi + 1, xi + 1] * tx * ty
+        )
+        kernel_image = np.where(inside, kernel_image, fill)
+        if not inside.all():
+            import warnings
+            warnings.warn(
+                f"{int((~inside).sum())} of {inside.size} lattice cells fall outside the "
+                f"raster ({nx}x{ny} at {sx:.4g}x{sy:.4g} m, i.e. "
+                f"{nx * sx / 1000:.3g}x{ny * sy / 1000:.3g} km) and were set to {fill}. "
+                "Use a smaller n, or a raster covering more ground.",
+                RuntimeWarning, stacklevel=2,
+            )
+        return cls(kernel_image, level, **kwargs)
+
     # -- public -----------------------------------------------------------
 
     def __call__(self, x, cell_ids):

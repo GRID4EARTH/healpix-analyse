@@ -187,3 +187,218 @@ def test_kernel_clipped_by_a_face_edge_warns():
     with pytest.warns(RuntimeWarning, match="fall off base face"):
         conv.kernel_as_field(cells, centre_cell=int(hgn.base_cell_coordinates_to_healpix(
             [face], [i_c], [j_c], level)[0]))
+
+
+# ---------------------------------------------------------------------------
+# The three ways of specifying the kernel
+# ---------------------------------------------------------------------------
+
+# Two reference points, deliberately: the HEALPix lattice is a *square metric
+# grid* in the equatorial belt (|lat| < 41.8 deg) and visibly sheared in the
+# polar caps. Everything about metric kernels only bites in the second case.
+BELT_LON, BELT_LAT = 0.0, -20.0     # equatorial belt; also _square_domain's centre
+CAP_LON, CAP_LAT = 20.0, 65.0       # polar cap, well inside base face 0 at LEVEL
+PIX_M = np.sqrt(4 * np.pi / (12 * (2 ** LEVEL) ** 2)) * 6371008.8   # ~6.4 km at level 10
+
+
+def _lattice_steps(lon, lat, level=LEVEL):
+    x_m, y_m = HealPixWideConv.lattice_offsets_m(level, lon, lat, 1)
+    return np.hypot(x_m[1, 2], y_m[1, 2]), np.hypot(x_m[2, 1], y_m[2, 1])
+
+
+def test_lattice_offsets_are_metric_and_centred():
+    n = 4
+    x_m, y_m = HealPixWideConv.lattice_offsets_m(LEVEL, CAP_LON, CAP_LAT, n)
+    assert x_m.shape == y_m.shape == (2 * n + 1, 2 * n + 1)
+    assert abs(x_m[n, n]) < 1e-9 and abs(y_m[n, n]) < 1e-9      # centre is the origin
+
+    # hypot(x, y) must be the true great-circle distance to each lattice cell
+    centre = int(np.asarray(hgn.lonlat_to_healpix([CAP_LON], [CAP_LAT], LEVEL))[0])
+    face, i_c, j_c = [
+        int(v[0]) for v in hgn.healpix_to_base_cell_coordinates([centre], LEVEL)
+    ]
+    d = np.arange(-n, n + 1)
+    dj, di = np.meshgrid(d, d, indexing="ij")
+    cells = hgn.base_cell_coordinates_to_healpix(
+        np.full(di.size, face), (i_c + di).ravel(), (j_c + dj).ravel(), LEVEL
+    ).astype(np.int64)
+    lon, lat = [np.asarray(v) for v in hgn.healpix_to_lonlat(cells.tolist(), LEVEL)]
+    clon, clat = [float(v[0]) for v in hgn.healpix_to_lonlat([centre], LEVEL)]
+    l1, p1, l2, p2 = np.radians(lon), np.radians(lat), np.radians(clon), np.radians(clat)
+    hav = np.sin((p2 - p1) / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin((l2 - l1) / 2) ** 2
+    r_true = 2 * np.arcsin(np.sqrt(np.clip(hav, 0, 1))) * 6371008.8
+
+    assert np.allclose(np.hypot(x_m, y_m).ravel(), r_true, rtol=1e-9, atol=1e-6)
+
+
+def test_lattice_is_square_in_the_belt_and_sheared_in_the_cap(capsys):
+    """Why `from_function`/`from_grid` exist -- and when they are unnecessary."""
+    si_b, sj_b = _lattice_steps(BELT_LON, BELT_LAT)
+    si_c, sj_c = _lattice_steps(CAP_LON, CAP_LAT)
+    print(f"[measured] level {LEVEL}, equatorial belt ({BELT_LON}, {BELT_LAT}): "
+          f"i-step {si_b:.0f} m, j-step {sj_b:.0f} m, ratio {max(si_b, sj_b)/min(si_b, sj_b):.3f}")
+    print(f"[measured] level {LEVEL}, polar cap     ({CAP_LON}, {CAP_LAT}): "
+          f"i-step {si_c:.0f} m, j-step {sj_c:.0f} m, ratio {max(si_c, sj_c)/min(si_c, sj_c):.3f}")
+    assert np.isclose(si_b, sj_b, rtol=0.01), "the belt lattice should be metrically square"
+    assert not np.isclose(si_c, sj_c, rtol=0.05), "the cap lattice should be sheared"
+
+
+def test_lattice_offsets_reject_a_lattice_running_off_the_face():
+    with pytest.raises(ValueError, match="runs off base face"):
+        HealPixWideConv.lattice_offsets_m(4, BELT_LON, BELT_LAT, n=100)   # face is 16x16
+
+
+def test_from_function_is_isotropic_in_metres_not_in_pixels():
+    n, r0 = 12, 4.0 * PIX_M
+    conv = HealPixWideConv.from_function(
+        lambda x, y: np.exp(-np.hypot(x, y) / r0), LEVEL, n, CAP_LON, CAP_LAT, Jmax=3
+    )
+    x_m, y_m = HealPixWideConv.lattice_offsets_m(LEVEL, CAP_LON, CAP_LAT, n)
+    assert np.allclose(conv.kernel_image, np.exp(-np.hypot(x_m, y_m) / r0))
+
+    # in the cap, a naive (i, j)-indexed kernel of the "same" shape is distorted
+    d = np.arange(-n, n + 1)
+    dj, di = np.meshgrid(d, d, indexing="ij")
+    step_i = np.hypot(x_m, y_m)[n, n + 1]
+    naive = np.exp(-np.hypot(di, dj) * step_i / r0)
+    rel = np.linalg.norm(naive - conv.kernel_image) / np.linalg.norm(conv.kernel_image)
+    print(f"[measured] polar cap: (i, j)-indexed vs metric kernel differ by {rel:.3f}")
+    assert rel > 0.1, (
+        "indexing by (i, j) should visibly distort a kernel defined in metres; "
+        f"got only {rel:.3f} relative difference"
+    )
+
+
+def test_from_function_rejects_a_badly_shaped_return():
+    with pytest.raises(ValueError, match="shaped like its inputs"):
+        HealPixWideConv.from_function(
+            lambda x, y: np.zeros(3), LEVEL, 4, BELT_LON, BELT_LAT
+        )
+
+
+def test_from_grid_bilinear_matches_the_same_kernel_evaluated_directly():
+    """A raster in metres, resampled, must agree with evaluating the function."""
+    n, r0 = 10, 4.0 * PIX_M
+    m, step = 201, PIX_M / 4.0            # raster covers ~50 pixels, 4 samples per pixel
+    ax = (np.arange(m) - (m - 1) / 2) * step
+    gx, gy = np.meshgrid(ax, ax)
+    raster = np.exp(-np.hypot(gx, gy) / r0)
+
+    from_raster = HealPixWideConv.from_grid(
+        raster, step, LEVEL, n, CAP_LON, CAP_LAT, Jmax=3
+    )
+    exact = HealPixWideConv.from_function(
+        lambda x, y: np.exp(-np.hypot(x, y) / r0), LEVEL, n, CAP_LON, CAP_LAT, Jmax=3
+    )
+    rel = (np.linalg.norm(from_raster.kernel_image - exact.kernel_image)
+           / np.linalg.norm(exact.kernel_image))
+    print(f"[measured] bilinear raster vs exact evaluation: rel {rel:.5f}")
+    assert rel < 5e-3, f"bilinear resampling should track the exact kernel; rel {rel:.4f}"
+
+
+def test_from_grid_warns_when_the_raster_is_too_small():
+    raster = np.ones((5, 5))
+    with pytest.warns(RuntimeWarning, match="outside the raster"):
+        HealPixWideConv.from_grid(raster, PIX_M / 10, LEVEL, n=12,
+                                   lon=BELT_LON, lat=BELT_LAT, Jmax=2)
+
+
+def test_from_grid_rejects_bad_inputs():
+    with pytest.raises(ValueError, match="grid must be 2-D"):
+        HealPixWideConv.from_grid(np.ones(5), 10.0, LEVEL, 4, BELT_LON, BELT_LAT)
+    with pytest.raises(ValueError, match="must be positive"):
+        HealPixWideConv.from_grid(np.ones((5, 5)), -1.0, LEVEL, 4, BELT_LON, BELT_LAT)
+
+
+def test_all_three_recipes_convolve_a_dirac_into_their_own_kernel():
+    """Whatever the recipe, conv(dirac) must reproduce that recipe's own kernel."""
+    cell_ids, _ = _square_domain()                      # centred on the belt point
+    n, r0 = 16, 4.0 * PIX_M
+    x_m, y_m = HealPixWideConv.lattice_offsets_m(LEVEL, BELT_LON, BELT_LAT, n)
+
+    m, step = 401, PIX_M / 4.0
+    ax = (np.arange(m) - (m - 1) / 2) * step
+    gx, gy = np.meshgrid(ax, ax)
+
+    recipes = {
+        "1: image": HealPixWideConv(
+            np.exp(-np.hypot(x_m, y_m) / r0), LEVEL, Jmax=JMAX),
+        "2: function of x, y in m": HealPixWideConv.from_function(
+            lambda x, y: np.exp(-np.hypot(x, y) / r0), LEVEL, n,
+            BELT_LON, BELT_LAT, Jmax=JMAX),
+        "3: raster in m, bilinear": HealPixWideConv.from_grid(
+            np.exp(-np.hypot(gx, gy) / r0), step, LEVEL, n,
+            BELT_LON, BELT_LAT, Jmax=JMAX),
+    }
+    for name, conv in recipes.items():
+        centre = conv.reference_centre(cell_ids)
+        x = np.zeros(cell_ids.size)
+        x[np.searchsorted(cell_ids, centre)] = 1.0
+        y = conv(x, cell_ids)
+        K = conv.kernel_as_field(cell_ids, centre_cell=centre)
+        rel = np.sqrt(np.mean((y - K) ** 2)) / np.sqrt(np.mean(K ** 2))
+        print(f"[measured] recipe '{name}': rel RMS(conv(dirac) - K) = {rel:.4f}")
+        assert rel < 0.25, f"recipe '{name}' failed to reproduce its own kernel ({rel:.3f})"
+
+
+def test_recipes_1_and_2_agree_in_the_equatorial_belt():
+    """Where the lattice is metrically square, (i, j) indexing is already right."""
+    n, r0 = 10, 4.0 * PIX_M
+    x_m, y_m = HealPixWideConv.lattice_offsets_m(LEVEL, BELT_LON, BELT_LAT, n)
+    step_i = np.hypot(x_m, y_m)[n, n + 1]
+    d = np.arange(-n, n + 1)
+    dj, di = np.meshgrid(d, d, indexing="ij")
+
+    naive = np.exp(-np.hypot(di, dj) * step_i / r0)
+    metric = np.exp(-np.hypot(x_m, y_m) / r0)
+    rel = np.linalg.norm(naive - metric) / np.linalg.norm(metric)
+    print(f"[measured] equatorial belt: (i, j)-indexed vs metric kernel differ by {rel:.4f}")
+    assert rel < 0.02, "in the belt the two constructions should essentially coincide"
+
+
+def test_from_radial_is_isotropic_on_the_ground():
+    n, r0 = 12, 4.0 * PIX_M
+    conv = HealPixWideConv.from_radial(
+        lambda r: np.exp(-r / r0), LEVEL, n, CAP_LON, CAP_LAT, Jmax=3
+    )
+    x_m, y_m = HealPixWideConv.lattice_offsets_m(LEVEL, CAP_LON, CAP_LAT, n)
+    assert np.allclose(conv.kernel_image, np.exp(-np.hypot(x_m, y_m) / r0))
+
+    # cells at equal distance on the ground must carry equal weight, even
+    # though they sit at very different (i, j) offsets in the polar cap
+    r = np.hypot(x_m, y_m)
+    ref = r[n, n + 2]                                   # some radius
+    ring = np.abs(r - ref) < 0.02 * ref
+    assert ring.sum() >= 4
+    vals = conv.kernel_image[ring]
+    assert np.ptp(vals) / vals.mean() < 0.05
+
+
+def test_from_radial_matches_from_function_for_an_isotropic_kernel():
+    n, r0 = 10, 3.0 * PIX_M
+    radial = HealPixWideConv.from_radial(
+        lambda r: np.exp(-r / r0), LEVEL, n, CAP_LON, CAP_LAT, Jmax=3)
+    xy = HealPixWideConv.from_function(
+        lambda x, y: np.exp(-np.hypot(x, y) / r0), LEVEL, n, CAP_LON, CAP_LAT, Jmax=3)
+    assert np.allclose(radial.kernel_image, xy.kernel_image)
+
+
+def test_from_radial_rejects_a_badly_shaped_return():
+    with pytest.raises(ValueError, match="shaped like its input"):
+        HealPixWideConv.from_radial(lambda r: np.zeros(3), LEVEL, 4, CAP_LON, CAP_LAT)
+
+
+def test_from_radial_convolves_a_dirac_into_its_own_kernel(capsys):
+    cell_ids, _ = _square_domain()
+    r0 = 4.0 * PIX_M
+    conv = HealPixWideConv.from_radial(
+        lambda r: np.exp(-r / r0), LEVEL, 16, BELT_LON, BELT_LAT,
+        Jmax=JMAX, compact_kernel_sz=5)
+    centre = conv.reference_centre(cell_ids)
+    x = np.zeros(cell_ids.size)
+    x[np.searchsorted(cell_ids, centre)] = 1.0
+    y = conv(x, cell_ids)
+    K = conv.kernel_as_field(cell_ids, centre_cell=centre)
+    rel = np.sqrt(np.mean((y - K) ** 2)) / np.sqrt(np.mean(K ** 2))
+    print(f"[measured] recipe '4: fn(r) in m': rel RMS(conv(dirac) - K) = {rel:.4f}")
+    assert rel < 0.25
