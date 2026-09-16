@@ -9,6 +9,7 @@ import torch
 from healpix_analyse.decomp import HealPixDecomp
 from healpix_analyse.kernel_pyramid import HealPixKernelPyramid, kernel_gaussian
 from healpix_analyse.pyramid_conv import HealPixPyramidConv
+from healpix_analyse.validation import direct_spherical_convolution, smooth_test_field
 
 
 def _make(level=4, jmax=2, sigma_pix=1.0, kernel_sz=5, dtype=torch.float64):
@@ -206,3 +207,70 @@ def test_multichannel_matches_running_channels_separately():
         np.asarray(pconv_single(rgb[:, c])) for c in range(3)
     ], axis=0)
     np.testing.assert_allclose(y_multi, y_ref, atol=1e-10, equal_nan=True)
+
+
+def test_forward_with_no_mask_matches_independent_oracle():
+    """The full :class:`HealPixPyramidConv` path -- ``compute_weighted`` ->
+    per-band kernel pyramid -> ``invert`` -- given **fully finite** input and
+    no ``weights``, should reduce to a plain convolution and closely match
+    the independent, non-pyramidal oracle in :mod:`healpix_analyse.validation`
+    (the same oracle used throughout ``tests/test_kernel_pyramid.py``).
+
+    This is deliberately a check of the convolution itself, isolated from
+    the NaN-filling/masking behaviour the rest of this file focuses on: no
+    NaN is introduced anywhere, so there is nothing for the mask machinery
+    to do, and any mismatch here would point at ``HealPixDecomp``'s
+    analysis/synthesis (not at the per-band kernel, which is already
+    covered on its own in ``test_kernel_pyramid.py``). ``Jmax=0`` (a single
+    band) keeps the comparison well-defined against one fixed-width kernel
+    -- a multi-stage pyramid's effective operator is not a single kernel,
+    so it is checked separately below (sanity only, not against this
+    oracle).
+    """
+    level = 5
+    kernel = kernel_gaussian(sigma_pix=1.2)
+    decomp = HealPixDecomp(level=level, ellipsoid="sphere", dtype=torch.float64, Jmax=0)
+    kp = HealPixKernelPyramid.from_kernel(
+        decomp, kernel, compact_kernel_sz=5, dtype=torch.float64,
+    )
+    pconv = HealPixPyramidConv(decomp, kp, mode="normalized")
+
+    x = smooth_test_field(decomp.cell_ids_per_scale[0], decomp.levels[0])
+    assert np.isfinite(x).all()  # genuinely unmasked: no NaN anywhere in the input
+
+    y = pconv(x)  # no `weights` passed: every pixel is fully trusted, no mask at all
+    assert np.isfinite(y).all(), "with no mask anywhere, the output must be fully finite"
+
+    y_ref = direct_spherical_convolution(
+        x, decomp.cell_ids_per_scale[0], decomp.levels[0], kernel,
+        kernel_sz=5, ellipsoid="sphere", restore_mask=False, normalize=True,
+    )
+    rel_rms = np.sqrt(np.mean((y - y_ref) ** 2)) / np.sqrt(np.mean(y_ref ** 2))
+    assert rel_rms < 0.15, f"rel RMS error {rel_rms:.4f} vs. independent oracle too large"
+
+
+def test_forward_with_no_mask_through_full_pyramid_stays_finite_and_smooths():
+    """Sanity check of the *multi-band* pyramid (``Jmax>0``, several Down
+    stages) on fully finite, unmasked input: the output must stay finite
+    everywhere (nothing for the mask machinery to leave a hole in) and must
+    actually smooth the input (reduced variance vs. the raw field), not
+    silently pass it through unchanged. A fixed-width independent oracle
+    does not apply here (see the note on the ``Jmax=0`` test above); this
+    complements it by covering the case the notebook and real data actually
+    use (``Jmax>1``).
+    """
+    level = 5
+    decomp = HealPixDecomp(level=level, ellipsoid="sphere", dtype=torch.float64, Jmax=3)
+    kp = HealPixKernelPyramid.from_kernel(
+        decomp, kernel_gaussian(sigma_pix=1.2), compact_kernel_sz=5, dtype=torch.float64,
+    )
+    pconv = HealPixPyramidConv(decomp, kp, mode="normalized")
+
+    x = smooth_test_field(decomp.cell_ids_per_scale[0], decomp.levels[0])
+    rng = np.random.default_rng(7)
+    x = x + 0.05 * rng.standard_normal(x.shape)  # a little texture, still fully finite
+    assert np.isfinite(x).all()
+
+    y = pconv(x)
+    assert np.isfinite(y).all(), "with no mask anywhere, the output must be fully finite"
+    assert np.var(y) < np.var(x), "a smoothing kernel pyramid should reduce variance, not pass x through"
