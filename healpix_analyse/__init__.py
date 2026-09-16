@@ -64,6 +64,8 @@ from healpix_analyse.kernel_pyramid import (
 
 from healpix_analyse.pyramid_conv import HealPixPyramidConv
 
+from healpix_analyse.wide_conv import HealPixWideConv
+
 from healpix_analyse.divcurl import (
     HealPixDivCurl,
     HealPixMultiScaleDivCurl,
@@ -198,6 +200,7 @@ __all__ = [
     "LargeConv",
     "HealPixFFTConv",
     "HealPixDecomp",
+    "HealPixWideConv",
     "HealPixPyramid",
     "HealPixWeightedPyramid",
     "HealPixKernelPyramid",
