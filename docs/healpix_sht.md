@@ -217,6 +217,13 @@ div, curl = sht.uv_to_curl_div(u_ssh, v_ssh)
 
 ## Power spectra
 
+`sht.anafast` below is the production-ready angular power spectrum for a
+full-sky HEALPix map, validated against `healpy`. The separate
+`powerspectra`/`powerspectra_lonlat` functions in `powerspectra.py` compute a
+different, flat-sky-style spectrum through `AlmTransform` and are still under
+development — see {doc}`powerspectra` for their current status before using
+them instead of `anafast`.
+
 ### Scalar auto-spectrum
 
 ```python

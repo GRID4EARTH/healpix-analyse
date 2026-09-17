@@ -419,6 +419,14 @@ The notebook reports reconstruction errors, verifies constant preservation,
 displays the tangent-plane projection and compares radial spectra for B04,
 B08 and NDVI.
 
+## Which power-spectrum helper?
+
+`LocalFFT.ps()` (also exposed as `local_ps`) is the production-ready 1D
+isotropic power spectrum for a local patch, described above. The separate
+`powerspectra`/`powerspectra_lonlat` functions (built on `AlmTransform` in
+`alm.py`) offer a similar-looking API but are still under development — see
+{doc}`powerspectra` before reaching for them.
+
 ## Errors and limitations
 
 - `cell_ids` must be unique, valid NESTED identifiers at one level.

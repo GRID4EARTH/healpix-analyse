@@ -124,6 +124,12 @@ suppress_warnings = [
 # ---------------------------------------------------------------------------
 napoleon_google_docstring = False
 napoleon_numpy_docstring = True
+# Render numpydoc "Attributes" sections as :ivar: fields inside the class
+# description instead of separate ``.. attribute::`` directives. Without this,
+# a dataclass whose docstring documents its own attributes is described twice
+# -- once by napoleon, once by autoapi -- which Sphinx reports as a duplicate
+# object description (and fails the build under -W).
+napoleon_use_ivar = True
 napoleon_include_init_with_doc = True
 napoleon_include_private_with_doc = False
 napoleon_include_special_with_doc = True

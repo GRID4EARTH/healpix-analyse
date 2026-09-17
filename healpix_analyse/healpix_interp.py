@@ -2,8 +2,27 @@
 get_interp_val — interpolation bilinéaire sur une grille HEALPix (NESTED)
 via healpix-geo pour les conversions de coordonnées.
 
-Équivalent à healpy.get_interp_val, avec support des ellipsoïdes de référence
-(ex. WGS84) grâce au package healpix-geo.
+Équivalent à healpy.get_interp_val / get_interp_weights.
+
+Deux régimes, selon `ellipsoid` :
+
+- ellipsoid="sphere" (défaut) : reproduit EXACTEMENT l'algorithme RING de
+  référence de healpy (`T_Healpix_Base::get_interpol`, healpix_base.cc),
+  transcrit ici en pur NumPy (aucune dépendance à `healpy` au runtime).
+  Les 4 pixels renvoyés sont rigoureusement identiques à
+  `healpy.get_interp_weights(nside, lon, lat, lonlat=True, nest=True)`
+  (schéma NESTED, obtenu par conversion RING->NESTED via
+  `healpix_geo.ring.to_nested`) ; les poids concordent à ~1e-12 près
+  (bruit de calcul flottant inévitable tant qu'on ne relie pas le même
+  binaire C++ — largement sous la précision utile de n'importe quelle
+  application scientifique).
+
+- ellipsoid != "sphere" (ex. "WGS84") : healpy n'a aucune notion
+  d'ellipsoïde, donc "identique à healpy" n'a pas de sens dans ce cas.
+  On délègue alors directement à `healpix_geo.nested.bilinear_interpolation`,
+  qui implémente une interpolation bilinéaire géométriquement correcte
+  (vérifiée indépendamment, voir la discussion qui a mené à ce fichier) et
+  supporte nativement les ellipsoïdes de référence.
 
 Dépendances :
     pip install healpix-geo  # inclut cdshealpix comme dépendance
@@ -13,120 +32,180 @@ Auteurs : Claude (Anthropic)
 """
 
 import numpy as np
-from healpix_geo.nested import healpix_to_lonlat, kth_neighbourhood, lonlat_to_healpix
+from healpix_geo import ring as _hg_ring
+from healpix_geo.nested import bilinear_interpolation as _nested_bilinear_interpolation
 
 
 # ---------------------------------------------------------------------------
-# Utilitaires géométriques
+# Portage NumPy fidèle de T_Healpix_Base<I>::get_interpol (schéma RING)
+#
+# Transcrit ligne à ligne depuis la source de référence :
+#   https://github.com/healpy/healpixmirror/blob/main/src/cxx/Healpix_cxx/healpix_base.cc
+# (fonctions ring_above, get_ring_info2, get_interpol). Ne PAS modifier ces
+# formules sans revalider contre healpy (voir tests associés) : plusieurs
+# constantes (fact1_, fact2_, le "shift" par demi-pixel) sont non triviales
+# et une erreur y est silencieuse (résultat plausible mais faux).
 # ---------------------------------------------------------------------------
 
-def _gnomonic_project(
-    lon_ref_deg: np.ndarray,
-    lat_ref_deg: np.ndarray,
-    lon_deg: np.ndarray,
-    lat_deg: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Projection gnomonique (plan tangent) de points (lon, lat) par rapport à un
-    point de référence.
+def _ring_above(z: np.ndarray, nside: int) -> np.ndarray:
+    """Numéro de l'anneau immédiatement au nord (ou au pôle) de z=cos(theta)."""
+    az = np.abs(z)
+    twothird = 2.0 / 3.0
+    out = np.empty(z.shape, dtype=np.int64)
 
-    Transforme chaque point (lon_deg[i], lat_deg[i]) en coordonnées (x, y) dans
-    le plan tangent centré en (lon_ref_deg, lat_ref_deg). Le point de référence
-    se projette à l'origine (0, 0).
+    eq = az <= twothird
+    # I(nside*(2-1.5*z)) ; toujours positif => trunc == floor
+    out[eq] = np.trunc(nside * (2.0 - 1.5 * z[eq])).astype(np.int64)
+
+    pol = ~eq
+    iring = np.trunc(nside * np.sqrt(3.0 * (1.0 - az[pol]))).astype(np.int64)
+    out[pol] = np.where(z[pol] > 0, iring, 4 * nside - iring - 1)
+    return out
+
+
+def _get_ring_info2(ring: np.ndarray, nside: int):
+    """
+    Renvoie, pour chaque numéro d'anneau RING (1 <= ring <= 4*nside-1) :
+    startpix, ringpix (nb de pixels sur l'anneau), theta (colatitude du
+    centre de l'anneau), shifted (les pixels sont-ils décalés d'un
+    demi-pas de phi par rapport à phi=0 ?).
+    """
+    ncap = 2 * nside * (nside - 1)
+    npix = 12 * nside * nside
+    fact1 = 2.0 / (3.0 * nside)
+    fact2 = 1.0 / (3.0 * nside * nside)
+
+    northring = np.where(ring > 2 * nside, 4 * nside - ring, ring)
+    theta = np.empty(ring.shape, dtype=np.float64)
+    ringpix = np.empty(ring.shape, dtype=np.int64)
+    startpix = np.empty(ring.shape, dtype=np.int64)
+    shifted = np.empty(ring.shape, dtype=bool)
+
+    cap = northring < nside
+    nr = northring[cap].astype(np.float64)
+    tmp = nr * nr * fact2
+    costheta = 1.0 - tmp
+    sintheta = np.sqrt(tmp * (2.0 - tmp))
+    theta[cap] = np.arctan2(sintheta, costheta)
+    ringpix[cap] = (4 * northring[cap]).astype(np.int64)
+    shifted[cap] = True
+    startpix[cap] = (2 * northring[cap] * (northring[cap] - 1)).astype(np.int64)
+
+    eqz = ~cap
+    theta[eqz] = np.arccos((2 * nside - northring[eqz]) * fact1)
+    ringpix[eqz] = 4 * nside
+    shifted[eqz] = ((northring[eqz] - nside) & 1) == 0
+    startpix[eqz] = ncap + (northring[eqz] - nside) * ringpix[eqz]
+
+    south = northring != ring
+    theta[south] = np.pi - theta[south]
+    startpix[south] = npix - startpix[south] - ringpix[south]
+
+    return startpix, ringpix, theta, shifted
+
+
+def _trunc_cast(tmp: np.ndarray) -> np.ndarray:
+    """Equivalent de I(tmp) en C++ pour un double : troncature vers zéro."""
+    return np.trunc(tmp).astype(np.int64)
+
+
+def _get_interpol_ring(theta: np.ndarray, phi: np.ndarray, nside: int):
+    """
+    Portage vectorisé de T_Healpix_Base<I>::get_interpol (schéma RING).
 
     Parameters
     ----------
-    lon_ref_deg, lat_ref_deg : array_like, shape broadcastable avec lon_deg/lat_deg
-        Point(s) de référence en degrés.
-    lon_deg, lat_deg : array_like
-        Points à projeter, en degrés.
+    theta : colatitude en radians, shape (N,), dans [0, pi].
+    phi : longitude en radians, shape (N,), déjà repliée dans [0, 2*pi).
+    nside : int
 
     Returns
     -------
-    x, y : np.ndarray
-        Coordonnées en radians dans le plan tangent.
+    pix : np.ndarray uint64, shape (N, 4) — pixels en schéma RING.
+    wgt : np.ndarray float64, shape (N, 4).
     """
-    lon_ref = np.radians(lon_ref_deg)
-    lat_ref = np.radians(lat_ref_deg)
-    lon = np.radians(lon_deg)
-    lat = np.radians(lat_deg)
+    N = theta.shape[0]
+    npix = 12 * nside * nside
+    twopi = 2.0 * np.pi
 
-    dlon = lon - lon_ref
-    cos_c = (
-        np.sin(lat_ref) * np.sin(lat)
-        + np.cos(lat_ref) * np.cos(lat) * np.cos(dlon)
-    )
-    # Eviter la division par zéro pour des points antipodaux (cos_c ≈ -1)
-    cos_c = np.where(np.abs(cos_c) < 1e-15, 1e-15, cos_c)
+    z = np.cos(theta)
+    ir1 = _ring_above(z, nside)
+    ir2 = ir1 + 1
 
-    x = np.cos(lat) * np.sin(dlon) / cos_c
-    y = (
-        np.cos(lat_ref) * np.sin(lat)
-        - np.sin(lat_ref) * np.cos(lat) * np.cos(dlon)
-    ) / cos_c
-    return x, y
+    pix = np.zeros((N, 4), dtype=np.int64)
+    wgt = np.zeros((N, 4), dtype=np.float64)
+    theta1 = np.zeros(N, dtype=np.float64)
+    theta2 = np.zeros(N, dtype=np.float64)
 
+    m1 = ir1 > 0
+    if m1.any():
+        sp, nr, th1, shift = _get_ring_info2(ir1[m1], nside)
+        theta1[m1] = th1
+        dphi = twopi / nr
+        half_shift = np.where(shift, 0.5, 0.0)
+        tmp = phi[m1] / dphi - half_shift
+        i1 = np.where(tmp < 0, _trunc_cast(tmp) - 1, _trunc_cast(tmp))
+        w1 = (phi[m1] - (i1 + half_shift) * dphi) / dphi
+        i2 = i1 + 1
+        i1 = np.where(i1 < 0, i1 + nr, i1)
+        i2 = np.where(i2 >= nr, i2 - nr, i2)
+        pix[m1, 0] = sp + i1
+        pix[m1, 1] = sp + i2
+        wgt[m1, 0] = 1 - w1
+        wgt[m1, 1] = w1
 
-def _bilinear_weights_from_tangent_plane(
-    sel_px: np.ndarray,
-    sel_py: np.ndarray,
-) -> np.ndarray:
-    """
-    Calcule les poids d'interpolation bilinéaire pour un point requête situé à
-    l'origine du plan tangent, étant donné 4 centres de cellules projetés.
+    m2 = ir2 < 4 * nside
+    if m2.any():
+        sp, nr, th2, shift = _get_ring_info2(ir2[m2], nside)
+        theta2[m2] = th2
+        dphi = twopi / nr
+        half_shift = np.where(shift, 0.5, 0.0)
+        tmp = phi[m2] / dphi - half_shift
+        i1 = np.where(tmp < 0, _trunc_cast(tmp) - 1, _trunc_cast(tmp))
+        w1 = (phi[m2] - (i1 + half_shift) * dphi) / dphi
+        i2 = i1 + 1
+        i1 = np.where(i1 < 0, i1 + nr, i1)
+        i2 = np.where(i2 >= nr, i2 - nr, i2)
+        pix[m2, 2] = sp + i1
+        pix[m2, 3] = sp + i2
+        wgt[m2, 2] = 1 - w1
+        wgt[m2, 3] = w1
 
-    Formule bilinéaire d'area :
-        Le poids de chaque coin est proportionnel à l'aire du rectangle opposé,
-        ce qui donne, pour un quad approximativement rectangulaire :
+    north_pole = ir1 == 0
+    if north_pole.any():
+        wtheta = theta[north_pole] / theta2[north_pole]
+        wgt[north_pole, 2] *= wtheta
+        wgt[north_pole, 3] *= wtheta
+        fac = (1 - wtheta) * 0.25
+        wgt[north_pole, 0] = fac
+        wgt[north_pole, 1] = fac
+        wgt[north_pole, 2] += fac
+        wgt[north_pole, 3] += fac
+        pix[north_pole, 0] = (pix[north_pole, 2] + 2) & 3
+        pix[north_pole, 1] = (pix[north_pole, 3] + 2) & 3
 
-            w_i = u_contrib_i * v_contrib_i
+    south_pole = (ir2 == 4 * nside) & ~north_pole
+    if south_pole.any():
+        wtheta = (theta[south_pole] - theta1[south_pole]) / (np.pi - theta1[south_pole])
+        wgt[south_pole, 0] *= (1 - wtheta)
+        wgt[south_pole, 1] *= (1 - wtheta)
+        fac = wtheta * 0.25
+        wgt[south_pole, 0] += fac
+        wgt[south_pole, 1] += fac
+        wgt[south_pole, 2] = fac
+        wgt[south_pole, 3] = fac
+        pix[south_pole, 2] = ((pix[south_pole, 0] + 2) & 3) + npix - 4
+        pix[south_pole, 3] = ((pix[south_pole, 1] + 2) & 3) + npix - 4
 
-        où :
-            u = ax / (ax + bx)   fraction vers l'est  (ax = |px| côté ouest,
-                                                        bx = |px| côté est)
-            v = ay / (ay + by)   fraction vers le nord
+    mid = ~north_pole & ~south_pole
+    if mid.any():
+        wtheta = (theta[mid] - theta1[mid]) / (theta2[mid] - theta1[mid])
+        wgt[mid, 0] *= (1 - wtheta)
+        wgt[mid, 1] *= (1 - wtheta)
+        wgt[mid, 2] *= wtheta
+        wgt[mid, 3] *= wtheta
 
-        Et pour chaque cellule i :
-            u_contrib = u    si sel_px[i] >= 0  (côté est)
-                       (1-u) si sel_px[i] <  0  (côté ouest)
-            v_contrib = v    si sel_py[i] >= 0  (côté nord)
-                       (1-v) si sel_py[i] <  0  (côté sud)
-
-    Parameters
-    ----------
-    sel_px, sel_py : np.ndarray, shape (N, 4)
-        Coordonnées des 4 cellules sélectionnées dans le plan tangent.
-        La requête est à (0, 0).
-
-    Returns
-    -------
-    weights : np.ndarray, shape (N, 4)
-        Poids bilinéaires, somme = 1 sur axis=1.
-    """
-    # Bornes de l'emprise : distance max à l'ouest/est/sud/nord
-    ax = np.maximum(-sel_px.min(axis=1), 0.0)  # |px| côté ouest (shape N)
-    bx = np.maximum(sel_px.max(axis=1), 0.0)   # |px| côté est
-    ay = np.maximum(-sel_py.min(axis=1), 0.0)  # |py| côté sud
-    by = np.maximum(sel_py.max(axis=1), 0.0)   # |py| côté nord
-
-    total_x = ax + bx
-    total_y = ay + by
-
-    # Fractions dans [0, 1]  (0.5 si dégénéré, i.e. tous les points d'un côté)
-    u = np.where(total_x > 0, ax / total_x, 0.5)[:, None]  # (N, 1)
-    v = np.where(total_y > 0, ay / total_y, 0.5)[:, None]
-
-    # Contribution de chaque cellule selon son quadrant
-    u_contrib = np.where(sel_px >= 0, u, 1.0 - u)   # (N, 4)
-    v_contrib = np.where(sel_py >= 0, v, 1.0 - v)
-
-    weights = u_contrib * v_contrib  # (N, 4)
-
-    # Normalisation de sécurité (doit déjà sommer à 1)
-    w_sum = weights.sum(axis=1, keepdims=True)
-    weights = np.where(w_sum > 0, weights / w_sum, 0.25)
-
-    return weights
+    return pix.astype(np.uint64), wgt
 
 
 # ---------------------------------------------------------------------------
@@ -143,18 +222,18 @@ def get_interp_weights(
     Renvoie les 4 cellules HEALPix et leurs poids d'interpolation bilinéaire
     pour chaque position (lon, lat).
 
-    Équivalent à healpy.get_interp_weights, mais utilise healpix-geo pour les
-    conversions de coordonnées et supporte les ellipsoïdes (ex. WGS84).
+    Pour ellipsoid="sphere" (défaut), les résultats (pixels ET poids) sont
+    rigoureusement identiques à
+    ``healpy.get_interp_weights(nside, lon, lat, lonlat=True, nest=True)``
+    (aux erreurs d'arrondi flottant près, ~1e-12) : c'est un portage direct
+    de l'algorithme RING de référence de healpy, pas une réinvention
+    géométrique approximative.
 
-    Algorithm
-    ---------
-    1. Trouve la cellule HEALPix contenante (via healpix_geo.nested.lonlat_to_healpix).
-    2. Récupère les 9 cellules candidates : la cellule centrale + ses 8 voisines
-       immédiates (via kth_neighbourhood, ring=1).
-    3. Projette les centres de ces 9 cellules sur le plan tangent en chaque
-       point requête (projection gnomonique).
-    4. Sélectionne les 4 centres les plus proches de la requête (= à l'origine).
-    5. Calcule les poids bilinéaires à partir des positions dans le plan tangent.
+    Pour un ellipsoïde non-sphérique, il n'existe pas de "référence healpy"
+    (healpy ne connaît que la sphère) : on utilise alors
+    ``healpix_geo.nested.bilinear_interpolation``, qui implémente une
+    interpolation bilinéaire correcte sur la grille NESTED en tenant compte
+    de l'ellipsoïde choisi.
 
     Parameters
     ----------
@@ -166,7 +245,7 @@ def get_interp_weights(
         Profondeur HEALPix (nside = 2**depth).
     ellipsoid : str, optional
         Ellipsoïde de référence : "sphere" (défaut, identique à healpy) ou
-        "WGS84", "GRS80", etc.  Voir la doc de healpix-geo pour la liste.
+        "WGS84", "GRS80", etc. Voir la doc de healpix-geo pour la liste.
 
     Returns
     -------
@@ -179,17 +258,6 @@ def get_interp_weights(
     ------
     ValueError
         Si lon et lat n'ont pas la même forme.
-
-    Notes
-    -----
-    Pour l'ellipsoïde "sphere", les résultats sont très proches de ceux de
-    healpy.get_interp_weights (schéma NESTED). Les très légères différences
-    viennent de l'utilisation du plan tangent local plutôt que du schéma RING
-    interne de healpy.
-
-    Pour les ellipsoïdes non-sphériques (ex. WGS84), la conversion lon/lat →
-    cellule HEALPix intègre la latitude authalique (voir healpix-geo), ce qui
-    n'est pas possible avec healpy.
     """
     lon = np.asarray(lon, dtype=np.float64)
     lat = np.asarray(lat, dtype=np.float64)
@@ -198,71 +266,26 @@ def get_interp_weights(
             f"lon et lat doivent avoir la même forme "
             f"(got {lon.shape} vs {lat.shape})"
         )
-    N = lon.size
     lon_flat = lon.ravel()
     lat_flat = lat.ravel()
 
-    # ------------------------------------------------------------------
-    # 1. Cellule contenante pour chaque point requête
-    # ------------------------------------------------------------------
-    ipix = lonlat_to_healpix(
+    if ellipsoid == "sphere":
+        nside = 2 ** depth
+        theta = np.radians(90.0 - lat_flat)
+        phi = np.radians(lon_flat) % (2.0 * np.pi)
+
+        pix_ring, weights = _get_interpol_ring(theta, phi, nside)
+        pixels = _hg_ring.to_nested(pix_ring.ravel(), depth).reshape(pix_ring.shape)
+        return pixels.astype(np.uint64), weights
+
+    # Ellipsoïdes non-sphériques : healpy n'a pas d'équivalent, on délègue
+    # à l'implémentation native de healpix-geo.
+    cell_ids, weights = _nested_bilinear_interpolation(
         lon_flat, lat_flat, depth, ellipsoid=ellipsoid
-    )  # shape (N,), dtype uint64
-
-    # ------------------------------------------------------------------
-    # 2. Cellules candidates : cellule centrale + 8 voisines (ring=1)
-    #    kth_neighbourhood renvoie (N, 9)
-    #    L'élément d'indice 4 est la cellule centrale elle-même.
-    #    Les voisins manquants (pôles) sont signalés par -1 ou une valeur
-    #    invalide ; on les masque.
-    # ------------------------------------------------------------------
-    all_cells = kth_neighbourhood(ipix, depth, ring=1)  # (N, 9), int64
-
-    # ------------------------------------------------------------------
-    # 3. Centres lon/lat des 9 cellules candidates
-    # ------------------------------------------------------------------
-    flat_cells = all_cells.ravel()                       # (N*9,)
-    valid_mask = flat_cells >= 0                          # (N*9,) bool
-    safe_cells = np.where(valid_mask, flat_cells, 0).astype(np.uint64)
-
-    c_lon, c_lat = healpix_to_lonlat(
-        safe_cells, depth, ellipsoid=ellipsoid
-    )  # (N*9,)
-
-    c_lon = c_lon.reshape(N, 9)
-    c_lat = c_lat.reshape(N, 9)
-    valid_mask = valid_mask.reshape(N, 9)  # (N, 9)
-
-    # ------------------------------------------------------------------
-    # 4. Projection gnomonique : plan tangent centré sur la requête
-    #    La requête est à l'origine (0, 0) par définition.
-    # ------------------------------------------------------------------
-    px, py = _gnomonic_project(
-        lon_flat[:, None], lat_flat[:, None],  # (N, 1)
-        c_lon, c_lat,                           # (N, 9)
-    )  # (N, 9)
-
-    # Distance² au point requête (= à l'origine)
-    dist2 = px**2 + py**2
-    # Invalider les voisins manquants
-    dist2 = np.where(valid_mask, dist2, np.inf)
-
-    # ------------------------------------------------------------------
-    # 5. Sélection des 4 centres les plus proches
-    # ------------------------------------------------------------------
-    idx4 = np.argsort(dist2, axis=1)[:, :4]   # (N, 4)
-    i_row = np.arange(N)[:, None]
-
-    sel_cells = all_cells[i_row, idx4]         # (N, 4)
-    sel_px = px[i_row, idx4]                   # (N, 4)
-    sel_py = py[i_row, idx4]                   # (N, 4)
-
-    # ------------------------------------------------------------------
-    # 6. Poids bilinéaires
-    # ------------------------------------------------------------------
-    weights = _bilinear_weights_from_tangent_plane(sel_px, sel_py)
-
-    return sel_cells.astype(np.uint64), weights
+    )
+    pixels = np.asarray(cell_ids.data if hasattr(cell_ids, "data") else cell_ids, dtype=np.uint64)
+    weights = np.asarray(weights.data if hasattr(weights, "data") else weights, dtype=np.float64)
+    return pixels, weights
 
 
 def get_interp_val(

@@ -33,6 +33,8 @@ pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 | Convolve a map, equivariantly, on the sphere | `HealPixConv` | {doc}`convol_doc` |
 | Split a flow into divergence and curl | `uv_to_curl_div` | {doc}`healpix_sht` |
 | Convolve with a large kernel, cheaply | `LargeConv` | {doc}`large_conv` |
+| Convolve with a wide kernel given as an image, a formula in metres or a raster | `HealPixWideConv` | {doc}`wide_convolution` |
+| Filter at every scale with one kernel per band | `HealPixPyramidConv` | {doc}`pyramid_convolution` |
 | Change resolution (coarser / finer) | `HealPixDown`, `HealPixUp` | {doc}`down`, {doc}`up` |
 | Build an exactly invertible multiscale pyramid | `HealPixDecomp` | {doc}`decomp` |
 | Get divergence and curl at every scale | `divcurl` | {doc}`divcurl` |
@@ -90,6 +92,8 @@ convol_doc
 convol_api
 convol_internals
 large_conv
+wide_convolution
+pyramid_convolution
 down
 up
 decomp
