@@ -106,7 +106,7 @@ class HealPixWideConv:
         NESTED tile into a square image). Must be square with an odd side.
     level : int
         The HEALPix level ``kernel_image`` is sampled at. ``cell_ids`` passed
-        to :meth:`__call__` must be at this level.
+        to :meth:`~HealPixWideConv.__call__` must be at this level.
     Jmax : int, default 6
         Number of pyramid stages. The kernel's reach grows roughly like
         ``compact_kernel_sz//2 * 2**Jmax`` finest-band pixels, so this is the

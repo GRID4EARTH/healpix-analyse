@@ -37,10 +37,10 @@ problem and is deliberately narrower in scope — see §F.
 
 | you have | use | see |
 |---|---|---|
-| the kernel already sampled on the HEALPix lattice, as a `(2n+1, 2n+1)` image | `HealPixWideConv(kernel_image, level, ...)` | [§B.1](#b1-mode-1--an-image-on-the-healpix-lattice) |
-| a formula in metres, possibly anisotropic | `HealPixWideConv.from_function(fn, level, n, lon, lat, ...)` | [§B.2](#b2-mode-2--a-function-of-x-y-in-metres) |
-| a raster with a fixed pixel size in metres | `HealPixWideConv.from_grid(grid, pixel_size_m, level, n, lon, lat, ...)` | [§B.3](#b3-mode-3--a-raster-in-metres-bilinearly-resampled) |
-| a formula in `r` only (isotropic — the common case) | `HealPixWideConv.from_radial(fn, level, n, lon, lat, ...)` | [§B.4](#b4-mode-4--a-function-of-r-in-metres) |
+| the kernel already sampled on the HEALPix lattice, as a `(2n+1, 2n+1)` image | `HealPixWideConv(kernel_image, level, ...)` | [§B.1](#wide-b1) |
+| a formula in metres, possibly anisotropic | `HealPixWideConv.from_function(fn, level, n, lon, lat, ...)` | [§B.2](#wide-b2) |
+| a raster with a fixed pixel size in metres | `HealPixWideConv.from_grid(grid, pixel_size_m, level, n, lon, lat, ...)` | [§B.3](#wide-b3) |
+| a formula in `r` only (isotropic — the common case) | `HealPixWideConv.from_radial(fn, level, n, lon, lat, ...)` | [§B.4](#wide-b4) |
 
 All four produce the same kind of object and are equally accurate; the choice
 is about which description is natural for your problem. §B.6 measures that
@@ -143,6 +143,7 @@ call (the fit), then **~0.1 s** per call on the same domain.
 
 ## B. Specifying the kernel — the four modes
 
+(wide-b1)=
 ### B.1 Mode 1 — an image on the HEALPix lattice
 
 ```python
@@ -162,6 +163,7 @@ came out of another HEALPix computation. If your kernel is defined in metres,
 prefer modes 2–4: on the lattice, "one pixel right" is not the same distance
 everywhere (§B.5).
 
+(wide-b2)=
 ### B.2 Mode 2 — a function of `x, y` in metres
 
 ```python
@@ -176,6 +178,7 @@ in metres from the centre. This is what makes an anisotropic kernel
 meaningful: "1500 m east-west by 400 m north-south" is a statement about the
 ground, not about pixel indices.
 
+(wide-b3)=
 ### B.3 Mode 3 — a raster in metres, bilinearly resampled
 
 ```python
@@ -203,6 +206,7 @@ Cells falling outside the raster are set to `fill` (default 0) and a
 `RuntimeWarning` names how many. Make the raster cover more ground than the
 `(2n+1)` lattice, whose corners reach `n·√2` pixels out.
 
+(wide-b4)=
 ### B.4 Mode 4 — a function of `r` in metres
 
 ```python

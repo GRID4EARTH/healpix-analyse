@@ -65,12 +65,12 @@ build `kernel_pyramid` above — nowhere else:
 | The kernel's **width/scale** | the factory's own scale parameter — usually `sigma_pix`, but check the factory's docstring, it isn't always named that | inside the `KERNEL` call, e.g. `kernel_gaussian(sigma_pix=1.2)` |
 | The kernel's **footprint size** (how many taps) | `compact_kernel_sz` (odd; 5 is the usual default) | `from_kernel(..., compact_kernel_sz=5)` |
 | **How far** the filter can reach (into a hole, or a domain's own edge — see §A.2) | `Jmax` on the `HealPixDecomp` the kernel pyramid is built from | `HealPixDecomp(..., Jmax=...)` |
-| **Multiple co-registered channels at once** (e.g. RGB) | `channels=C` | `from_kernel(..., channels=C)` — see [§A.6](#a-6-multiple-channels-eg-rgb) |
-| **Anisotropy** (direction-dependent response) | a `kernel(rho_pix, phi)` that actually depends on `phi`, plus `gauge_type` | `from_kernel(..., gauge_type=...)` — see [§A.4](#a-4-anisotropy-and-gauges) |
+| **Multiple co-registered channels at once** (e.g. RGB) | `channels=C` | `from_kernel(..., channels=C)` — see [§A.6](#pyr-a6) |
+| **Anisotropy** (direction-dependent response) | a `kernel(rho_pix, phi)` that actually depends on `phi`, plus `gauge_type` | `from_kernel(..., gauge_type=...)` — see [§A.4](#pyr-a4) |
 | A kernel **fit to data** instead of an analytic formula | `HealPixKernelPyramid.calibrate(...)` instead of `.from_kernel(...)` | see [§D](#d-calibration-how-it-works-and-its-limits) |
-| A **wide, slowly-decaying analytic target** (Lorentzian/power-law tail) decomposed into small kernels across all bands, defined once at J=0 | `HealPixKernelPyramid.calibrate_joint(decomp, target_kernel, ...)` | see [§D.1](#d-1-calibrate-joint-decomposing-one-wide-kernel-across-bands) |
+| A **wide, slowly-decaying analytic target** (Lorentzian/power-law tail) decomposed into small kernels across all bands, defined once at J=0 | `HealPixKernelPyramid.calibrate_joint(decomp, target_kernel, ...)` | see [§D.1](#pyr-d1) |
 | `mode="normalized"` (NaN/weight-aware) vs. `"signed"` (no masking, allows negative kernels) | `mode=` | `HealPixPyramidConv(decomp, kernel_pyramid, mode=...)` |
-| **Where** the kernel is defined (once, at the finest band, vs. re-derived per band) | `weights_from_finest_band` (default `True`) | `from_kernel(..., weights_from_finest_band=True)` — see [§A.1bis](#a-1bis-one-kernel-at-j-0-not-one-per-band) |
+| **Where** the kernel is defined (once, at the finest band, vs. re-derived per band) | `weights_from_finest_band` (default `True`) | `from_kernel(..., weights_from_finest_band=True)` — see [§A.1bis](#pyr-a1bis) |
 
 None of this lives in `HealPixPyramidConv` itself — it only *applies* the
 kernel pyramid it is given (`decomp.compute_weighted` → per-band kernel →
@@ -85,6 +85,7 @@ don't need to be hunted down inside §3's actual construction code.
 
 ## A. Mathematical foundations
 
+(pyr-a1)=
 ### A.1 The target operator, and what a pyramid can and cannot give you for free
 
 Let `W` be the analysis operator of a `HealPixDecomp` (its stacked
@@ -110,6 +111,7 @@ independently on each band, with **no cross-band terms**. This is a
 deliberate simplification whose approximation error must be *measured*, not
 assumed — see [Section E](#e-validation-results-and-honest-limits).
 
+(pyr-a1bis)=
 ### A.1bis One kernel, at J=0 — not one per band
 
 `from_kernel` takes a single continuous profile, `kernel(rho_pix, phi_rad)`,
@@ -194,6 +196,7 @@ note that a *negative* synthesized weight `S(B_K m̃)` at some pixel makes the
 division well-defined but not a meaningful "confidence" any more — this is
 an open point, see [Section E](#e-validation-results-and-honest-limits).
 
+(pyr-a4)=
 ### A.4 Anisotropy and gauges
 
 A kernel profile is a function `K(rho_pix, phi_rad)` evaluated once, on the
@@ -208,6 +211,7 @@ output pixel's own local tangent frame consistently, the same way
 forwards `gauge_type`/`n_gauges`/`singularity_lonlat`/`ref_direction`
 unchanged to every band's `HealPixConv`.
 
+(pyr-a5)=
 ### A.5 True sphere vs. ellipsoid
 
 Every geometry call in this module (`HealPixConv`, and the independent
@@ -242,6 +246,7 @@ lowercase `"wgs84"` from a store. Wrap the value yourself in that case:
 `Notebooks/pyramid_conv_sentinel2_test.ipynb` §6 and §8 for two real
 examples of exactly this.
 
+(pyr-a6)=
 ### A.6 Multiple channels (e.g. RGB)
 
 `HealPixKernelPyramid.from_kernel`/`calibrate` accept a `channels` argument
@@ -289,7 +294,7 @@ leading dimensions), and only `HealPixKernelPyramid.apply` needed the fix.
   `HealPixConv(in_channels=out_channels=channels, ...)` per band (`channels`
   defaults to 1), with a fixed (`requires_grad=False`) kernel set via
   `HealPixConv.set_kernel`, block-diagonal across channels when
-  `channels>1` — see [Section A.6](#a-6-multiple-channels-eg-rgb). Built
+  `channels>1` — see [Section A.6](#pyr-a6). Built
   either analytically (`from_kernel`, evaluating a Python callable on the
   exact stencil geometry) or by least-squares calibration against a
   reference operator (`calibrate`, see [Section D](#d-calibration-how-it-works-and-its-limits)).
@@ -412,6 +417,7 @@ resolution*. Two things follow, both confirmed by
   kernels requires *joint*, cross-band least-squares optimization — see
   `calibrate_joint`, next.
 
+(pyr-d1)=
 ### D.1 `calibrate_joint`: decomposing one wide kernel across bands
 
 `HealPixKernelPyramid.calibrate_joint(decomp, target_kernel, ...)` fits
@@ -533,11 +539,11 @@ amortized across many forward calls, not repeated per call.
 worked around):
 
 1. **Block-diagonal only.** No inter-band coupling is modeled or corrected
-   for; see [Section A.1](#a-1-the-target-operator-and-what-a-pyramid-can-and-cannot-give-you-for-free)
+   for; see [Section A.1](#pyr-a1)
    and [Section D](#d-calibration-how-it-works-and-its-limits).
 2. **`calibrate` is single-band, not joint** — it cannot make a compact
    per-band kernel reproduce an arbitrarily wide target on its own. Use
-   `calibrate_joint` ([Section D.1](#d-1-calibrate-joint-decomposing-one-wide-kernel-across-bands))
+   `calibrate_joint` ([Section D.1](#pyr-d1))
    for that: a genuine multi-band joint least-squares fit against one wide
    target, measured to cut the residual from ≈87% to ≈3% on the same
    target and per-band kernel size. `calibrate_joint` itself only supports
@@ -555,7 +561,7 @@ worked around):
    instead.
 5. **`ellipsoid` consistency across `decomp`/kernel pyramid is not
    auto-checked** (using `"sphere"` for one and `"WGS84"` for the other is
-   still a silent mislabeling) — see [Section A.5](#a-5-true-sphere-vs-ellipsoid).
+   still a silent mislabeling) — see [Section A.5](#pyr-a5).
    The *casing* of a given ellipsoid name is handled automatically as of
    this revision (`"wgs84"`/`"WGS84"`/`"Wgs84"` all resolve the same way);
    only mixing genuinely different ellipsoids remains unchecked.
@@ -569,7 +575,7 @@ worked around):
    `compact_kernel_sz`, not intended as a hot path.
 9. **Multi-channel (`channels>1`) requires `n_gauges=1`.** The general
    multi-gauge, multi-channel case (`[G, C, C, P]` with `G>1`) is not
-   supported — see [Section A.6](#a-6-multiple-channels-eg-rgb). Every
+   supported — see [Section A.6](#pyr-a6). Every
    channel also shares the *same* kernel profile (block-diagonal, identical
    diagonal blocks); per-channel-distinct profiles are not supported.
 
@@ -582,7 +588,7 @@ Farbman, R. Fattal, D. Lischinski, *"Convolution Pyramids"*, ACM
 Transactions on Graphics 30(4), 2011. The cited paper's core technique —
 jointly optimizing every pyramid level's kernel so that the *cascade*
 reproduces one global target operator — is what `calibrate_joint`
-([Section D.1](#d-1-calibrate-joint-decomposing-one-wide-kernel-across-bands))
+([Section D.1](#pyr-d1))
 now does too, but by a different, more general and less precise route:
 direct numerical least-squares against a brute-force reference, evaluated
 by probing the real `HealPixDecomp`/`HealPixConv` machinery, rather than

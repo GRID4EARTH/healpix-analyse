@@ -33,7 +33,7 @@ class HealPixPyramidConv(nn.Module):
     kernel_pyramid : HealPixKernelPyramid
     mode : {"normalized", "signed"}, default "normalized"
         ``"normalized"`` (default): NaN/weight-aware. Internally runs
-        :meth:`HealPixDecomp.compute_weighted` on the input, applies the
+        :meth:`~healpix_analyse.decomp.HealPixDecomp.compute_weighted` on the input, applies the
         kernel pyramid identically to the data channel ``q`` and the weight
         channel ``m``, synthesizes both, and divides **once** --
         ``y = S(B_K q) / S(B_K m)`` -- never band by band. This is a strict
@@ -42,7 +42,7 @@ class HealPixPyramidConv(nn.Module):
         up to floating-point round-off, so this mode is safe to use as the
         default even without missing data.
         ``"signed"``: no masking at all -- runs the kernel pyramid directly
-        on :meth:`HealPixDecomp.compute`/:meth:`~HealPixDecomp.invert`. Only
+        on :meth:`~healpix_analyse.decomp.HealPixDecomp.compute`/:meth:`~healpix_analyse.decomp.HealPixDecomp.invert`. Only
         meaningful on fully finite input; useful for validating kernels that
         are not required to stay positive (signed kernels), where dividing
         by a synthesized weight would be the wrong operation.
@@ -79,7 +79,7 @@ class HealPixPyramidConv(nn.Module):
         """Apply the per-band kernels to an already-computed pyramid.
 
         Does **not** synthesize or divide -- use :meth:`forward` (or
-        :meth:`HealPixDecomp.invert`) for that. Accepts either a plain
+        :meth:`~healpix_analyse.decomp.HealPixDecomp.invert`) for that. Accepts either a plain
         :class:`~healpix_analyse.decomp.HealPixPyramid` or a
         :class:`~healpix_analyse.decomp.HealPixWeightedPyramid` (in which
         case the *same* per-band kernels are applied to both the ``q`` and

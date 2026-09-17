@@ -4,8 +4,8 @@ Theoretical status (read before using)
 ---------------------------------------
 Let ``W`` be the analysis operator of a :class:`~healpix_analyse.decomp.HealPixDecomp`
 (the stacked Down/Up chain) and ``S`` its synthesis operator, so that
-``S W = I`` exactly (this is what makes :meth:`HealPixDecomp.invert` an exact
-inverse of :meth:`HealPixDecomp.compute`).  Convolving a map ``x`` with a
+``S W = I`` exactly (this is what makes :meth:`~healpix_analyse.decomp.HealPixDecomp.invert` an exact
+inverse of :meth:`~healpix_analyse.decomp.HealPixDecomp.compute`).  Convolving a map ``x`` with a
 target operator ``K`` and then decomposing, or decomposing and then acting on
 the pyramid coefficients, are *not* interchangeable in general.  Write the
 "acting on coefficients" operator as ``B_K`` such that the intended pipeline
@@ -54,12 +54,37 @@ comparison, but it means two bands nominally sharing "the same" kernel can
 carry slightly different discrete taps for reasons that have nothing to do
 with the kernel itself.
 
-This module does not claim to reproduce a specific published construction
-(e.g. the least-squares boundary-matched kernels of Farbman, Fattal &
-Lischinski, "Convolution Pyramids", ACM TOG 2011); it provides analytic
-per-band kernels evaluated on the exact stencil geometry used at runtime by
-:class:`~healpix_analyse.convol.HealPixConv`, plus an optional, explicitly
-approximate least-squares calibration helper against a direct reference.
+**``from_kernel``/``calibrate`` vs. ``calibrate_joint``: two different
+problems.** Both ``from_kernel`` (an analytic profile, shared or resampled
+per band) and ``calibrate`` (a least-squares fit, one band at a time)
+choose each band's kernel *independently* -- there is no single common
+target they are jointly trying to reproduce, and neither can represent a
+target many times wider than one band's own compact support (measured
+directly in ``test_calibrate_on_a_much_wider_target_does_not_silently_claim_success``).
+:meth:`HealPixKernelPyramid.calibrate_joint` solves the actually different
+problem of *decomposing* one wide, slowly-decaying target kernel -- defined
+once, at the finest resolution -- into small per-band kernels that
+reconstruct it *together*, through the real ``S B W`` pipeline (not the
+degenerate literal ``B=W K S`` case above, which collapses to ``y=Kx``
+identically). This lets a Lorentzian- or power-law-tailed kernel, far wider
+than any single ``compact_kernel_sz`` stencil, be represented well using
+only small per-band kernels -- the pyramid's own geometric coarsening
+supplies most of the reach, and each band's fitted kernel only has to
+correct the local shape at its own scale (measured: ~3% relative RMS error
+for a Lorentzian(scale=6 pixels) target on a 4-band pyramid using 5x5
+per-band kernels throughout, vs. ~87% for the same target fit to a single
+band alone -- see ``test_calibrate_joint_decomposes_a_wide_kernel_across_bands``).
+
+This module does not claim to reproduce the specific published construction
+of Farbman, Fattal & Lischinski, "Convolution Pyramids" (ACM TOG 2011) --
+their boundary-matched, closed-form per-family derivations are not
+implemented here. ``calibrate_joint`` solves the same class of problem
+(representing a wide kernel as a small-kernel pyramid) by direct joint
+least-squares against a brute-force reference instead, which is more
+general (any kernel profile the reference oracle can evaluate) but purely
+numerical, with no closed-form guarantees -- its accuracy must be measured
+per kernel family and per ``Jmax``, the same as every other calibration
+path in this module.
 """
 
 from __future__ import annotations
@@ -72,6 +97,7 @@ import torch
 
 from healpix_analyse.convol import HealPixConv, _local_kernel_grid
 from healpix_analyse.decomp import HealPixDecomp
+from healpix_analyse.validation import direct_spherical_convolution
 
 KernelFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
 """A kernel profile ``fn(rho_pix, phi_rad) -> weight``.
@@ -203,8 +229,8 @@ class HealPixKernelPyramid:
     convention, and cell-id domain of a given
     :class:`~healpix_analyse.decomp.HealPixDecomp`, band for band, so that
     :meth:`apply` can be composed directly with
-    :meth:`HealPixDecomp.compute`/:meth:`~HealPixDecomp.compute_weighted` and
-    :meth:`~HealPixDecomp.invert`.
+    :meth:`~healpix_analyse.decomp.HealPixDecomp.compute`/:meth:`~healpix_analyse.decomp.HealPixDecomp.compute_weighted` and
+    :meth:`~healpix_analyse.decomp.HealPixDecomp.invert`.
 
     This is a **block-diagonal** approximation -- see the module docstring
     (block-diagonal *across pyramid bands*; see also ``channels`` below for
@@ -492,6 +518,175 @@ class HealPixKernelPyramid:
         return cls(
             decomp=decomp, convs=tuple(convs), kernel_sz=compact_kernel_sz,
             gauge_type=gauge_type, n_gauges=1, channels=channels,
+        )
+
+    @classmethod
+    def calibrate_joint(
+        cls,
+        decomp: HealPixDecomp,
+        target_kernel: KernelFn,
+        *,
+        target_kernel_sz: int = 41,
+        compact_kernel_sz: int = 5,
+        gauge_type: str = "phi",
+        n_probes: int = 128,
+        n_excitations: int = 6,
+        seed: int = 0,
+        ridge: float = 1e-6,
+        ellipsoid: str = "sphere",
+        dtype: Optional[torch.dtype] = None,
+        device=None,
+    ) -> "HealPixKernelPyramid":
+        """Decompose a single, wide target kernel (defined once, at the
+        finest resolution) into a genuine pyramid of small per-band kernels.
+
+        This is a different problem from :meth:`from_kernel` and
+        :meth:`calibrate`: both of those pick, independently for each band,
+        a kernel that acts well *at that band's own resolution* -- there is
+        no single common target they are jointly trying to reproduce, and
+        (per the module docstring, and demonstrated by
+        ``test_calibrate_on_a_much_wider_target_does_not_silently_claim_success``)
+        neither can represent a target many times wider than one band's own
+        compact support.
+
+        ``calibrate_joint`` instead fits all bands' kernels *together*
+        against one fixed target ``target_kernel``, evaluated only at the
+        finest band's own resolution (``decomp.levels[0]``) via a direct,
+        wide-support brute-force reference (:func:`~healpix_analyse.validation.direct_spherical_convolution`
+        with ``kernel_sz=target_kernel_sz`` -- make this comfortably larger
+        than the target's actual decay, e.g. ``target_kernel_sz~=6*scale_pix``
+        for a Lorentzian/exponential tail). The fitted operator is the real
+        composed pipeline ``y = S(B(W(x)))`` (:meth:`~healpix_analyse.decomp.HealPixDecomp.compute`
+        then each band's own small ``HealPixConv`` then
+        :meth:`~healpix_analyse.decomp.HealPixDecomp.invert`) -- not band-by-band in isolation -- so
+        each band's fitted kernel only has to supply whatever the pyramid's
+        own geometric coarsening does not already give it for free. This is
+        why a *wide*, slowly-decaying target (Lorentzian, power-law) can be
+        represented well by *small* (``compact_kernel_sz``) per-band
+        kernels: most of the target's reach comes from the pyramid's
+        coarsening itself, and each band only has to correct the local
+        shape at its own scale. See ``docs/pyramid_convolution.md`` for the
+        derivation and honest limits (reach is still bounded by
+        ``decomp.Jmax``; a target wider than the coarsest band's own reach
+        cannot be represented regardless of how the taps are fit).
+
+        Parameters
+        ----------
+        decomp : HealPixDecomp
+            Must be built with ``cell_ids=None`` (full sphere) -- fitting
+            needs a well-defined "external" pixel order to compare against
+            the direct reference on the same footprint, and the full sphere
+            keeps that unambiguous. A partial-domain decomposition can still
+            use the resulting :class:`HealPixKernelPyramid` afterwards (the
+            fitted per-band taps are footprint-independent, like
+            :meth:`from_kernel`'s), just not for the fit itself.
+        target_kernel : IsoKernelFn
+            ``fn(rho_pix, phi) -> weight``, evaluated in **finest-band**
+            pixel units (same convention as :mod:`healpix_analyse.validation`).
+            Isotropic only (no ``phi`` dependence), matching the independent
+            oracle's own documented scope.
+        target_kernel_sz : int, default 41
+            Odd stencil size for the *brute-force reference* -- how far the
+            direct oracle searches for neighbours, in finest-band pixel
+            units. This is independent of, and normally much larger than,
+            ``compact_kernel_sz`` (that one bounds each *band's own* fitted
+            kernel, not the target being approximated).
+        compact_kernel_sz : int, default 5
+            Odd stencil size for every band's own fitted kernel.
+        n_probes, n_excitations, seed, ridge : as in :meth:`calibrate`, but
+            probing now runs the full analysis/synthesis chain, so cost
+            scales with ``n_excitations * n_bands * compact_kernel_sz**2``.
+
+        Only ``channels=1`` is supported here (unlike :meth:`from_kernel`/
+        :meth:`calibrate`) -- fitting a joint multi-channel operator is not
+        implemented, a currently unaddressed limitation, not a silent
+        approximation.
+        """
+        if decomp.partial:
+            raise ValueError(
+                "calibrate_joint requires a full-sphere HealPixDecomp "
+                "(cell_ids=None) -- see the docstring"
+            )
+        if compact_kernel_sz < 1 or compact_kernel_sz % 2 == 0:
+            raise ValueError("compact_kernel_sz must be a positive odd integer")
+        rng = np.random.default_rng(seed)
+        dtype = dtype or decomp.dtype
+        device = device if device is not None else decomp.device
+        n_bands = decomp.n_bands
+
+        # decomp was built with cell_ids=None, so the external order used by
+        # compute()/invert() is simply arange(n_pixels) -- no un/sort dance
+        # needed to align a freshly generated excitation with cell ids.
+        fine_ids = decomp.cell_ids_per_scale[0]
+        fine_level = decomp.levels[0]
+
+        convs: list[HealPixConv] = []
+        P_per_band: list[int] = []
+        for j in range(n_bands):
+            level_j = decomp.levels[j]
+            conv = HealPixConv(
+                level=level_j, in_channels=1, out_channels=1,
+                kernel_sz=compact_kernel_sz, n_gauges=1, gauge_type=gauge_type,
+                cell_ids=None, ellipsoid=ellipsoid, dtype=dtype, device=device,
+            )
+            convs.append(conv)
+            rho_pix_j, _ = _stencil_pixel_polar(compact_kernel_sz, 2 ** level_j)
+            P_per_band.append(int(rho_pix_j.size))
+        P = P_per_band[0]
+        if any(p != P for p in P_per_band):
+            raise RuntimeError("internal error: bands disagree on stencil tap count")
+        n_unknowns = n_bands * P
+
+        zero_bands_template = [
+            torch.zeros(decomp.sizes[k], dtype=dtype, device=device)
+            for k in range(n_bands)
+        ]
+        basis = np.eye(P, dtype=np.float32)
+
+        A_rows = []
+        b_rows = []
+        for _exc in range(max(1, n_excitations)):
+            x_np = rng.standard_normal(decomp.n_pixels)
+            x = torch.as_tensor(x_np, dtype=dtype, device=device)
+
+            target_full = direct_spherical_convolution(
+                x_np, fine_ids, fine_level, target_kernel,
+                kernel_sz=target_kernel_sz, ellipsoid=ellipsoid,
+                restore_mask=False, normalize=False,
+            )
+            n_probes_e = min(n_probes, decomp.n_pixels)
+            probe_idx = rng.choice(decomp.n_pixels, size=n_probes_e, replace=False)
+            b_rows.append(target_full[probe_idx])
+
+            pyr = decomp.compute(x)
+            A_e = np.zeros((n_probes_e, n_unknowns), dtype=np.float64)
+            for j in range(n_bands):
+                conv_j = convs[j]
+                band_j = pyr.bands[j]
+                for tap in range(P):
+                    conv_j.set_kernel(basis[tap][None, None, :], requires_grad=False)
+                    filtered_j = conv_j(band_j)
+                    modified_bands = list(zero_bands_template)
+                    modified_bands[j] = torch.as_tensor(
+                        filtered_j, dtype=dtype, device=device
+                    ).reshape(-1)
+                    y_tap = decomp.invert(modified_bands, restore_mask=False)
+                    y_tap_np = np.asarray(y_tap).reshape(-1)
+                    A_e[:, j * P + tap] = y_tap_np[probe_idx]
+            A_rows.append(A_e)
+
+        A = np.concatenate(A_rows, axis=0)
+        b = np.concatenate(b_rows, axis=0)
+        reg = ridge * np.eye(n_unknowns)
+        w_all, *_ = np.linalg.lstsq(A.T @ A + reg, A.T @ b, rcond=None)
+
+        for j in range(n_bands):
+            w_j = w_all[j * P:(j + 1) * P]
+            convs[j].set_kernel(w_j[None, None, :].astype(np.float32), requires_grad=False)
+
+        return cls(
+            decomp=decomp, convs=tuple(convs), kernel_sz=compact_kernel_sz,
+            gauge_type=gauge_type, n_gauges=1, channels=1,
         )
 
     def apply(self, bands: Sequence) -> tuple:
