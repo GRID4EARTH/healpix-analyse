@@ -310,7 +310,7 @@ class AlmTransform:
         that :meth:`fft` does not currently compute (see the ``TODO`` next to
         its second FFT stage), and relies on ring bookkeeping
         (``self.n_rings``, ``self.idx_ring``, ``self.weights``, ``self.xa``,
-        ``self.N_k``) that :meth:`__init__` does not currently set. Rather
+        ``self.N_k``) that ``__init__`` does not currently set. Rather
         than fail on a missing attribute or silently return a wrong map, this
         raises explicitly until that work lands.
         """

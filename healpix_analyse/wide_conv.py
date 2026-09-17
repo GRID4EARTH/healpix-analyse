@@ -106,7 +106,7 @@ class HealPixWideConv:
         NESTED tile into a square image). Must be square with an odd side.
     level : int
         The HEALPix level ``kernel_image`` is sampled at. ``cell_ids`` passed
-        to :meth:`~HealPixWideConv.__call__` must be at this level.
+        to ``__call__`` must be at this level.
     Jmax : int, default 6
         Number of pyramid stages. The kernel's reach grows roughly like
         ``compact_kernel_sz//2 * 2**Jmax`` finest-band pixels, so this is the
@@ -114,7 +114,7 @@ class HealPixWideConv:
     compact_kernel_sz : int, default 5
         Odd size of each band's fitted stencil.
     gauge_type, ellipsoid
-        Passed through to each band's :class:`HealPixConv`.
+        Passed through to each band's :class:`~healpix_analyse.convol.HealPixConv`.
     ridge : float, default 1e-12
         Tikhonov regularization on the per-band least-squares fit.
     dtype : torch.dtype, default ``torch.float64``
