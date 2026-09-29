@@ -1,0 +1,87 @@
+import numpy as np
+import math
+import io
+import requests
+from PIL import Image
+
+
+# --- 1) Lat/Lon -> fractional XYZ tile coords at zoom z ---
+def latlon_to_xyz_frac(lat, lon, z):
+    """Return fractional tile coordinates (xf, yf) at zoom z (Web Mercator)."""
+    n = 2 ** z
+    xf = (lon + 180.0) / 360.0 * n
+    lat_rad = np.radians(lat)
+    yf = (1.0 - np.log(np.tan(lat_rad) + 1/np.cos(lat_rad)) / math.pi) / 2.0 * n
+    return xf, yf
+
+
+# --- 2) Fractional tile coords -> (xtile, ytile, px, py) inside 256×256 tile ---
+def xyz_frac_to_tile_pixel(xf, yf, tile_size=256):
+    xtile = np.floor(xf).astype(int)
+    ytile = np.floor(yf).astype(int)
+    px = np.floor((xf - xtile) * tile_size).astype(int)
+    py = np.floor((yf - ytile) * tile_size).astype(int)
+    # clamp just in case of edge cases at tile borders
+    px = np.clip(px, 0, tile_size - 1)
+    py = np.clip(py, 0, tile_size - 1)
+    return xtile, ytile, px, py
+
+
+# --- 3) Simple tile cache + fetcher for Esri World Imagery ---
+ESRI_WORLD_IMAGERY = (
+    "https://server.arcgisonline.com/ArcGIS/rest/services/"
+    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+)
+
+
+class TileCache:
+    def __init__(self):
+        self.cache = {}  # (z,x,y) -> PIL.Image
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "research-sampler/1.0"})
+
+    def get_tile(self, z, x, y, timeout=10):
+        key = (z, x, y)
+        if key in self.cache:
+            return self.cache[key]
+        url = ESRI_WORLD_IMAGERY.format(z=z, x=x, y=y)
+        r = self.session.get(url, timeout=timeout)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        self.cache[key] = img
+        return img
+
+
+# --- 4) Main sampler ---
+def sample_esri_world_imagery(lat, lon, zoom=17, tile_size=256):
+    """
+    lat, lon: arrays of shape (N,)
+    zoom: Web Mercator zoom level
+    returns: RGB uint8 array of shape (N, 3)
+    """
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    assert lat.shape == lon.shape
+    N = lat.size
+    xf, yf = latlon_to_xyz_frac(lat, lon, zoom)
+    xt, yt, px, py = xyz_frac_to_tile_pixel(xf, yf, tile_size=tile_size)
+    # Group by tile to fetch each only once
+    tile_cache = TileCache()
+    rgb = np.zeros((N, 3), dtype=np.uint8)
+    # Make an index per unique tile
+    tiles, inv = np.unique(np.stack([xt, yt], axis=1), axis=0, return_inverse=True)
+    # For each unique tile, fetch and sample all points in that tile
+    for t_idx, (x_tile, y_tile) in enumerate(tiles):
+        # gather original indices belonging to this tile
+        sel = np.where(inv == t_idx)[0]
+        # fetch image
+        try:
+            img = tile_cache.get_tile(zoom, x_tile, y_tile)
+        except Exception as e:
+            # If a tile fails, leave zeros or handle as you wish
+            print(f"Warning: failed to fetch tile z={zoom} x={x_tile} y={y_tile}: {e}")
+            continue
+        pix = img.load()  # pixel accessor is fast enough for sparse samples
+        for i in sel:
+            rgb[i] = pix[int(px[i]), int(py[i])]
+    return rgb
