@@ -1,0 +1,62 @@
+[
+  {
+    "case": "19-3600-4-old-0.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4-old-1.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4-old-2.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4-old-0.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4-old-1.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4-old-2.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5-old-0.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5-old-1.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5-old-2.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5-old-0.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5-old-1.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5-old-2.npy",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  }
+]

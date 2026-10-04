@@ -1,0 +1,122 @@
+[
+  {
+    "case": "19-600-4",
+    "repetition": 0,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4",
+    "repetition": 1,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4",
+    "repetition": 2,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4",
+    "repetition": 3,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4",
+    "repetition": 4,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5",
+    "repetition": 0,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5",
+    "repetition": 1,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5",
+    "repetition": 2,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5",
+    "repetition": 3,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5",
+    "repetition": 4,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4",
+    "repetition": 0,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4",
+    "repetition": 1,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4",
+    "repetition": 2,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4",
+    "repetition": 3,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4",
+    "repetition": 4,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5",
+    "repetition": 0,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5",
+    "repetition": 1,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5",
+    "repetition": 2,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5",
+    "repetition": 3,
+    "exact": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5",
+    "repetition": 4,
+    "exact": true,
+    "max_abs_error": 0.0
+  }
+]

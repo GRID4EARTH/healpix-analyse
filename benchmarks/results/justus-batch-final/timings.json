@@ -1,0 +1,802 @@
+[
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.04615941597148776,
+    "repeat_s": 0.0030287079862318933,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 0,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.04284262500004843,
+    "repeat_s": 0.0031211250461637974,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 0,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.04403529199771583,
+    "repeat_s": 0.0029965839930810034,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 1,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.043292249960359186,
+    "repeat_s": 0.003072333987802267,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 1,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.04359812499023974,
+    "repeat_s": 0.0033942500012926757,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 2,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.043505582958459854,
+    "repeat_s": 0.00304958299966529,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 2,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.043295333976857364,
+    "repeat_s": 0.002842749992851168,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 3,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.04313549998914823,
+    "repeat_s": 0.003135291044600308,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 3,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.04292308399453759,
+    "repeat_s": 0.002980707969982177,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 4,
+    "case": "19-600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 600,
+    "cells": 3883,
+    "cold_s": 0.04312245803885162,
+    "repeat_s": 0.002989458036608994,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 5.427761077880859,
+      "weight_used_mib": 3.5790023803710938,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 4,
+    "case": "19-600-4"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7756541250273585,
+    "repeat_s": 0.06036941701313481,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 0,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7757395830121823,
+    "repeat_s": 0.05894083296880126,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 0,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7776483750203624,
+    "repeat_s": 0.0617753749829717,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 1,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7715372079983354,
+    "repeat_s": 0.06087858398677781,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 1,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7712861669715494,
+    "repeat_s": 0.060712290985975415,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 2,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7714497920242138,
+    "repeat_s": 0.0609604999772273,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 2,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7712756660184823,
+    "repeat_s": 0.061924833978991956,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 3,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.778626041021198,
+    "repeat_s": 0.06260437500895932,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 3,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7795664590084925,
+    "repeat_s": 0.06207350001204759,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "new",
+    "repetition": 4,
+    "case": "20-600-5"
+  },
+  {
+    "level": 20,
+    "size_m": 600,
+    "cells": 15069,
+    "cold_s": 0.7767566249822266,
+    "repeat_s": 0.06308541604084894,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 125.45635604858398,
+      "weight_used_mib": 83.4842758178711,
+      "geometry_entries": 1,
+      "weight_entries": 1
+    },
+    "label": "old",
+    "repetition": 4,
+    "case": "20-600-5"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5309166659717448,
+    "repeat_s": 1.541956749977544,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 0,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5375668330234475,
+    "repeat_s": 1.5484156660386361,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 0,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5504178749979474,
+    "repeat_s": 1.5552510420093313,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 1,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5473443749942817,
+    "repeat_s": 1.5611394589650445,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 1,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5716384580009617,
+    "repeat_s": 1.5722239590249956,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 2,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5635967919952236,
+    "repeat_s": 1.56919316702988,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 2,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5616862919996493,
+    "repeat_s": 1.5743714169948362,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 3,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5666670830105431,
+    "repeat_s": 1.5637514580157585,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 3,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5677973330020905,
+    "repeat_s": 1.5752391660353169,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 4,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 19,
+    "size_m": 3600,
+    "cells": 133002,
+    "cold_s": 1.5876119589665905,
+    "repeat_s": 1.583704874967225,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 4,
+    "case": "19-3600-4"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.3971781249856576,
+    "repeat_s": 3.4123701250064187,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 0,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.412098667002283,
+    "repeat_s": 3.411360041995067,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 0,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.427415292011574,
+    "repeat_s": 3.418762625020463,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 1,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.433232915995177,
+    "repeat_s": 3.429067125020083,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 1,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.4131866669631563,
+    "repeat_s": 3.4300401670043357,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 2,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.4444509159657173,
+    "repeat_s": 3.4238299999851733,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 2,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.4382612089975737,
+    "repeat_s": 3.4491909579955973,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 3,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.4594208750058897,
+    "repeat_s": 3.4883620829787105,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 3,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.4743988750269637,
+    "repeat_s": 3.4718167079845443,
+    "geo_version": "0.2.1",
+    "analyse_module": "/Users/todaka/python/git/G4E/healpix-analyse/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "old",
+    "repetition": 4,
+    "case": "20-1200-5"
+  },
+  {
+    "level": 20,
+    "size_m": 1200,
+    "cells": 59426,
+    "cold_s": 3.465396416024305,
+    "repeat_s": 3.4601357499486767,
+    "geo_version": "0.4.1",
+    "analyse_module": "/tmp/healpix-analyse-batched/healpix_analyse/radial_filter.py",
+    "cache": {
+      "geometry_max_mib": 192.0,
+      "weight_max_mib": 96.0,
+      "geometry_used_mib": 0.0,
+      "weight_used_mib": 0.0,
+      "geometry_entries": 0,
+      "weight_entries": 0
+    },
+    "label": "new",
+    "repetition": 4,
+    "case": "20-1200-5"
+  }
+]

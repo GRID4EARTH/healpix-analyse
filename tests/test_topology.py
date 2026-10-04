@@ -103,7 +103,7 @@ def test_adapter_delegates_to_healpix_geo(
     )
     assert calls[0][1:] == (
         2,
-        connectivity,
+        "all" if connectivity == "edge_or_vertex" else "edge",
         0,
     )
 
