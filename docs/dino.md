@@ -89,6 +89,39 @@ of ≈ 2.5 km and patch embeddings on level-15 cells (≈ 160 m).
 
 ---
 
+## Sliding window over the images: `stride`
+
+In tangent mode, `stride` sets the step between image centres, in parent
+cells. `stride=1` (default) gives one image per parent cell. `stride=1/2`
+adds the images centred between two neighbouring cells and between four, with
+the same projection, resolution and size: a block of `G x G` cells gives
+`(2G - 1)**2` images inside it, e.g. 31 x 31 for 16 x 16.
+
+```python
+res = GetDINOV3SAT(rgb, cell_id, level=20, parent_level=15, projection="tangent",
+                   tile_px=64, stride=0.5, model=model)
+res.embedding        # [4 M, Ndino]  four images per parent cell
+res.cell_id          # [4 M]  cells of res.cell_level = parent_level + 1
+res.centre_lon, res.centre_lat   # image centres
+res.on_parent_grid   # True for the images that stride=1 gives
+```
+
+The centres are exact HEALPix points, defined across face boundaries: the
+north corners (largest face `x` and `y`) of the cells of
+`parent_level + log2(1/stride)` (`stride_centres`). The images centred on a
+parent cell are exactly those of `stride=1`.
+
+`stride` is not `over_sample`: `over_sample=n` keeps one image per cell and
+shifts the windows by `16/n` px *inside* it to get a denser token field;
+`stride` moves the images themselves. The two cannot be combined, and
+`stride < 1` does not return patch tokens.
+
+`Notebooks/dino_debug_petite_zone.ipynb` checks all this on a 512 x 512 px
+zone: the images DINO receives, the classes (UMAP + k-means) with
+`stride=1` and `stride=1/2`.
+
+---
+
 ## Orientation and geometry
 
 Inside a HEALPix base face the local axes are rotated by 45° with respect to

@@ -785,41 +785,165 @@ def tangent_tiles(
         H, W = (int(v) for v in tile_px)
 
     clon, clat = _pix2ang(parent_level, centre_ids)
-    lon, lat = tangent_grid_lonlat(clon, clat, (H, W), gsd / radius, shift=shift, radius=radius)
+    tiles, valid, coverage, lon, lat = _tangent_images(
+        d, ids, level, clon, clat, H, W, gsd / radius, shift=shift,
+        interpolation=interpolation, fill=fill)
+    return tiles, centre_ids, valid, coverage, lon, lat
 
-    M, C = centre_ids.size, d.shape[1]
 
-    # Sample tile by tile rather than in one call: the bilinear stencil costs
-    # 4 ids + 4 weights per output pixel, so a whole level-20 scene at once
-    # needs gigabytes, while the result is only [M, H, W, C].  `chunk` bounds
-    # the temporaries to a few tens of MB whatever the scene size.
-    # ~2e6 sampled points per pass: the stencil costs about 64 bytes per point
-    # (4 ids + 4 weights) before the values are even gathered, so this keeps the
-    # temporaries near 100 MB instead of several GB on a full level-20 scene.
+
+def _tangent_images(
+    d: np.ndarray,
+    ids: np.ndarray,
+    level: int,
+    clon: np.ndarray,
+    clat: np.ndarray,
+    H: int,
+    W: int,
+    gsd_rad: float,
+    *,
+    shift: Tuple[float, float] = (0.0, 0.0),
+    interpolation: str = "bilinear",
+    fill: str = "mean",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    North-up tangent images ``[M, C, H, W]`` centred on arbitrary points.
+
+    ``d`` / ``ids`` must already be deduplicated.  Shared by
+    :func:`tangent_tiles` (centres = parent cells) and :func:`tangent_images`
+    (centres = anything, e.g. the :func:`stride_centres` lattice).
+    """
+    clon = np.atleast_1d(np.asarray(clon, dtype=np.float64))
+    clat = np.atleast_1d(np.asarray(clat, dtype=np.float64))
+    M, C = clon.size, d.shape[1]
+
+    # Sample image by image rather than in one call: the bilinear stencil
+    # costs about 64 bytes per point (4 ids + 4 weights) before the values are
+    # even gathered, so ~2e6 points per pass keeps the temporaries near 100 MB
+    # instead of several GB on a full level-20 scene.
     chunk = max(1, 2_000_000 // max(1, H * W))
     vals = np.empty((M, H, W, C), dtype=np.float32)
     valid = np.empty((M, H, W), dtype=bool)
+    lon = np.empty((M, H, W)); lat = np.empty((M, H, W))
     for a in range(0, M, chunk):
         b_ = min(a + chunk, M)
+        lon[a:b_], lat[a:b_] = tangent_grid_lonlat(clon[a:b_], clat[a:b_], (H, W), gsd_rad,
+                                                   shift=shift)
         vals[a:b_], valid[a:b_] = sample_healpix(
             d, ids, level, lon[a:b_], lat[a:b_], interpolation=interpolation)
 
-    coverage = valid.reshape(M, -1).mean(axis=1)
+    coverage = valid.reshape(M, -1).mean(axis=1) if M else np.zeros(0)
 
     if fill == "mean":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             m = np.nanmean(vals.reshape(M, H * W, C), axis=1)
         m = np.where(np.isfinite(m), m, 0.0).astype(np.float32)
-        bad = ~np.isfinite(vals)
-        vals = np.where(bad, np.broadcast_to(m[:, None, None, :], vals.shape), vals)
+        vals = np.where(np.isfinite(vals), vals, m[:, None, None, :])
     elif fill == "zero":
         vals = np.nan_to_num(vals, nan=0.0)
     elif fill != "nan":
         raise ValueError("fill must be 'mean', 'zero' or 'nan'")
 
-    tiles = np.ascontiguousarray(np.transpose(vals, (0, 3, 1, 2)))     # [M, C, S, S]
-    return tiles, centre_ids, valid, coverage, lon, lat
+    tiles = np.ascontiguousarray(np.transpose(vals, (0, 3, 1, 2)))     # [M, C, H, W]
+    return tiles, valid, coverage, lon, lat
+
+
+def tangent_images(
+    data: ArrayLike,
+    cell_id: ArrayLike,
+    level: int,
+    centre_lon: ArrayLike,
+    centre_lat: ArrayLike,
+    tile_px: Union[int, Tuple[int, int]],
+    *,
+    gsd_m: Optional[float] = None,
+    shift: Tuple[float, float] = (0.0, 0.0),
+    interpolation: str = "bilinear",
+    fill: str = "mean",
+    duplicates: str = "mean",
+    radius: float = EARTH_RADIUS_M,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    North-up tangent images of ``tile_px`` pixels centred on given points.
+
+    Same projection, sampling and filling as :func:`tangent_tiles`, but the
+    centres are free -- the points of :func:`stride_centres`, for instance.
+
+    Returns
+    -------
+    tiles : float32 [M, C, H, W]
+    valid : bool [M, H, W]
+    coverage : float [M]
+    lon, lat : float64 [M, H, W]
+    """
+    d = _as_numpy(data)
+    if d.ndim == 1:
+        d = d[:, None]
+    d = d.astype(np.float32, copy=False)
+    ids = _as_numpy(cell_id).astype(np.int64)
+    d, ids = _deduplicate(d, ids, duplicates)
+    H, W = (int(tile_px), int(tile_px)) if np.isscalar(tile_px) else (int(v) for v in tile_px)
+    gsd = float(gsd_m) if gsd_m is not None else healpix_gsd_m(level, radius)
+    return _tangent_images(d, ids, level, centre_lon, centre_lat, H, W, gsd / radius,
+                           shift=shift, interpolation=interpolation, fill=fill)
+
+
+def _stride_n(stride: float) -> int:
+    """``n`` such that ``stride = 1/n``, checking that ``n`` is a power of two."""
+    stride = float(stride)
+    n = int(round(1.0 / stride)) if stride > 0 else 0
+    if n < 1 or (n & (n - 1)) or abs(1.0 / n - stride) > 1e-9:
+        raise ValueError("stride must be 1/n with n a power of two (1, 0.5, 0.25, ...)")
+    return n
+
+
+def stride_centres(
+    parent_ids: ArrayLike,
+    parent_level: int,
+    stride: float = 0.5,
+) -> Tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Image centres of a sliding window of step ``stride`` cell over the parent cells.
+
+    With ``stride = 1`` the centres are the parent cells' centres.  With
+    ``stride = 1/n`` (``n`` a power of two) the lattice is ``n`` times denser
+    along both face axes: between two neighbouring centres come ``n - 1``
+    evenly spaced points -- the midpoint for ``n = 2`` -- and in between four of
+    them, the corresponding interior points (their centre for ``n = 2``).
+
+    Those points are exact HEALPix points, defined across face boundaries: in
+    face coordinates a parent cell ``(x, y)`` of size 1 has its centre at
+    ``(x + 1/2, y + 1/2)``, and the lattice points belonging to it are
+    ``(x + i/n, y + j/n)`` for ``i, j = 1..n`` -- the north corners (largest
+    ``x`` and ``y``) of its ``n**2`` children at ``parent_level + log2(n)``.
+    The child ``(n/2 - 1, n/2 - 1)`` has the parent centre as north corner, so
+    the ``stride = 1`` images are a subset of the ``stride = 1/n`` ones.
+
+    Returns
+    -------
+    cell_id : int64 [M * n**2]
+        The children whose north corner is the image centre (the parent cells
+        themselves when ``stride = 1``).
+    cell_level : int
+        ``parent_level + log2(n)``.
+    lon, lat : float64 [M * n**2]
+        The image centres, in degrees.
+    on_parent_grid : bool [M * n**2]
+        True for the centres of the parent cells, i.e. the ``stride = 1`` images.
+    """
+    parents = np.unique(_as_numpy(parent_ids).astype(np.int64))
+    n = _stride_n(stride)
+    if n == 1:
+        lon, lat = _pix2ang(parent_level, parents)
+        return parents, int(parent_level), lon, lat, np.ones(parents.size, bool)
+    m = int(np.log2(n))
+    child = ((parents[:, None] << (2 * m)) + np.arange(4 ** m, dtype=np.int64)[None]).reshape(-1)
+    blon, blat = _boundaries_lonlat(parent_level + m, child, step=1)    # [M, 4]
+    # corner 2 of healpix-geo's outline is the north corner (largest x and y)
+    lx, ly = nested_to_xy(child & (4 ** m - 1))
+    on_grid = (lx == n // 2 - 1) & (ly == n // 2 - 1)
+    return child, int(parent_level) + m, blon[:, 2], blat[:, 2], on_grid
 
 
 def load_dinov3_sat(
@@ -939,6 +1063,17 @@ class DINOEmbedding:
         ``patch_level = level - 4``.
     patch_cell_id : int64 array [M * P] or None
     patch_level : int or None
+    stride : float
+        Step between image centres, in parent cells (tangent mode).
+    cell_level : int
+        Level of ``cell_id``: ``parent_level`` when ``stride = 1``,
+        ``parent_level + log2(1 / stride)`` otherwise, the image centre being
+        then the north corner of the cell (see :func:`stride_centres`).
+    centre_lon, centre_lat : float arrays [M]
+        Image centres, in degrees (tangent mode).
+    on_parent_grid : bool array [M]
+        True for the images centred on a parent cell, i.e. those that
+        ``stride = 1`` produces.
     """
 
     embedding: np.ndarray
@@ -954,6 +1089,11 @@ class DINOEmbedding:
     over_sample: int = 1
     gsd_m: Optional[float] = None
     tile_px: Optional[int] = None
+    stride: float = 1.0
+    cell_level: Optional[int] = None
+    centre_lon: Optional[np.ndarray] = None
+    centre_lat: Optional[np.ndarray] = None
+    on_parent_grid: Optional[np.ndarray] = None
 
 
 def _percell_embeddings(
@@ -1048,6 +1188,7 @@ def GetDINOV3SAT(
     *,
     projection: str = "tangent",
     over_sample: int = 1,
+    stride: float = 1.0,
     context_px: Optional[int] = None,
     out_cells: Optional[ArrayLike] = None,
     gsd_m: Optional[float] = None,
@@ -1151,6 +1292,17 @@ def GetDINOV3SAT(
         network ``n**2`` times on windows shifted by ``16 / n`` pixels and
         interleaves the tokens, giving a token field ``n`` times denser in each
         direction, at ``level - 4 + log2(n)``.  Cost grows as ``n**2``.
+    stride : float
+        Tangent mode only: step between image centres, in parent cells.
+        ``1`` (default) gives one image per parent cell.  ``1/2`` adds the
+        images centred between two neighbouring cells and between four, with
+        the same projection, resolution and size -- a sliding window of half a
+        cell over the images: a block of ``G x G`` cells gives ``(2G - 1)**2``
+        images inside it (``2G`` per side once the half steps towards the next
+        block are counted).  ``1/n`` generalises, ``n`` a power of two.  The
+        images are identified by ``cell_id`` at ``cell_level`` and located by
+        ``centre_lon`` / ``centre_lat``; see :func:`stride_centres`.  Not
+        compatible with ``over_sample > 1`` nor ``return_patches``.
     gsd_m : float, optional
         Ground sampling of the tangent grid, in metres.  Defaults to the
         HEALPix native value ``sqrt(cell area)`` at ``level``.
@@ -1212,6 +1364,14 @@ def GetDINOV3SAT(
         raise ValueError("over_sample must be a power of two (1, 2, 4, ...)")
     if n > DINOV3_PATCH:
         raise ValueError(f"over_sample must be <= {DINOV3_PATCH}")
+    stride = float(stride)
+    if stride != 1.0:
+        if projection != "tangent":
+            raise ValueError("stride is only available with projection='tangent'")
+        if n > 1 or return_patches:
+            raise ValueError("stride < 1 cannot be combined with over_sample > 1 "
+                             "or return_patches")
+        _stride_n(stride)                                       # validates the value
     if projection not in ("tangent", "nested", "percell"):
         raise ValueError("projection must be 'tangent', 'nested' or 'percell'")
 
@@ -1289,12 +1449,23 @@ def GetDINOV3SAT(
         if H % DINOV3_PATCH or W % DINOV3_PATCH:
             raise ValueError(f"tile_px must be a multiple of {DINOV3_PATCH}")
 
-        tiles0, centre_ids, _valid, coverage, _lon, _lat = tangent_tiles(
-            d, ids, level, parent_level, tile_px=(H, W), gsd_m=gsd,
-            interpolation=interpolation, fill=fill, duplicates=duplicates,
-        )
+        if stride != 1.0:
+            # sliding window over the images: centres every `stride` cell
+            centre_ids, cell_level, c_lon, c_lat, on_grid = stride_centres(
+                all_centres, parent_level, stride)
+            tiles0, _valid, coverage, _lon, _lat = _tangent_images(
+                d, ids, level, c_lon, c_lat, H, W, gsd / EARTH_RADIUS_M,
+                interpolation=interpolation, fill=fill)
+        else:
+            tiles0, centre_ids, _valid, coverage, _lon, _lat = tangent_tiles(
+                d, ids, level, parent_level, tile_px=(H, W), gsd_m=gsd,
+                interpolation=interpolation, fill=fill, duplicates=duplicates,
+            )
+            cell_level, on_grid = int(parent_level), np.ones(centre_ids.size, bool)
+            c_lon, c_lat = _pix2ang(parent_level, centre_ids)
         keep = coverage >= float(min_coverage)
         centre_ids, coverage = centre_ids[keep], coverage[keep]
+        c_lon, c_lat, on_grid = c_lon[keep], c_lat[keep], on_grid[keep]
         views = []
         for sh in shifts:
             if sh == (0.0, 0.0):
@@ -1381,6 +1552,9 @@ def GetDINOV3SAT(
         gsd_m=(gsd if projection == "tangent" else None),
         tile_px=(H, W),
     )
+    if projection == "tangent":
+        res.stride, res.cell_level = stride, cell_level
+        res.centre_lon, res.centre_lat, res.on_parent_grid = c_lon, c_lat, on_grid
     if not return_patches:
         return res
 
@@ -1449,6 +1623,8 @@ __all__ = [
     "tiles_to_nested",
     "tile_grid_cell_ids",
     "tangent_tiles",
+    "tangent_images",
+    "stride_centres",
     "tangent_grid_lonlat",
     "offsets_to_lonlat",
     "sample_healpix",
