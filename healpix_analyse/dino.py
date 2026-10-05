@@ -968,26 +968,48 @@ def stride_centres(
 REFLECTANCE_WHITE: float = 0.3      # reflectance shown as white in "reflectance" mode
 
 
+def _fmt_range(v) -> str:
+    v = np.atleast_1d(np.asarray(v, dtype=np.float64))
+    return f"{v[0]:.4g}" if v.size == 1 else "(" + ", ".join(f"{x:.4g}" for x in v) + ")"
+
+
 def input_range_of(
     data: ArrayLike,
-    input_range: Union[str, Tuple[float, float]] = "auto",
+    input_range: Union[str, Tuple] = "auto",
     *,
     percentiles: Tuple[float, float] = (1.0, 99.0),
     sample: int = 2_000_000,
-) -> Tuple[float, float, str]:
+) -> Tuple[Union[float, np.ndarray], Union[float, np.ndarray], str]:
     """
     ``(lo, hi, how)`` such that ``clip((x - lo) / (hi - lo), 0, 1)`` is what DINOv3 SAT expects.
+
+    ``lo`` and ``hi`` are scalars, or one value per band (``"sat493m"``).
 
     input_range
         ``"auto"`` / ``"percentile"``: the ``percentiles`` of all the finite
         values passed (all bands together, so colours are kept) -- works
-        whatever the units; ``"reflectance"``: ``(0, REFLECTANCE_WHITE)``;
-        ``"uint8"``: ``(0, 255)``; ``"unit"``: ``(0, 1)``, the data are already
-        in the network's range; or an explicit ``(lo, hi)`` pair -- the way to
-        apply the range of a first date unchanged to the next ones.
+        whatever the units.
+        ``"sat493m"``: one affine map per band that gives the scene the mean and
+        standard deviation of the SAT-493M training images (``SAT493M_MEAN`` /
+        ``SAT493M_STD``, i.e. about 110 / 105 / 75 +- 54 / 40 / 36 in 0-255
+        levels): the network sees statistics close to its training, at the
+        price of a colour balance set to that of the training images.  The
+        statistics are robust (values between the 0.5 and 99.5 percentiles).
+        ``"reflectance"``: ``(0, REFLECTANCE_WHITE)``; ``"uint8"``: ``(0, 255)``;
+        ``"unit"``: ``(0, 1)``, the data are already in the network's range.
+        A ``(lo, hi)`` pair, scalars or per band: explicit -- the way to apply
+        the mapping of a first date unchanged to the next ones.
     """
+    def _finite_sample(x):
+        if x.shape[0] > sample:
+            x = x[np.random.default_rng(0).integers(0, x.shape[0], sample)]
+        return x
+
     if not isinstance(input_range, str):
-        lo, hi = (float(v) for v in input_range)
+        lo, hi = input_range
+        lo = np.asarray(lo, dtype=np.float64); hi = np.asarray(hi, dtype=np.float64)
+        lo = float(lo) if lo.ndim == 0 else lo
+        hi = float(hi) if hi.ndim == 0 else hi
         how = "fixed"
     elif input_range == "unit":
         lo, hi, how = 0.0, 1.0, "unit"
@@ -996,38 +1018,58 @@ def input_range_of(
     elif input_range == "reflectance":
         lo, hi, how = 0.0, REFLECTANCE_WHITE, "reflectance"
     elif input_range in ("auto", "percentile"):
-        x = np.asarray(_as_numpy(data), dtype=np.float64).reshape(-1)
-        if x.size > sample:
-            x = x[np.random.default_rng(0).integers(0, x.size, sample)]
+        x = _finite_sample(np.asarray(_as_numpy(data), dtype=np.float64).reshape(-1))
         x = x[np.isfinite(x)]
         if x.size == 0:
             raise ValueError("no finite value in the input")
         lo, hi = (float(v) for v in np.percentile(x, percentiles))
         how = "percentile"
+    elif input_range == "sat493m":
+        x = np.asarray(_as_numpy(data), dtype=np.float64)
+        x = _finite_sample(x[:, None] if x.ndim == 1 else x)
+        C = x.shape[1]
+        if C != len(SAT493M_MEAN):
+            raise ValueError(f"'sat493m' needs {len(SAT493M_MEAN)} bands, got {C}")
+        lo = np.empty(C); hi = np.empty(C)
+        for c in range(C):
+            v = x[:, c][np.isfinite(x[:, c])]
+            if v.size == 0:
+                raise ValueError("no finite value in the input")
+            a, b = np.percentile(v, [0.5, 99.5])
+            v = v[(v >= a) & (v <= b)]
+            mu, sd = float(v.mean()), float(v.std())
+            if not sd > 0:
+                raise ValueError("constant band: 'sat493m' cannot scale it")
+            span = sd / SAT493M_STD[c]                 # input units per [0, 1]
+            lo[c] = mu - SAT493M_MEAN[c] * span
+            hi[c] = lo[c] + span
+        how = "sat493m"
     else:
-        raise ValueError("input_range must be 'auto', 'percentile', 'reflectance', "
+        raise ValueError("input_range must be 'auto', 'percentile', 'sat493m', 'reflectance', "
                          "'uint8', 'unit' or a (lo, hi) pair")
-    if not hi > lo:
+    if not np.all(np.asarray(hi) > np.asarray(lo)):
         raise ValueError(f"empty input range ({lo}, {hi}): constant data?")
     return lo, hi, how
 
 
 def scale_input(
     data: ArrayLike,
-    input_range: Union[str, Tuple[float, float]] = "auto",
+    input_range: Union[str, Tuple] = "auto",
     *,
     verbose: bool = False,
-) -> Tuple[np.ndarray, Tuple[float, float], str]:
+) -> Tuple[np.ndarray, Tuple, str]:
     """
     Map the data to the [0, 1] range DINOv3 SAT expects (NaN kept).
 
-    Returns the scaled float32 array, the ``(lo, hi)`` used and how it was
-    chosen.  ``verbose`` prints the raw and scaled ranges and the saturated
+    Returns the scaled float32 array, the ``(lo, hi)`` used (scalars or per
+    band) and how it was chosen.  ``verbose`` prints the raw and scaled ranges,
+    the per-band mean / std against the SAT-493M ones, and the clipped
     fraction -- the check to make before trusting any embedding.
     """
     d = np.asarray(_as_numpy(data), dtype=np.float32)
     lo, hi, how = input_range_of(d, input_range)
-    out = (d - np.float32(lo)) / np.float32(hi - lo)
+    lo32 = np.asarray(lo, dtype=np.float32); span32 = np.asarray(hi, dtype=np.float32) - lo32
+    out = (d - lo32) / span32
     fin = np.isfinite(out)
     sat = float(((out[fin] < 0) | (out[fin] > 1)).mean()) if fin.any() else 0.0   # strictly outside
     out = np.where(fin, np.clip(out, 0.0, 1.0), np.nan).astype(np.float32)
@@ -1036,14 +1078,22 @@ def scale_input(
         q = np.percentile(raw, [1, 50, 99]) if raw.size else [np.nan] * 3
         m = np.nanmedian(out) if fin.any() else np.nan
         print(f"DINO input: raw p1 {q[0]:.4g}  median {q[1]:.4g}  p99 {q[2]:.4g} -> "
-              f"'{how}' [{lo:.4g}, {hi:.4g}] -> [0, 1] (x255: median {255 * m:.0f}), "
+              f"'{how}' lo {_fmt_range(lo)} hi {_fmt_range(hi)} -> [0, 1], "
               f"{100 * sat:.1f}% clipped")
+        if out.ndim == 2 and out.shape[1] == len(SAT493M_MEAN):
+            mu = 255 * np.nanmean(out, axis=0); sd = 255 * np.nanstd(out, axis=0)
+            tm = 255 * np.asarray(SAT493M_MEAN); ts = 255 * np.asarray(SAT493M_STD)
+            print("  per band, 0-255 levels: mean " + " / ".join(f"{v:.0f}" for v in mu)
+                  + " (SAT-493M " + " / ".join(f"{v:.0f}" for v in tm) + "), std "
+                  + " / ".join(f"{v:.0f}" for v in sd)
+                  + " (SAT-493M " + " / ".join(f"{v:.0f}" for v in ts) + ")")
         if sat > 0.2:
             print("  /!\\ more than 20% of the values clipped: input_range is probably wrong "
                   "for these units")
         if fin.any() and (m < 0.05 or m > 0.95):
             print("  /!\\ the scaled image is nearly black or white: check input_range")
     return out, (lo, hi), how
+
 
 def load_dinov3_sat(
     model_name: str = "dinov3_vitl16",
@@ -1173,8 +1223,8 @@ class DINOEmbedding:
     on_parent_grid : bool array [M]
         True for the images centred on a parent cell, i.e. those that
         ``stride = 1`` produces.
-    input_range : (float, float)
-        The ``(lo, hi)`` mapped to [0, 1] before the network; pass it as
+    input_range : (lo, hi)
+        The ``(lo, hi)`` (scalars or per band) mapped to [0, 1] before the network; pass it as
         ``input_range`` to process other dates with the same mapping.
     input_scaling : str
         How it was chosen ("percentile", "reflectance", "fixed", ...).
@@ -1304,7 +1354,7 @@ def GetDINOV3SAT(
     weights: Optional[str] = None,
     model_name: str = "dinov3_vitl16",
     bands: Sequence[int] = (0, 1, 2),
-    input_range: Union[str, Tuple[float, float]] = "auto",
+    input_range: Union[str, Tuple] = "auto",
     verbose: bool = True,
     mean: Sequence[float] = SAT493M_MEAN,
     std: Sequence[float] = SAT493M_STD,
@@ -1432,7 +1482,9 @@ def GetDINOV3SAT(
         How the data are mapped to the [0, 1] range the network expects (an
         8-bit RGB image divided by 255): see :func:`input_range_of`.  The
         default ``"auto"`` stretches the 1-99 percentiles of the whole input
-        (all bands together) to [0, 1] and clips, whatever the units.  For a
+        (all bands together) to [0, 1] and clips, whatever the units;
+        ``"sat493m"`` gives each band the mean and std of the SAT-493M
+        training images.  For a
         time series, pass the ``res.input_range`` of the first date to the
         others so that they share one mapping.
     verbose : bool

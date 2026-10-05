@@ -505,6 +505,20 @@ def test_scale_input_modes():
         scale_input(x, "kelvin")
 
 
+def test_scale_input_sat493m_matches_training_statistics():
+    from healpix_analyse.dino import scale_input, SAT493M_MEAN, SAT493M_STD
+    rng = np.random.default_rng(0)
+    x = np.stack([rng.normal(0.08, 0.02, 200000), rng.normal(0.07, 0.015, 200000),
+                  rng.normal(0.05, 0.01, 200000)], 1) * 1e6           # any units
+    out, (lo, hi), how = scale_input(x, "sat493m")
+    assert how == "sat493m" and np.shape(lo) == (3,)
+    assert np.allclose(out.mean(0), SAT493M_MEAN, atol=0.01)
+    assert np.allclose(out.std(0), SAT493M_STD, atol=0.01)
+    # the per-band range is reusable as is, e.g. for another date
+    out2, _, how2 = scale_input(x, (lo, hi))
+    assert how2 == "fixed" and np.allclose(out2, out)
+
+
 def test_units_do_not_change_the_embeddings():
     """With input_range='auto' the same scene in reflectance, DN or x1e6 units
     gives the same embeddings: the network always sees the same image."""
@@ -517,6 +531,9 @@ def test_units_do_not_change_the_embeddings():
         r = GetDINOV3SAT(data[sel] * k + 3.0, ids[sel], level, parent_level, **kw)
         assert np.allclose(r.embedding, ref.embedding, atol=1e-4)
         assert r.input_scaling == "percentile"
+    ref_s = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, input_range="sat493m", **kw)
+    r_s = GetDINOV3SAT(data[sel] * 1e6, ids[sel], level, parent_level, input_range="sat493m", **kw)
+    assert np.allclose(r_s.embedding, ref_s.embedding, atol=1e-4) and r_s.input_scaling == "sat493m"
     # reusing the range of a first date gives the same mapping on a second one
     r2 = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, input_range=ref.input_range, **kw)
     assert np.allclose(r2.embedding, ref.embedding, atol=1e-5) and r2.input_scaling == "fixed"

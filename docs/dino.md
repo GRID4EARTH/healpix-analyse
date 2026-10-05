@@ -100,6 +100,7 @@ before and after (`verbose=True`):
 | `input_range` | mapping to [0, 1], then clipped |
 |---|---|
 | `"auto"` (default), `"percentile"` | 1st-99th percentiles of all the input values, all bands together |
+| `"sat493m"` | per band: the scene gets the mean / std of the SAT-493M training images (about 110 / 105 / 75 ± 54 / 40 / 36 in 0-255 levels) |
 | `"reflectance"` | `(0, REFLECTANCE_WHITE)` = `(0, 0.3)` |
 | `"uint8"` | `(0, 255)` |
 | `"unit"` | `(0, 1)`: the data are already in range |
@@ -110,7 +111,14 @@ a white or black image and tokens that carry almost nothing. With `"auto"`
 the embeddings no longer depend on the units. For a time series, pass the
 `res.input_range` of the first date to the others so that every date shares
 one mapping. `scale_input(data, input_range, verbose=True)` does the same
-mapping on its own, to check a store before running the network.
+mapping on its own, to check a store before running the network; it prints
+the per-band mean / std in 0-255 levels next to the SAT-493M ones.
+
+The constants are those of Meta's transform for the SAT-493M weights
+(`ToTensor()` then `Normalize(mean=(0.430, 0.411, 0.296), std=(0.213, 0.156,
+0.143))`). Note that SAT-493M was trained on sub-metre imagery: at Sentinel-2's
+10 m a 16-px patch covers ~160 m, and objects look 15-20 times smaller than in
+training -- a gap no radiometric mapping removes.
 
 ---
 
