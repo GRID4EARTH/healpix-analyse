@@ -89,6 +89,31 @@ of ≈ 2.5 km and patch embeddings on level-15 cells (≈ 160 m).
 
 ---
 
+## Input range — what the network expects
+
+DINOv3 SAT-493M was trained on 8-bit RGB imagery divided by 255, then
+normalised with `SAT493M_MEAN` / `SAT493M_STD`. It expects values in [0, 1]
+with the brightness of an 8-bit visual product. `GetDINOV3SAT` therefore maps
+its input through `input_range` before anything else, and prints the ranges
+before and after (`verbose=True`):
+
+| `input_range` | mapping to [0, 1], then clipped |
+|---|---|
+| `"auto"` (default), `"percentile"` | 1st-99th percentiles of all the input values, all bands together |
+| `"reflectance"` | `(0, REFLECTANCE_WHITE)` = `(0, 0.3)` |
+| `"uint8"` | `(0, 255)` |
+| `"unit"` | `(0, 1)`: the data are already in range |
+| `(lo, hi)` | explicit |
+
+Raw units fed unchanged (Sentinel-2 DN, scaled floats of order 1e6, ...) give
+a white or black image and tokens that carry almost nothing. With `"auto"`
+the embeddings no longer depend on the units. For a time series, pass the
+`res.input_range` of the first date to the others so that every date shares
+one mapping. `scale_input(data, input_range, verbose=True)` does the same
+mapping on its own, to check a store before running the network.
+
+---
+
 ## Sliding window over the images: `stride`
 
 In tangent mode, `stride` sets the step between image centres, in parent

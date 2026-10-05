@@ -415,7 +415,8 @@ def test_tangent_over_sample_is_a_sliding_window():
     for n in (1, 2, 4):
         r = GetDINOV3SAT(data, ids, level, parent_level, projection="tangent",
                          tile_px=64, over_sample=n, model=_MeanDino(), device="cpu",
-                         return_patches=True, mean=(0, 0, 0), std=(1, 1, 1))
+                         return_patches=True, mean=(0, 0, 0), std=(1, 1, 1),
+                         input_range="unit", verbose=False)
         assert r.patch_level == level - 4 + int(np.log2(n))
         # cells of the central block: their images are entirely inside the data
         c = (r.patch_cell_id >> (2 * (r.patch_level - 10))) == b
@@ -485,3 +486,37 @@ def test_get_dinov3sat_stride_half():
     assert np.isfinite(r2.centre_lon).all() and r2.centre_lat.shape == (64,)
     with pytest.raises(ValueError, match="over_sample"):
         GetDINOV3SAT(data[sel], ids[sel], level, parent_level, stride=0.5, over_sample=2, **kw)
+
+
+# ---------------------------------------------------------------------------
+# input range: the network always gets [0, 1]
+# ---------------------------------------------------------------------------
+
+def test_scale_input_modes():
+    from healpix_analyse.dino import scale_input, REFLECTANCE_WHITE
+    x = np.array([[0.0, 0.1, 0.2], [0.3, np.nan, 0.6]], np.float32)
+    out, (lo, hi), how = scale_input(x, "reflectance")
+    assert how == "reflectance" and (lo, hi) == (0.0, REFLECTANCE_WHITE)
+    assert np.isnan(out[1, 1]) and np.nanmax(out) == 1.0 and np.nanmin(out) == 0.0
+    assert np.allclose(scale_input(x * 255 / 0.6, "uint8")[0][0], x[0] / 0.6, atol=1e-6)
+    out, (lo, hi), how = scale_input(x, (0.1, 0.5))
+    assert how == "fixed" and np.isclose(out[0, 2], 0.25)
+    with pytest.raises(ValueError):
+        scale_input(x, "kelvin")
+
+
+def test_units_do_not_change_the_embeddings():
+    """With input_range='auto' the same scene in reflectance, DN or x1e6 units
+    gives the same embeddings: the network always sees the same image."""
+    level, parent_level = 17, 13
+    data, ids, b = _smooth_field(level, 11)
+    sel = (ids >> (2 * (level - 11))) == b
+    kw = dict(projection="tangent", tile_px=32, model=_MeanDino(), device="cpu", verbose=False)
+    ref = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, **kw)
+    for k in (1e4, 1e6):
+        r = GetDINOV3SAT(data[sel] * k + 3.0, ids[sel], level, parent_level, **kw)
+        assert np.allclose(r.embedding, ref.embedding, atol=1e-4)
+        assert r.input_scaling == "percentile"
+    # reusing the range of a first date gives the same mapping on a second one
+    r2 = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, input_range=ref.input_range, **kw)
+    assert np.allclose(r2.embedding, ref.embedding, atol=1e-5) and r2.input_scaling == "fixed"

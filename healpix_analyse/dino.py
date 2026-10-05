@@ -805,9 +805,13 @@ def _tangent_images(
     shift: Tuple[float, float] = (0.0, 0.0),
     interpolation: str = "bilinear",
     fill: str = "mean",
+    keep_lonlat: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     North-up tangent images ``[M, C, H, W]`` centred on arbitrary points.
+
+    ``keep_lonlat=False`` does not keep the pixel positions (``lon`` and
+    ``lat`` come back as ``None``): they weigh twice as much as the images.
 
     ``d`` / ``ids`` must already be deduplicated.  Shared by
     :func:`tangent_tiles` (centres = parent cells) and :func:`tangent_images`
@@ -824,13 +828,15 @@ def _tangent_images(
     chunk = max(1, 2_000_000 // max(1, H * W))
     vals = np.empty((M, H, W, C), dtype=np.float32)
     valid = np.empty((M, H, W), dtype=bool)
-    lon = np.empty((M, H, W)); lat = np.empty((M, H, W))
+    lon = np.empty((M, H, W)) if keep_lonlat else None
+    lat = np.empty((M, H, W)) if keep_lonlat else None
     for a in range(0, M, chunk):
         b_ = min(a + chunk, M)
-        lon[a:b_], lat[a:b_] = tangent_grid_lonlat(clon[a:b_], clat[a:b_], (H, W), gsd_rad,
-                                                   shift=shift)
+        lo_, la_ = tangent_grid_lonlat(clon[a:b_], clat[a:b_], (H, W), gsd_rad, shift=shift)
         vals[a:b_], valid[a:b_] = sample_healpix(
-            d, ids, level, lon[a:b_], lat[a:b_], interpolation=interpolation)
+            d, ids, level, lo_, la_, interpolation=interpolation)
+        if keep_lonlat:
+            lon[a:b_], lat[a:b_] = lo_, la_
 
     coverage = valid.reshape(M, -1).mean(axis=1) if M else np.zeros(0)
 
@@ -945,6 +951,99 @@ def stride_centres(
     on_grid = (lx == n // 2 - 1) & (ly == n // 2 - 1)
     return child, int(parent_level) + m, blon[:, 2], blat[:, 2], on_grid
 
+
+
+# ---------------------------------------------------------------------------
+# Input range: what the network expects
+# ---------------------------------------------------------------------------
+#
+# DINOv3 SAT-493M was trained on 8-bit RGB imagery divided by 255, then
+# normalised with SAT493M_MEAN / SAT493M_STD.  The network therefore expects
+# values in [0, 1] with the brightness of an 8-bit visual product.  Raw stores
+# come in anything -- reflectance (0-1), Sentinel-2 DN (0-10000), 8-bit, or
+# arbitrary scaled units -- and feeding them unchanged gives a saturated or
+# black image whose tokens carry almost nothing but position.  Every call to
+# GetDINOV3SAT therefore maps its input through ``input_range`` first.
+
+REFLECTANCE_WHITE: float = 0.3      # reflectance shown as white in "reflectance" mode
+
+
+def input_range_of(
+    data: ArrayLike,
+    input_range: Union[str, Tuple[float, float]] = "auto",
+    *,
+    percentiles: Tuple[float, float] = (1.0, 99.0),
+    sample: int = 2_000_000,
+) -> Tuple[float, float, str]:
+    """
+    ``(lo, hi, how)`` such that ``clip((x - lo) / (hi - lo), 0, 1)`` is what DINOv3 SAT expects.
+
+    input_range
+        ``"auto"`` / ``"percentile"``: the ``percentiles`` of all the finite
+        values passed (all bands together, so colours are kept) -- works
+        whatever the units; ``"reflectance"``: ``(0, REFLECTANCE_WHITE)``;
+        ``"uint8"``: ``(0, 255)``; ``"unit"``: ``(0, 1)``, the data are already
+        in the network's range; or an explicit ``(lo, hi)`` pair -- the way to
+        apply the range of a first date unchanged to the next ones.
+    """
+    if not isinstance(input_range, str):
+        lo, hi = (float(v) for v in input_range)
+        how = "fixed"
+    elif input_range == "unit":
+        lo, hi, how = 0.0, 1.0, "unit"
+    elif input_range == "uint8":
+        lo, hi, how = 0.0, 255.0, "uint8"
+    elif input_range == "reflectance":
+        lo, hi, how = 0.0, REFLECTANCE_WHITE, "reflectance"
+    elif input_range in ("auto", "percentile"):
+        x = np.asarray(_as_numpy(data), dtype=np.float64).reshape(-1)
+        if x.size > sample:
+            x = x[np.random.default_rng(0).integers(0, x.size, sample)]
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            raise ValueError("no finite value in the input")
+        lo, hi = (float(v) for v in np.percentile(x, percentiles))
+        how = "percentile"
+    else:
+        raise ValueError("input_range must be 'auto', 'percentile', 'reflectance', "
+                         "'uint8', 'unit' or a (lo, hi) pair")
+    if not hi > lo:
+        raise ValueError(f"empty input range ({lo}, {hi}): constant data?")
+    return lo, hi, how
+
+
+def scale_input(
+    data: ArrayLike,
+    input_range: Union[str, Tuple[float, float]] = "auto",
+    *,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, Tuple[float, float], str]:
+    """
+    Map the data to the [0, 1] range DINOv3 SAT expects (NaN kept).
+
+    Returns the scaled float32 array, the ``(lo, hi)`` used and how it was
+    chosen.  ``verbose`` prints the raw and scaled ranges and the saturated
+    fraction -- the check to make before trusting any embedding.
+    """
+    d = np.asarray(_as_numpy(data), dtype=np.float32)
+    lo, hi, how = input_range_of(d, input_range)
+    out = (d - np.float32(lo)) / np.float32(hi - lo)
+    fin = np.isfinite(out)
+    sat = float(((out[fin] < 0) | (out[fin] > 1)).mean()) if fin.any() else 0.0   # strictly outside
+    out = np.where(fin, np.clip(out, 0.0, 1.0), np.nan).astype(np.float32)
+    if verbose:
+        raw = d[np.isfinite(d)]
+        q = np.percentile(raw, [1, 50, 99]) if raw.size else [np.nan] * 3
+        m = np.nanmedian(out) if fin.any() else np.nan
+        print(f"DINO input: raw p1 {q[0]:.4g}  median {q[1]:.4g}  p99 {q[2]:.4g} -> "
+              f"'{how}' [{lo:.4g}, {hi:.4g}] -> [0, 1] (x255: median {255 * m:.0f}), "
+              f"{100 * sat:.1f}% clipped")
+        if sat > 0.2:
+            print("  /!\\ more than 20% of the values clipped: input_range is probably wrong "
+                  "for these units")
+        if fin.any() and (m < 0.05 or m > 0.95):
+            print("  /!\\ the scaled image is nearly black or white: check input_range")
+    return out, (lo, hi), how
 
 def load_dinov3_sat(
     model_name: str = "dinov3_vitl16",
@@ -1074,6 +1173,11 @@ class DINOEmbedding:
     on_parent_grid : bool array [M]
         True for the images centred on a parent cell, i.e. those that
         ``stride = 1`` produces.
+    input_range : (float, float)
+        The ``(lo, hi)`` mapped to [0, 1] before the network; pass it as
+        ``input_range`` to process other dates with the same mapping.
+    input_scaling : str
+        How it was chosen ("percentile", "reflectance", "fixed", ...).
     """
 
     embedding: np.ndarray
@@ -1094,6 +1198,8 @@ class DINOEmbedding:
     centre_lon: Optional[np.ndarray] = None
     centre_lat: Optional[np.ndarray] = None
     on_parent_grid: Optional[np.ndarray] = None
+    input_range: Optional[Tuple[float, float]] = None
+    input_scaling: Optional[str] = None
 
 
 def _percell_embeddings(
@@ -1198,6 +1304,8 @@ def GetDINOV3SAT(
     weights: Optional[str] = None,
     model_name: str = "dinov3_vitl16",
     bands: Sequence[int] = (0, 1, 2),
+    input_range: Union[str, Tuple[float, float]] = "auto",
+    verbose: bool = True,
     mean: Sequence[float] = SAT493M_MEAN,
     std: Sequence[float] = SAT493M_STD,
     pooling: str = "cls",
@@ -1261,8 +1369,8 @@ def GetDINOV3SAT(
     Parameters
     ----------
     data : array [N, C]
-        Reflectances at ``level``, expected in ``[0, 1]`` (Sentinel-2
-        ``DN / 10000`` for instance).  NaN marks a missing pixel.
+        Values at ``level``, in any units: they are mapped to the network's
+        range by ``input_range``.  NaN marks a missing pixel.
     cell_id : int array [N]
         NESTED cell ids at ``level``.
     level : int
@@ -1320,6 +1428,15 @@ def GetDINOV3SAT(
         Passed to :func:`load_dinov3_sat` when ``model`` is ``None``.
     bands : sequence of 3 int
         Indices of the (R, G, B) bands in ``data`` -- Sentinel-2 B04, B03, B02.
+    input_range : str or (float, float)
+        How the data are mapped to the [0, 1] range the network expects (an
+        8-bit RGB image divided by 255): see :func:`input_range_of`.  The
+        default ``"auto"`` stretches the 1-99 percentiles of the whole input
+        (all bands together) to [0, 1] and clips, whatever the units.  For a
+        time series, pass the ``res.input_range`` of the first date to the
+        others so that they share one mapping.
+    verbose : bool
+        Print the input ranges before and after scaling.
     mean, std : sequence of 3 float
         Normalisation constants (SAT-493M defaults).
     pooling : {"cls", "mean", "cls+mean", "centre"}
@@ -1381,6 +1498,8 @@ def GetDINOV3SAT(
     d = d[:, list(bands)]
     ids = _as_numpy(cell_id).astype(np.int64)
     d, ids = _deduplicate(d, ids, duplicates)
+    # the network expects an 8-bit-like RGB image in [0, 1]; never feed raw units
+    d, in_range, in_how = scale_input(d, input_range, verbose=verbose)
 
     # ---- one tangent plane per output cell --------------------------------
     if projection == "percell":
@@ -1417,6 +1536,7 @@ def GetDINOV3SAT(
             embedding=emb[keep], cell_id=cells[keep], parent_level=tl,
             coverage=cov[keep], projection="percell", over_sample=1,
             gsd_m=gsd, tile_px=(context_px, context_px),
+            input_range=in_range, input_scaling=in_how,
         )
         # the same field is exposed through the patch_* names so that code
         # written for the tiled modes keeps working unchanged
@@ -1455,7 +1575,7 @@ def GetDINOV3SAT(
                 all_centres, parent_level, stride)
             tiles0, _valid, coverage, _lon, _lat = _tangent_images(
                 d, ids, level, c_lon, c_lat, H, W, gsd / EARTH_RADIUS_M,
-                interpolation=interpolation, fill=fill)
+                interpolation=interpolation, fill=fill, keep_lonlat=False)
         else:
             tiles0, centre_ids, _valid, coverage, _lon, _lat = tangent_tiles(
                 d, ids, level, parent_level, tile_px=(H, W), gsd_m=gsd,
@@ -1551,6 +1671,8 @@ def GetDINOV3SAT(
         over_sample=n,
         gsd_m=(gsd if projection == "tangent" else None),
         tile_px=(H, W),
+        input_range=in_range,
+        input_scaling=in_how,
     )
     if projection == "tangent":
         res.stride, res.cell_level = stride, cell_level
@@ -1639,6 +1761,9 @@ __all__ = [
     "cell_vectors",
     "cell_neighbours",
     "set_ellipsoid",
+    "scale_input",
+    "input_range_of",
+    "REFLECTANCE_WHITE",
     "SAT493M_MEAN",
     "SAT493M_STD",
 ]
