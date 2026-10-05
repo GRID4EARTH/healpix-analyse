@@ -354,3 +354,76 @@ def test_percell_one_embedding_per_cell():
     # the tiled modes need level - parent_level >= 4; per-cell does not
     with pytest.raises(ValueError, match="percell"):
         GetDINOV3SAT(data, cell_id, level, parent_level, model=_FakeDino())
+
+
+# ---------------------------------------------------------------------------
+# over_sample in tangent mode: a true sliding window
+# ---------------------------------------------------------------------------
+
+class _MeanDino(nn.Module):
+    """Exact stand-in: each token is the mean colour of its 16x16 patch."""
+
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward_features(self, x):
+        tok = nn.functional.avg_pool2d(x, 16).flatten(2).transpose(1, 2)
+        return {"x_norm_clstoken": tok.mean(1), "x_norm_patchtokens": tok}
+
+
+def _smooth_field(level, block_level, lon0=2.35, lat0=48.85):
+    """A smooth, anisotropic field on a block of cells around (lon0, lat0) plus its neighbours."""
+    from healpix_analyse.dino import cell_neighbours, cells_at_lonlat, cell_centres_lonlat
+    b = int(cells_at_lonlat(block_level, np.array([lon0]), np.array([lat0]))[0])
+    nb = cell_neighbours(block_level, np.array([b]))[:, 0]
+    blocks = np.r_[b, nb[nb >= 0]]
+    kk = level - block_level
+    ids = ((blocks[:, None] << (2 * kk)) + np.arange(4 ** kk)[None]).ravel()
+    lon, lat = cell_centres_lonlat(level, ids)
+    data = np.stack([np.sin(lat * 300), np.cos(lon * 250), np.sin(lat * 200 + lon * 150)], 1)
+    return (0.2 + 0.1 * data).astype(np.float32), ids, b
+
+
+def test_tangent_shift_moves_window_south_and_east():
+    """shift=(dy, dx) must give the base grid moved dy rows south and dx columns east."""
+    from healpix_analyse.dino import tangent_tiles
+    level, parent_level = 17, 12
+    data, ids, b = _smooth_field(level, 10)
+    kw = dict(tile_px=(64, 64), fill="nan")
+    base, cid = tangent_tiles(data, ids, level, parent_level, **kw)[:2]
+    sel = np.isin(cid, (b << 4) + np.arange(16))
+    base = base[sel]
+    for dy, dx in [(8, 0), (0, 8), (4, 12)]:
+        v = tangent_tiles(data, ids, level, parent_level, shift=(dy, dx), **kw)[0][sel]
+        # v[r, c] == base[r + dy, c + dx]
+        a = base[..., dy:, dx:]
+        w = v[..., :64 - dy, :64 - dx]
+        assert np.nanmax(np.abs(a - w)) < 1e-6
+
+
+def test_tangent_over_sample_is_a_sliding_window():
+    """With an exact backbone, a finer over_sample must get closer to the true
+    16-px sliding-window mean at the position of each output cell."""
+    from healpix_analyse.dino import (
+        EARTH_RADIUS_M, cell_centres_lonlat, healpix_gsd_m, sample_healpix,
+        tangent_grid_lonlat,
+    )
+    level, parent_level = 17, 12               # cells of 32 px in 64 px images
+    data, ids, b = _smooth_field(level, 10)
+    errs = []
+    for n in (1, 2, 4):
+        r = GetDINOV3SAT(data, ids, level, parent_level, projection="tangent",
+                         tile_px=64, over_sample=n, model=_MeanDino(), device="cpu",
+                         return_patches=True, mean=(0, 0, 0), std=(1, 1, 1))
+        assert r.patch_level == level - 4 + int(np.log2(n))
+        # cells of the central block: their images are entirely inside the data
+        c = (r.patch_cell_id >> (2 * (r.patch_level - 10))) == b
+        emb, cid = r.patch_embedding[c], r.patch_cell_id[c]
+        lon, lat = cell_centres_lonlat(r.patch_level, cid)
+        glon, glat = tangent_grid_lonlat(lon, lat, 16, healpix_gsd_m(level) / EARTH_RADIUS_M)
+        v, ok = sample_healpix(data, ids, level, glon, glat)
+        good = ok.reshape(lon.size, -1).all(1)
+        truth = v.reshape(lon.size, -1, 3)[good].mean(1)
+        errs.append(np.abs(emb[good] - truth).mean())
+    assert errs[1] < 0.8 * errs[0] and errs[2] < 0.8 * errs[1], errs

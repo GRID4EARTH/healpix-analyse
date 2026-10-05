@@ -128,6 +128,9 @@ def _unmask(a, fill):
     """
     mask = getattr(a, "mask", None)
     data = np.asarray(getattr(a, "data", a))
+    if data.dtype.kind == "u":
+        # recent healpix-geo returns uint64 ids, which cannot hold the -1 fill
+        data = data.astype(np.int64)
     if mask is None:
         return data
     return np.where(np.asarray(mask), fill, data)
@@ -538,8 +541,12 @@ def tangent_grid_lonlat(
     gsd_rad : float
         Pixel spacing in tangent units (ground sampling / Earth radius).
     shift : (float, float)
-        Extra offset of the grid origin, in pixels (row, column).  Used by the
-        sliding-window oversampling.
+        Extra offset of the grid origin, in pixels (row, column), with the
+        image conventions: a positive row shift moves the window **south**
+        (down the image), a positive column shift moves it **east**.  Row
+        ``r`` of the shifted grid is then row ``r + shift[0]`` of the
+        unshifted one -- what the token interleaving of the sliding-window
+        oversampling in :func:`GetDINOV3SAT` relies on.
 
     Returns
     -------
@@ -549,7 +556,8 @@ def tangent_grid_lonlat(
     """
     rows, cols = (size, size) if np.isscalar(size) else (int(size[0]), int(size[1]))
     xi = (np.arange(cols, dtype=np.float64) - (cols - 1) / 2.0 + shift[1]) * gsd_rad
-    eta = ((rows - 1) / 2.0 - np.arange(rows, dtype=np.float64) + shift[0]) * gsd_rad
+    # rows grow southwards, so a positive row shift lowers eta
+    eta = ((rows - 1) / 2.0 - np.arange(rows, dtype=np.float64) - shift[0]) * gsd_rad
     ETA, XI = np.meshgrid(eta, xi, indexing="ij")                     # [rows, cols]
     return offsets_to_lonlat(centre_lon, centre_lat, XI, ETA)
 
