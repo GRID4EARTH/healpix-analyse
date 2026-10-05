@@ -122,6 +122,25 @@ training -- a gap no radiometric mapping removes.
 
 ---
 
+## One vector per image: `pooling`
+
+DINOv3 returns one token per 16 x 16 px patch plus a global CLS token: a 64 px
+image gives 16 patch tokens and one CLS. `pooling` chooses the vector kept:
+
+| `pooling` | vector | describes |
+|---|---|---|
+| `"cls"` (package default) | CLS token | the whole image |
+| `"mean"` | mean of all patch tokens | the whole image, every patch equal |
+| `"cls+mean"` | both, concatenated (2 x Ndino) | global and local |
+| `"centre"` | mean of the patch tokens covering the parent cell at the image centre | the cell itself, the rest of the image serving as context |
+
+With images larger than their cell (`TILE_PX = 64` for 32 px cells), only
+`"centre"` describes the cell rather than its surroundings: it averages the
+central 2 x 2 tokens. The window is a centred square of the cell's size,
+widened when needed to stay centred on the token grid. The notebooks use it.
+
+---
+
 ## Sliding window over the images: `stride`
 
 In tangent mode, `stride` sets the step between image centres, in parent

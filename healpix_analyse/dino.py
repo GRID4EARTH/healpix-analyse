@@ -1095,6 +1095,22 @@ def scale_input(
     return out, (lo, hi), how
 
 
+
+def _centre_window(tok_h: int, tok_w: int, cell_px: int) -> Tuple[int, int, int, int]:
+    """
+    ``(row0, nrows, col0, ncols)`` of the tokens covering a centred square of ``cell_px`` px.
+
+    At least one token per axis, at most the whole grid, and the same parity
+    as the grid so that the window stays centred on the image centre.
+    """
+    out = []
+    for t in (int(tok_h), int(tok_w)):
+        m = min(t, max(1, int(np.ceil(cell_px / DINOV3_PATCH))))
+        if (t - m) % 2:
+            m += 1
+        out += [(t - m) // 2, m]
+    return tuple(out)
+
 def load_dinov3_sat(
     model_name: str = "dinov3_vitl16",
     weights: Optional[str] = None,
@@ -1492,10 +1508,14 @@ def GetDINOV3SAT(
     mean, std : sequence of 3 float
         Normalisation constants (SAT-493M defaults).
     pooling : {"cls", "mean", "cls+mean", "centre"}
-        Tile vector: CLS token, mean of the patch tokens, or their
-        concatenation (``2 * Ndino``).  In ``percell`` mode the default is the
-        patch token holding the cell centre (``"centre"``), which is what
-        describes the cell itself rather than its whole window.
+        Vector kept per image: the CLS token (a summary of the whole image),
+        the mean of its patch tokens, their concatenation (``2 * Ndino``), or
+        ``"centre"``: the mean of the patch tokens covering the parent cell at
+        the image centre -- a square of ``2**(level - parent_level)`` px,
+        widened to keep it centred on the token grid (64 px images of 32 px
+        cells: the central 2 x 2 tokens).  ``"centre"`` describes the cell
+        itself while the network still sees the whole image as context.  In
+        ``percell`` mode the default is the token holding the cell centre.
     return_patches : bool
         Also return the patch tokens.
     min_coverage : float
@@ -1676,6 +1696,11 @@ def GetDINOV3SAT(
     std_t = torch.tensor(std, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
     use_ac = autocast and dev.type == "cuda"
 
+    # "centre" pooling: the tokens covering a square of the parent cell's size
+    # (2**k px) at the image centre -- the cell itself, while the network
+    # still sees the whole image as context
+    cr0, cnr, cc0, cnc = _centre_window(tok_h, tok_w, 2 ** k)
+
     cls_sum, D = None, 0
     tok = None                                     # [M, n*tok_h, n*tok_w, D]
     with torch.inference_mode():
@@ -1693,8 +1718,11 @@ def GetDINOV3SAT(
                     val = patches.mean(dim=1)
                 elif pooling == "cls+mean":
                     val = torch.cat([cls, patches.mean(dim=1)], dim=1)
+                elif pooling == "centre":
+                    g = patches.reshape(patches.shape[0], tok_h, tok_w, -1)
+                    val = g[:, cr0:cr0 + cnr, cc0:cc0 + cnc].mean(dim=(1, 2))
                 else:
-                    raise ValueError("pooling must be 'cls', 'mean' or 'cls+mean'")
+                    raise ValueError("pooling must be 'cls', 'mean', 'cls+mean' or 'centre'")
                 cls_out.append(val.cpu())
                 if return_patches:
                     patch_out.append(patches.cpu())

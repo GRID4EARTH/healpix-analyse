@@ -537,3 +537,24 @@ def test_units_do_not_change_the_embeddings():
     # reusing the range of a first date gives the same mapping on a second one
     r2 = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, input_range=ref.input_range, **kw)
     assert np.allclose(r2.embedding, ref.embedding, atol=1e-5) and r2.input_scaling == "fixed"
+
+
+def test_centre_pooling_describes_the_cell():
+    """pooling='centre' = mean of the tokens over the cell at the image centre
+    (central 2 x 2 tokens for 64 px images of 32 px cells), with or without stride."""
+    from healpix_analyse.dino import _centre_window, tangent_images
+    assert _centre_window(4, 4, 32) == (1, 2, 1, 2)
+    assert _centre_window(4, 4, 16) == (1, 2, 1, 2)       # kept centred
+    assert _centre_window(8, 8, 64) == (2, 4, 2, 4)
+    assert _centre_window(4, 4, 128) == (0, 4, 0, 4)      # whole image = "mean"
+    level, parent_level = 17, 12                          # cells of 32 px in 64 px images
+    data, ids, b = _smooth_field(level, 10)
+    kw = dict(projection="tangent", tile_px=64, model=_MeanDino(), device="cpu",
+              mean=(0, 0, 0), std=(1, 1, 1), input_range="unit", verbose=False)
+    for stride in (1.0, 0.5):
+        r = GetDINOV3SAT(data, ids, level, parent_level, pooling="centre", stride=stride, **kw)
+        img = tangent_images(data, ids, level, r.centre_lon[:50], r.centre_lat[:50], 64)[0]
+        expect = img[:, :, 16:48, 16:48].mean(axis=(2, 3))
+        assert np.allclose(r.embedding[:50], expect, atol=1e-5)
+        rm = GetDINOV3SAT(data, ids, level, parent_level, pooling="mean", stride=stride, **kw)
+        assert not np.allclose(r.embedding, rm.embedding)
