@@ -14,6 +14,14 @@
   buffers.
 
 ### Added
+- `HealPixGeoFFT` / `geo_fft_convolve`: FFT convolution of a block inside one
+  base face with a wide kernel sampled on geodesic distances and azimuths from
+  the block centre (predefined families in metres, kilometres, degrees or
+  cells, or any callable `k(rho, phi)`), normalized convolution for missing
+  data as a ratio of two FFTs. The kernel window is sized from the local
+  lattice geometry, which is a sheared parallelogram with unequal sides in the
+  polar caps; treating the face lattice as a square grid is measured to be
+  off by 5-30 % on Sentinel-2 tiles at level 20.
 - `HealPixResampler` and `resample_healpix`: reusable and one-shot local
   resampling between full or partial NESTED HEALPix levels, with NaN support.
 - `HealPixDivCurl` and `HealPixMultiScaleDivCurl`: fixed gauge-aware

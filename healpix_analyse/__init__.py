@@ -46,6 +46,7 @@ from healpix_analyse.down import HealPixDown
 from healpix_analyse.up import HealPixUp
 from healpix_analyse.large_conv import LargeConv
 from healpix_analyse.fft_conv import HealPixFFTConv
+from healpix_analyse.geo_fft import HealPixGeoFFT, geo_fft_convolve
 
 from healpix_analyse.decomp import (
     HealPixDecomp,
@@ -199,6 +200,8 @@ __all__ = [
     "HealPixUp",
     "LargeConv",
     "HealPixFFTConv",
+    "HealPixGeoFFT",
+    "geo_fft_convolve",
     "HealPixDecomp",
     "HealPixWideConv",
     "HealPixPyramid",
