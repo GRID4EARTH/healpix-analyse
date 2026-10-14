@@ -1026,7 +1026,6 @@ class HealPixConv(nn.Module):
             raise ValueError(f"Expected {self.K} pixels, got {N}.")
 
         so  = self._sort_order.to(device=t.device)        # [K]
-        io  = self._inv_order.to(device=t.device)         # [K]
         pos = self._pos_safe.to(device=t.device)          # [4, G, K*P]
         wn  = self._w_norm.to(device=t.device, dtype=t.dtype)   # [4, G, K*P]
         W   = self.weight.to(device=t.device, dtype=t.dtype)    # [G, C_in, C_out, P]
@@ -1100,9 +1099,10 @@ class HealPixConv(nn.Module):
             .view(B, G * C_out, K)      # [B, G*C_out, K]
         )
 
-        # Bias + unsort
+        # Bias.  Row k of the geometry is pixel cell_ids[k], so y is already
+        # in the input (cell_ids) order: no un-sorting is needed, and the
+        # former `y[:, :, io]` scrambled the output of unsorted cell_ids.
         y = y + self.bias.to(device=t.device, dtype=t.dtype).view(1, -1, 1)
-        y = y[:, :, io]                                    # [B, G*C_out, K]
 
         if self.use_norm and self.norm is not None:
             nm = self.norm.to(device=t.device, dtype=t.dtype)

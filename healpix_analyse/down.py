@@ -293,14 +293,17 @@ class HealPixDown(nn.Module):
         # Partial-sky column lookup  (vectorisable via searchsorted)
         # ------------------------------------------------------------------
         if self.partial:
-            ids_in_sorted = np.sort(cell_ids_in)
+            # Columns index the *input array*, i.e. the order of cell_ids_in,
+            # not the sorted ids used for the lookup.
+            order = np.argsort(cell_ids_in, kind="stable")
+            ids_in_sorted = cell_ids_in[order]
 
             def _col_vec(pix_arr: np.ndarray):
                 """Map pixel ids → (column_index, availability_mask) — vectorised."""
                 idx  = np.searchsorted(ids_in_sorted, pix_arr)
                 idx  = np.clip(idx, 0, len(ids_in_sorted) - 1)
                 mask = ids_in_sorted[idx] == pix_arr
-                return idx, mask
+                return order[idx], mask
         else:
             def _col_vec(pix_arr: np.ndarray):
                 return pix_arr.astype(np.int64), np.ones(len(pix_arr), dtype=bool)
@@ -612,12 +615,14 @@ class HealPixDown(nn.Module):
                 ch_avail = [c if c in ids_in_set else fallback for c in ch]
                 children_list.append(ch_avail)
 
-            # Map absolute pixel ids → column indices in cell_ids_in
-            ids_in_sorted = np.sort(self._cell_ids_in)
+            # Map absolute pixel ids → column indices in cell_ids_in (input
+            # array order, hence the argsort after the sorted lookup)
+            order         = np.argsort(self._cell_ids_in, kind="stable")
+            ids_in_sorted = self._cell_ids_in[order]
             children_np   = np.array(children_list, dtype=np.int64)  # [N_out, 4]
             flat           = children_np.ravel()
-            col_idx        = np.searchsorted(ids_in_sorted, flat).reshape(children_np.shape)
-            children_idx   = col_idx
+            col_idx        = order[np.searchsorted(ids_in_sorted, flat)]
+            children_idx   = col_idx.reshape(children_np.shape)
         else:
             children_idx = np.stack([
                 4 * cell_ids_out,
