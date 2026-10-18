@@ -31,9 +31,6 @@ import torch.nn as nn
 import healpix_geo
 from pyproj import Transformer
 
-import os
-from concurrent.futures import ThreadPoolExecutor
-
 # ---------------------------------------------------------------------------
 # Type alias
 # ---------------------------------------------------------------------------
@@ -265,7 +262,7 @@ class HealPixDown(nn.Module):
       Bottleneck                     Before              After
     ──────────────────────────────────────────────────────────────────────────
       healpix_to_lonlat (centers)    N_out scalar calls  1 vectorised call
-      cone_coverage                  N_out sequential    N_out parallel (threads)
+      cone_coverage                  N_out sequential    1 batched call
       healpix_to_lonlat (fine pix)   N_out batch calls   1 batch call (unique)
       Weight computation             Python for loop     numpy (N_out, K) matrix
       COO accumulation               list.append         pre-allocated arrays
@@ -317,26 +314,24 @@ class HealPixDown(nn.Module):
         lats0_rad = np.deg2rad(lats0_deg)
 
         # ------------------------------------------------------------------
-        # 2. Parallel cone_coverage
-        #    healpix-geo is backed by Rust → releases the GIL → true parallelism
-        #    (was: N_out sequential calls)
+        # 2. Batched cone_coverage — ONE native call for all coarse centres
+        #    (was: N_out calls from a Python thread pool)
         # ------------------------------------------------------------------
         radius_deg = np.rad2deg(self.radius_rad)
-        ellipsoid  = self.ellipsoid
+        cones, _, _ = healpix_geo.nested.cone_coverage(
+            np.column_stack((lons0_deg, lats0_deg)),
+            radius_deg, ilevel, ellipsoid=self.ellipsoid,
+        )
+        cone_offsets = np.asarray(cones.offsets, dtype=np.int64)
+        cone_cells   = np.asarray(cones.data, dtype=np.int64)
 
-        def _query_cone(i_out: int) -> np.ndarray:
-            cand, _, _ = healpix_geo.nested.cone_coverage(
-                (float(lons0_deg[i_out]), float(lats0_deg[i_out])),
-                radius_deg, ilevel, ellipsoid=ellipsoid,
-            )
+        all_cands = []
+        for i_out in range(N_out):
+            cand = cone_cells[cone_offsets[i_out]:cone_offsets[i_out + 1]]
             if cand.size == 0:                                   # fallback: 4 children
                 p_out = int(cell_ids_out[i_out])
                 cand  = (4 * p_out + np.arange(4, dtype=np.int64))
-            return cand.astype(np.int64)
-
-        n_workers  = min(os.cpu_count() or 1, N_out)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            all_cands = list(pool.map(_query_cone, range(N_out)))
+            all_cands.append(cand)
         # all_cands[i] : array of fine NESTED pixel ids for coarse pixel i
 
         sizes   = np.array([len(c) for c in all_cands], dtype=np.int64)   # (N_out,)

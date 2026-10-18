@@ -31,7 +31,7 @@ def patch(size_m: float, refinement_level: int) -> np.ndarray:
         ellipsoid="WGS84",
         flat=True,
     )
-    return np.asarray(ids, dtype=np.uint64)
+    return np.asarray(ids.data, dtype=np.uint64)
 
 
 def equivalent_cartesian_grid(

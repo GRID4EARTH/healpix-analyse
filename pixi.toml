@@ -18,10 +18,10 @@ healpy = ">=1.16"
 
 [pypi-dependencies]
 healpix-analyse= { path = ".", editable = true }
-# Validate PR #37 and PR #42 against the shared upstream integration branch.
-# Keep pyproject.toml on the released dependency so normal installations are
-# not tied to an unreleased branch.
-healpix-geo = { git = "https://github.com/GRID4EARTH/healpix-geo.git", branch = "integration", subdirectory = "python/healpix-geo" }
+# Native batched cone_coverage (GRID4EARTH/healpix-geo#292) is required to
+# preserve filtering performance. Temporary validation pin on the PR head;
+# replace it only with a release containing that API.
+healpix-geo = { git = "https://github.com/tinaok/healpix-geo.git", rev = "bd67c153beb6058425eddd55cf8da340f57a4b94", subdirectory = "healpix-geo-python" }
 
 [feature.affine.dependencies]
 affine = "*"

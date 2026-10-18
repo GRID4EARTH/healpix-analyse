@@ -4,6 +4,18 @@
 
 A convenience `gaussian_filter` wrapper provides normalized Gaussian smoothing using `sigma_m` rather than a pixel-based standard deviation.
 
+Metric filtering requires the native batched `healpix_geo.nested.cone_coverage`
+API, which accepts multiple centers and returns compact `RaggedArray` results.
+It does not silently substitute scalar queries if that API is unavailable.
+Development currently uses the exact GEO revision pinned in `pixi.toml`;
+the pin must only be replaced by a release containing batched coverage.
+
+GEO supplies coverage candidates and geographic cell-center coordinates.
+The distance cutoff and Gaussian weights retain WGS84 ellipsoidal geodesic
+distances computed with `pyproj.Geod`. Spherical angular distances are not
+substituted for those physical distances. The `healpy` reference used by
+topology tests is not the backend for this metric filtering path.
+
 The central spatial contract is:
 
 ```text

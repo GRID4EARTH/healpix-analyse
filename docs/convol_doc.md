@@ -593,9 +593,10 @@ import healpix_geo
 
 level = 6
 nside = 2**level
-cell_ids, _, _ = healpix_geo.nested.cone_coverage(
+cones, _, _ = healpix_geo.nested.cone_coverage(
     (0.0, 45.0), 20.0, level, ellipsoid="WGS84"
 )
+cell_ids = cones.data  # a single centre is a single row
 conv = HealPixConv(
     level=level, in_channels=1, out_channels=8,
     cell_ids=cell_ids,

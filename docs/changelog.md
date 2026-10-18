@@ -10,6 +10,10 @@
   derive `nside = 2**level` internally. This applies to `HealPixConv`,
   `LargeConv`, `HealPixDown`, `HealPixUp`, `HEALPixSHT`, localized ALM
   transforms, and `build_healpix_adjacency`.
+- Cone candidates for the metric neighbourhood helpers and for
+  `HealPixDown` (`mode="smooth"`) come from one batched
+  `healpix_geo.nested.cone_coverage` call instead of one call per cell.
+  Outputs are unchanged.
 
 ### Fixed
 - `HealPixConv` geometry cache keys retain the input `cell_ids` order, so a
