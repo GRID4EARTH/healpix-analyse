@@ -146,6 +146,13 @@ def benchmark(args: argparse.Namespace) -> dict[str, object]:
         )
 
         for connectivity in ("edge", "edge_or_vertex"):
+            # GEO calls the full neighbourhood "all" and starts it at S; the
+            # adapter rotates it to start at SW.
+            backend_connectivity = (
+                "all" if connectivity == "edge_or_vertex" else connectivity
+            )
+            backend_shift = -1 if connectivity == "edge_or_vertex" else 0
+
             functions = {
                 "previous_healpy_adapter": (
                     lambda cells=cells, connectivity=connectivity: previous_healpy_adapter(
@@ -162,7 +169,7 @@ def benchmark(args: argparse.Namespace) -> dict[str, object]:
                     )
                 ),
                 "backend_auto": (
-                    lambda cells=cells, connectivity=connectivity: healpix_geo_nested.neighbours(
+                    lambda cells=cells, connectivity=backend_connectivity: healpix_geo_nested.neighbours(
                         cells,
                         args.depth,
                         connectivity=connectivity,
@@ -170,7 +177,7 @@ def benchmark(args: argparse.Namespace) -> dict[str, object]:
                     )
                 ),
                 "backend_one_thread": (
-                    lambda cells=cells, connectivity=connectivity: healpix_geo_nested.neighbours(
+                    lambda cells=cells, connectivity=backend_connectivity: healpix_geo_nested.neighbours(
                         cells,
                         args.depth,
                         connectivity=connectivity,
@@ -181,8 +188,13 @@ def benchmark(args: argparse.Namespace) -> dict[str, object]:
 
             expected = functions["previous_healpy_adapter"]()
             np.testing.assert_array_equal(functions["new_adapter"](), expected)
-            np.testing.assert_array_equal(functions["backend_auto"](), expected)
-            np.testing.assert_array_equal(functions["backend_one_thread"](), expected)
+            np.testing.assert_array_equal(
+                np.roll(functions["backend_auto"](), backend_shift, axis=1), expected
+            )
+            np.testing.assert_array_equal(
+                np.roll(functions["backend_one_thread"](), backend_shift, axis=1),
+                expected,
+            )
 
             timings = measure(
                 functions,

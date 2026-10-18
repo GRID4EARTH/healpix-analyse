@@ -25,7 +25,8 @@ dependencies = [
   "numpy",
   "torch",
   "healpy",
-  "healpix-geo>=0.4.1",
+  # lower bound: the first release with batched nested.cone_coverage (GRID4EARTH/healpix-geo#292)
+  "healpix-geo",
   "pyproj>=3.6",
 ]
 

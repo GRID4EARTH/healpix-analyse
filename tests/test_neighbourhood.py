@@ -108,6 +108,43 @@ def test_cone_candidate_csr_never_silently_falls_back(monkeypatch):
     assert calls[0][0].shape == (2, 2)
 
 
+@pytest.mark.parametrize("neighbourhood", ["cone_coverage", "cell_center"])
+def test_batched_neighbourhoods_match_single_cell_queries(neighbourhood):
+    module = importlib.import_module("healpix_analyse._neighbourhood")
+    level = 6
+    radius = 200_000.0
+    # cells from a northern polar and an equatorial base cell
+    cells = np.concatenate(
+        (
+            np.arange(0, 64, dtype=np.uint64),
+            np.arange(4 * 4**level, 4 * 4**level + 64, dtype=np.uint64),
+        )
+    )
+
+    actual = build_neighbourhoods(
+        cells,
+        radius,
+        level,
+        neighbourhood=neighbourhood,
+        ellipsoid="WGS84",
+    )
+    expected = [
+        module._neighbourhood(
+            int(cell),
+            radius,
+            level,
+            neighbourhood=neighbourhood,
+            ellipsoid="WGS84",
+        )
+        for cell in cells
+    ]
+
+    np.testing.assert_array_equal(
+        [row.size for row in actual], [row.size for row in expected]
+    )
+    np.testing.assert_array_equal(np.concatenate(actual), np.concatenate(expected))
+
+
 def test_parallel_wgs84_distance_is_bit_identical(monkeypatch):
     module = importlib.import_module("healpix_analyse._neighbourhood")
     longitude = np.linspace(-179.0, 179.0, 257, dtype=np.float64)
