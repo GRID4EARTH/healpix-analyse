@@ -1,6 +1,6 @@
 # healpix-analyse
 
-[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://eopf-dggs.github.io/healpix-analyse/)
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://grid4earth.eu/healpix-analyse/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](https://www.python.org/)
 
@@ -212,20 +212,20 @@ The output order follows `out_cell_ids`; unavailable cells are filled with
 ## Installation
 
 ```bash
-pip install git+https://github.com/EOPF-DGGS/healpix-analyse.git
+pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 ```
 
 ### From source (development)
 
 ```bash
-git clone git@github.com:EOPF-DGGS/healpix-analyse.git
+git clone git@github.com:GRID4EARTH/healpix-analyse.git
 cd healpix-analyse
 pip install -e .
 ```
 
 ## Documentation
 
-Full documentation is available at **[eopf-dggs.github.io/healpix-analyse](https://grid4earth.github.io/healpix-analyse/)**.
+Full documentation is available at **[grid4earth.eu/healpix-analyse](https://grid4earth.eu/healpix-analyse/)**.
 
 To build locally:
 
