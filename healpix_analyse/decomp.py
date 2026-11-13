@@ -139,6 +139,13 @@ class HealPixDecomp(nn.Module):
         Matched synthesis normalisation.  Exact pyramid reconstruction does
         not depend on this choice because the prediction is stored as a
         residual, but it changes the interpretation of individual bands.
+    down_mode : {"smooth", "mean"}, default="smooth"
+        ``HealPixDown`` mode of every analysis step.  ``"mean"`` averages the
+        4 NESTED children, so the coarse band keeps the global mean of a
+        full-sphere map; with ``up_norm="col_l1"`` the paired Up copies each
+        parent to its children (a Haar-like pyramid whose detail bands sum
+        to zero over every group of 4 children).  Gaussian parameters are
+        ignored with ``"mean"``.  Reconstruction stays exact either way.
     dtype, device : optional
         PyTorch execution options.  CUDA is selected when available.
 
@@ -171,6 +178,7 @@ class HealPixDecomp(nn.Module):
         up_norm: str = "col_l1",
         dtype: torch.dtype = torch.float32,
         device: Optional[Union[str, torch.device]] = None,
+        down_mode: str = "smooth",
     ) -> None:
         super().__init__()
 
@@ -180,6 +188,9 @@ class HealPixDecomp(nn.Module):
             raise ValueError("Jmax must be -1 or a non-negative integer")
         if dtype not in (torch.float32, torch.float64):
             raise ValueError("dtype must be torch.float32 or torch.float64")
+        self.down_mode = str(down_mode).lower().strip()
+        if self.down_mode not in ("smooth", "mean"):
+            raise ValueError("down_mode must be 'smooth' or 'mean'")
 
         self.level = int(level)
         requested_jmax = int(Jmax)
@@ -236,7 +247,7 @@ class HealPixDecomp(nn.Module):
         for _ in range(self.n_scales):
             down = HealPixDown(
                 level=current_level,
-                mode="smooth",
+                mode=self.down_mode,
                 ellipsoid=self.ellipsoid,
                 radius_deg=radius_deg,
                 sigma_deg=sigma_deg,
@@ -595,7 +606,7 @@ class HealPixDecomp(nn.Module):
         return (
             f"level={self.level}, Jmax={self.Jmax}, scales={self.n_scales}, "
             f"bands={self.n_bands}, domain={domain}, sizes={self.sizes}, "
-            f"filter='symmetric Gaussian', up_norm={self.up_norm!r}"
+            f"down_mode={self.down_mode!r}, up_norm={self.up_norm!r}"
         )
 
 

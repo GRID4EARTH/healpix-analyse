@@ -7,9 +7,12 @@ Reduces the HEALPix resolution by a factor of 2:
     nside_out = nside_in // 2
     N_out     = N_in // 4
 
-Two modes:
+Three modes:
     "smooth"  -- weighted Gaussian average over a disc (linear, differentiable).
     "maxpool" -- non-linear max over the 4 direct NESTED children.
+    "mean"    -- unweighted mean over the 4 direct NESTED children.  HEALPix
+                 cells have equal area, so this is the only mode that
+                 conserves the global mean of the field.
 
 Works on the full sphere or on a partial-sky subset.  Resolution is exposed
 through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
@@ -101,8 +104,9 @@ class HealPixDown(nn.Module):
     HEALPix downsampling: reduce resolution by a factor of 2.
 
     Reduces ``level`` → ``level - 1`` using either a
-    Gaussian-weighted sparse matrix (``mode="smooth"``) or a max-pooling
-    over the 4 direct NESTED children (``mode="maxpool"``).
+    Gaussian-weighted sparse matrix (``mode="smooth"``), a max-pooling
+    over the 4 direct NESTED children (``mode="maxpool"``), or their
+    unweighted mean (``mode="mean"``).
 
     Can operate on the full sphere or on a partial-sky subset.
 
@@ -113,10 +117,28 @@ class HealPixDown(nn.Module):
         corresponding HEALPix resolution is ``nside_in = 2**level``.
         When ``cell_ids`` is ``None``, the input is expected to have
         ``N = 12 * nside_in**2`` pixels.
-    mode : {"smooth", "maxpool"}, default "smooth"
+    mode : {"smooth", "maxpool", "mean"}, default "smooth"
         Downsampling strategy.
         *smooth*   -- differentiable Gaussian-weighted average (linear).
         *maxpool*  -- non-linear max over 4 NESTED children (fast).
+        *mean*     -- unweighted mean over the 4 NESTED children (linear,
+        differentiable).  On the full sphere the global mean of the
+        output equals the global mean of the input, so this is the mode
+        to use for a hierarchy of maps.  *smooth* does not have this
+        property: its weights are normalised per output cell only, which
+        preserves constant fields but not the global mean.
+        On a partial sky, a coarse cell is the mean of the children
+        present in ``cell_ids``; :attr:`coverage` gives the fraction of
+        children present, and the mean of the output weighted by
+        :attr:`coverage` equals the mean of the input.
+        NaN values propagate to the parent cell unless ``skipna=True``.
+    skipna : bool, default False
+        Only for ``mode="mean"``.  If True, non-finite children are left
+        out of the mean (a NaN-skipping mean); a parent with no finite
+        child is NaN.  The number of children used then depends on the
+        data: :meth:`valid_fraction` returns it per output cell, and the
+        mean of the output weighted by ``valid_fraction(x)`` equals the
+        mean of the finite input values.
     radius_deg : float or None
         Angular radius of the Gaussian kernel (degrees).
         Defaults to ~3 times the fine pixel size.
@@ -171,6 +193,7 @@ class HealPixDown(nn.Module):
         cell_ids: Optional[ArrayLike] = None,
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
+        skipna: bool = False,
     ) -> None:
         super().__init__()
 
@@ -194,8 +217,11 @@ class HealPixDown(nn.Module):
 
         # ---- validate mode / weight_norm ----
         self.mode = mode.lower().strip()
-        if self.mode not in ("smooth", "maxpool"):
-            raise ValueError("mode must be 'smooth' or 'maxpool'.")
+        if self.mode not in ("smooth", "maxpool", "mean"):
+            raise ValueError("mode must be 'smooth', 'maxpool' or 'mean'.")
+        self.skipna = bool(skipna)
+        if self.skipna and self.mode != "mean":
+            raise ValueError("skipna is only supported with mode='mean'.")
         self.weight_norm = weight_norm.lower().strip()
         if self.weight_norm not in ("l1", "l2", "none"):
             raise ValueError("weight_norm must be 'l1', 'l2', or 'none'.")
@@ -237,6 +263,8 @@ class HealPixDown(nn.Module):
             self.register_buffer("_M_indices", M.indices().clone())
             self.register_buffer("_M_values",  M.values().clone())
             self._M_size = M.size()
+        elif self.mode == "mean":
+            self._build_mean_children()
         else:
             # maxpool: precompute children indices
             self._build_maxpool_children()
@@ -631,9 +659,141 @@ class HealPixDown(nn.Module):
             torch.as_tensor(children_idx, dtype=torch.long, device=self.device),
         )
 
+    def _build_mean_children(self) -> None:
+        """
+        Precompute the child index mapping for the mean mode.
+
+        Registers ``_children_idx`` of shape [N_out, 4] (positions in the
+        input array, in the order of ``cell_ids``) and ``_children_valid``
+        of shape [N_out, 4] (False where a child is absent from a
+        partial-sky ``cell_ids``).
+        """
+        children = 4 * self._cell_ids_out[:, None] + np.arange(4, dtype=np.int64)
+
+        if self.partial:
+            # position of each child in the input array; cell_ids need not
+            # be sorted
+            order = np.argsort(self._cell_ids_in, kind="stable")
+            ids_sorted = self._cell_ids_in[order]
+            pos = np.clip(
+                np.searchsorted(ids_sorted, children), 0, len(ids_sorted) - 1
+            )
+            valid = ids_sorted[pos] == children
+            children_idx = np.where(valid, order[pos], 0)
+        else:
+            valid = np.ones(children.shape, dtype=bool)
+            children_idx = children
+
+        self.register_buffer(
+            "_children_idx",
+            torch.as_tensor(children_idx, dtype=torch.long, device=self.device),
+        )
+        self.register_buffer(
+            "_children_valid",
+            torch.as_tensor(valid, dtype=torch.bool, device=self.device),
+        )
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+
+    def _gather_children(
+        self, t: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Gather the 4 NESTED children of every output cell (``mode="mean"``).
+
+        Returns ``(gathered, valid)`` with shape ``[B, N_out, 4]``.  ``valid``
+        marks the children that take part in the mean: present in
+        ``cell_ids`` and, with ``skipna``, finite.  It is ``None`` when every
+        child takes part (full sphere, ``skipna=False``).
+        """
+        idx = self._children_idx.to(device=t.device)            # [N_out, 4]
+        gathered = t[:, idx]                                     # [B, N_out, 4]
+        valid = None
+        if self.partial:
+            valid = self._children_valid.to(device=t.device).expand_as(gathered)
+        if self.skipna:
+            finite = torch.isfinite(gathered)
+            valid = finite if valid is None else valid & finite
+        return gathered, valid
+
+    def valid_fraction(self, x: ArrayLike) -> ArrayLike:
+        """
+        Fraction of the 4 NESTED children of each output cell that enter
+        the mean for this input ``x`` (``mode="mean"`` only).
+
+        A child counts when it is present in ``cell_ids`` and its value is
+        finite.  With ``skipna=True``, the mean of ``self(x)[0]`` weighted
+        by this array equals the mean of the finite values of ``x``.  To
+        chain levels conservatively, carry the weights along: downsample
+        ``where(isfinite(x), x, 0)`` and ``isfinite(x)`` with a plain
+        ``mode="mean"`` operator and divide at the end.
+
+        Parameters
+        ----------
+        x : numpy.ndarray or torch.Tensor, shape [N] or [B, N]
+            The input that is (or will be) passed to :meth:`forward`.
+
+        Returns
+        -------
+        same type as x, shape [N_out] or [B, N_out], values in {0, .25, .5, .75, 1}
+        """
+        if self.mode != "mean":
+            raise AttributeError("valid_fraction is only defined for mode='mean'.")
+        t, is_numpy, was_1d = _prepare_input(x, self.device, self.dtype)
+        if t.shape[1] != self.N_in:
+            raise ValueError(
+                f"Expected input with {self.N_in} pixels, got {t.shape[1]}."
+            )
+        gathered = t[:, self._children_idx.to(device=t.device)]
+        valid = torch.isfinite(gathered)
+        if self.partial:
+            valid = valid & self._children_valid.to(device=t.device)
+        frac = valid.sum(dim=-1).to(t.dtype) / 4.0
+        return _restore_output(frac, is_numpy, was_1d)
+
+    def sparse_matrix(self) -> torch.Tensor:
+        """
+        The linear operator as a coalesced sparse ``[N_out, N_in]`` matrix.
+
+        ``mode="smooth"``: the Gaussian weights.  ``mode="mean"``: weight
+        ``1 / n`` on each of the ``n`` children present in ``cell_ids``
+        (the data-independent part; ``skipna`` is not represented).  Used
+        by :class:`~healpix_analyse.up.HealPixUp` (``paired_down=...``).
+        """
+        if self.mode == "smooth":
+            return torch.sparse_coo_tensor(
+                self._M_indices, self._M_values, size=self._M_size,
+                device=self._M_values.device, dtype=self._M_values.dtype,
+            ).coalesce()
+        if self.mode != "mean":
+            raise ValueError("maxpool is not linear; it has no sparse matrix.")
+        idx = self._children_idx
+        valid = self._children_valid
+        rows = torch.arange(self.N_out, device=idx.device)[:, None].expand_as(idx)
+        n = valid.sum(dim=-1, keepdim=True).to(self.dtype).expand(idx.shape)
+        return torch.sparse_coo_tensor(
+            torch.stack([rows[valid], idx[valid]]),
+            1.0 / n[valid],
+            size=(self.N_out, self.N_in),
+            device=idx.device, dtype=self.dtype,
+        ).coalesce()
+
+    @property
+    def coverage(self) -> np.ndarray:
+        """
+        Fraction of the 4 NESTED children of each output cell that are
+        present in ``cell_ids`` (``mode="mean"`` only).
+
+        All ones on the full sphere.  On a partial sky, the mean of the
+        output weighted by this array equals the mean of the input.  It
+        does not depend on the data; for the NaN-skipping mean use
+        :meth:`valid_fraction`.
+        """
+        if self.mode != "mean":
+            raise AttributeError("coverage is only defined for mode='mean'.")
+        return self._children_valid.sum(dim=-1).cpu().numpy() / 4.0
 
     @property
     def cell_ids_out(self) -> np.ndarray:
@@ -679,6 +839,16 @@ class HealPixDown(nn.Module):
             # M: [N_out, N_in];  t: [B, N_in]
             # y_T = M @ t.T  →  [N_out, B]
             y = torch.sparse.mm(M, t.T).T   # [B, N_out]
+
+        elif self.mode == "mean":
+            gathered, valid = self._gather_children(t)          # [B, N_out, 4]
+            if valid is None:
+                y = gathered.mean(dim=-1)                       # [B, N_out]
+            else:
+                gathered = torch.where(
+                    valid, gathered, torch.zeros((), dtype=t.dtype, device=t.device)
+                )
+                y = gathered.sum(dim=-1) / valid.sum(dim=-1).to(t.dtype)
 
         else:  # maxpool
             idx = self._children_idx.to(device=t.device)   # [N_out, 4]
