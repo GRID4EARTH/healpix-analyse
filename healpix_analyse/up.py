@@ -95,7 +95,8 @@ class HealPixUp(nn.Module):
         Floating-point dtype for the sparse matrix values.
     paired_down : HealPixDown or None
         Reuse the exact sparse matrix and fine-cell domain of an existing
-        smooth downsampler.  This is the strictest way to construct a matched
+        ``smooth`` or ``mean`` downsampler.  With a ``mean`` downsampler and
+        ``up_norm="col_l1"``, every child receives its parent's value.  This is the strictest way to construct a matched
         Up operator for a partial patch.  ``cell_ids`` must then be omitted;
         the ellipsoid and weight normalisation are inherited.
 
@@ -173,8 +174,8 @@ class HealPixUp(nn.Module):
                 raise ValueError(
                     "cell_ids must be omitted when paired_down is given."
                 )
-            if paired_down.mode != "smooth":
-                raise ValueError("paired_down must use mode='smooth'.")
+            if paired_down.mode not in ("smooth", "mean"):
+                raise ValueError("paired_down must use mode='smooth' or 'mean'.")
             if paired_down.nside_out != self.nside_in:
                 raise ValueError(
                     f"paired_down outputs nside={paired_down.nside_out}, "
@@ -240,13 +241,7 @@ class HealPixUp(nn.Module):
             down = paired_down
 
         # Reconstruct Down matrix M_down: [N_in_coarse, N_out_fine]
-        M_down = torch.sparse_coo_tensor(
-            down._M_indices.to(device=self.device),
-            down._M_values.to(device=self.device, dtype=self.dtype),
-            size=down._M_size,
-            device=self.device,
-            dtype=self.dtype,
-        ).coalesce()
+        M_down = down.sparse_matrix().to(device=self.device, dtype=self.dtype).coalesce()
 
         # Transpose → M_up: [N_out_fine, N_in_coarse]
         M_up = self._transpose_sparse(M_down)
