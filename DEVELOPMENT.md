@@ -9,58 +9,37 @@ contributions are welcome.
 
 ## Branches
 
-- `main` is stable and release-ready.
-- `integration` is a shared branch for combining and validating unreleased changes before they
-  are promoted to `main`. It is used primarily for integration and cross-repository validation,
-  not as the default branch for day-to-day feature development.
+- `main` is stable and release-ready. It depends only on released versions of other packages.
 - Feature branches and pull requests contain individual developments. They should be focused
-  and linked to the relevant issue where possible. Start them from `main` by default.
+  and linked to the relevant issue where possible. Start them from `main`.
 - Releases are tagged from `main`.
 
-The usual path remains a focused feature pull request to `main`. Use `integration` only when a
-change or compatible group of changes needs combined or upstream validation before promotion:
-
 ```text
-feature branch ────────────────────────────────> PR to main ──> main ──> release tag
-       \
-        └─ when integration validation is needed ─> integration
-                                                       ├─> cross-feature validation
-                                                       ├─> cross-repository validation
-                                                       └─> PR: integration -> main
+feature branch ──> PR to main ──> main ──> release tag
 ```
 
 ## Cross-repository development
 
-Some `healpix-analyse` changes need unreleased functionality from `healpix-geo`, or must be
-tested with another GRID4EARTH repository before they are ready for release. In that situation:
+Some `healpix-analyse` changes need unreleased functionality from `healpix-geo` or another
+GRID4EARTH repository. In that situation:
 
-1. Develop the change on a focused feature branch and submit it through the normal pull request
-   process.
-2. When combined validation is needed, integrate the feature into `healpix-analyse`'s
-   `integration` branch after its relevant checks pass.
-3. Point the development dependency temporarily to the other repository's `integration` branch
-   and document that unreleased dependency in the pull request. For example, test against
-   `GRID4EARTH/healpix-geo@integration` when unreleased geometry changes are required.
-4. Run the repository tests and the relevant cross-repository workflows. The `integration`
-   branch may contain temporary dependency pins for this purpose, but release branches must not.
-5. After the combined checks pass, promote the compatible, release-ready changes to `main`
-   through an `integration`-to-`main` pull request and the normal review process. Keep unrelated
-   or incomplete changes out of that promotion.
-6. Tag the release from `main`, then replace temporary branch dependencies with released
-   versions.
+1. Develop the change on a focused feature branch and open the pull request to `main`.
+2. Pin the development dependency in `pixi.toml` to the exact commit of the other repository
+   that contains the needed change, and say so in the pull request.
+3. Run the repository tests against that commit.
+4. Once the other repository has released the change, replace the pin with the released version
+   (and a lower bound in `pyproject.toml`), run the tests again, then merge.
 
-The `integration` branch is a validation and promotion point. It is not a replacement for
-focused feature branches, pull-request review, or releases, and feature branches should not use
-it as their base unless the feature specifically depends on unreleased integrated work.
+A pull request that still pins an unreleased commit is not merged into `main`.
 
 ## Continuous integration and releases
 
-Tests and documentation builds run for pull requests targeting `main` or `integration`, and for
-pushes to either branch. Deployment remains deliberately narrower:
+Tests and documentation builds run for pull requests targeting `main` and for pushes to `main`.
+Deployment remains deliberately narrower:
 
 - GitHub Pages is deployed only from a push to `main`.
 - PyPI publishing occurs only from a published GitHub release.
-- Releases and Zenodo archives are created from tags on `main`, never from `integration`.
+- Releases and Zenodo archives are created from tags on `main`.
 
 ## Authorship and credit
 
