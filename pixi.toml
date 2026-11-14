@@ -19,9 +19,10 @@ healpy = ">=1.16"
 [pypi-dependencies]
 healpix-analyse= { path = ".", editable = true }
 # Native batched cone_coverage (GRID4EARTH/healpix-geo#292) is required to
-# preserve filtering performance. Temporary validation pin on the PR head;
-# replace it only with a release containing that API.
-healpix-geo = { git = "https://github.com/tinaok/healpix-geo.git", rev = "bd67c153beb6058425eddd55cf8da340f57a4b94", subdirectory = "healpix-geo-python" }
+# preserve filtering performance. Temporary pin on a healpix-geo main commit
+# that contains it (merged, not yet released); replace it with a release
+# containing that API.
+healpix-geo = { git = "https://github.com/GRID4EARTH/healpix-geo.git", rev = "df851033add59d39442dbb5642a4d9ac50033b49", subdirectory = "healpix-geo-python" }
 
 [feature.affine.dependencies]
 affine = "*"
