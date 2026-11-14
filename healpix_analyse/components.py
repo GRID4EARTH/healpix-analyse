@@ -27,9 +27,8 @@ Topology backend
 Immediate-neighbour lookup is delegated to the private
 ``healpix_analyse._topology`` module.
 
-That module currently uses healpy as a temporary compatibility backend.
-It is intended to move to ``healpix-geo`` / CDSHEALPix once directional
-neighbour access becomes available there.
+That module uses the direction-preserving immediate-neighbour API from
+``healpix-geo``, backed by CDSHEALPix.
 
 Torch
 -----

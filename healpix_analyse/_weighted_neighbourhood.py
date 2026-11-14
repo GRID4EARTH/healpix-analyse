@@ -346,6 +346,156 @@ def neighbour_positions(
     return positions
 
 
+def _numpy_segment_sum(
+    values: np.ndarray,
+    row_offsets: np.ndarray,
+) -> np.ndarray:
+    """Sum the final axis over contiguous CSR-style row segments."""
+    number_of_rows = row_offsets.size - 1
+    output_shape = (*values.shape[:-1], number_of_rows)
+    if number_of_rows == 0:
+        return np.empty(output_shape, dtype=values.dtype)
+    if values.shape[-1] == 0:
+        return np.zeros(output_shape, dtype=values.dtype)
+
+    row_counts = np.diff(row_offsets)
+    starts = np.minimum(row_offsets[:-1], values.shape[-1] - 1)
+    result = np.add.reduceat(values, starts, axis=-1)
+    result[..., row_counts == 0] = 0
+    return result
+
+
+def compact_weighted_neighbourhood_reduce(
+    values: np.ndarray | torch.Tensor,
+    neighbour_positions: np.ndarray,
+    row_offsets: np.ndarray,
+    weights: np.ndarray,
+    *,
+    normalize: bool = False,
+) -> np.ndarray | torch.Tensor:
+    """Apply weights over an unpadded CSR-style neighbourhood geometry."""
+    if not isinstance(values, (np.ndarray, torch.Tensor)) or values.ndim < 1:
+        raise TypeError("'values' must be a NumPy array or PyTorch tensor.")
+    positions = np.asarray(neighbour_positions)
+    if positions.ndim != 1:
+        raise ValueError("'neighbour_positions' must be one-dimensional.")
+    if positions.dtype == np.bool_ or not np.issubdtype(
+        positions.dtype,
+        np.integer,
+    ):
+        raise TypeError("'neighbour_positions' must contain integers.")
+    if np.any(positions < 0) or np.any(positions >= values.shape[-1]):
+        raise ValueError("A neighbour position is outside the input signal.")
+    positions = positions.astype(np.int64, copy=False)
+    offsets = np.asarray(row_offsets, dtype=np.int64)
+    supplied_weights = np.asarray(weights)
+
+    if offsets.ndim != 1 or offsets.size == 0:
+        raise ValueError("'row_offsets' must be a non-empty 1-D array.")
+    if offsets[0] != 0 or np.any(np.diff(offsets) < 0):
+        raise ValueError("'row_offsets' must be non-decreasing and start at 0.")
+    if offsets[-1] != positions.size:
+        raise ValueError("The final row offset must equal the neighbour count.")
+    try:
+        supplied_weights = np.broadcast_to(
+            supplied_weights,
+            positions.shape,
+        ).astype(np.float64, copy=False)
+    except ValueError as exc:
+        raise ValueError(
+            "'weights' must be scalar or match the neighbour vector."
+        ) from exc
+    if not np.all(np.isfinite(supplied_weights)):
+        raise ValueError("'weights' must be finite.")
+    if not isinstance(normalize, (bool, np.bool_)):
+        raise TypeError("'normalize' must be a boolean.")
+
+    number_of_rows = offsets.size - 1
+
+    if isinstance(values, torch.Tensor):
+        dtype = _torch_output_dtype(values)
+        signal = values.to(dtype=dtype)
+        output_shape = (*signal.shape[:-1], number_of_rows)
+        if positions.size == 0:
+            fill = float("nan") if normalize else 0.0
+            return torch.full(
+                output_shape,
+                fill,
+                dtype=dtype,
+                device=signal.device,
+            )
+
+        position_tensor = torch.as_tensor(
+            positions,
+            dtype=torch.long,
+            device=signal.device,
+        )
+        gathered = torch.index_select(signal, -1, position_tensor)
+        weight_tensor = torch.as_tensor(
+            np.array(supplied_weights, copy=True),
+            dtype=dtype,
+            device=signal.device,
+        )
+        prefix = (1,) * (signal.ndim - 1)
+        weight_tensor = weight_tensor.reshape(*prefix, -1)
+        sample_valid = ~torch.isnan(gathered)
+        effective_weights = torch.where(
+            sample_valid,
+            weight_tensor,
+            torch.zeros((), dtype=dtype, device=signal.device),
+        )
+        contributions = effective_weights * torch.where(
+            sample_valid,
+            gathered,
+            torch.zeros((), dtype=dtype, device=signal.device),
+        )
+        row_ids = torch.as_tensor(
+            np.repeat(
+                np.arange(number_of_rows, dtype=np.int64),
+                np.diff(offsets),
+            ),
+            dtype=torch.long,
+            device=signal.device,
+        )
+        row_ids = row_ids.reshape(*prefix, -1).expand_as(contributions)
+        numerator = torch.zeros(
+            output_shape,
+            dtype=dtype,
+            device=signal.device,
+        ).scatter_add(-1, row_ids, contributions)
+        if not normalize:
+            return numerator
+        denominator = torch.zeros_like(numerator).scatter_add(
+            -1,
+            row_ids,
+            effective_weights.expand_as(contributions),
+        )
+        nonzero = denominator != 0
+        return torch.where(
+            nonzero,
+            numerator / torch.where(nonzero, denominator, 1),
+            torch.full_like(numerator, float("nan")),
+        )
+
+    output_dtype = np.result_type(values.dtype, np.float64)
+    gathered = np.asarray(values[..., positions], dtype=output_dtype)
+    prefix = (1,) * (values.ndim - 1)
+    broadcast_weights = supplied_weights.reshape(*prefix, -1).astype(
+        output_dtype,
+        copy=False,
+    )
+    sample_valid = ~np.isnan(gathered)
+    effective_weights = np.where(sample_valid, broadcast_weights, 0.0)
+    contributions = effective_weights * np.where(sample_valid, gathered, 0.0)
+    numerator = _numpy_segment_sum(contributions, offsets)
+    if not normalize:
+        return numerator
+    denominator = _numpy_segment_sum(effective_weights, offsets)
+    result = np.full(numerator.shape, np.nan, dtype=output_dtype)
+    np.divide(numerator, denominator, out=result, where=denominator != 0)
+    return result
+
+
 def _torch_output_dtype(
     values: torch.Tensor,
 ) -> torch.dtype:
@@ -841,6 +991,7 @@ def weighted_neighbourhood_reduce(
 
 
 __all__ = [
+    "compact_weighted_neighbourhood_reduce",
     "neighbour_positions",
     "weighted_neighbourhood_reduce",
 ]

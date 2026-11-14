@@ -3,10 +3,17 @@
 ## Unreleased
 
 ### Changed
+- Connected-component topology now uses the direction-preserving
+  `healpix_geo.nested.neighbours` backend. A reproducible benchmark records
+  correctness checks, input dtype, threading mode and reference timings.
 - HEALPix-facing public APIs now take the Grid4Earth `level` directly and
   derive `nside = 2**level` internally. This applies to `HealPixConv`,
   `LargeConv`, `HealPixDown`, `HealPixUp`, `HEALPixSHT`, localized ALM
   transforms, and `build_healpix_adjacency`.
+- Cone candidates for the metric neighbourhood helpers and for
+  `HealPixDown` (`mode="smooth"`) come from one batched
+  `healpix_geo.nested.cone_coverage` call instead of one call per cell.
+  Outputs are unchanged.
 
 ### Fixed
 - `HealPixConv` geometry cache keys retain the input `cell_ids` order, so a
@@ -14,6 +21,11 @@
   buffers.
 
 ### Added
+- `radial_filter` and `gaussian_filter` keep process-wide LRU caches of the
+  filter geometry (up to 192 MiB by default) and of the Gaussian weights (up
+  to 96 MiB). `configure_radial_filter_cache` changes or disables the limits
+  (`0` disables a cache), and `radial_filter_cache_info` reports limits and
+  current usage.
 - `HealPixResampler` and `resample_healpix`: reusable and one-shot local
   resampling between full or partial NESTED HEALPix levels, with NaN support.
 - `HealPixDivCurl` and `HealPixMultiScaleDivCurl`: fixed gauge-aware

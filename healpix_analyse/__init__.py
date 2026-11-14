@@ -156,10 +156,9 @@ from .directional_filter import directional_filter
 #     Cells sharing either an edge or a vertex.
 #     This is the HEALPix analogue of Cartesian 8-connectivity.
 #
-# The topology backend itself is intentionally private.  The current
-# implementation uses healpy temporarily through ``_topology.py`` and is
-# intended to move to healpix-geo / CDSHEALPix once directional neighbour
-# access is available there.
+# The topology backend itself is intentionally private. ``_topology.py``
+# delegates direction-preserving immediate-neighbour access to healpix-geo /
+# CDSHEALPix.
 # ---------------------------------------------------------------------------
 
 from healpix_analyse.components import (
@@ -171,8 +170,10 @@ from healpix_analyse.components import (
 )
 
 from healpix_analyse.radial_filter import (
+    configure_radial_filter_cache,
     gaussian_filter,
     radial_filter,
+    radial_filter_cache_info,
 )
 
 # ---------------------------------------------------------------------------
@@ -272,6 +273,8 @@ __all__ = [
     # ------------------------------------------------------------------
     "radial_filter",
     "gaussian_filter",
+    "configure_radial_filter_cache",
+    "radial_filter_cache_info",
 
     # ------------------------------------------------------------------
     # HEALPix scalar-field gradients
