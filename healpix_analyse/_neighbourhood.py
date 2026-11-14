@@ -718,7 +718,6 @@ def _cone_candidates(
         flat=True,
     )
 
-    # a single centre is a single ragged row
     return np.asarray(cell_ids, dtype=np.uint64)
 
 
