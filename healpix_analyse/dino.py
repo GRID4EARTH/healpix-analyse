@@ -130,6 +130,9 @@ def _unmask(a, fill):
     data = np.asarray(getattr(a, "data", a))
     if mask is None:
         return data
+    if fill < 0 and np.issubdtype(data.dtype, np.unsignedinteger):
+        # cell ids come back as uint64, which cannot hold the -1 fill
+        data = data.astype(np.int64)
     return np.where(np.asarray(mask), fill, data)
 
 
