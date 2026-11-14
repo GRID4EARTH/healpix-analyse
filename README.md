@@ -8,7 +8,7 @@ A Python toolkit for analysing signals defined on HEALPix spherical grids,
 with a focus on Earth Observation data. All operators are implemented in PyTorch
 and are fully differentiable through `torch.autograd`.
 
-**[Read the full documentation] (https://grid4earth.github.io/healpix-analyse/)**
+**[Read the full documentation](https://grid4earth.eu/healpix-analyse/)**
 
 ---
 
