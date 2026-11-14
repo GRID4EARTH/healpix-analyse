@@ -253,32 +253,13 @@ class HealPixDown(nn.Module):
         )
         return 2.0 * np.arcsin(np.sqrt(a))
 
-    """
-    Optimized replacement for HealPixDown._build_smooth_matrix().
-
-    Drop this method directly into the HealPixDown class to replace the original.
-
-    Performance improvements vs the original loop:
-    ──────────────────────────────────────────────────────────────────────────
-      Bottleneck                     Before              After
-    ──────────────────────────────────────────────────────────────────────────
-      healpix_to_lonlat (centers)    N_out scalar calls  1 vectorised call
-      cone_coverage                  N_out sequential    1 batched call
-      healpix_to_lonlat (fine pix)   N_out batch calls   1 batch call (unique)
-      Weight computation             Python for loop     numpy (N_out, K) matrix
-      COO accumulation               list.append         pre-allocated arrays
-    ──────────────────────────────────────────────────────────────────────────
-
-    Expected speed-up: 20x–200x depending on N_out and number of CPU cores.
-    """
-
-
     def _build_smooth_matrix(self) -> torch.Tensor:
         """
         Build sparse weight matrix M of shape (N_out, N_in):
             y[i_out] = Σ_j  M[i_out, j_in] * x[j_in]
 
-        Vectorised & parallelised — replaces the original per-pixel Python loop.
+        Vectorised, with one batched ``cone_coverage`` call for all output
+        cells.
         """
         cell_ids_out = self._cell_ids_out   # (N_out,) int64
         cell_ids_in  = self._cell_ids_in    # (N_in,)  int64 | None

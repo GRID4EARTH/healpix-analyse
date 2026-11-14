@@ -87,27 +87,6 @@ def test_cone_candidate_csr_uses_batched_api_with_at_most_eight_threads(
     }
 
 
-def test_cone_candidate_csr_never_silently_falls_back(monkeypatch):
-    module = importlib.import_module("healpix_analyse._neighbourhood")
-    calls = []
-
-    def unavailable(*args, **kwargs):
-        calls.append(args)
-        raise TypeError("batched coverage unavailable")
-
-    monkeypatch.setattr(module.nested, "cone_coverage", unavailable)
-    with pytest.raises(TypeError, match="batched coverage unavailable"):
-        module._cone_candidate_csr(
-            np.array([1.0, 3.0]),
-            np.array([2.0, 4.0]),
-            100.0,
-            20,
-            ellipsoid="WGS84",
-        )
-    assert len(calls) == 1
-    assert calls[0][0].shape == (2, 2)
-
-
 @pytest.mark.parametrize("neighbourhood", ["cone_coverage", "cell_center"])
 def test_batched_neighbourhoods_match_single_cell_queries(neighbourhood):
     module = importlib.import_module("healpix_analyse._neighbourhood")

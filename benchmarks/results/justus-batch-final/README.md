@@ -58,5 +58,7 @@ explicitly and is not affected. The published GEO commit was
 `5a43c343d2f5940ae87a730fbedb856e0256ef4a`; its release build passed 69 GEO and
 408 ANALYSE tests (477 in total, 21 skipped).
 
-Later changes to #292 (no thread cap, always ragged results) are validated in
-GRID4EARTH/healpix-analyse#51, not by these timings.
+Later changes to GRID4EARTH/healpix-geo#292 (no thread cap, ragged results
+for an array of centres) were released in healpix-geo 0.5.0 and are validated
+by the test suite, not by these timings. These results are a historical record
+of the migration.

@@ -10,12 +10,11 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
+# Allow only one concurrent deployment
 concurrency:
   group: "pages"
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -24,41 +23,33 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.10.1
         with:
-          python-version: "3.11"
-          cache: "pip"
+          environments: docs
 
-      - name: Install PyTorch (CPU only, beaucoup plus rapide)
-        run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Install package and doc dependencies
-        run: |
-          pip install -e .
-          pip install -r docs/requirements.txt
-
-      - name: Build HTML documentation
-        run: |
-          cd docs
-          make html
+      # sphinx runs with -W: warnings fail the build
+      - name: Build docs
+        run: pixi run -e docs build-docs
 
       - name: Upload pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
-          path: docs/_build/html
+          path: docs/_build/
 
   deploy:
     name: Deploy to GitHub Pages
+    # Only deploy on pushes to main, not on pull requests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

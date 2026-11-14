@@ -21,6 +21,11 @@
   buffers.
 
 ### Added
+- `radial_filter` and `gaussian_filter` keep process-wide LRU caches of the
+  filter geometry (up to 192 MiB by default) and of the Gaussian weights (up
+  to 96 MiB). `configure_radial_filter_cache` changes or disables the limits
+  (`0` disables a cache), and `radial_filter_cache_info` reports limits and
+  current usage.
 - `HealPixResampler` and `resample_healpix`: reusable and one-shot local
   resampling between full or partial NESTED HEALPix levels, with NaN support.
 - `HealPixDivCurl` and `HealPixMultiScaleDivCurl`: fixed gauge-aware

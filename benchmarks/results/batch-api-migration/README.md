@@ -26,7 +26,8 @@ square patch; it is a synthetic scene, not a complete Sentinel-2 tile.
 
 Baseline: ANALYSE `3ba9c25`, GEO integration `e170f4a`.
 Candidate: GEO `0495c3b` on main `7659474`, with the ANALYSE API adapter in
-this branch. GEO's development version is 0.4.1; this is not a released API.
+this branch, on a pre-release GEO build (the batched API was released in
+healpix-geo 0.5.0).
 WGS84 geodesic distances still use `pyproj.Geod`; neither spherical angular
 distances nor a healpy backend were substituted.
 
@@ -43,5 +44,5 @@ reference test calling nonexistent `healpy.healpix_to_base_cell_coordinates`;
 it reproduces against released GEO 0.4.0. The new batched tests pass. Rust
 Clippy passes with warnings denied, and Rust formatting/Python lint pass.
 
-The dependency pin must remain until a GEO release contains native batched
-coverage. Do not replace it with GEO 0.4.0 to make a promotion PR mergeable.
+These results are a historical record of the migration; the package now
+requires healpix-geo 0.5 or later.

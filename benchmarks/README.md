@@ -151,18 +151,17 @@ Before batched cone coverage, the final `cProfile` run attributed 1.574 s of
 lookup used 0.131 s. Gaussian weight construction used 0.050 s. Threaded
 cumulative times overlap, so these numbers are not additive.
 
-When `healpix-geo` provides `cone_coverage_many` (introduced by
-`GRID4EARTH/healpix-geo#242`), the same candidate rows are requested in one
-native batched call using at most eight threads. A Level-20, 600 m profile
-measured 0.067 s in the single batched call, versus the earlier 0.514 s across
-15,069 scalar calls. The complete cold filter measured 1.015 s in that
-profile, of which exact WGS84 inverse geodesy used 0.415 s. The implementation
-automatically retains the scalar path as a compatibility fallback for released
-`healpix-geo` versions that do not yet expose the batched API.
+With batched cone coverage (`healpix_geo.nested.cone_coverage` with an
+`(N, 2)` array of centres, healpix-geo 0.5 or later), the same candidate rows
+are requested in one native call using at most eight threads. A Level-20,
+600 m profile measured 0.067 s in the single batched call, versus the earlier
+0.514 s across 15,069 scalar calls. The complete cold filter measured 1.015 s
+in that profile, of which exact WGS84 inverse geodesy used 0.415 s. These
+profiles were taken on pre-release healpix-geo builds.
 
 On a Level-20, 1,200 m fixture, back-to-back runs in the same environment
-measured 5.315 s with batched cone coverage and 6.522 s with the scalar
-fallback, an 18.5% cold-path reduction. Both produced the same checksum. This
+measured 5.315 s with batched cone coverage and 6.522 s with one scalar
+call per centre, an 18.5% cold-path reduction. Both produced the same checksum. This
 fixture exceeds the default geometry and weight cache limits, so its reported
 repeat still reconstructs both entries and should not be interpreted as a
 cache-hit timing.
