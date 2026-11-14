@@ -149,6 +149,32 @@ Changing the normalisation changes individual detail maps but never the
 reconstruction identity, because the same prediction is subtracted during
 analysis and added during synthesis.
 
+## NaN and confidence-weighted data
+
+`compute`/`invert` require finite input. For maps that carry `NaN` (missing
+observations) or a per-pixel confidence weight, use
+`compute_weighted`/`invert` instead:
+
+```python
+pyramid = decomp.compute_weighted(x, weights=weights)  # weights optional; NaN => 0 confidence
+y = decomp.invert(pyramid, restore_mask=True)           # NaN where support is 0
+```
+
+Internally, `compute_weighted` runs the *same* linear analysis operator on
+`q = weights * x` (missing values zeroed) and on `m = weights` alone, and
+returns both as a `HealPixWeightedPyramid`. `invert` synthesizes both
+channels and divides **once**, `y = S(q) / S(m)`, after synthesis -- never
+band by band. This is the standard normalized-convolution convention and is
+what makes a constant map behind an arbitrary mask reconstruct back to that
+same constant wherever it has any support at all, and `NaN` (or `0`, with
+`restore_mask=False`) exactly where it has none.
+
+The detail bands of `m` are *signed correction terms*, not per-band
+confidences in `[0, 1]`; do not clip, threshold, or divide them
+individually. See [Pyramidal convolution](pyramid_convolution.md) for how
+this combines with a per-band kernel pyramid for masked, NaN-aware spherical
+smoothing/filtering.
+
 ## Interpretation and limitations
 
 This is a Laplacian pyramid with wavelet-like detail bands. It is not claimed
@@ -194,4 +220,8 @@ pyramid = decomp.compute(data)
 pyramid = decomp(data)             # same operation through nn.Module.forward
 data = decomp.invert(pyramid)
 fine_components = decomp.expand(pyramid)
+
+# NaN/weight-aware variants (see "NaN and confidence-weighted data" above)
+weighted_pyramid = decomp.compute_weighted(data, weights=None)
+data = decomp.invert(weighted_pyramid, restore_mask=True, eps=1e-8)
 ```

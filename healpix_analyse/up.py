@@ -41,6 +41,7 @@ except ImportError as e:
 '''
 
 from healpix_analyse.down import HealPixDown, _prepare_input, _restore_output
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
@@ -142,7 +143,8 @@ class HealPixUp(nn.Module):
         self.device = torch.device(device)
         self.dtype = dtype
         self.ellipsoid = (
-            paired_down.ellipsoid if paired_down is not None else ellipsoid
+            paired_down.ellipsoid if paired_down is not None
+            else canonicalize_ellipsoid(ellipsoid)
         )
         self.weight_norm = (
             paired_down.weight_norm if paired_down is not None else weight_norm

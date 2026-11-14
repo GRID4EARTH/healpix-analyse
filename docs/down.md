@@ -152,12 +152,14 @@ print(y_batch.shape) # (8, 12288)
 ### Partial sky
 
 ```python
-import healpy as hp
 import numpy as np
+from healpix_geo import nested
 from healpix_analyse.down import HealPixDown
 
-nside = 64;  level = 6   # nside = 2**6
-patch = hp.query_disc(nside, hp.ang2vec(np.pi/2, 0.), np.radians(20.), nest=True)
+level = 6                       # nside = 2**6
+# the NESTED cells within 20 degrees of (lon, lat) = (0, 0)
+patch = nested.cone_coverage((0.0, 0.0), 20.0, level)
+patch = np.asarray(getattr(patch, "data", patch), dtype=np.int64).reshape(-1)
 
 down = HealPixDown(level=level, cell_ids=patch)
 

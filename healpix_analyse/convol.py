@@ -52,6 +52,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import healpix_geo
 from healpix_analyse.healpix_interp import get_interp_weights
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
@@ -645,7 +646,7 @@ class HealPixConv(nn.Module):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device)
         self.dtype  = dtype
-        self.ellipsoid = ellipsoid
+        self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
         if isinstance(level, bool) or int(level) != level or int(level) < 0:
             raise ValueError("level must be an integer >= 0.")

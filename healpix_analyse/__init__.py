@@ -50,7 +50,21 @@ from healpix_analyse.fft_conv import HealPixFFTConv
 from healpix_analyse.decomp import (
     HealPixDecomp,
     HealPixPyramid,
+    HealPixWeightedPyramid,
 )
+
+from healpix_analyse.kernel_pyramid import (
+    HealPixKernelPyramid,
+    kernel_gaussian,
+    kernel_exponential,
+    kernel_lorentzian,
+    kernel_beta,
+    kernel_anisotropic_gaussian,
+)
+
+from healpix_analyse.pyramid_conv import HealPixPyramidConv
+
+from healpix_analyse.wide_conv import HealPixWideConv
 
 from healpix_analyse.divcurl import (
     HealPixDivCurl,
@@ -162,6 +176,22 @@ from healpix_analyse.radial_filter import (
     radial_filter_cache_info,
 )
 
+# ---------------------------------------------------------------------------
+# Foundation-model embeddings (DINOv3 SAT-493M on NESTED blocks)
+#
+# The backbone is loaded at run time from Meta's own distribution and is
+# subject to the DINOv3 License; nothing of it is vendored here (see
+# docs/dino.md).
+# ---------------------------------------------------------------------------
+
+from healpix_analyse.dino import (
+    GetDINOV3SAT,
+    DINOEmbedding,
+    load_dinov3_sat,
+    nested_to_tiles,
+    tiles_to_nested,
+)
+
 __all__ = [
     # ------------------------------------------------------------------
     # Multi-resolution operators
@@ -171,7 +201,16 @@ __all__ = [
     "LargeConv",
     "HealPixFFTConv",
     "HealPixDecomp",
+    "HealPixWideConv",
     "HealPixPyramid",
+    "HealPixWeightedPyramid",
+    "HealPixKernelPyramid",
+    "HealPixPyramidConv",
+    "kernel_gaussian",
+    "kernel_exponential",
+    "kernel_lorentzian",
+    "kernel_beta",
+    "kernel_anisotropic_gaussian",
     "HealPixDivCurl",
     "HealPixMultiScaleDivCurl",
     "HealPixDivCurlPyramid",
@@ -252,4 +291,13 @@ __all__ = [
     "component_area",
     "healpix_cell_area",
     "remove_small_components",
+
+    # ------------------------------------------------------------------
+    # DINOv3 embeddings of NESTED blocks
+    # ------------------------------------------------------------------
+    "GetDINOV3SAT",
+    "DINOEmbedding",
+    "load_dinov3_sat",
+    "nested_to_tiles",
+    "tiles_to_nested",
 ]

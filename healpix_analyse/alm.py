@@ -222,7 +222,7 @@ class AlmTransform:
         # fréquences en cycles / unité de x
         f = torch.fft.fftfreq(self.n_lon, device=self.device, dtype=self.dtype)
 
-        if True:
+        if self.debug:
             import matplotlib.pyplot as plt
             plt.figure(figsize=(16,8))
             plt.imshow((f[None, :] * x0[:, None]).cpu()[:20, :], cmap='bwr')
@@ -258,19 +258,20 @@ class AlmTransform:
         data_shifted = torch.cat([data_[:,0][:,None], data_[:,:-1]], dim=1)  # shift data by one pixel to the right and pad by replicating the last pixel on the right
 
         data = (1-self.pixel_shift[:,None]) * data_ + self.pixel_shift[:,None] * data_shifted
-        print("data input", data_)
-        print("data corrected", data)
+        if self.debug:
+            print("data input", data_)
+            print("data corrected", data)
 
         # TODO: implement non PBC handling
         if pbc != True:
             raise NotImplementedError("Non-periodic boundary conditions are not yet implemented.")
-        
+
         # 1D FFTs along longitudes, in parallel over latitude rings
         # TODO: implement rfft
         out_fft = torch.fft.fft(self._as_real_tensor(data, device=self.device, dtype=self.dtype), dim=-1)
 
 
-        if True:
+        if self.debug:
             import matplotlib.pyplot as plt
             plt.plot(out_fft[:,130].real.cpu())
             plt.plot(out_fft[:,130].imag.cpu())
@@ -280,13 +281,13 @@ class AlmTransform:
         #out_fft = out_fft * self.phase_shift
         # TODO: raise Warning if phase shift is large
 
-        if True:
+        if self.debug:
             import matplotlib.pyplot as plt
             plt.plot(out_fft[:,130].real.cpu())
             plt.plot(out_fft[:,130].imag.cpu())
             plt.show()
 
-        if True:
+        if self.debug:
             import matplotlib.pyplot as plt
             plt.imshow(np.fft.fftshift(np.abs(out_fft.detach().cpu())), norm='log')
             plt.colorbar(label='Power (log scale)', orientation='horizontal')
@@ -303,16 +304,24 @@ class AlmTransform:
         self,
         data: ArrayLike,
     ) -> ArrayLike:
-        """Reconstruct a map on the same local HEALPix cells."""
-        o_fft = np.fft.ifft(data_fft)
-    
-        idata = np.zeros([self.size])
-        for k in range(self.n_rings):
-            idx = np.where(self.idx_ring==k)[0]
-            inv_fft = o_fft[:,k]/self.weights[k]
-            inv_fft = self.shift_from_fft_phase(inv_fft,-self.xa[idx[0]])
-            idata[idx]=torch.fft.ifft(inv_fft)[0:self.N_k[k]].real
-        return idata 
+        """Reconstruct a map on the same local HEALPix cells.
+
+        Not implemented yet. The inverse needs the Legendre-projection stage
+        that :meth:`fft` does not currently compute (see the ``TODO`` next to
+        its second FFT stage), and relies on ring bookkeeping
+        (``self.n_rings``, ``self.idx_ring``, ``self.weights``, ``self.xa``,
+        ``self.N_k``) that ``__init__`` does not currently set. Rather
+        than fail on a missing attribute or silently return a wrong map, this
+        raises explicitly until that work lands.
+        """
+        raise NotImplementedError(
+            "AlmTransform.ifft() is not implemented yet: the Legendre "
+            "projection stage of the local SHT (see the TODO in fft()) and "
+            "the ring bookkeeping it depends on are still missing. Use "
+            "HEALPixSHT.anafast (healpix_sht.py, full sky) or LocalFFT "
+            "(fft_local.py, local patch) for a working FFT / power-spectrum "
+            "pipeline in the meantime — see docs/powerspectra.md."
+        )
 
     
     @staticmethod
