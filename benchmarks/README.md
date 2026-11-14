@@ -161,10 +161,10 @@ profiles were taken on pre-release healpix-geo builds.
 
 On a Level-20, 1,200 m fixture, back-to-back runs in the same environment
 measured 5.315 s with batched cone coverage and 6.522 s with one scalar
-call per centre, an 18.5% cold-path reduction. Both produced the same checksum. This
-fixture exceeds the default geometry and weight cache limits, so its reported
-repeat still reconstructs both entries and should not be interpreted as a
-cache-hit timing.
+call per centre, an 18.5% cold-path reduction. Both produced the same
+checksum. This fixture exceeds the default geometry and weight cache
+limits, so its reported repeat still reconstructs both entries and should
+not be interpreted as a cache-hit timing.
 
 `line_profiler` gives the same conclusion inside the fused geometry builder:
 candidate `cone_coverage` uses 41.5%, the one WGS84 distance pass 29.5%, and
