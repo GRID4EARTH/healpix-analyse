@@ -3,10 +3,17 @@
 ## Unreleased
 
 ### Changed
+- Connected-component topology now uses the direction-preserving
+  `healpix_geo.nested.neighbours` backend. A reproducible benchmark records
+  correctness checks, input dtype, threading mode and reference timings.
 - HEALPix-facing public APIs now take the Grid4Earth `level` directly and
   derive `nside = 2**level` internally. This applies to `HealPixConv`,
   `LargeConv`, `HealPixDown`, `HealPixUp`, `HEALPixSHT`, localized ALM
   transforms, and `build_healpix_adjacency`.
+- Cone candidates for the metric neighbourhood helpers and for
+  `HealPixDown` (`mode="smooth"`) come from one batched
+  `healpix_geo.nested.cone_coverage` call instead of one call per cell.
+  Outputs are unchanged.
 
 ### Fixed
 - `HealPixConv` geometry cache keys retain the input `cell_ids` order, so a

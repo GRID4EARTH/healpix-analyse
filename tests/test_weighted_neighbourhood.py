@@ -25,9 +25,45 @@ import pytest
 import torch
 
 from healpix_analyse._weighted_neighbourhood import (
+    compact_weighted_neighbourhood_reduce,
     neighbour_positions,
     weighted_neighbourhood_reduce,
 )
+
+
+def test_compact_reduction_matches_padded_reduction():
+    cell_ids = np.array([30, 10, 20], dtype=np.uint64)
+    values = np.array(
+        [[3.0, 1.0, np.nan], [6.0, 2.0, 4.0]],
+        dtype=np.float64,
+    )
+    neighbour_ids = np.array(
+        [[10, 20, 30], [30, -1, -1], [20, 10, -1]],
+        dtype=np.int64,
+    )
+    valid_mask = neighbour_ids >= 0
+    weights = np.array(
+        [[0.5, 0.25, 0.125], [2.0, 0.0, 0.0], [1.5, -0.5, 0.0]],
+        dtype=np.float64,
+    )
+
+    padded = weighted_neighbourhood_reduce(
+        values,
+        cell_ids,
+        neighbour_ids,
+        valid_mask,
+        weights,
+        normalize=True,
+    )
+    compact = compact_weighted_neighbourhood_reduce(
+        values,
+        np.array([1, 2, 0, 0, 2, 1], dtype=np.int64),
+        np.array([0, 3, 4, 6], dtype=np.int64),
+        weights[valid_mask],
+        normalize=True,
+    )
+
+    np.testing.assert_array_equal(compact, padded)
 
 
 # ---------------------------------------------------------------------------

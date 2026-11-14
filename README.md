@@ -3,6 +3,7 @@
 [![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://grid4earth.eu/healpix-analyse/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](https://www.python.org/)
+[![DOI](https://zenodo.org/badge/1176905310.svg)](https://zenodo.org/badge/latestdoi/1176905310)
 
 A Python toolkit for analysing signals defined on HEALPix spherical grids,
 with a focus on Earth Observation data. All operators are implemented in PyTorch
@@ -240,6 +241,27 @@ make html
 - [healpix-geo](https://healpix-geo.readthedocs.io/) — HEALPix geometry: pixel coordinates, ellipsoids, coverage queries
 - **healpix-analyse** — signal analysis: SHT, convolutions, power spectra, multi-resolution operators
 - [healpix-ai](https://iaocea.github.io/healpix-ai/) — deep learning: autoencoders, U-Nets, forecasters built on top of `healpix-analyse`
+
+## Development and contributing
+
+Bug reports, feature requests, and contributions are welcome. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution process and
+[`DEVELOPMENT.md`](DEVELOPMENT.md) for the lightweight branch and cross-repository development
+workflow.
+
+## Citation
+
+GitHub releases are archived by Zenodo. Use the DOI badge at the top of this page to cite the
+latest archived release, or cite the DOI for the exact version used in your work.
+
+## Funding and acknowledgements
+
+**Funded by ESA, built by a European consortium.**
+
+ESA Contract: `4000147951/25/I-NS` — Technical Officer: Vincent Dumoulin.
+
+We also thank all external contributors and the open-source projects on which `healpix-analyse`
+depends.
 
 ## License
 

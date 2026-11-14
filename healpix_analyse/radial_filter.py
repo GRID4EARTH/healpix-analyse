@@ -46,22 +46,179 @@ not part of this API.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
+from threading import RLock
 from typing import Any
+import warnings
 
 import numpy as np
 import torch
 
 from ._neighbourhood import (
-    RelativeNeighbourhoodGeometry,
-    build_neighbourhoods,
-    relative_geometry_from_neighbourhoods,
+    CompactMetricNeighbourhoodGeometry,
+    build_metric_neighbourhood_geometry,
 )
-from ._weighted_neighbourhood import weighted_neighbourhood_reduce
+from ._weighted_neighbourhood import compact_weighted_neighbourhood_reduce
 
 
 ArrayLike = np.ndarray | torch.Tensor
 Kernel = Callable[[np.ndarray], Any]
+
+_GEOMETRY_CACHE_MAX_BYTES = 192 * 1024 * 1024
+_WEIGHT_CACHE_MAX_BYTES = 96 * 1024 * 1024
+_geometry_cache: OrderedDict[
+    tuple[Any, ...],
+    CompactMetricNeighbourhoodGeometry,
+] = OrderedDict()
+_geometry_cache_bytes = 0
+_gaussian_weight_cache: OrderedDict[tuple[Any, ...], np.ndarray] = OrderedDict()
+_gaussian_weight_cache_bytes = 0
+_cache_lock = RLock()
+_warned_oversize_cache_entries: set[tuple[Any, ...]] = set()
+
+
+def _mib(number_of_bytes: int) -> float:
+    return number_of_bytes / (1024.0**2)
+
+
+def _validate_cache_limit_mib(value: float, *, name: str) -> int:
+    """Validate a public cache limit and convert it to bytes."""
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"'{name}' must be a finite non-negative number.")
+    try:
+        limit_mib = float(value)
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            f"'{name}' must be a finite non-negative number."
+        ) from error
+    if not np.isfinite(limit_mib) or limit_mib < 0.0:
+        raise ValueError(f"'{name}' must be finite and non-negative.")
+    return int(limit_mib * 1024.0**2)
+
+
+def radial_filter_cache_info() -> dict[str, float | int]:
+    """Return current radial/Gaussian cache limits and usage.
+
+    Returns
+    -------
+    dict
+        Geometry and weight limits and current usage in MiB, plus the number
+        of retained entries in each cache.
+    """
+    with _cache_lock:
+        return {
+            "geometry_max_mib": _mib(_GEOMETRY_CACHE_MAX_BYTES),
+            "weight_max_mib": _mib(_WEIGHT_CACHE_MAX_BYTES),
+            "geometry_used_mib": _mib(_geometry_cache_bytes),
+            "weight_used_mib": _mib(_gaussian_weight_cache_bytes),
+            "geometry_entries": len(_geometry_cache),
+            "weight_entries": len(_gaussian_weight_cache),
+        }
+
+
+def configure_radial_filter_cache(
+    *,
+    geometry_max_mib: float | None = None,
+    weight_max_mib: float | None = None,
+) -> dict[str, float | int]:
+    """Configure bounded radial/Gaussian caches and return their status.
+
+    ``None`` leaves a limit unchanged. A zero limit disables that cache.
+    Reducing a limit immediately evicts least-recently-used entries until the
+    retained data fits. Large production workloads should ensure sufficient
+    process memory for both cached arrays and temporary construction arrays.
+
+    Parameters
+    ----------
+    geometry_max_mib
+        Maximum retained metric-geometry size in MiB.
+    weight_max_mib
+        Maximum retained Gaussian-weight size in MiB.
+
+    Returns
+    -------
+    dict
+        Updated result from :func:`radial_filter_cache_info`.
+    """
+    global _GEOMETRY_CACHE_MAX_BYTES, _WEIGHT_CACHE_MAX_BYTES
+    global _geometry_cache_bytes, _gaussian_weight_cache_bytes
+
+    geometry_limit = (
+        None
+        if geometry_max_mib is None
+        else _validate_cache_limit_mib(
+            geometry_max_mib,
+            name="geometry_max_mib",
+        )
+    )
+    weight_limit = (
+        None
+        if weight_max_mib is None
+        else _validate_cache_limit_mib(
+            weight_max_mib,
+            name="weight_max_mib",
+        )
+    )
+
+    with _cache_lock:
+        if geometry_limit is not None:
+            _GEOMETRY_CACHE_MAX_BYTES = geometry_limit
+        if weight_limit is not None:
+            _WEIGHT_CACHE_MAX_BYTES = weight_limit
+        while (
+            _geometry_cache
+            and _geometry_cache_bytes > _GEOMETRY_CACHE_MAX_BYTES
+        ):
+            _, evicted = _geometry_cache.popitem(last=False)
+            _geometry_cache_bytes -= _geometry_nbytes(evicted)
+        while (
+            _gaussian_weight_cache
+            and _gaussian_weight_cache_bytes > _WEIGHT_CACHE_MAX_BYTES
+        ):
+            _, evicted = _gaussian_weight_cache.popitem(last=False)
+            _gaussian_weight_cache_bytes -= evicted.nbytes
+        _warned_oversize_cache_entries.clear()
+    return radial_filter_cache_info()
+
+
+def _warn_oversize_cache_entry(
+    *,
+    kind: str,
+    required_bytes: int,
+    limit_bytes: int,
+    domain_size: int,
+    refinement_level: int,
+    radius_m: float,
+    option_name: str,
+) -> None:
+    """Warn once when one spatial plan cannot fit its configured cache."""
+    token = (
+        kind,
+        domain_size,
+        refinement_level,
+        radius_m,
+        required_bytes,
+        limit_bytes,
+    )
+    with _cache_lock:
+        if token in _warned_oversize_cache_entries:
+            return
+        _warned_oversize_cache_entries.add(token)
+
+    suggested_mib = int(np.ceil(_mib(required_bytes) * 1.05))
+    warnings.warn(
+        f"The radial-filter {kind} cache entry requires "
+        f"{_mib(required_bytes):.1f} MiB, "
+        f"exceeding its configured {_mib(limit_bytes):.1f} MiB cache limit. "
+        f"It will not be cached, so repeated calls rebuild or recompute it. "
+        f"Either call configure_radial_filter_cache({option_name}="
+        f"{suggested_mib}) after checking available memory, or process tiles "
+        f"with a halo of at least radius_m={radius_m:g} m and discard halo "
+        f"outputs when stitching.",
+        RuntimeWarning,
+        stacklevel=4,
+    )
 
 
 def _validate_cell_ids(
@@ -209,6 +366,16 @@ def _validate_domain(
     return domain_ids
 
 
+def _positions_in_input(
+    cell_ids: np.ndarray,
+    domain: np.ndarray,
+) -> np.ndarray:
+    """Map the validated output domain to positions in the input signal."""
+    sorter = np.argsort(cell_ids)
+    positions = np.searchsorted(cell_ids[sorter], domain)
+    return sorter[positions]
+
+
 def _validate_values(
     values: ArrayLike,
     number_of_cells: int,
@@ -234,49 +401,161 @@ def _validate_values(
         )
 
 
-def _restrict_neighbourhoods_to_domain(
-    neighbourhoods: list[np.ndarray],
+def _cache_key(
     domain: np.ndarray,
-) -> list[np.ndarray]:
-    """Remove cells outside the processing domain before aggregation.
+    refinement_level: int,
+    radius: float,
+    ellipsoid: str,
+) -> tuple[Any, ...]:
+    """Return an exact, mutation-safe key for reusable filter geometry."""
+    contiguous = np.ascontiguousarray(domain, dtype=np.uint64)
+    return (
+        contiguous.size,
+        contiguous.tobytes(),
+        int(refinement_level),
+        float(radius),
+        ellipsoid,
+    )
 
-    Domain filtering belongs to the spatial-neighbourhood stage rather than
-    to ``weighted_neighbourhood_reduce``.  A cell outside ``domain`` is not a
-    zero, NaN, or padded sample; it is simply absent from the operation.
-    """
-    if domain.size == 0:
-        return []
 
-    domain_set = {
-        int(cell)
-        for cell in domain
-    }
+def _geometry_nbytes(geometry: CompactMetricNeighbourhoodGeometry) -> int:
+    return sum(
+        array.nbytes
+        for array in (
+            geometry.center_ids,
+            geometry.neighbour_indices,
+            geometry.row_offsets,
+            geometry.distance_m,
+        )
+    )
 
-    restricted: list[np.ndarray] = []
 
-    for neighbourhood in neighbourhoods:
-        kept = np.asarray(
-            [
-                cell
-                for cell in neighbourhood
-                if int(cell) in domain_set
-            ],
-            dtype=np.uint64,
+def _filter_geometry(
+    domain: np.ndarray,
+    refinement_level: int,
+    radius: float,
+    ellipsoid: str,
+) -> tuple[tuple[Any, ...], CompactMetricNeighbourhoodGeometry]:
+    """Build or retrieve value-independent radial filter geometry."""
+    global _geometry_cache_bytes
+
+    key = _cache_key(domain, refinement_level, radius, ellipsoid)
+    with _cache_lock:
+        cached = _geometry_cache.get(key)
+        if cached is not None:
+            _geometry_cache.move_to_end(key)
+            return key, cached
+
+    geometry = build_metric_neighbourhood_geometry(
+        domain,
+        radius,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+
+    size = _geometry_nbytes(geometry)
+    if size <= _GEOMETRY_CACHE_MAX_BYTES:
+        with _cache_lock:
+            replaced = _geometry_cache.pop(key, None)
+            if replaced is not None:
+                _geometry_cache_bytes -= _geometry_nbytes(replaced)
+            while (
+                _geometry_cache
+                and _geometry_cache_bytes + size > _GEOMETRY_CACHE_MAX_BYTES
+            ):
+                _, evicted = _geometry_cache.popitem(last=False)
+                _geometry_cache_bytes -= _geometry_nbytes(evicted)
+            _geometry_cache[key] = geometry
+            _geometry_cache_bytes += size
+    else:
+        _warn_oversize_cache_entry(
+            kind="geometry",
+            required_bytes=size,
+            limit_bytes=_GEOMETRY_CACHE_MAX_BYTES,
+            domain_size=domain.size,
+            refinement_level=refinement_level,
+            radius_m=radius,
+            option_name="geometry_max_mib",
         )
 
-        restricted.append(kept)
+    return key, geometry
 
-    return restricted
+
+def _gaussian_weights(
+    key: tuple[Any, ...],
+    geometry: CompactMetricNeighbourhoodGeometry,
+    sigma: float,
+) -> np.ndarray:
+    """Build or retrieve exact Gaussian weights for cached geometry."""
+    global _gaussian_weight_cache_bytes
+
+    weight_key = (*key, float(sigma))
+    with _cache_lock:
+        cached = _gaussian_weight_cache.get(weight_key)
+        if cached is not None:
+            _gaussian_weight_cache.move_to_end(weight_key)
+            return cached
+
+    distance = geometry.distance_m.copy()
+    row_counts = np.diff(geometry.row_offsets)
+    self_mask = (
+        geometry.neighbour_indices
+        == np.repeat(
+            np.arange(geometry.center_ids.size, dtype=np.int64),
+            row_counts,
+        )
+    )
+    distance[self_mask] = 0.0
+    scaled = distance / sigma
+    weights = np.exp(-0.5 * scaled * scaled)
+
+    if weights.nbytes <= _WEIGHT_CACHE_MAX_BYTES:
+        with _cache_lock:
+            replaced = _gaussian_weight_cache.pop(weight_key, None)
+            if replaced is not None:
+                _gaussian_weight_cache_bytes -= replaced.nbytes
+            while (
+                _gaussian_weight_cache
+                and _gaussian_weight_cache_bytes + weights.nbytes
+                > _WEIGHT_CACHE_MAX_BYTES
+            ):
+                _, evicted = _gaussian_weight_cache.popitem(last=False)
+                _gaussian_weight_cache_bytes -= evicted.nbytes
+            _gaussian_weight_cache[weight_key] = weights
+            _gaussian_weight_cache_bytes += weights.nbytes
+    else:
+        _warn_oversize_cache_entry(
+            kind="Gaussian-weight",
+            required_bytes=weights.nbytes,
+            limit_bytes=_WEIGHT_CACHE_MAX_BYTES,
+            domain_size=geometry.center_ids.size,
+            refinement_level=int(key[2]),
+            radius_m=float(key[3]),
+            option_name="weight_max_mib",
+        )
+
+    return weights
+
+
+def _clear_filter_caches() -> None:
+    """Clear private geometry/weight caches (primarily for tests)."""
+    global _geometry_cache_bytes, _gaussian_weight_cache_bytes
+    with _cache_lock:
+        _geometry_cache.clear()
+        _gaussian_weight_cache.clear()
+        _warned_oversize_cache_entries.clear()
+        _geometry_cache_bytes = 0
+        _gaussian_weight_cache_bytes = 0
 
 
 def _evaluate_kernel(
     kernel: Kernel,
-    geometry: RelativeNeighbourhoodGeometry,
+    geometry: CompactMetricNeighbourhoodGeometry,
 ) -> np.ndarray:
     """Evaluate a radial kernel for every valid centre-neighbour pair.
 
-    The user kernel is called only on valid physical distances.  Padded
-    ``NaN`` distances are never passed to user code.
+    The user kernel is called only on valid physical distances. Compact
+    geometry contains no padding positions.
 
     The callable receives a one-dimensional NumPy array containing the
     physical distances of all valid pairs and may return either:
@@ -294,15 +573,8 @@ def _evaluate_kernel(
             "'kernel' must be callable."
         )
 
-    weights = np.zeros(
-        geometry.distance_m.shape,
-        dtype=np.float64,
-    )
-
-    valid = geometry.valid_mask
-
-    if not np.any(valid):
-        return weights
+    if geometry.distance_m.size == 0:
+        return np.empty(0, dtype=np.float64)
 
     # The centre cell is a valid neighbour of itself for radial filtering.
     # WGS84 inverse geodesics can return tiny non-zero round-off values even
@@ -310,21 +582,13 @@ def _evaluate_kernel(
     # self-distances to exactly zero before user-kernel evaluation so kernels
     # may safely use conditions such as ``distance_m == 0.0``.
     distance_m = geometry.distance_m.copy()
-
-    self_mask = (
-        geometry.valid_mask
-        & (
-            geometry.neighbour_ids
-            == geometry.center_ids[:, None]
-        )
+    self_mask = geometry.neighbour_indices == np.repeat(
+        np.arange(geometry.center_ids.size, dtype=np.int64),
+        np.diff(geometry.row_offsets),
     )
     distance_m[self_mask] = 0.0
 
-    distance = distance_m[
-        valid
-    ]
-
-    raw_weights = kernel(distance)
+    raw_weights = kernel(distance_m)
 
     if isinstance(
         raw_weights,
@@ -341,7 +605,7 @@ def _evaluate_kernel(
 
     if raw_weights.ndim == 0:
         valid_weights = np.full(
-            distance.shape,
+            distance_m.shape,
             raw_weights.item(),
             dtype=np.float64,
         )
@@ -349,7 +613,7 @@ def _evaluate_kernel(
         try:
             valid_weights = np.broadcast_to(
                 raw_weights,
-                distance.shape,
+                distance_m.shape,
             ).astype(
                 np.float64,
                 copy=False,
@@ -367,11 +631,7 @@ def _evaluate_kernel(
             "'kernel' returned non-finite weights for valid neighbour pairs."
         )
 
-    weights[
-        valid
-    ] = valid_weights
-
-    return weights
+    return valid_weights
 
 
 def radial_filter(
@@ -541,40 +801,11 @@ def radial_filter(
             "Radial filtering currently supports ellipsoid='WGS84' only."
         )
 
-    # A zero-radius radial neighbourhood has an exact and useful semantic:
-    # each target cell contributes only to itself.  Handle this explicitly
-    # instead of relying on candidate-generation / geodesic round-off at the
-    # zero-distance boundary.
-    if radius == 0.0:
-        neighbourhoods = [
-            np.asarray([cell], dtype=np.uint64)
-            for cell in output_domain
-        ]
-    else:
-        # Public radial semantics are physical centre-to-centre distance.  The
-        # shared cell_center neighbourhood applies the exact WGS84 distance
-        # cutoff after candidate generation.
-        neighbourhoods = build_neighbourhoods(
-            output_domain,
-            radius,
-            refinement_level,
-            neighbourhood="cell_center",
-            ellipsoid=ellipsoid,
-        )
-
-    # Domain is both the participating spatial set and output domain.  Cells
-    # outside it are removed before geometry/aggregation rather than being
-    # represented by zero-valued or NaN-valued samples.
-    neighbourhoods = _restrict_neighbourhoods_to_domain(
-        neighbourhoods,
+    _, geometry = _filter_geometry(
         output_domain,
-    )
-
-    geometry = relative_geometry_from_neighbourhoods(
-        output_domain,
-        neighbourhoods,
         refinement_level,
-        ellipsoid=ellipsoid,
+        radius,
+        ellipsoid,
     )
 
     weights = _evaluate_kernel(
@@ -582,11 +813,11 @@ def radial_filter(
         geometry,
     )
 
-    return weighted_neighbourhood_reduce(
+    domain_positions = _positions_in_input(cells, geometry.center_ids)
+    return compact_weighted_neighbourhood_reduce(
         values,
-        cells,
-        geometry.neighbour_ids,
-        geometry.valid_mask,
+        domain_positions[geometry.neighbour_indices],
+        geometry.row_offsets,
         weights,
         normalize=normalize,
     )
@@ -639,6 +870,11 @@ def gaussian_filter(
 
     The physical smoothing scale is independent of HEALPix refinement level:
     ``sigma_m=240`` always means 240 metres rather than a number of pixels.
+
+    Geometry and Gaussian weights are retained in bounded caches. If one plan
+    exceeds a limit, a warning reports the measured requirement and suggests
+    :func:`configure_radial_filter_cache` or halo-safe tiling. Use
+    :func:`radial_filter_cache_info` to inspect current limits and usage.
     """
     sigma = _validate_positive_finite(
         sigma_m,
@@ -660,27 +896,39 @@ def gaussian_filter(
             "'truncate * sigma_m' must be finite."
         )
 
-    def _gaussian_kernel(
-        distance_m: np.ndarray,
-    ) -> np.ndarray:
-        scaled = distance_m / sigma
-        return np.exp(
-            -0.5 * scaled * scaled
+    cells = _validate_cell_ids(
+        cell_ids,
+        name="cell_ids",
+    )
+    _validate_values(values, cells.size)
+    output_domain = _validate_domain(cells, domain)
+
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Radial filtering currently supports ellipsoid='WGS84' only."
         )
 
-    return radial_filter(
-        values,
-        cell_ids,
+    key, geometry = _filter_geometry(
+        output_domain,
         refinement_level,
-        radius_m=radius,
-        kernel=_gaussian_kernel,
+        radius,
+        ellipsoid,
+    )
+    weights = _gaussian_weights(key, geometry, sigma)
+
+    domain_positions = _positions_in_input(cells, geometry.center_ids)
+    return compact_weighted_neighbourhood_reduce(
+        values,
+        domain_positions[geometry.neighbour_indices],
+        geometry.row_offsets,
+        weights,
         normalize=True,
-        domain=domain,
-        ellipsoid=ellipsoid,
     )
 
 
 __all__ = [
+    "configure_radial_filter_cache",
     "gaussian_filter",
+    "radial_filter_cache_info",
     "radial_filter",
 ]

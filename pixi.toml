@@ -1,8 +1,8 @@
 [workspace]
-authors = ["Jean-Marc Delouis"]
+authors = ["Jean-Marc Delouis", "Tina Odaka"]
 channels = ["conda-forge"]
 name = "healpix-analyse"
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 version = "2026.8.1"
 
 [tasks]
@@ -12,11 +12,15 @@ numpy = ">=2.4.2,<3"
 python = ">=3.10,<3.14"
 jupyterlab = ">=4.5.5,<5"
 pytorch = ">=2.0,<3"
+pyproj = ">=3.6"
+healpy = ">=1.16"
 
 
 [pypi-dependencies]
 healpix-analyse= { path = ".", editable = true }
-healpix-geo = "*"
+# 0.5.0 is the first release with batched nested.cone_coverage
+# (GRID4EARTH/healpix-geo#292), required to preserve filtering performance.
+healpix-geo = ">=0.5"
 
 [feature.affine.dependencies]
 affine = "*"

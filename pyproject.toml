@@ -24,8 +24,9 @@ classifiers = [
 dependencies = [
   "numpy",
   "torch",
-  # HEALPix geometry comes from the GRID4EARTH suite, not from healpy
-  "healpix-geo",
+  # HEALPix geometry comes from the GRID4EARTH suite, not from healpy.
+  # lower bound: the first release with batched nested.cone_coverage (GRID4EARTH/healpix-geo#292)
+  "healpix-geo>=0.5",
   "pyproj>=3.6",
   "termcolor",
   "umap-learn",
@@ -35,6 +36,10 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest>=8",
+]
+
+benchmark = [
+  "scipy>=1.11",
 ]
 
 # DINOv3 embeddings -- healpix_analyse.dino
@@ -100,4 +105,3 @@ include = [
 ]
 
 [tool.setuptools_scm]
-
