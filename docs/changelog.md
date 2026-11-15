@@ -2,23 +2,22 @@
 
 ## Unreleased
 
+## 2026.11.0 (2026-11-15)
+
 ### Changed
+- `healpix-geo` 0.5 or later is required: it is the first release with the
+  batched `healpix_geo.nested.cone_coverage`.
 - Connected-component topology now uses the direction-preserving
   `healpix_geo.nested.neighbours` backend. A reproducible benchmark records
   correctness checks, input dtype, threading mode and reference timings.
-- HEALPix-facing public APIs now take the Grid4Earth `level` directly and
-  derive `nside = 2**level` internally. This applies to `HealPixConv`,
-  `LargeConv`, `HealPixDown`, `HealPixUp`, `HEALPixSHT`, localized ALM
-  transforms, and `build_healpix_adjacency`.
 - Cone candidates for the metric neighbourhood helpers and for
   `HealPixDown` (`mode="smooth"`) come from one batched
   `healpix_geo.nested.cone_coverage` call instead of one call per cell.
   Outputs are unchanged.
 
 ### Fixed
-- `HealPixConv` geometry cache keys retain the input `cell_ids` order, so a
-  permutation of the same partial domain cannot reuse incompatible sorting
-  buffers.
+- The `dino` sampling helpers no longer raise `OverflowError` under NumPy 2
+  when masking missing bilinear stencil corners.
 
 ### Added
 - `radial_filter` and `gaussian_filter` keep process-wide LRU caches of the
@@ -26,6 +25,21 @@
   to 96 MiB). `configure_radial_filter_cache` changes or disables the limits
   (`0` disables a cache), and `radial_filter_cache_info` reports limits and
   current usage.
+
+## 2026.10.2 and earlier
+
+### Changed
+- HEALPix-facing public APIs now take the Grid4Earth `level` directly and
+  derive `nside = 2**level` internally. This applies to `HealPixConv`,
+  `LargeConv`, `HealPixDown`, `HealPixUp`, `HEALPixSHT`, localized ALM
+  transforms, and `build_healpix_adjacency`.
+
+### Fixed
+- `HealPixConv` geometry cache keys retain the input `cell_ids` order, so a
+  permutation of the same partial domain cannot reuse incompatible sorting
+  buffers.
+
+### Added
 - `HealPixResampler` and `resample_healpix`: reusable and one-shot local
   resampling between full or partial NESTED HEALPix levels, with NaN support.
 - `HealPixDivCurl` and `HealPixMultiScaleDivCurl`: fixed gauge-aware
