@@ -87,8 +87,11 @@ class HealPixResampler(nn.Module):
     down_mode : {"smooth", "mean"}, default="smooth"
         ``HealPixDown`` mode used for each downscaling step.  ``"mean"``
         averages the 4 NESTED children, which conserves the global mean of
-        a full-sphere map; ``"smooth"`` (Gaussian) does not.  Gaussian
-        parameters are ignored with ``"mean"``.  Upscaling is unaffected.
+        a NaN-free full-sphere map; ``"smooth"`` (Gaussian) does not.
+        Missing values are skipped at every step (see Notes), so with NaNs
+        the result over several steps is a mean of means and the global
+        mean of the finite input is not conserved.  Gaussian parameters
+        are ignored with ``"mean"``.  Upscaling is unaffected.
     up_norm : {"adjoint", "col_l1", "diag_l2"}, default="col_l1"
         Normalisation used by ``HealPixUp``.
     dtype, device : optional
@@ -465,9 +468,9 @@ class HealPixResampler(nn.Module):
             f"in_level={self.in_level}, out_level={self.out_level}, "
             f"direction={self.direction!r}, input_pixels={self.n_input}, "
             f"output_pixels={self.n_output}, steps={len(self.layers)}, "
-            f"down_mode={self.down_mode!r}, "
             f"input_full_sphere={self.input_full_sphere}, "
             f"output_full_sphere={self.output_full_sphere}"
+            + ("" if self.down_mode == "smooth" else f", down_mode={self.down_mode!r}")
         )
 
 

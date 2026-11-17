@@ -95,10 +95,16 @@ class HealPixUp(nn.Module):
         Floating-point dtype for the sparse matrix values.
     paired_down : HealPixDown or None
         Reuse the exact sparse matrix and fine-cell domain of an existing
-        ``smooth`` or ``mean`` downsampler.  With a ``mean`` downsampler and
-        ``up_norm="col_l1"``, every child receives its parent's value.  This is the strictest way to construct a matched
-        Up operator for a partial patch.  ``cell_ids`` must then be omitted;
-        the ellipsoid and weight normalisation are inherited.
+        ``smooth`` or ``mean`` downsampler.  This is the strictest way to
+        construct a matched Up operator for a partial patch.  ``cell_ids``
+        must then be omitted; the ellipsoid and weight normalisation are
+        inherited.
+
+        With a ``mean`` downsampler and ``up_norm="col_l1"``, every child
+        receives its parent's value.  ``"adjoint"`` gives each child
+        ``parent / n`` and ``"diag_l2"`` gives ``n * parent``, where ``n``
+        is the number of children of that parent present in the fine
+        domain (4 on the full sphere).
 
     Examples
     --------

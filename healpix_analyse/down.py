@@ -12,7 +12,8 @@ Three modes:
     "maxpool" -- non-linear max over the 4 direct NESTED children.
     "mean"    -- unweighted mean over the 4 direct NESTED children.  HEALPix
                  cells have equal area, so this is the only mode that
-                 conserves the global mean of the field.
+                 conserves the global mean of a NaN-free full-sphere
+                 field.
 
 Works on the full sphere or on a partial-sky subset.  Resolution is exposed
 through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
@@ -119,8 +120,9 @@ class HealPixDown(nn.Module):
         *smooth*   -- differentiable Gaussian-weighted average (linear).
         *maxpool*  -- non-linear max over 4 NESTED children (fast).
         *mean*     -- unweighted mean over the 4 NESTED children (linear,
-        differentiable).  On the full sphere the global mean of the
-        output equals the global mean of the input, so this is the mode
+        differentiable).  For a NaN-free full-sphere input the global
+        mean of the output equals the global mean of the input (with
+        NaNs, see ``skipna``), so this is the mode
         to use for a hierarchy of maps.  *smooth* does not have this
         property: its weights are normalised per output cell only, which
         preserves constant fields but not the global mean.
@@ -716,7 +718,7 @@ class HealPixDown(nn.Module):
         same type as x, shape [N_out] or [B, N_out], values in {0, .25, .5, .75, 1}
         """
         if self.mode != "mean":
-            raise AttributeError("valid_fraction is only defined for mode='mean'.")
+            raise ValueError("valid_fraction is only defined for mode='mean'.")
         t, is_numpy, was_1d = _prepare_input(x, self.device, self.dtype)
         if t.shape[1] != self.N_in:
             raise ValueError(
@@ -768,7 +770,7 @@ class HealPixDown(nn.Module):
         :meth:`valid_fraction`.
         """
         if self.mode != "mean":
-            raise AttributeError("coverage is only defined for mode='mean'.")
+            raise ValueError("coverage is only defined for mode='mean'.")
         return self._children_valid.sum(dim=-1).cpu().numpy() / 4.0
 
     @property

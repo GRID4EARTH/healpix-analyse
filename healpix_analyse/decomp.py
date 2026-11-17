@@ -606,7 +606,12 @@ class HealPixDecomp(nn.Module):
         return (
             f"level={self.level}, Jmax={self.Jmax}, scales={self.n_scales}, "
             f"bands={self.n_bands}, domain={domain}, sizes={self.sizes}, "
-            f"down_mode={self.down_mode!r}, up_norm={self.up_norm!r}"
+            + (
+                "filter='symmetric Gaussian'"
+                if self.down_mode == "smooth"
+                else "filter='mean of 4 NESTED children'"
+            )
+            + f", up_norm={self.up_norm!r}"
         )
 
 

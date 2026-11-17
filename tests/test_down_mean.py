@@ -153,7 +153,9 @@ def test_nan_propagates_to_its_parent_only():
 def test_invalid_mode_and_coverage_guard():
     with pytest.raises(ValueError, match="mean"):
         HealPixDown(3, mode="average", device="cpu")
-    with pytest.raises(AttributeError):
+    # ValueError, not AttributeError: nn.Module.__getattr__ would hide the
+    # message of an AttributeError raised inside a property
+    with pytest.raises(ValueError, match="coverage is only defined for mode='mean'"):
         HealPixDown(3, mode="maxpool", device="cpu").coverage
 
 
@@ -246,9 +248,12 @@ def test_skipna_is_differentiable_on_finite_inputs():
     np.testing.assert_allclose(np.delete(grad, [4, 5, 6, 7]), 0.25, atol=1e-15)
 
 
-def test_valid_fraction_guard():
-    with pytest.raises(AttributeError):
-        HealPixDown(3, mode="maxpool", device="cpu").valid_fraction(np.zeros(768))
+def test_valid_fraction_and_sparse_matrix_guards():
+    down = HealPixDown(3, mode="maxpool", device="cpu")
+    with pytest.raises(ValueError, match="valid_fraction is only defined for mode='mean'"):
+        down.valid_fraction(np.zeros(768))
+    with pytest.raises(ValueError, match="maxpool is not linear"):
+        down.sparse_matrix()
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +300,7 @@ def test_resampler_down_mode_mean():
     np.testing.assert_allclose(y, expected, atol=1e-12)
     assert y.mean() == pytest.approx(x.mean(), rel=1e-13)
     assert "down_mode='mean'" in repr(op)
+    assert "down_mode" not in repr(HealPixResampler(5, 4, device="cpu"))
 
     y2, _ = resample_healpix(
         x, in_level=5, out_level=2, down_mode="mean", device="cpu",
@@ -332,7 +338,8 @@ def test_decomp_down_mode_mean_reconstructs_and_conserves():
     # Haar-like: each detail band sums to zero over every group of 4 children
     for band in pyr.details:
         np.testing.assert_allclose(band.reshape(-1, 4).sum(-1), 0.0, atol=1e-10)
-    assert "down_mode='mean'" in repr(dec)
+    assert "filter='mean of 4 NESTED children'" in repr(dec)
+    assert "filter='symmetric Gaussian'" in repr(HealPixDecomp(2, device="cpu"))
     assert HealPixDecomp(2, device="cpu").down_layers[0].mode == "smooth"
 
 
@@ -348,3 +355,49 @@ def test_decomp_down_mode_mean_partial_sky():
     )
     pyr = dec.compute(x)
     np.testing.assert_allclose(dec.invert(pyr), x, atol=1e-10)
+
+    # what ``mean`` adds on a partial sky (one step: parents 10, 11, 300 with
+    # 4, 2 and 2 children present)
+    dec1 = HealPixDecomp(
+        level, cell_ids=cell_ids, Jmax=1, down_mode="mean",
+        device="cpu", dtype=torch.float64,
+    )
+    pyr1 = dec1.compute(x)
+    coverage = dec1.down_layers[0].coverage
+    np.testing.assert_array_equal(coverage, [1.0, 0.5, 0.5])
+    # the coverage-weighted mean of the coarse band is the input mean
+    weighted = (pyr1.coarse * coverage).sum() / coverage.sum()
+    assert weighted == pytest.approx(x.mean(), rel=1e-13)
+    # the detail band sums to zero over the children present of every parent
+    # (band in the caller's cell order, like the input)
+    detail = pyr1.details[0]
+    for parent in (10, 11, 300):
+        assert abs(detail[cell_ids // 4 == parent].sum()) < 1e-10
+
+
+@pytest.mark.parametrize(
+    "up_norm, expected",
+    [
+        # n children present: 4 for parent 10, 2 for 11 and for 300
+        ("col_l1", [1, 1, 1, 1, 2, 2, 3, 3]),                    # parent
+        ("adjoint", [.25, .25, .25, .25, 1, 1, 1.5, 1.5]),       # parent / n
+        ("diag_l2", [4, 4, 4, 4, 4, 4, 6, 6]),                   # n * parent
+    ],
+)
+def test_up_paired_with_mean_down_partial_sky(up_norm, expected):
+    from healpix_analyse.up import HealPixUp
+
+    level = 4
+    cell_ids = np.array([43, 40, 41, 42, 47, 44, 1203, 1202])
+    down = _down(level, cell_ids=cell_ids)
+    np.testing.assert_array_equal(down.cell_ids_out, [10, 11, 300])
+    M = down.sparse_matrix().to_dense().numpy()
+    np.testing.assert_allclose(M.sum(axis=1), 1.0, atol=1e-15)
+
+    up = HealPixUp(
+        level - 1, paired_down=down, up_norm=up_norm,
+        device="cpu", dtype=torch.float64,
+    )
+    fine, ids = up(np.array([1.0, 2.0, 3.0]))
+    np.testing.assert_array_equal(ids, cell_ids)       # caller's order
+    np.testing.assert_allclose(fine, expected, atol=1e-12)
