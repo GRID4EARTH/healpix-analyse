@@ -72,7 +72,7 @@ def test_constant_is_preserved_and_dirac_gives_the_kernel_image():
     conv = HealPixGeoFFT(LEVEL, cells, "lorentzian", scale=30.0, radius=200.0)
     inner = interior(cells, conv.window)
     assert np.allclose(conv(np.ones(cells.size))[inner], 1.0)
-    # Dirac at the central cell -> raw response equals the kernel image (mirrored: response at j = k(j -> c))
+    # Dirac at the central cell c: y[p] = sum_d K[d] x[p + d], so y[c - d] = K[d]
     _, ii, jj = [np.asarray(v, dtype=np.int64) for v in hgn.healpix_to_base_cell_coordinates(cells.tolist(), LEVEL)]
     ic, jc = ii.min() + conv.W // 2, jj.min() + conv.H // 2
     delta = np.zeros(cells.size)
@@ -81,8 +81,46 @@ def test_constant_is_preserved_and_dirac_gives_the_kernel_image():
     n = conv.window
     sel = (np.abs(ii - ic) <= n) & (np.abs(jj - jc) <= n)
     img = np.zeros((2 * n + 1, 2 * n + 1))
-    img[jj[sel] - jc + n, ii[sel] - ic + n] = resp[sel]
-    assert np.allclose(img, conv.kernel_image, atol=1e-9)   # y[c + d] = K[d] for a Dirac at c
+    img[jc - jj[sel] + n, ic - ii[sel] + n] = resp[sel]
+    assert np.allclose(img, conv.kernel_image, atol=1e-9)
+
+
+def _brute_force(x, cells, kernel, radius_m, targets, level=LEVEL):
+    """sum_q k(rho(p -> q), phi(p -> q)) x_q, with rho in metres, for the cells `targets`."""
+    from healpix_analyse.geo_fft import _bearing_rad, _geodesic_rad
+    lon, lat = (np.asarray(v, float) for v in hgn.healpix_to_lonlat(cells.tolist(), level, ellipsoid="sphere"))
+    out = []
+    for p in targets:
+        rho = _geodesic_rad(lon[p], lat[p], lon, lat) * R_EARTH
+        phi = _bearing_rad(lon[p], lat[p], lon, lat)
+        w = np.where(rho <= radius_m, kernel(rho, phi), 0.0)
+        out.append(np.sum(w * x))
+    return np.array(out)
+
+
+@pytest.mark.parametrize("lon,lat", [(-60.0, -3.0), (1.46, 48.27)])
+def test_one_sided_kernel_orientation(lon, lat):
+    """A kernel that only looks north of the output cell must take its input from the north."""
+    cells = block(lon, lat, delta=6)
+    north = lambda rho, phi: (0.5 + 0.5 * np.cos(phi)) ** 4 * np.exp(-rho / 20.0)
+    conv = HealPixGeoFFT(LEVEL, cells, north, radius=80.0, normalized=False)
+    x = np.random.default_rng(3).standard_normal(cells.size)
+    inner = np.flatnonzero(interior(cells, conv.window))
+    targets = inner[:: max(1, inner.size // 40)]
+    ref = _brute_force(x, cells, north, 80.0, targets)
+    y = conv(x)[targets]
+    # residual: drift of the cell geometry at the truncation rim (~1e-3); a mirrored kernel is off by ~1
+    assert np.sqrt(np.mean((y - ref) ** 2)) / np.sqrt(np.mean(ref ** 2)) < 1e-2
+    mirrored = _brute_force(x, cells, lambda rho, phi: north(rho, phi + np.pi), 80.0, targets)
+    assert np.sqrt(np.mean((y - mirrored) ** 2)) / np.sqrt(np.mean(ref ** 2)) > 0.3
+    # a Dirac at q is seen by the output cells to its south
+    lon_c, lat_c = (np.asarray(v, float) for v in hgn.healpix_to_lonlat(cells.tolist(), LEVEL, ellipsoid="sphere"))
+    q = inner[inner.size // 2]
+    delta = np.zeros(cells.size)
+    delta[q] = 1.0
+    resp = conv.raw(delta)
+    hit = resp > 0.1 * resp.max()
+    assert np.mean(lat_c[hit] - lat_c[q]) < 0
 
 
 def test_non_contiguous_cells_and_torch_input():
@@ -112,9 +150,6 @@ def test_callable_anisotropic_kernel_and_units():
     aniso = lambda rho, phi: np.exp(-(rho * np.cos(phi) / 200.0) ** 2 - (rho * np.sin(phi) / 60.0) ** 2)
     conv = HealPixGeoFFT(LEVEL, cells, aniso, radius=600.0)
     k = conv.kernel_image
-    n = conv.window
-    # elongated along north (phi = 0): the image decays more slowly along the north-south direction
-    north = k[:, n]          # varying j at fixed i is not north in general; compare total spread instead
     assert k.sum() > 0 and np.isfinite(k).all()
     # the same kernel in pixel units must give the same image
     alpha = conv.geometry["cell_size_rad"]
@@ -165,6 +200,67 @@ def test_one_shot_function_and_geometry():
     assert np.allclose(y1, y2, equal_nan=True)
     g = lattice_geometry(LEVEL, 7, 2 ** 19, 2 ** 19)
     assert 98.0 < g["angle_deg"] < 100.5 and abs(g["step_i"] - g["step_j"]) < 0.02
+
+
+def test_default_radius_covers_every_azimuth():
+    cells = block(-60.0, -3.0, delta=7)
+    narrow_north = lambda rho, phi: np.exp(-0.5 * (rho * np.cos(phi) / 10.0) ** 2 - 0.5 * (rho * np.sin(phi) / 40.0) ** 2)
+    conv = HealPixGeoFFT(LEVEL, cells, narrow_north)
+    assert 3.5 * 40.0 < conv.radius < 4.5 * 40.0           # set by the long (east-west) axis
+
+
+def test_window_contains_the_geodesic_disc():
+    """The window is widened when the lattice geometry drifts across it (large window, polar cap)."""
+    level = 12
+    cells = block(45.0, 75.0, delta=8, level=level)
+    conv = HealPixGeoFFT(level, cells, "top_hat", scale=150.0, units="km", radius=150.0)
+    n = conv.window
+    ic, jc = conv.i0 + conv.W // 2, conv.j0 + conv.H // 2
+    big = block(45.0, 75.0, delta=10, level=level)                 # wide enough to hold the whole disc
+    _, ii, jj = [np.asarray(v, dtype=np.int64) for v in hgn.healpix_to_base_cell_coordinates(big.tolist(), level)]
+    lon, lat = (np.asarray(v, float) for v in hgn.healpix_to_lonlat(big.tolist(), level, ellipsoid="sphere"))
+    assert ii.min() < ic - n - 8 and ii.max() > ic + n + 8 and jj.min() < jc - n - 8 and jj.max() > jc + n + 8
+    c = np.flatnonzero((ii == ic) & (jj == jc))[0]
+    from healpix_analyse.geo_fft import _geodesic_rad
+    in_disc = _geodesic_rad(lon[c], lat[c], lon, lat) * R_EARTH / 1000.0 <= 150.0
+    needed = max(np.abs(ii[in_disc] - ic).max(), np.abs(jj[in_disc] - jc).max())
+    assert needed <= n
+    g = conv.geometry                                  # the bound from the centre geometry alone is one short here
+    centre_bound = int(np.ceil(150e3 / R_EARTH / g["cell_size_rad"]
+                               / (min(g["step_i"], g["step_j"]) * np.sin(np.radians(g["angle_deg"])))))
+    assert centre_bound < needed
+
+
+def test_weights_and_non_finite_input():
+    cells = block(-60.0, -3.0, delta=5)
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((2, 3, cells.size))
+    w = rng.random(cells.size)
+    conv = HealPixGeoFFT(LEVEL, cells, "gaussian", scale=20.0, radius=80.0)
+    y = conv(x, weights=w)
+    assert np.allclose(y, conv.raw(x * w) / conv.raw(np.broadcast_to(w, x.shape).copy()), equal_nan=True)
+    assert np.allclose(conv(x, weights=w[None, None, :]), y, equal_nan=True)
+    with pytest.raises(ValueError, match="broadcast"):
+        conv(x[0, 0], weights=np.stack([w, w]))
+    with pytest.raises(ValueError, match="normalized"):
+        HealPixGeoFFT(LEVEL, cells, "gaussian", scale=20.0, radius=80.0, normalized=False)(x, weights=w)
+    # inf counts as missing / zero in every mode
+    xi = x[0, 0].copy()
+    xi[10] = np.inf
+    xz = xi.copy()
+    xz[10] = 0.0
+    assert np.isfinite(conv.raw(xi)).all()
+    assert np.allclose(conv.raw(xi), conv.raw(xz))
+
+
+def test_module_to_moves_the_operator():
+    cells = block(-60.0, -3.0, delta=5)
+    conv = HealPixGeoFFT(LEVEL, cells, "gaussian", scale=20.0, radius=80.0)
+    assert {b.device for b in (conv._kfft, conv._rows, conv._cols)} == {conv.device_}
+    if torch.cuda.is_available():
+        conv = conv.to("cuda")
+        y = conv(torch.ones(cells.size, dtype=torch.float64, device="cuda"))
+        assert y.device.type == "cuda"
 
 
 def test_wide_block_warns():

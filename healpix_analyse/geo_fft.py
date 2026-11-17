@@ -260,12 +260,16 @@ class HealPixGeoFFT(nn.Module):
         ``"screened_poisson"``, ``"top_hat"``, ``"dog"``) or any callable
         ``k(rho, phi)`` of the geodesic distance ``rho`` (in ``units``) and the
         azimuth ``phi`` from north (radians, clockwise), evaluated on arrays.
+        ``rho`` and ``phi`` go from the output cell to the input cell: the
+        output at ``p`` is ``sum_q k(rho(p -> q), phi(p -> q)) x_q``, the
+        convention of :func:`~healpix_analyse.directional_filter.directional_filter`.
     scale : float, optional
         Scale parameter of a predefined kernel, in ``units``.
     radius : float, optional
         Truncation radius of the kernel, in ``units``.  Default: the distance
-        at which the kernel (at azimuth 0) falls below ``1e-3`` of its value
-        at the origin, capped so that the window fits in the base face.  The
+        beyond which the kernel, in every one of 16 azimuths, stays below
+        ``1e-3`` of its largest value, capped so that the window fits in the
+        base face.  The
         same truncated kernel is what :func:`~healpix_analyse.validation.direct_spherical_convolution`
         applies when given the same ``radius``.
     units : {"m", "km", "deg", "pix"}, default "m"
@@ -281,9 +285,17 @@ class HealPixGeoFFT(nn.Module):
         ``K*w`` falls below ``support_eps`` of its maximum.  ``False``: the raw
         sum with zeros at the missing cells.  A signed kernel forces ``False``.
     support_eps : float, default 1e-6
+        Relative support threshold of the normalized mode.  With
+        ``dtype=torch.float32`` a value of ``1e-5`` or more keeps it above
+        the rounding noise of the FFT.
     ellipsoid : str, default "sphere"
+        Ellipsoid of the cell centres.  Distances and azimuths are always
+        great-circle values on the sphere of radius 6 371 008.8 m, also for
+        ``"wgs84"``.
     dtype : torch.dtype, default torch.float64
+        Fixed at construction; ``module.to(dtype)`` does not change it.
     device : torch.device or str, optional
+        ``module.to(device)`` moves the operator.
     warn_extent_deg : float, default 10.0
         A block wider than this (great-circle distance between opposite
         corners) triggers a warning: the cell geometry then varies noticeably
@@ -293,7 +305,15 @@ class HealPixGeoFFT(nn.Module):
     ----------
     kernel_image : np.ndarray, shape (2n+1, 2n+1)
         The kernel actually applied, sampled at the lattice positions around
-        the central cell (``[dj + n, di + n]``).
+        the central cell: ``kernel_image[dj + n, di + n]`` is the weight that
+        the output at the centre ``c`` gives to the input at ``c + (di, dj)``,
+        so that ``y[c] = sum_d kernel_image[d] x[c + d]``.
+
+    Notes
+    -----
+    Cells across the boundary of the base face are not seen: near a face
+    edge the result uses the one-sided neighbourhood inside the face (and
+    the normalized mode renormalizes over it).
     geometry : dict
         ``step_i``, ``step_j`` (cell units), ``angle_deg`` of the lattice at the
         centre, ``window`` (``n``), ``centre_lonlat``, ``face``, ``shape``.
@@ -312,7 +332,7 @@ class HealPixGeoFFT(nn.Module):
         self.level = int(level)
         self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
         self.dtype = dtype
-        self.device_ = torch.device(device) if device is not None else torch.device("cpu")
+        dev = torch.device(device) if device is not None else torch.device("cpu")
         self.support_eps = float(support_eps)
         self.units = str(units)
         if self.units not in ("m", "km", "deg", "pix"):
@@ -334,8 +354,8 @@ class HealPixGeoFFT(nn.Module):
         self.i0, self.j0 = int(ii.min()), int(jj.min())
         self.W, self.H = int(ii.max() - self.i0 + 1), int(jj.max() - self.j0 + 1)     # image [H=j, W=i]
         self.n_cells = int(cells.size)
-        self._rows = torch.as_tensor(jj - self.j0, dtype=torch.long, device=self.device_)
-        self._cols = torch.as_tensor(ii - self.i0, dtype=torch.long, device=self.device_)
+        self.register_buffer("_rows", torch.as_tensor(jj - self.j0, dtype=torch.long, device=dev), persistent=False)
+        self.register_buffer("_cols", torch.as_tensor(ii - self.i0, dtype=torch.long, device=dev), persistent=False)
         self.cell_ids_ = cells
 
         # -- centre and local geometry
@@ -372,54 +392,93 @@ class HealPixGeoFFT(nn.Module):
             n_block = max(self.H, self.W)                                # default search: up to the block size
             radius = self._default_radius(min(n_max, n_block) * step_min_cells / self.cells_per_unit)
         self.radius = float(radius)
+        rad_per_unit = _UNIT_TO_RAD[self.units] if self.units != "pix" else alpha
+
+        def rho_phi(di, dj):
+            """Geodesic distance (user units) and azimuth from the centre to (ic + di, jc + dj)."""
+            lon, lat = _lattice_lonlat(self.face, ic + np.asarray(di), jc + np.asarray(dj), self.level, self.ellipsoid)
+            return (_geodesic_rad(lon_c[0], lat_c[0], lon, lat) / rad_per_unit,
+                    _bearing_rad(lon_c[0], lat_c[0], lon, lat))
+
         n = int(math.ceil(self.radius * self.cells_per_unit / step_min_cells))
         if n > n_max:
             raise ValueError(
                 f"the kernel window (half-size {n} lattice steps for radius {self.radius} {self.units}) runs off "
                 f"base face {self.face}; the largest radius here is {n_max * step_min_cells / self.cells_per_unit:.4g} "
                 f"{self.units}")
+        # The bound above uses the lattice geometry at the centre, which drifts across a large window:
+        # widen the window until the ring just outside it lies entirely outside the geodesic disc.
+        while n < n_max:
+            m = n + 1
+            ring = np.arange(-m, m + 1)
+            rdi = np.concatenate([ring, ring, np.full(ring.size, -m), np.full(ring.size, m)])
+            rdj = np.concatenate([np.full(ring.size, -m), np.full(ring.size, m), ring, ring])
+            if rho_phi(rdi, rdj)[0].min() > self.radius:
+                break
+            n = m
         self.window = n
 
-        # -- kernel image: geodesic distance and azimuth from the centre to every lattice position
+        # -- kernel image (stencil): geodesic distance and azimuth from the centre to every lattice position
         d = np.arange(-n, n + 1)
         dj, di = np.meshgrid(d, d, indexing="ij")
-        lon, lat = _lattice_lonlat(self.face, ic + di, jc + dj, self.level, self.ellipsoid)
-        rho_rad = _geodesic_rad(lon_c[0], lat_c[0], lon, lat).reshape(2 * n + 1, 2 * n + 1)
-        phi = _bearing_rad(lon_c[0], lat_c[0], lon, lat).reshape(2 * n + 1, 2 * n + 1)
-        rho = rho_rad / (_UNIT_TO_RAD[self.units] if self.units != "pix" else alpha)
+        rho, phi = rho_phi(di.ravel(), dj.ravel())
+        rho, phi = rho.reshape(2 * n + 1, 2 * n + 1), phi.reshape(2 * n + 1, 2 * n + 1)
         k = np.asarray(self.kernel_fn(rho, phi), dtype=np.float64)
         k = np.where(rho <= self.radius, k, 0.0)
         self.kernel_image = k
         self.geometry["window"] = n
 
-        # -- FFT plan: zero-padded linear convolution of an [H, W] image with the (2n+1)^2 kernel
+        # -- FFT plan: zero-padded linear convolution of an [H, W] image.  The output at p is
+        # sum_d k[d] x[p + d] (a correlation by the stencil), i.e. a convolution by the stencil flipped.
         self._Hp = _fast_len(self.H + 2 * n)
         self._Wp = _fast_len(self.W + 2 * n)
-        kpad = torch.zeros(self._Hp, self._Wp, dtype=self.dtype, device=self.device_)
-        kpad[: 2 * n + 1, : 2 * n + 1] = torch.as_tensor(k, dtype=self.dtype, device=self.device_)
+        kpad = torch.zeros(self._Hp, self._Wp, dtype=self.dtype, device=dev)
+        kpad[: 2 * n + 1, : 2 * n + 1] = torch.as_tensor(np.ascontiguousarray(k[::-1, ::-1]), dtype=self.dtype,
+                                                         device=dev)
         kpad = torch.roll(kpad, shifts=(-n, -n), dims=(0, 1))          # kernel centre at the origin
         self.register_buffer("_kfft", torch.fft.rfft2(kpad), persistent=False)
 
     # ------------------------------------------------------------------ helpers
+    @property
+    def device_(self) -> torch.device:
+        """Device of the operator (follows ``module.to(device)``)."""
+        return self._kfft.device
+
     def _default_radius(self, radius_max: float) -> float:
-        """Distance (user units) where |k| at azimuth 0 first falls below 1e-3 of |k(0)|.
+        """Distance (user units) beyond which max over 16 azimuths of |k| stays below 1e-3 of max |k|.
 
         Searched on [0, radius_max] with three successive refinements, so that
         the result is accurate to ~1e-9 radius_max even when radius_max is the
-        distance to the face edge.
+        distance to the face edge.  Returns ``radius_max`` (with a warning)
+        when the kernel never falls below the threshold there.
         """
-        k0 = float(np.abs(np.asarray(self.kernel_fn(np.zeros(1), np.zeros(1)), dtype=np.float64))[0])
-        if not k0 > 0:
-            k0 = float(np.abs(self.kernel_fn(np.linspace(0, radius_max, 4097), np.zeros(4097))).max())
+        phis = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+
+        def profile(r):
+            rr, pp = np.meshgrid(r, phis, indexing="ij")
+            k = np.abs(np.asarray(self.kernel_fn(rr, pp), dtype=np.float64))
+            return k.max(axis=1)
+
         lo, hi = 0.0, float(radius_max)
+        r = np.linspace(lo, hi, 4097)
+        prof = profile(r)
+        kmax = float(prof.max())
+        if not kmax > 0:
+            raise ValueError("the kernel is zero everywhere on the search interval; give `radius`")
+        thr = 1e-3 * kmax
         for _ in range(3):
+            above = np.flatnonzero(prof >= thr)
+            last = int(above[-1]) if above.size else 0
+            if last == r.size - 1:
+                if hi == float(radius_max):
+                    warnings.warn(
+                        f"the kernel does not fall below 1e-3 of its maximum within {radius_max:.4g} {self.units} "
+                        "(window limited by the face or the block); it is truncated there -- give `radius`",
+                        RuntimeWarning, stacklevel=3)
+                return float(hi)
+            lo, hi = r[last], r[last + 1]
             r = np.linspace(lo, hi, 4097)
-            k = np.abs(np.asarray(self.kernel_fn(r, np.zeros_like(r)), dtype=np.float64))
-            below = np.flatnonzero(k < 1e-3 * k0)
-            if below.size == 0:
-                return float(radius_max)
-            i = int(below[0])
-            lo, hi = (r[i - 1] if i > 0 else 0.0), r[i]
+            prof = profile(r)
         return float(hi)
 
     def _to_image(self, x: torch.Tensor) -> torch.Tensor:
@@ -450,9 +509,9 @@ class HealPixGeoFFT(nn.Module):
 
     # ------------------------------------------------------------------ public API
     def raw(self, x: ArrayLike) -> ArrayLike:
-        """Raw convolution ``K*x`` at the cells; NaN count as zero."""
+        """Raw convolution ``K*x`` at the cells; non-finite values (NaN, inf) count as zero."""
         t, shape, is_numpy = self._prepare(x)
-        img = self._to_image(torch.nan_to_num(t))
+        img = self._to_image(torch.where(torch.isfinite(t), t, torch.zeros_like(t)))
         y = self._conv(img)[:, self._rows, self._cols]
         return self._restore(y, shape, is_numpy)
 
@@ -477,6 +536,9 @@ class HealPixGeoFFT(nn.Module):
         ``support_eps`` of its maximum.  Raw mode: ``K*x`` with zeros at the
         missing cells.
         """
+        if weights is not None and not self.normalized:
+            raise ValueError("weights are used only by the normalized convolution (normalized=False here, "
+                             "or a signed kernel); multiply x by the weights instead")
         t, shape, is_numpy = self._prepare(x)
         finite = torch.isfinite(t)
         if not self.normalized:
@@ -485,10 +547,14 @@ class HealPixGeoFFT(nn.Module):
         if weights is None:
             w = finite.to(self.dtype)
         else:
-            w, _, _ = self._prepare(weights)
+            wt = torch.as_tensor(weights, device=self.device_).to(self.dtype)
+            try:
+                wt = torch.broadcast_to(wt, shape)
+            except RuntimeError as err:
+                raise ValueError(f"weights of shape {tuple(wt.shape)} do not broadcast to x of shape "
+                                 f"{tuple(shape)}") from err
+            w = wt.reshape(-1, self.n_cells)
             w = torch.where(finite & torch.isfinite(w), w, torch.zeros_like(w))
-            if w.shape[0] == 1 and t.shape[0] > 1:
-                w = w.expand_as(t)
         num = self._conv(self._to_image(torch.where(finite, t, torch.zeros_like(t)) * w))[:, self._rows, self._cols]
         den = self._conv(self._to_image(w))[:, self._rows, self._cols]
         thr = self.support_eps * den.abs().amax(dim=-1, keepdim=True)

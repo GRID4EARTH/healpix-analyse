@@ -100,9 +100,12 @@ register_kernel("my_kernel", lambda scale, p=1.0: (lambda rho, phi: np.exp(-(rho
 ### Any equation
 
 `kernel` may be any callable `k(rho, phi)` evaluated on arrays: `rho` is the
-geodesic distance from the block centre in `units`, `phi` the azimuth from
-north (radians, clockwise). Anisotropic kernels in the geographic frame come
-for free:
+geodesic distance in `units`, `phi` the azimuth from north (radians,
+clockwise), both measured **from the output cell to the input cell**: the
+output at `p` is `sum_q k(rho(p → q), phi(p → q)) x_q`, as in
+`directional_filter`. A kernel that is not symmetric under `phi → phi + π`
+(a one-sided, upwind or shadow kernel) is therefore applied with this
+orientation. Anisotropic kernels in the geographic frame come for free:
 
 ```python
 aniso = lambda rho, phi: np.exp(-(rho * np.cos(phi) / 300.0) ** 2 - (rho * np.sin(phi) / 100.0) ** 2)
@@ -120,27 +123,41 @@ and can be passed with `units="pix"`.
 and kilometres use the mean Earth radius 6 371 008.8 m, as elsewhere in the
 package.
 
-`radius` truncates the kernel; the default is the distance at which the
-kernel falls below 10⁻³ of its value at the origin. The truncated kernel is
+`radius` truncates the kernel; the default is the distance beyond which the
+kernel, in all of 16 azimuths, stays below 10⁻³ of its maximum (a warning is
+raised when the window allowed by the face or the block is too small for
+that). The truncated kernel is
 the operator applied, and the one to give to
 `validation.direct_spherical_convolution` for a check. The kernel window is
 sized from the local lattice geometry so that it covers the geodesic disc in
 every direction: in the polar caps the disc can span three times more lattice
-steps along one axis than its radius in cells.
+steps along one axis than its radius in cells. The window is first sized from
+the lattice geometry at the centre, then widened until the ring of lattice
+positions just outside it lies outside the geodesic disc, which accounts for
+the drift of that geometry across a large window.
+
+The `"matern"`, `"voigt"` and `"screened_poisson"` families use SciPy.
 
 ## Domain and missing data
 
 `cell_ids` are any cells of one base face, in any order, not necessarily
 contiguous: the operator works on their bounding rectangle in base-face
 coordinates, and lattice positions that are not in `cell_ids` count as
-missing. Cells spanning two faces raise an error.
+missing. Cells spanning two faces raise an error. Cells across the boundary
+of the base face are not seen: near a face edge the result uses the one-sided
+neighbourhood inside the face, and the normalized mode renormalizes over it.
 
 With `normalized=True` (default), NaN in `x` (or zero `weights`) are missing
 data: the result is `K*(w x) / K*w`, the exact normalized convolution for the
 kernel image used, NaN where the support `K*w` is below `support_eps` of its
 maximum. This is the right form for gaps; it also removes the pixelisation
 bias of the raw sum on complete data. `conv.raw(x)` gives the plain sum with
-zeros at the missing cells.
+zeros at the missing cells. `weights` (any shape that broadcasts to `x`)
+are used only by the normalized mode. With `dtype=torch.float32`, raise
+`support_eps` to about 10⁻⁵, above the rounding noise of the FFT.
+
+Distances and azimuths are great-circle values on the sphere of radius
+6 371 008.8 m, also when `ellipsoid="wgs84"` places the cell centres.
 
 ## Limits, and when to use something else
 
