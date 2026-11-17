@@ -129,7 +129,12 @@ class HealPixDown(nn.Module):
         On a partial sky, a coarse cell is the mean of the children
         present in ``cell_ids``; :attr:`coverage` gives the fraction of
         children present, and the mean of the output weighted by
-        :attr:`coverage` equals the mean of the input.
+        :attr:`coverage` equals the mean of the input.  This holds for one
+        step: chaining partial-sky operators with incomplete parents gives
+        a mean of means.  To stay conservative over several steps, run the
+        data and a map of ones through the chain, multiply each step's
+        output by that step's :attr:`coverage`, and divide the two at the
+        end: the ratio is the mean of the descendants present.
         NaN values propagate to the parent cell unless ``skipna=True``.
     skipna : bool, default False
         Only for ``mode="mean"``.  If True, non-finite children are left

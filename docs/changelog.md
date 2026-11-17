@@ -14,6 +14,19 @@
   5-30 % on Sentinel-2 tiles at level 20. The kernel `k(rho, phi)` is
   evaluated from the output cell to the input cell, as in
   `directional_filter`.
+- `HealPixDown(mode="mean")`: unweighted mean of the 4 NESTED children. It
+  conserves the global mean of a NaN-free full-sphere map, which
+  `mode="smooth"` does not (its Gaussian weights are normalised per output
+  cell only). On a partial sky, `coverage` gives the fraction of children
+  present per output cell.
+- `skipna=True` (with `mode="mean"`): NaN-skipping mean;
+  `HealPixDown.valid_fraction(x)` returns the fraction of children used for
+  that input, so a weighted mean of the output stays conservative.
+- `HealPixDown.sparse_matrix()`: the `smooth` or `mean` operator as a sparse
+  matrix. `HealPixUp(paired_down=...)` accepts a `mean` downsampler.
+- `down_mode` keyword (`"smooth"` default, or `"mean"`) on
+  `HealPixResampler`, `resample_healpix` and `HealPixDecomp`. Defaults and
+  reprs are unchanged.
 
 ### Fixed
 - `HealPixKernelPyramid` fitting accepts operators that return torch tensors

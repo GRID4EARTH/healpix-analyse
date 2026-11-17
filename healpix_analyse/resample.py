@@ -88,9 +88,11 @@ class HealPixResampler(nn.Module):
         ``HealPixDown`` mode used for each downscaling step.  ``"mean"``
         averages the 4 NESTED children, which conserves the global mean of
         a NaN-free full-sphere map; ``"smooth"`` (Gaussian) does not.
-        Missing values are skipped at every step (see Notes), so with NaNs
-        the result over several steps is a mean of means and the global
-        mean of the finite input is not conserved.  Gaussian parameters
+        Each step averages the children available at that step: missing
+        values are skipped (see Notes), and on a partial sky only the
+        children present in ``in_cell_ids`` are used.  Over several steps
+        with NaNs or incomplete parents the result is therefore a mean of
+        means, not the mean of all available descendants.  Gaussian parameters
         are ignored with ``"mean"``.  Upscaling is unaffected.
     up_norm : {"adjoint", "col_l1", "diag_l2"}, default="col_l1"
         Normalisation used by ``HealPixUp``.
