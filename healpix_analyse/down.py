@@ -10,10 +10,10 @@ Reduces the HEALPix resolution by a factor of 2:
 Three modes:
     "smooth"  -- weighted Gaussian average over a disc (linear, differentiable).
     "maxpool" -- non-linear max over the 4 direct NESTED children.
-    "mean"    -- unweighted mean over the 4 direct NESTED children.  HEALPix
-                 cells have equal area, so this is the only mode that
-                 conserves the global mean of a NaN-free full-sphere
-                 field.
+    "mean"    -- unweighted mean over the 4 direct NESTED children.
+
+HEALPix cells have equal area, so "mean" is the only mode that conserves
+the global mean of a NaN-free full-sphere field.
 
 Works on the full sphere or on a partial-sky subset.  Resolution is exposed
 through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
