@@ -126,7 +126,8 @@ package.
 `radius` truncates the kernel; the default is the distance beyond which the
 kernel, in all of 16 azimuths, stays below 10⁻³ of its maximum (a warning is
 raised when the window allowed by the face or the block is too small for
-that). The truncated kernel is
+that: heavy-tailed families such as `"lorentzian"` and `"voigt"` usually
+need an explicit `radius`). The truncated kernel is
 the operator applied, and the one to give to
 `validation.direct_spherical_convolution` for a check. The kernel window is
 sized from the local lattice geometry so that it covers the geodesic disc in

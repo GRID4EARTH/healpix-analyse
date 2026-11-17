@@ -293,7 +293,8 @@ class HealPixGeoFFT(nn.Module):
         great-circle values on the sphere of radius 6 371 008.8 m, also for
         ``"wgs84"``.
     dtype : torch.dtype, default torch.float64
-        Fixed at construction; ``module.to(dtype)`` does not change it.
+        Real dtype of the computation.  ``module.to(torch.float32)`` (or
+        ``.double()``) switches the operator to that precision.
     device : torch.device or str, optional
         ``module.to(device)`` moves the operator.
     warn_extent_deg : float, default 10.0
@@ -309,16 +310,17 @@ class HealPixGeoFFT(nn.Module):
         the output at the centre ``c`` gives to the input at ``c + (di, dj)``,
         so that ``y[c] = sum_d kernel_image[d] x[c + d]``.
 
-    Notes
-    -----
-    Cells across the boundary of the base face are not seen: near a face
-    edge the result uses the one-sided neighbourhood inside the face (and
-    the normalized mode renormalizes over it).
     geometry : dict
         ``step_i``, ``step_j`` (cell units), ``angle_deg`` of the lattice at the
         centre, ``window`` (``n``), ``centre_lonlat``, ``face``, ``shape``.
     extent_deg : float
         Great-circle extent of the block.
+
+    Notes
+    -----
+    Cells across the boundary of the base face are not seen: near a face
+    edge the result uses the one-sided neighbourhood inside the face (and
+    the normalized mode renormalizes over it).
     """
 
     def __init__(self, level: int, cell_ids, kernel: Union[str, KernelFn], *,
@@ -331,7 +333,6 @@ class HealPixGeoFFT(nn.Module):
         super().__init__()
         self.level = int(level)
         self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
-        self.dtype = dtype
         dev = torch.device(device) if device is not None else torch.device("cpu")
         self.support_eps = float(support_eps)
         self.units = str(units)
@@ -432,17 +433,23 @@ class HealPixGeoFFT(nn.Module):
         # sum_d k[d] x[p + d] (a correlation by the stencil), i.e. a convolution by the stencil flipped.
         self._Hp = _fast_len(self.H + 2 * n)
         self._Wp = _fast_len(self.W + 2 * n)
-        kpad = torch.zeros(self._Hp, self._Wp, dtype=self.dtype, device=dev)
-        kpad[: 2 * n + 1, : 2 * n + 1] = torch.as_tensor(np.ascontiguousarray(k[::-1, ::-1]), dtype=self.dtype,
-                                                         device=dev)
+        kpad = torch.zeros(self._Hp, self._Wp, dtype=dtype, device=dev)
+        kpad[: 2 * n + 1, : 2 * n + 1] = torch.as_tensor(np.ascontiguousarray(k[::-1, ::-1]), dtype=dtype, device=dev)
         kpad = torch.roll(kpad, shifts=(-n, -n), dims=(0, 1))          # kernel centre at the origin
-        self.register_buffer("_kfft", torch.fft.rfft2(kpad), persistent=False)
+        # stored as (re, im) pairs: module.to(dtype) then casts it like any real buffer, whereas a
+        # complex buffer cast to a real dtype would lose its imaginary part
+        self.register_buffer("_kfft_ri", torch.view_as_real(torch.fft.rfft2(kpad)).clone(), persistent=False)
 
     # ------------------------------------------------------------------ helpers
     @property
     def device_(self) -> torch.device:
         """Device of the operator (follows ``module.to(device)``)."""
-        return self._kfft.device
+        return self._kfft_ri.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Real dtype of the operator (follows ``module.to(dtype)``)."""
+        return self._kfft_ri.dtype
 
     def _default_radius(self, radius_max: float) -> float:
         """Distance (user units) beyond which max over 16 azimuths of |k| stays below 1e-3 of max |k|.
@@ -492,7 +499,7 @@ class HealPixGeoFFT(nn.Module):
         B = img.shape[0]
         pad = torch.zeros(B, self._Hp, self._Wp, dtype=self.dtype, device=self.device_)
         pad[:, : self.H, : self.W] = img
-        y = torch.fft.irfft2(torch.fft.rfft2(pad) * self._kfft, s=(self._Hp, self._Wp))
+        y = torch.fft.irfft2(torch.fft.rfft2(pad) * torch.view_as_complex(self._kfft_ri), s=(self._Hp, self._Wp))
         return y[:, : self.H, : self.W]
 
     def _prepare(self, x: ArrayLike):

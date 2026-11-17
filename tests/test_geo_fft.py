@@ -82,7 +82,7 @@ def test_constant_is_preserved_and_dirac_gives_the_kernel_image():
     sel = (np.abs(ii - ic) <= n) & (np.abs(jj - jc) <= n)
     img = np.zeros((2 * n + 1, 2 * n + 1))
     img[jc - jj[sel] + n, ic - ii[sel] + n] = resp[sel]
-    assert np.allclose(img, conv.kernel_image, atol=1e-9)
+    assert np.abs(img - conv.kernel_image).max() < 1e-9
 
 
 def _brute_force(x, cells, kernel, radius_m, targets, level=LEVEL):
@@ -253,10 +253,19 @@ def test_weights_and_non_finite_input():
     assert np.allclose(conv.raw(xi), conv.raw(xz))
 
 
-def test_module_to_moves_the_operator():
+def test_module_to_moves_and_casts_the_operator():
     cells = block(-60.0, -3.0, delta=5)
-    conv = HealPixGeoFFT(LEVEL, cells, "gaussian", scale=20.0, radius=80.0)
-    assert {b.device for b in (conv._kfft, conv._rows, conv._cols)} == {conv.device_}
+    north = lambda rho, phi: (0.5 + 0.5 * np.cos(phi)) ** 4 * np.exp(-rho / 20.0)
+    conv = HealPixGeoFFT(LEVEL, cells, north, radius=80.0, normalized=False)
+    x = np.random.default_rng(5).standard_normal(cells.size)
+    y64 = conv(x)
+    conv32 = conv.to(torch.float32)
+    assert conv32.dtype == torch.float32
+    y32 = conv32(x)
+    assert y32.dtype == np.float32
+    assert np.abs(y32 - y64).max() < 1e-5 * np.abs(y64).max()    # the spectrum keeps its imaginary part
+    assert np.allclose(conv32.double()(x), y64)
+    assert {b.device for b in (conv._kfft_ri, conv._rows, conv._cols)} == {conv.device_}
     if torch.cuda.is_available():
         conv = conv.to("cuda")
         y = conv(torch.ones(cells.size, dtype=torch.float64, device="cuda"))
