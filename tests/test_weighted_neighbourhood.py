@@ -1077,3 +1077,32 @@ def test_torch_cuda_device_preserved():
             dtype=torch.float32,
         ),
     )
+
+
+def test_numpy_segment_sum_with_empty_rows_at_start_middle_and_end():
+    from healpix_analyse._weighted_neighbourhood import _numpy_segment_sum
+
+    values = np.array([1.0, 2.0, 3.0, 4.0])
+
+    # Trailing empty row must not drop the last element of the last
+    # non-empty row.
+    np.testing.assert_array_equal(
+        _numpy_segment_sum(values, np.array([0, 4, 4])),
+        [10.0, 0.0],
+    )
+    # Empty rows at the start, in the middle and at the end.
+    np.testing.assert_array_equal(
+        _numpy_segment_sum(values, np.array([0, 0, 2, 2, 4, 4, 4])),
+        [0.0, 3.0, 0.0, 7.0, 0.0, 0.0],
+    )
+    # Leading dimensions are preserved.
+    stacked = np.stack([values, 10 * values])
+    np.testing.assert_array_equal(
+        _numpy_segment_sum(stacked, np.array([0, 0, 1, 1, 4, 4])),
+        [[0.0, 1.0, 0.0, 9.0, 0.0], [0.0, 10.0, 0.0, 90.0, 0.0]],
+    )
+    # All rows empty.
+    np.testing.assert_array_equal(
+        _numpy_segment_sum(values, np.array([4, 4, 4])),
+        [0.0, 0.0],
+    )
