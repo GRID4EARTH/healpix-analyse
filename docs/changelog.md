@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added
+- `HealPixGeoFFT` / `geo_fft_convolve`: FFT convolution of a block inside one
+  base face with a wide kernel sampled on geodesic distances and azimuths from
+  the block centre (predefined families in metres, kilometres, degrees or
+  cells, or any callable `k(rho, phi)`), normalized convolution for missing
+  data as a ratio of two FFTs. The kernel window is sized from the local
+  lattice geometry, which is a sheared parallelogram with unequal sides in the
+  polar caps, and widened where that geometry drifts across a large window;
+  treating the face lattice as a square grid is measured to be off by
+  5-30 % on Sentinel-2 tiles at level 20. The kernel `k(rho, phi)` is
+  evaluated from the output cell to the input cell, as in
+  `directional_filter`.
+
+### Fixed
+- `HealPixKernelPyramid` fitting accepts operators that return torch tensors
+  on a GPU or with gradients.
+
 ## 2026.11.0 (2026-11-15)
 
 ### Changed
