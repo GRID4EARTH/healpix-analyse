@@ -1,0 +1,100 @@
+[
+  {
+    "level": 0,
+    "cells": 12,
+    "connectivity": "edge",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 0,
+    "cells": 12,
+    "connectivity": "edge_or_vertex",
+    "exact_match": true,
+    "missing_positions": 24
+  },
+  {
+    "level": 1,
+    "cells": 48,
+    "connectivity": "edge",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 1,
+    "cells": 48,
+    "connectivity": "edge_or_vertex",
+    "exact_match": true,
+    "missing_positions": 24
+  },
+  {
+    "level": 3,
+    "cells": 768,
+    "connectivity": "edge",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 3,
+    "cells": 768,
+    "connectivity": "edge_or_vertex",
+    "exact_match": true,
+    "missing_positions": 24
+  },
+  {
+    "level": 6,
+    "cells": 49152,
+    "connectivity": "edge",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 6,
+    "cells": 49152,
+    "connectivity": "edge_or_vertex",
+    "exact_match": true,
+    "missing_positions": 24
+  },
+  {
+    "level": 16,
+    "cells": 10000,
+    "connectivity": "edge",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 16,
+    "cells": 10000,
+    "connectivity": "edge_or_vertex",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 20,
+    "cells": 10000,
+    "connectivity": "edge",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 20,
+    "cells": 10000,
+    "connectivity": "edge_or_vertex",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 29,
+    "cells": 10000,
+    "connectivity": "edge",
+    "exact_match": true,
+    "missing_positions": 0
+  },
+  {
+    "level": 29,
+    "cells": 10000,
+    "connectivity": "edge_or_vertex",
+    "exact_match": true,
+    "missing_positions": 0
+  }
+]

@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- `benchmarks/benchmark_geo_release.py` and the report and timings of the
+  HEALPIX-GEO 0.4.0 direct-sum benchmark
+  (`benchmarks/results/geo040-performance/`), so that the first-call and
+  cache timings of `gaussian_filter` can be cited and re-run.
 - `HealPixGeoFFT` / `geo_fft_convolve`: FFT convolution of a block inside one
   base face with a wide kernel sampled on geodesic distances and azimuths from
   the block centre (predefined families in metres, kilometres, degrees or
