@@ -3,6 +3,22 @@
 ## Unreleased
 
 ### Added
+- `radial_filter` and `gaussian_filter` take `normalization="present"`
+  (default, the existing behaviour) or `"full_disc"`: the weights are divided
+  by their sum over the whole kernel disc, cells outside the domain included
+  and contributing zero, so that mass diffusing out of the domain is lost (the
+  `mode="constant", cval=0` of a raster filter). A `NaN` inside the domain
+  counts as zero in that mode.
+- `gaussian_filter_operator`, `radial_filter_operator` and
+  `apply_filter_operator`: the weights of a filter as three plain arrays in
+  compressed-row form (`FilterOperator`: row offsets, column indices, weights),
+  built once and applied to values with leading dimensions (NumPy or Torch).
+  No new dependency; the result equals the filter with the same options.
+- `gaussian_filter(..., width_rule="matched")` (and the operator): the
+  requested width is reached below about one cell, by solving the Gaussian
+  shape per cell above about 0.6 cell and blending with the identity below it.
+  The default `"sampled"` is unchanged, and its documentation now says that its
+  effective width is smaller than requested below about one cell.
 - `HealPixGeoFFT` / `geo_fft_convolve`: FFT convolution of a block inside one
   base face with a wide kernel sampled on geodesic distances and azimuths from
   the block centre (predefined families in metres, kilometres, degrees or

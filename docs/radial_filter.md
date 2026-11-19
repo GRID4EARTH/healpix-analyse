@@ -101,7 +101,16 @@ With the default `truncate=4.0`, `sigma_m=240.0` therefore uses a physical suppo
 960 m
 ```
 
-The Gaussian wrapper is normalized by construction, so a constant finite field remains constant after filtering.
+With the default `normalization="present"` the Gaussian wrapper is normalized by construction, so a constant finite field remains constant after filtering (with `"full_disc"` it decays near the edge of the domain, see below).
+
+```{warning}
+The default Gaussian is sampled at the cell centres. When `sigma_m` is below
+about one cell, the response of the filter to a single cell is narrower than
+`sigma_m`: at 0.3 cell the effective width (one-axis RMS) is about 0.11 cell
+and the centre cell keeps 96 to 97 % of the weight, and below about 0.2 cell the
+filter is the identity. Use `width_rule="matched"` (see
+[Widths below one cell](#widths-below-one-cell)) when the width itself matters.
+```
 
 ## Physical-distance semantics
 
@@ -258,6 +267,125 @@ and renormalizes those remaining weights.
 A single missing neighbour therefore does not contaminate the complete neighbourhood with `NaN`.
 
 If the effective weight sum is zero under `normalize=True`, the result is `NaN`.
+
+## Fixed normalisation at the edge of the domain
+
+`normalization` chooses what the weights are divided by, in `radial_filter`
+and `gaussian_filter`:
+
+| value | divided by | at the edge of the domain |
+|---|---|---|
+| `"present"` (default, same as `normalize=True`) | sum of the weights of the cells present | a constant field stays constant; no mass leaves |
+| `"full_disc"` | sum of the weights over the whole kernel disc, cells outside the domain included | cells outside the domain contribute zero; mass that diffuses out is lost |
+
+`"full_disc"` is the `mode="constant", cval=0` of a raster filter. The row of
+a cell whose disc crosses the edge sums to the fraction of the disc weight
+that lies inside the domain, and `filter(ones)` shows that fraction.
+
+```python
+out = gaussian_filter(
+    probability,
+    cell_ids,
+    refinement_level=10,
+    sigma_m=6000.0,
+    normalization="full_disc",
+)
+```
+
+Cells of `cell_ids` that are not in `domain` count as outside the domain. The
+kernel of `radial_filter` is also evaluated on the distances to the cells
+outside the domain. A `ValueError` is raised if the weights of some disc sum to
+zero. Passing `normalization` with `normalize=False` is an error.
+
+**Missing values with `"full_disc"`.** A `NaN` inside the domain is left out of
+the numerator and kept in the denominator: it counts as zero, and the result is
+never `NaN` because of `NaN` input. With `"present"` the weights of the
+remaining cells are renormalised, as described under *Missing values*.
+
+## Reusable weights
+
+The weights of a filter can be built once and applied many times, for example
+to every time step of a model, or chunk by chunk:
+
+```python
+from healpix_analyse import apply_filter_operator, gaussian_filter_operator
+
+op = gaussian_filter_operator(
+    cell_ids,
+    refinement_level=10,
+    sigma_m=6000.0,
+    normalization="full_disc",
+)
+row_offsets, column_indices, weights = op        # three plain NumPy arrays
+
+out = apply_filter_operator(values, *op)         # values: (time, N) or (N,)
+```
+
+`radial_filter_operator` does the same for a kernel. The result is a
+`FilterOperator`, a named tuple of three arrays in compressed-row form:
+
+```text
+out[..., i] = sum_k weights[k] * values[..., column_indices[k]]
+              for k in row_offsets[i]:row_offsets[i + 1]
+```
+
+Row `i` is the output cell `domain[i]` and the column indices point into
+`cell_ids`. The weights already contain the normalisation, and
+`apply_filter_operator` gives the same values as the filter with the same
+options (NumPy and Torch input; leading dimensions are kept). No SciPy or
+`sparse` import is needed. A caller that has one of them can wrap the arrays:
+
+```python
+import scipy.sparse as sp
+
+matrix = sp.csr_matrix(
+    (op.weights, op.column_indices, op.row_offsets),
+    shape=(len(cell_ids), len(cell_ids)),
+)
+out = matrix @ values
+```
+
+`apply_filter_operator` leaves `NaN` values out of the sum, so a `NaN` counts as
+zero, which is the rule of `"full_disc"`; the equality with the filter for an
+operator built with `"present"` holds for data without `NaN`. With `renormalize_missing=True` the weights of the remaining cells are
+divided by their sum, which is what the filters do with
+`normalization="present"`.
+
+xarray and dask wrappers are left to the calling package.
+
+## Widths below one cell
+
+With `width_rule="sampled"` (default) the Gaussian is sampled at the cell
+centres and a width below about one cell is not reached. With
+`width_rule="matched"`:
+
+- where `sigma_m` is above the effective width of a reference operator `G0`
+  (the sampled Gaussian with a width of 0.6 cell, whose effective width is
+  about 0.58 cell), the shape parameter `s` of
+  `w = exp(-d^2 / (2 s^2))` is solved per cell so that the discrete second
+  moment `sum(w d^2) / sum(w)` over the disc equals `2 sigma_m^2`;
+- below it, the cell uses `T = I + (sigma_m / sigma_0)^2 (G0 - I)`, with
+  `sigma_0` the effective width of `G0` at that cell.
+
+The effective width of the row of every cell is then equal to `sigma_m`; the
+response to one cell is within a few per cent of it (one-axis RMS, the
+anisotropy of the response is about 1.06), the width is continuous and monotone
+in `sigma_m`, and the filter tends to the identity when `sigma_m` tends to
+zero. The support is `truncate * max(sigma_m, 0.6 cell)`, and `truncate` must be at least 3 (a `ValueError` otherwise). The option works with
+both normalisations and with `gaussian_filter_operator`. It is not meant for
+widths of several cells, where the sampled Gaussian is already accurate and the
+solve costs extra time.
+
+Measured for one real domain at level 10 (8125 cells), response to one cell, in
+cells:
+
+| requested | `"sampled"` | `"matched"` |
+|---|---|---|
+| 0.1 | 0.00 | 0.10 |
+| 0.3 | 0.11 | 0.30 |
+| 0.5 | 0.45 | 0.50 |
+| 1.0 | 1.00 | 1.00 |
+| 2.0 | 2.00 | 2.01 |
 
 ## Custom radial kernels
 
