@@ -986,6 +986,90 @@ def build_metric_neighbourhood_geometry(
     )
 
 
+def build_outside_domain_distances(
+    cells: np.ndarray,
+    radius: float,
+    refinement_level: int,
+    *,
+    ellipsoid: str = "WGS84",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return centre distances to the disc cells that are not in ``cells``.
+
+    For every centre in ``cells`` the result lists, in CSR form, the WGS84
+    centre-to-centre distances of all cells within ``radius`` that are *not*
+    members of ``cells``.  Together with
+    :func:`build_metric_neighbourhood_geometry` it describes the whole kernel
+    disc of every centre, which is what a fixed (full-disc) normalisation
+    needs.  Only distances are returned: cells outside the domain carry no
+    values.
+    """
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Metric neighbour geometry currently supports "
+            "ellipsoid='WGS84' only."
+        )
+
+    centers = np.asarray(cells, dtype=np.uint64)
+    number_of_centers = centers.size
+    empty = (
+        np.zeros(number_of_centers + 1, dtype=np.int64),
+        np.empty(0, dtype=np.float64),
+    )
+    if number_of_centers == 0 or radius == 0.0:
+        return empty
+
+    center_lon, center_lat = nested.healpix_to_lonlat(
+        centers,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    center_lon = np.asarray(center_lon)
+    center_lat = np.asarray(center_lat)
+    candidate_offsets, flat_candidates = _cone_candidate_csr(
+        center_lon,
+        center_lat,
+        radius,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    candidate_rows = np.repeat(
+        np.arange(number_of_centers, dtype=np.int64),
+        np.diff(candidate_offsets),
+    )
+
+    sorted_domain = np.sort(centers)
+    positions = np.minimum(
+        np.searchsorted(sorted_domain, flat_candidates),
+        number_of_centers - 1,
+    )
+    outside = sorted_domain[positions] != flat_candidates
+    flat_candidates = flat_candidates[outside]
+    candidate_rows = candidate_rows[outside]
+    if flat_candidates.size == 0:
+        return empty
+
+    lon, lat = nested.healpix_to_lonlat(
+        flat_candidates,
+        refinement_level,
+        ellipsoid=ellipsoid,
+    )
+    distance_m = _wgs84_distance(
+        center_lon[candidate_rows],
+        center_lat[candidate_rows],
+        np.asarray(lon),
+        np.asarray(lat),
+    )
+    within_radius = distance_m <= radius
+    row_counts = np.bincount(
+        candidate_rows[within_radius],
+        minlength=number_of_centers,
+    )
+    row_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(row_counts))
+    )
+    return row_offsets, distance_m[within_radius]
+
+
 def build_metric_geometry_from_vectorized_ring(
     cells: np.ndarray,
     radius: float,
@@ -1164,5 +1248,6 @@ __all__ = [
     "relative_geometry_from_neighbourhoods",
     "metric_geometry_from_neighbourhoods",
     "build_metric_neighbourhood_geometry",
+    "build_outside_domain_distances",
     "build_metric_geometry_from_vectorized_ring",
 ]

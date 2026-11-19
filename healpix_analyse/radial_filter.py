@@ -49,15 +49,17 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable
 from threading import RLock
-from typing import Any
+from typing import Any, NamedTuple
 import warnings
 
 import numpy as np
 import torch
 
 from ._neighbourhood import (
+    _WGS84_AUTHALIC_RADIUS_M,
     CompactMetricNeighbourhoodGeometry,
     build_metric_neighbourhood_geometry,
+    build_outside_domain_distances,
 )
 from ._weighted_neighbourhood import compact_weighted_neighbourhood_reduce
 
@@ -568,25 +570,28 @@ def _evaluate_kernel(
     kernels.  Non-finite weights at valid positions are rejected because they
     indicate an invalid kernel definition rather than missing signal data.
     """
-    if not callable(kernel):
-        raise TypeError(
-            "'kernel' must be callable."
-        )
-
-    if geometry.distance_m.size == 0:
-        return np.empty(0, dtype=np.float64)
-
     # The centre cell is a valid neighbour of itself for radial filtering.
     # WGS84 inverse geodesics can return tiny non-zero round-off values even
     # when centre and neighbour IDs are identical.  Canonicalize these
     # self-distances to exactly zero before user-kernel evaluation so kernels
     # may safely use conditions such as ``distance_m == 0.0``.
     distance_m = geometry.distance_m.copy()
-    self_mask = geometry.neighbour_indices == np.repeat(
-        np.arange(geometry.center_ids.size, dtype=np.int64),
-        np.diff(geometry.row_offsets),
-    )
-    distance_m[self_mask] = 0.0
+    distance_m[_self_mask(geometry)] = 0.0
+    return _evaluate_kernel_distances(kernel, distance_m)
+
+
+def _evaluate_kernel_distances(
+    kernel: Kernel,
+    distance_m: np.ndarray,
+) -> np.ndarray:
+    """Evaluate ``kernel`` on one-dimensional distances and validate it."""
+    if not callable(kernel):
+        raise TypeError(
+            "'kernel' must be callable."
+        )
+
+    if distance_m.size == 0:
+        return np.empty(0, dtype=np.float64)
 
     raw_weights = kernel(distance_m)
 
@@ -634,6 +639,500 @@ def _evaluate_kernel(
     return valid_weights
 
 
+_NORMALIZATIONS = ("present", "full_disc")
+_WIDTH_RULES = ("sampled", "matched")
+
+# Sub-cell Gaussian widths (``width_rule="matched"``).  The reference
+# operator ``G0`` is the sampled Gaussian of width ``_REFERENCE_SIGMA_CELLS``
+# cells; below its effective width a cell blends ``G0`` with the identity.
+_REFERENCE_SIGMA_CELLS = 0.6
+_MIN_MATCHED_TRUNCATE = 3.0
+_MIN_MATCHED_SIGMA_CELLS = 0.5
+_SHAPE_SEARCH_LOWER_CELLS = 0.02
+_SHAPE_SEARCH_ITERATIONS = 60
+_SHAPE_SEARCH_TOLERANCE = 1e-12
+
+
+class FilterOperator(NamedTuple):
+    """Weights of a linear filter in compressed-row (CSR) form.
+
+    The operator maps a signal defined on ``cell_ids`` (final axis of length
+    ``N``) to a signal defined on the output domain (``M`` rows)::
+
+        out[..., i] = sum_k weights[k] * values[..., column_indices[k]]
+                      for k in row_offsets[i]:row_offsets[i + 1]
+
+    All three fields are plain NumPy arrays, so the caller can wrap them in
+    the sparse-matrix type of their choice, for example
+    ``scipy.sparse.csr_matrix((weights, column_indices, row_offsets),
+    shape=(M, N))``, or pass them to :func:`apply_filter_operator`.
+    """
+
+    row_offsets: np.ndarray
+    column_indices: np.ndarray
+    weights: np.ndarray
+
+
+def _validate_normalization(normalization: str) -> str:
+    if normalization not in _NORMALIZATIONS:
+        raise ValueError(
+            f"'normalization' must be one of {_NORMALIZATIONS}; "
+            f"got {normalization!r}."
+        )
+    return normalization
+
+
+def _validate_width_rule(width_rule: str) -> str:
+    if width_rule not in _WIDTH_RULES:
+        raise ValueError(
+            f"'width_rule' must be one of {_WIDTH_RULES}; "
+            f"got {width_rule!r}."
+        )
+    return width_rule
+
+
+def _cell_size_m(refinement_level: int) -> float:
+    """Return ``sqrt(cell area)`` in metres on the authalic sphere."""
+    area = 4.0 * np.pi * _WGS84_AUTHALIC_RADIUS_M**2 / (
+        12.0 * 4.0 ** int(refinement_level)
+    )
+    return float(np.sqrt(area))
+
+
+def _self_mask(geometry: CompactMetricNeighbourhoodGeometry) -> np.ndarray:
+    return geometry.neighbour_indices == np.repeat(
+        np.arange(geometry.center_ids.size, dtype=np.int64),
+        np.diff(geometry.row_offsets),
+    )
+
+
+def _row_sums(
+    rows: np.ndarray,
+    weights: np.ndarray,
+    number_of_rows: int,
+) -> np.ndarray:
+    return np.bincount(rows, weights=weights, minlength=number_of_rows)
+
+
+def _normalize_rows(
+    weights_in: np.ndarray,
+    rows_in: np.ndarray,
+    weights_out: np.ndarray | None,
+    rows_out: np.ndarray | None,
+    number_of_rows: int,
+    normalization: str,
+) -> np.ndarray:
+    """Divide in-domain weights by the row sum chosen by ``normalization``."""
+    total = _row_sums(rows_in, weights_in, number_of_rows)
+    if normalization == "full_disc":
+        total = total + _row_sums(rows_out, weights_out, number_of_rows)
+    if np.any(total == 0.0):
+        raise ValueError(
+            "The kernel weights sum to zero over the normalisation set "
+            f"({normalization!r}) of at least one cell; the normalised "
+            "weights are undefined."
+        )
+    return weights_in / total[rows_in]
+
+
+def _solve_gaussian_shape(
+    rows: np.ndarray,
+    distance: np.ndarray,
+    cut: float,
+    target_m2: float,
+    lower: float,
+    upper: float,
+    number_of_rows: int,
+) -> np.ndarray:
+    """Per row, find ``s`` such that the sampled Gaussian has a given m2.
+
+    The second moment is ``sum(w d^2) / sum(w)`` with
+    ``w = exp(-d^2 / (2 s^2))`` on ``d <= cut``.  It increases with ``s``,
+    so the root is found by bisection on ``log s`` for all rows at once.
+    """
+    inside = distance <= cut
+    rows = rows[inside]
+    d2 = distance[inside] ** 2
+    low = np.full(number_of_rows, np.log(lower))
+    high = np.full(number_of_rows, np.log(upper))
+    for _ in range(_SHAPE_SEARCH_ITERATIONS):
+        mid = 0.5 * (low + high)
+        w = np.exp(-d2 / (2.0 * np.exp(2.0 * mid)[rows]))
+        z = _row_sums(rows, w, number_of_rows)
+        m2 = _row_sums(rows, w * d2, number_of_rows) / z
+        too_wide = m2 > target_m2
+        high = np.where(too_wide, mid, high)
+        low = np.where(too_wide, low, mid)
+        if np.max(high - low) < _SHAPE_SEARCH_TOLERANCE:
+            break
+    return np.exp(0.5 * (low + high))
+
+
+def _second_moment(
+    rows: np.ndarray,
+    weights: np.ndarray,
+    distance: np.ndarray,
+    number_of_rows: int,
+) -> np.ndarray:
+    return _row_sums(rows, weights * distance**2, number_of_rows) / _row_sums(
+        rows, weights, number_of_rows
+    )
+
+
+def _gaussian_operator_weights(
+    geometry: CompactMetricNeighbourhoodGeometry,
+    outside_offsets: np.ndarray | None,
+    outside_distance: np.ndarray | None,
+    *,
+    sigma: float,
+    truncate: float,
+    refinement_level: int,
+    normalization: str,
+    width_rule: str,
+) -> np.ndarray:
+    """Return normalised Gaussian weights for the in-domain pairs."""
+    n_rows = geometry.center_ids.size
+    rows_in = np.repeat(
+        np.arange(n_rows, dtype=np.int64), np.diff(geometry.row_offsets)
+    )
+    distance_in = geometry.distance_m.copy()
+    is_self = _self_mask(geometry)
+    distance_in[is_self] = 0.0
+
+    if outside_distance is None:
+        rows_out = np.empty(0, dtype=np.int64)
+        distance_out = np.empty(0, dtype=np.float64)
+    else:
+        rows_out = np.repeat(
+            np.arange(n_rows, dtype=np.int64), np.diff(outside_offsets)
+        )
+        distance_out = outside_distance
+
+    if width_rule == "sampled":
+        weights_in = np.exp(-0.5 * (distance_in / sigma) ** 2)
+        weights_out = np.exp(-0.5 * (distance_out / sigma) ** 2)
+        return _normalize_rows(
+            weights_in, rows_in, weights_out, rows_out, n_rows, normalization
+        )
+
+    cell = _cell_size_m(refinement_level)
+    rows_all = np.concatenate((rows_in, rows_out))
+    distance_all = np.concatenate((distance_in, distance_out))
+
+    # Reference operator G0 and its per-cell effective width.
+    s0 = _REFERENCE_SIGMA_CELLS * cell
+    cut0 = truncate * s0
+    w0_all = np.where(
+        distance_all <= cut0, np.exp(-0.5 * (distance_all / s0) ** 2), 0.0
+    )
+    sigma0 = np.sqrt(
+        0.5 * _second_moment(rows_all, w0_all, distance_all, n_rows)
+    )
+    blend = sigma <= sigma0  # per cell: identity/G0 blend, else matched
+
+    # Matched shape for the remaining cells.
+    cut = truncate * max(sigma, _MIN_MATCHED_SIGMA_CELLS * cell)
+    shape = np.full(n_rows, s0)
+    solve = ~blend
+    if np.any(solve):
+        keep = solve[rows_all]
+        index = np.cumsum(solve) - 1
+        shape[solve] = _solve_gaussian_shape(
+            index[rows_all[keep]],
+            distance_all[keep],
+            cut,
+            2.0 * sigma**2,
+            _SHAPE_SEARCH_LOWER_CELLS * cell,
+            2.0 * max(sigma, _MIN_MATCHED_SIGMA_CELLS * cell),
+            int(solve.sum()),
+        )
+    wm_all = np.where(
+        distance_all <= cut,
+        np.exp(-0.5 * (distance_all / shape[rows_all]) ** 2),
+        0.0,
+    )
+    kernel_all = np.where(blend[rows_all], w0_all, wm_all)
+    n_in = rows_in.size
+    kernel_in, kernel_out = kernel_all[:n_in], kernel_all[n_in:]
+
+    normalised = _normalize_rows(
+        kernel_in, rows_in, kernel_out, rows_out, n_rows, normalization
+    )
+    mix = np.ones(n_rows)
+    mix[blend] = (sigma / sigma0[blend]) ** 2
+    weights = normalised * mix[rows_in]
+    weights = weights + np.where(
+        is_self & blend[rows_in], 1.0 - mix[rows_in], 0.0
+    )
+    return weights
+
+
+def _validate_gaussian_parameters(
+    sigma_m: float,
+    truncate: float,
+    *,
+    width_rule: str,
+    refinement_level: int,
+) -> tuple[float, float, float]:
+    """Validate sigma/truncate; return ``(sigma, truncate, disc radius)``."""
+    sigma = _validate_positive_finite(sigma_m, name="sigma_m")
+    truncation = _validate_positive_finite(truncate, name="truncate")
+    _validate_width_rule(width_rule)
+    scale = sigma
+    if width_rule == "matched":
+        if truncation < _MIN_MATCHED_TRUNCATE:
+            raise ValueError(
+                "width_rule='matched' needs truncate >= "
+                f"{_MIN_MATCHED_TRUNCATE:g}: a shorter support cannot "
+                "reach the requested width."
+            )
+        # Cells blended with the identity use the reference width.
+        scale = max(sigma, _REFERENCE_SIGMA_CELLS * _cell_size_m(refinement_level))
+    radius = scale * truncation
+
+    # Both validated operands are finite, but their product can still
+    # overflow for extreme user inputs.  Reject that explicitly rather than
+    # passing an infinite physical radius into neighbourhood construction.
+    if not np.isfinite(radius):
+        raise ValueError("'truncate * sigma_m' must be finite.")
+    return sigma, truncation, radius
+
+
+def _outside_distances(
+    output_domain: np.ndarray,
+    refinement_level: int,
+    radius: float,
+    ellipsoid: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    return build_outside_domain_distances(
+        output_domain, radius, refinement_level, ellipsoid=ellipsoid
+    )
+
+
+def gaussian_filter_operator(
+    cell_ids: np.ndarray,
+    refinement_level: int,
+    *,
+    sigma_m: float,
+    truncate: float = 4.0,
+    normalization: str = "present",
+    width_rule: str = "sampled",
+    domain: np.ndarray | None = None,
+    ellipsoid: str = "WGS84",
+) -> FilterOperator:
+    """Return the weights of :func:`gaussian_filter` as a reusable operator.
+
+    The options are those of :func:`gaussian_filter`, and applying the result
+    with :func:`apply_filter_operator` gives the same values as
+    ``gaussian_filter(values, cell_ids, refinement_level, sigma_m=...,
+    truncate=..., normalization=..., width_rule=..., domain=...)`` for
+    values without NaN (see :func:`apply_filter_operator` for NaN).  Build
+    the operator once, then apply it to as many
+    signals (time steps, chunks) as needed, or hand the three arrays to a
+    sparse-matrix type.
+
+    Parameters
+    ----------
+    cell_ids, refinement_level, sigma_m, truncate, normalization, \
+    width_rule, domain, ellipsoid
+        See :func:`gaussian_filter`.
+
+    Returns
+    -------
+    FilterOperator
+        ``(row_offsets, column_indices, weights)``.  Row ``i`` is the output
+        cell ``domain[i]`` (``cell_ids[i]`` without ``domain``); the column
+        indices point into ``cell_ids``, i.e. into the final axis of the
+        signal to filter.  The weights already include the normalisation.
+
+    Notes
+    -----
+    With ``normalization="present"`` every row sums to one.  With
+    ``"full_disc"`` the row of a cell whose kernel disc leaves the domain
+    sums to the fraction of the disc weight that lies inside the domain.
+    """
+    sigma, truncation, radius = _validate_gaussian_parameters(
+        sigma_m, truncate, width_rule=width_rule, refinement_level=refinement_level
+    )
+    _validate_normalization(normalization)
+    cells = _validate_cell_ids(cell_ids, name="cell_ids")
+    output_domain = _validate_domain(cells, domain)
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Radial filtering currently supports ellipsoid='WGS84' only."
+        )
+    return _gaussian_operator(
+        cells,
+        output_domain,
+        refinement_level,
+        sigma,
+        truncation,
+        radius,
+        normalization,
+        width_rule,
+        ellipsoid,
+    )
+
+
+def _gaussian_operator(
+    cells: np.ndarray,
+    output_domain: np.ndarray,
+    refinement_level: int,
+    sigma: float,
+    truncation: float,
+    radius: float,
+    normalization: str,
+    width_rule: str,
+    ellipsoid: str,
+) -> FilterOperator:
+    _, geometry = _filter_geometry(
+        output_domain, refinement_level, radius, ellipsoid
+    )
+    if normalization == "full_disc" or width_rule == "matched":
+        outside_offsets, outside_distance = _outside_distances(
+            output_domain, refinement_level, radius, ellipsoid
+        )
+    else:
+        outside_offsets = outside_distance = None
+    weights = _gaussian_operator_weights(
+        geometry,
+        outside_offsets,
+        outside_distance,
+        sigma=sigma,
+        truncate=truncation,
+        refinement_level=refinement_level,
+        normalization=normalization,
+        width_rule=width_rule,
+    )
+    domain_positions = _positions_in_input(cells, geometry.center_ids)
+    return FilterOperator(
+        np.asarray(geometry.row_offsets, dtype=np.int64),
+        domain_positions[geometry.neighbour_indices].astype(np.int64),
+        weights,
+    )
+
+
+def radial_filter_operator(
+    cell_ids: np.ndarray,
+    refinement_level: int,
+    *,
+    radius_m: float,
+    kernel: Kernel,
+    normalization: str = "present",
+    domain: np.ndarray | None = None,
+    ellipsoid: str = "WGS84",
+) -> FilterOperator:
+    """Return the weights of :func:`radial_filter` as a reusable operator.
+
+    Same options as :func:`radial_filter` (without ``values``), with
+    ``normalization`` as described there.  See :class:`FilterOperator` and
+    :func:`apply_filter_operator`.
+
+    For ``normalization="full_disc"`` the kernel is evaluated on the
+    distances to all cells of the disc, inside and outside the domain, in one
+    call.  A ``ValueError`` is raised if the kernel weights of some disc sum
+    to zero.
+
+    The distances of the in-domain and outside cells are concatenated into
+    one array for that call, so the kernel must act element by element (it
+    must not normalise by a statistic of its input).  As for
+    :func:`gaussian_filter_operator`, equality with the filter holds for
+    values without NaN: see :func:`apply_filter_operator`.
+    """
+    _validate_normalization(normalization)
+    cells = _validate_cell_ids(cell_ids, name="cell_ids")
+    output_domain = _validate_domain(cells, domain)
+    radius = _validate_radius(radius_m)
+    if ellipsoid != "WGS84":
+        raise NotImplementedError(
+            "Radial filtering currently supports ellipsoid='WGS84' only."
+        )
+    _, geometry = _filter_geometry(
+        output_domain, refinement_level, radius, ellipsoid
+    )
+    n_rows = geometry.center_ids.size
+    rows_in = np.repeat(
+        np.arange(n_rows, dtype=np.int64), np.diff(geometry.row_offsets)
+    )
+    distance_in = geometry.distance_m.copy()
+    distance_in[_self_mask(geometry)] = 0.0
+
+    if normalization == "full_disc":
+        outside_offsets, outside_distance = _outside_distances(
+            output_domain, refinement_level, radius, ellipsoid
+        )
+        rows_out = np.repeat(
+            np.arange(n_rows, dtype=np.int64), np.diff(outside_offsets)
+        )
+        all_weights = _evaluate_kernel_distances(
+            kernel,
+            np.concatenate((distance_in, outside_distance)),
+        )
+        weights_in = all_weights[: rows_in.size]
+        weights_out = all_weights[rows_in.size :]
+    else:
+        weights_in = _evaluate_kernel(kernel, geometry)
+        rows_out = weights_out = None
+
+    weights = _normalize_rows(
+        weights_in, rows_in, weights_out, rows_out, n_rows, normalization
+    )
+    domain_positions = _positions_in_input(cells, geometry.center_ids)
+    return FilterOperator(
+        np.asarray(geometry.row_offsets, dtype=np.int64),
+        domain_positions[geometry.neighbour_indices].astype(np.int64),
+        weights,
+    )
+
+
+def apply_filter_operator(
+    values: ArrayLike,
+    row_offsets: np.ndarray,
+    column_indices: np.ndarray,
+    weights: np.ndarray,
+    *,
+    renormalize_missing: bool = False,
+) -> ArrayLike:
+    """Apply a :class:`FilterOperator` to a signal.
+
+    Parameters
+    ----------
+    values
+        NumPy array or PyTorch tensor.  The final axis is indexed by
+        ``column_indices``; leading dimensions (for example time) are kept.
+    row_offsets, column_indices, weights
+        The three arrays of a :class:`FilterOperator`; ``apply_filter_operator(
+        values, *operator)`` works.
+    renormalize_missing
+        NaN values in ``values`` are always left out of the weighted sum.
+        With ``False`` (default) the weights are used as they are, so a NaN
+        counts as zero: mass is neither added nor redistributed.  This is the
+        rule of ``normalization="full_disc"``; for an operator built with
+        ``"present"`` pass ``True`` to get the filter's result on data with
+        NaN.  With
+        ``True`` the weights of the remaining cells are divided by their sum,
+        which is what :func:`gaussian_filter` and :func:`radial_filter` do
+        with ``normalization="present"``; a row without any valid value gives
+        NaN.
+
+    Returns
+    -------
+    numpy.ndarray or torch.Tensor
+        Shape ``values.shape[:-1] + (len(row_offsets) - 1,)``.  NumPy input
+        gives NumPy output; Torch input stays on its device and keeps
+        autograd with respect to ``values``.
+    """
+    if not isinstance(renormalize_missing, (bool, np.bool_)):
+        raise TypeError("'renormalize_missing' must be a boolean.")
+    return compact_weighted_neighbourhood_reduce(
+        values,
+        column_indices,
+        row_offsets,
+        weights,
+        normalize=bool(renormalize_missing),
+    )
+
+
 def radial_filter(
     values: ArrayLike,
     cell_ids: np.ndarray,
@@ -642,6 +1141,7 @@ def radial_filter(
     radius_m: float,
     kernel: Kernel,
     normalize: bool = True,
+    normalization: str | None = None,
     domain: np.ndarray | None = None,
     ellipsoid: str = "WGS84",
 ) -> ArrayLike:
@@ -696,6 +1196,31 @@ def radial_filter(
         helper.  With ``normalize=True``, their weights are also removed from
         the denominator.  If the effective weight sum is zero, the normalized
         result is NaN.
+
+    normalization
+        What the weights are divided by.  ``None`` (default) keeps the
+        behaviour selected by ``normalize``.  Otherwise it implies
+        ``normalize=True`` and must be one of:
+
+        ``"present"``
+            The sum of the weights of the cells present in the domain (and
+            not NaN), as for ``normalize=True``.  A constant field stays
+            constant up to the edge of the domain.
+
+        ``"full_disc"``
+            The sum of the weights over the whole kernel disc, cells outside
+            the domain included.  Cells outside the domain count in the
+            denominator and contribute zero to the numerator, so mass that
+            diffuses out of the domain is lost: this is a raster filter with
+            ``mode="constant", cval=0``.  The kernel is evaluated on the
+            distances to the cells outside the domain too.  A NaN value
+            inside the domain is excluded from the numerator and kept in the
+            denominator, that is it counts as zero.  The result is therefore
+            never NaN because of NaN input.  A ``ValueError`` is raised if
+            the weights of some disc sum to zero.
+
+        Passing ``normalization`` together with ``normalize=False`` raises
+        ``ValueError``.
 
     domain
         Optional processing and output domain.  It must be a subset of
@@ -796,10 +1321,29 @@ def radial_filter(
 
     normalize = bool(normalize)
 
+    if normalization is not None:
+        _validate_normalization(normalization)
+        if not normalize:
+            raise ValueError(
+                "'normalization' requires normalize=True."
+            )
+
     if ellipsoid != "WGS84":
         raise NotImplementedError(
             "Radial filtering currently supports ellipsoid='WGS84' only."
         )
+
+    if normalization == "full_disc":
+        operator = radial_filter_operator(
+            cells,
+            refinement_level,
+            radius_m=radius,
+            kernel=kernel,
+            normalization="full_disc",
+            domain=output_domain,
+            ellipsoid=ellipsoid,
+        )
+        return apply_filter_operator(values, *operator)
 
     _, geometry = _filter_geometry(
         output_domain,
@@ -830,6 +1374,8 @@ def gaussian_filter(
     *,
     sigma_m: float,
     truncate: float = 4.0,
+    normalization: str = "present",
+    width_rule: str = "sampled",
     domain: np.ndarray | None = None,
     ellipsoid: str = "WGS84",
 ) -> ArrayLike:
@@ -856,6 +1402,18 @@ def gaussian_filter(
         Gaussian support radius in units of ``sigma_m``.  Must be finite and
         strictly positive.  The default is ``4.0``.
 
+    normalization
+        ``"present"`` (default) divides the weights by their sum over the
+        cells present in the domain; ``"full_disc"`` divides by their sum over
+        the whole disc, cells outside the domain contributing zero, so that
+        mass diffusing out of the domain is lost.  See :func:`radial_filter`
+        for the rule on NaN values.
+
+    width_rule
+        ``"sampled"`` (default) uses the Gaussian above, sampled at the cell
+        centres.  ``"matched"`` makes the width of the response of every cell
+        equal to ``sigma_m`` also below about one cell, see Notes.
+
     Returns
     -------
     numpy.ndarray or torch.Tensor
@@ -863,38 +1421,51 @@ def gaussian_filter(
 
     Notes
     -----
-    Gaussian smoothing is normalized by construction.  Constant finite fields
-    therefore remain constant, including near partial-domain boundaries after
-    unavailable samples are removed and the remaining effective weights are
-    renormalized.
+    Gaussian smoothing is normalized by construction.  With the default
+    ``normalization="present"``, constant finite fields remain constant,
+    including near partial-domain boundaries after unavailable samples are
+    removed and the remaining effective weights are renormalized.
 
     The physical smoothing scale is independent of HEALPix refinement level:
     ``sigma_m=240`` always means 240 metres rather than a number of pixels.
+
+    **Widths below about one cell.**  With ``width_rule="sampled"`` the
+    Gaussian is only sampled at the cell centres, so the effective width of
+    the response to a single cell (its one-axis RMS) is smaller than
+    ``sigma_m`` when ``sigma_m`` is below about one cell, and it is almost
+    zero below about 0.3 cell, where the centre cell keeps nearly all the
+    weight.  The output then hardly depends on ``sigma_m``.  Above about two
+    cells the difference is negligible.
+
+    ``width_rule="matched"`` removes this limit.  For a cell with ``w =
+    exp(-d**2 / (2 s**2))`` on the disc, the shape parameter ``s`` is solved
+    per cell so that the discrete second moment ``sum(w d**2) / sum(w)``
+    equals ``2 * sigma_m**2``.  Where ``sigma_m`` is below the effective width
+    of the reference operator ``G0`` (the sampled Gaussian with
+    ``s = 0.6`` cell), the cell uses ``I + (sigma_m / sigma_0)**2 (G0 - I)``
+    instead, with ``sigma_0`` the effective width of ``G0`` there.  The result
+    is continuous and monotone in ``sigma_m``, and tends to the identity when
+    ``sigma_m`` tends to zero.  The support is ``truncate * max(sigma_m,
+    0.6 cell)``, and the solved shape is evaluated on the whole disc,
+    whichever the normalisation.
 
     Geometry and Gaussian weights are retained in bounded caches. If one plan
     exceeds a limit, a warning reports the measured requirement and suggests
     :func:`configure_radial_filter_cache` or halo-safe tiling. Use
     :func:`radial_filter_cache_info` to inspect current limits and usage.
+    The default options use both caches; the other options use the geometry
+    cache only.
+
+    To apply the same filter many times, or from code that works chunk by
+    chunk, build the weights once with :func:`gaussian_filter_operator`.
     """
-    sigma = _validate_positive_finite(
+    sigma, truncation, radius = _validate_gaussian_parameters(
         sigma_m,
-        name="sigma_m",
-    )
-
-    truncation = _validate_positive_finite(
         truncate,
-        name="truncate",
+        width_rule=width_rule,
+        refinement_level=refinement_level,
     )
-
-    radius = sigma * truncation
-
-    # Both validated operands are finite, but their product can still
-    # overflow for extreme user inputs.  Reject that explicitly rather than
-    # passing an infinite physical radius into neighbourhood construction.
-    if not np.isfinite(radius):
-        raise ValueError(
-            "'truncate * sigma_m' must be finite."
-        )
+    _validate_normalization(normalization)
 
     cells = _validate_cell_ids(
         cell_ids,
@@ -908,27 +1479,52 @@ def gaussian_filter(
             "Radial filtering currently supports ellipsoid='WGS84' only."
         )
 
-    key, geometry = _filter_geometry(
+    if normalization == "present" and width_rule == "sampled":
+        key, geometry = _filter_geometry(
+            output_domain,
+            refinement_level,
+            radius,
+            ellipsoid,
+        )
+        weights = _gaussian_weights(key, geometry, sigma)
+
+        domain_positions = _positions_in_input(cells, geometry.center_ids)
+        return compact_weighted_neighbourhood_reduce(
+            values,
+            domain_positions[geometry.neighbour_indices],
+            geometry.row_offsets,
+            weights,
+            normalize=True,
+        )
+
+    operator = _gaussian_operator(
+        cells,
         output_domain,
         refinement_level,
+        sigma,
+        truncation,
         radius,
+        normalization,
+        width_rule,
         ellipsoid,
     )
-    weights = _gaussian_weights(key, geometry, sigma)
-
-    domain_positions = _positions_in_input(cells, geometry.center_ids)
-    return compact_weighted_neighbourhood_reduce(
+    # NaN input is excluded from the sum and kept in the denominator.
+    # With "present" the weights of the remaining cells are renormalised,
+    # as in the default path.
+    return apply_filter_operator(
         values,
-        domain_positions[geometry.neighbour_indices],
-        geometry.row_offsets,
-        weights,
-        normalize=True,
+        *operator,
+        renormalize_missing=normalization == "present",
     )
 
 
 __all__ = [
+    "FilterOperator",
+    "apply_filter_operator",
     "configure_radial_filter_cache",
     "gaussian_filter",
+    "gaussian_filter_operator",
+    "radial_filter_operator",
     "radial_filter_cache_info",
     "radial_filter",
 ]
