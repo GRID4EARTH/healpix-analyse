@@ -11,9 +11,12 @@
   counts as zero in that mode.
 - `gaussian_filter_operator`, `radial_filter_operator` and
   `apply_filter_operator`: the weights of a filter as three plain arrays in
-  compressed-row form (`FilterOperator`: row offsets, column indices, weights),
-  built once and applied to values with leading dimensions (NumPy or Torch).
-  No new dependency; the result equals the filter with the same options.
+  compressed-row form plus the number of columns (`FilterOperator`: row
+  offsets, column indices, weights, `n_columns`), built once and applied to
+  values with leading dimensions (NumPy or Torch). `apply_filter_operator`
+  checks the signal length when `n_columns` is given. Operators are always
+  normalised. No new dependency; the result equals the filter with the same
+  options.
 - `gaussian_filter(..., width_rule="matched")` (and the operator): the
   requested width is reached below about one cell, by solving the Gaussian
   shape per cell above about 0.6 cell and blending with the identity below it.

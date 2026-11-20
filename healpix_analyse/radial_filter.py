@@ -662,15 +662,19 @@ class FilterOperator(NamedTuple):
         out[..., i] = sum_k weights[k] * values[..., column_indices[k]]
                       for k in row_offsets[i]:row_offsets[i + 1]
 
-    All three fields are plain NumPy arrays, so the caller can wrap them in
+    The first three fields are plain NumPy arrays and ``n_columns`` is the
+    integer ``N``, the length of the final axis of the signal the operator
+    was built for (``len(cell_ids)``).  The caller can wrap the arrays in
     the sparse-matrix type of their choice, for example
     ``scipy.sparse.csr_matrix((weights, column_indices, row_offsets),
-    shape=(M, N))``, or pass them to :func:`apply_filter_operator`.
+    shape=(len(row_offsets) - 1, n_columns))``, or pass the operator to
+    :func:`apply_filter_operator`.
     """
 
     row_offsets: np.ndarray
     column_indices: np.ndarray
     weights: np.ndarray
+    n_columns: int
 
 
 def _validate_normalization(normalization: str) -> str:
@@ -726,12 +730,16 @@ def _normalize_rows(
     total = _row_sums(rows_in, weights_in, number_of_rows)
     if normalization == "full_disc":
         total = total + _row_sums(rows_out, weights_out, number_of_rows)
-    if np.any(total == 0.0):
-        raise ValueError(
-            "The kernel weights sum to zero over the normalisation set "
-            f"({normalization!r}) of at least one cell; the normalised "
-            "weights are undefined."
-        )
+        if np.any(total == 0.0):
+            raise ValueError(
+                "The kernel weights sum to zero over the whole disc of at "
+                "least one cell; the full-disc normalisation is undefined."
+            )
+    else:
+        # As in radial_filter(normalize=True): a row whose weights sum to
+        # zero is left as it is and gives NaN once applied with
+        # renormalize_missing=True, instead of raising an error here.
+        total = np.where(total == 0.0, 1.0, total)
     return weights_in / total[rows_in]
 
 
@@ -928,8 +936,8 @@ def gaussian_filter_operator(
     truncate=..., normalization=..., width_rule=..., domain=...)`` for
     values without NaN (see :func:`apply_filter_operator` for NaN).  Build
     the operator once, then apply it to as many
-    signals (time steps, chunks) as needed, or hand the three arrays to a
-    sparse-matrix type.
+    signals (time steps, chunks) as needed, or hand the arrays to a
+    sparse-matrix type.  Operators are always normalised.
 
     Parameters
     ----------
@@ -940,16 +948,22 @@ def gaussian_filter_operator(
     Returns
     -------
     FilterOperator
-        ``(row_offsets, column_indices, weights)``.  Row ``i`` is the output
-        cell ``domain[i]`` (``cell_ids[i]`` without ``domain``); the column
-        indices point into ``cell_ids``, i.e. into the final axis of the
-        signal to filter.  The weights already include the normalisation.
+        ``(row_offsets, column_indices, weights, n_columns)``.  Row ``i`` is
+        the output cell ``domain[i]`` (``cell_ids[i]`` without ``domain``);
+        the column indices point into ``cell_ids``, i.e. into the final axis
+        of the signal to filter, whose length is ``n_columns``.  The weights
+        already include the normalisation.
 
     Notes
     -----
     With ``normalization="present"`` every row sums to one.  With
     ``"full_disc"`` the row of a cell whose kernel disc leaves the domain
     sums to the fraction of the disc weight that lies inside the domain.
+
+    With ``width_rule="matched"`` the width of the response equals
+    ``sigma_m`` for the rows whose disc lies inside the domain.  Rows near
+    the edge are renormalised (``"present"``) or truncated (``"full_disc"``),
+    so their effective width differs from ``sigma_m``.
     """
     sigma, truncation, radius = _validate_gaussian_parameters(
         sigma_m, truncate, width_rule=width_rule, refinement_level=refinement_level
@@ -1009,6 +1023,7 @@ def _gaussian_operator(
         np.asarray(geometry.row_offsets, dtype=np.int64),
         domain_positions[geometry.neighbour_indices].astype(np.int64),
         weights,
+        int(cells.size),
     )
 
 
@@ -1024,9 +1039,18 @@ def radial_filter_operator(
 ) -> FilterOperator:
     """Return the weights of :func:`radial_filter` as a reusable operator.
 
-    Same options as :func:`radial_filter` (without ``values``), with
-    ``normalization`` as described there.  See :class:`FilterOperator` and
-    :func:`apply_filter_operator`.
+    The options are those of :func:`radial_filter` (without ``values``) and
+    ``normalization`` is described there, with one difference: there is no
+    ``normalize=False``.  An operator is always normalised, so that its rows
+    sum to one (``"present"``) or to the in-domain fraction of the disc
+    (``"full_disc"``).  Apply the raw weighted sum with
+    :func:`radial_filter` and ``normalize=False``.  See
+    :class:`FilterOperator` and :func:`apply_filter_operator`.
+
+    With ``"present"`` a row whose kernel weights sum to zero (possible only
+    for a kernel with negative weights) is left as it is; it gives NaN when
+    applied with ``renormalize_missing=True``, as :func:`radial_filter` does,
+    and no error is raised.
 
     For ``normalization="full_disc"`` the kernel is evaluated on the
     distances to all cells of the disc, inside and outside the domain, in one
@@ -1082,6 +1106,7 @@ def radial_filter_operator(
         np.asarray(geometry.row_offsets, dtype=np.int64),
         domain_positions[geometry.neighbour_indices].astype(np.int64),
         weights,
+        int(cells.size),
     )
 
 
@@ -1090,6 +1115,7 @@ def apply_filter_operator(
     row_offsets: np.ndarray,
     column_indices: np.ndarray,
     weights: np.ndarray,
+    n_columns: int | None = None,
     *,
     renormalize_missing: bool = False,
 ) -> ArrayLike:
@@ -1101,8 +1127,13 @@ def apply_filter_operator(
         NumPy array or PyTorch tensor.  The final axis is indexed by
         ``column_indices``; leading dimensions (for example time) are kept.
     row_offsets, column_indices, weights
-        The three arrays of a :class:`FilterOperator`; ``apply_filter_operator(
-        values, *operator)`` works.
+        The first three fields of a :class:`FilterOperator`.
+    n_columns
+        Optional.  The fourth field of a :class:`FilterOperator`, so that
+        ``apply_filter_operator(values, *operator)`` works.  When given, a
+        ``ValueError`` is raised if the final axis of ``values`` does not
+        have that length; without it the length is not checked, and a longer
+        signal would be applied silently to its first columns.
     renormalize_missing
         NaN values in ``values`` are always left out of the weighted sum.
         With ``False`` (default) the weights are used as they are, so a NaN
@@ -1124,6 +1155,12 @@ def apply_filter_operator(
     """
     if not isinstance(renormalize_missing, (bool, np.bool_)):
         raise TypeError("'renormalize_missing' must be a boolean.")
+    if n_columns is not None and values.shape[-1] != n_columns:
+        raise ValueError(
+            "The final axis of 'values' has length "
+            f"{values.shape[-1]}, but the operator was built for "
+            f"{n_columns} cells."
+        )
     return compact_weighted_neighbourhood_reduce(
         values,
         column_indices,
@@ -1220,7 +1257,9 @@ def radial_filter(
             the weights of some disc sum to zero.
 
         Passing ``normalization`` together with ``normalize=False`` raises
-        ``ValueError``.
+        ``ValueError``.  ``"full_disc"`` rebuilds its weights at every call
+        (only the geometry is cached): to filter many time steps, build the
+        weights once with :func:`radial_filter_operator`.
 
     domain
         Optional processing and output domain.  It must be a subset of
@@ -1437,7 +1476,10 @@ def gaussian_filter(
     weight.  The output then hardly depends on ``sigma_m``.  Above about two
     cells the difference is negligible.
 
-    ``width_rule="matched"`` removes this limit.  For a cell with ``w =
+    ``width_rule="matched"`` removes this limit.  The width of every cell
+    whose disc lies inside the domain is ``sigma_m``; at the edge of the
+    domain the rows are renormalised (``"present"``) or truncated
+    (``"full_disc"``), and their effective width differs.  For a cell with ``w =
     exp(-d**2 / (2 s**2))`` on the disc, the shape parameter ``s`` is solved
     per cell so that the discrete second moment ``sum(w d**2) / sum(w)``
     equals ``2 * sigma_m**2``.  Where ``sigma_m`` is below the effective width
@@ -1458,6 +1500,10 @@ def gaussian_filter(
 
     To apply the same filter many times, or from code that works chunk by
     chunk, build the weights once with :func:`gaussian_filter_operator`.
+    ``normalization="full_disc"`` and ``width_rule="matched"`` rebuild their
+    weights at every call, because only the geometry is cached: in a loop
+    over time steps, build the operator once and apply it with
+    :func:`apply_filter_operator`.
     """
     sigma, truncation, radius = _validate_gaussian_parameters(
         sigma_m,

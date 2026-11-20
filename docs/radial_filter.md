@@ -316,13 +316,14 @@ op = gaussian_filter_operator(
     sigma_m=6000.0,
     normalization="full_disc",
 )
-row_offsets, column_indices, weights = op        # three plain NumPy arrays
+row_offsets, column_indices, weights, n_columns = op   # three arrays and N
 
 out = apply_filter_operator(values, *op)         # values: (time, N) or (N,)
 ```
 
 `radial_filter_operator` does the same for a kernel. The result is a
-`FilterOperator`, a named tuple of three arrays in compressed-row form:
+`FilterOperator`, a named tuple of three arrays in compressed-row form and the
+number of columns `n_columns` (`len(cell_ids)`):
 
 ```text
 out[..., i] = sum_k weights[k] * values[..., column_indices[k]]
@@ -330,7 +331,8 @@ out[..., i] = sum_k weights[k] * values[..., column_indices[k]]
 ```
 
 Row `i` is the output cell `domain[i]` and the column indices point into
-`cell_ids`. The weights already contain the normalisation, and
+`cell_ids`. The weights already contain the normalisation (an operator is always
+normalised: there is no `normalize=False`), and
 `apply_filter_operator` gives the same values as the filter with the same
 options (NumPy and Torch input; leading dimensions are kept). No SciPy or
 `sparse` import is needed. A caller that has one of them can wrap the arrays:
@@ -340,10 +342,17 @@ import scipy.sparse as sp
 
 matrix = sp.csr_matrix(
     (op.weights, op.column_indices, op.row_offsets),
-    shape=(len(cell_ids), len(cell_ids)),
+    shape=(len(op.row_offsets) - 1, op.n_columns),   # (len(domain), len(cell_ids))
 )
 out = matrix @ values
 ```
+
+`apply_filter_operator(values, *op)` checks that the final axis of `values` has
+length `n_columns`; with the three-array call the length is not checked.
+
+`normalization="full_disc"` and `width_rule="matched"` rebuild their weights at
+every `gaussian_filter` / `radial_filter` call (only the geometry is cached), so
+in a loop over time steps build the operator once.
 
 `apply_filter_operator` leaves `NaN` values out of the sum, so a `NaN` counts as
 zero, which is the rule of `"full_disc"`; the equality with the filter for an
@@ -367,12 +376,19 @@ centres and a width below about one cell is not reached. With
 - below it, the cell uses `T = I + (sigma_m / sigma_0)^2 (G0 - I)`, with
   `sigma_0` the effective width of `G0` at that cell.
 
-The effective width of the row of every cell is then equal to `sigma_m`; the
+The effective width of the row of every cell whose disc lies inside the domain
+is then equal to `sigma_m`; rows at the edge are renormalised (`"present"`) or
+truncated (`"full_disc"`), and their width differs. The
 response to one cell is within a few per cent of it (one-axis RMS, the
 anisotropy of the response is about 1.06), the width is continuous and monotone
 in `sigma_m`, and the filter tends to the identity when `sigma_m` tends to
 zero. The support is `truncate * max(sigma_m, 0.6 cell)`, and `truncate` must be at least 3 (a `ValueError` otherwise). The option works with
-both normalisations and with `gaussian_filter_operator`. It is not meant for
+both normalisations and with `gaussian_filter_operator`. Rows of the matched operator sum to 1 away from the edge; its column sums,
+which carry the conservation of the total, are close to 1 but not exactly 1.
+Measured for `"full_disc"` over the columns whose whole disc lies inside the
+domain: within 1.1e-4 of 1 on the 8125-cell level-10 domain above (0.3, 1 and 2
+cells), and within 1.2e-3 on regular patches of about 7900 cells at levels 8 and
+10 (worst at 0.3 cell). The tests require 2e-3 on both levels. It is not meant for
 widths of several cells, where the sampled Gaussian is already accurate and the
 solve costs extra time.
 

@@ -10,6 +10,9 @@ the cells outside the domain in the full-disc normalisation.
 
 from __future__ import annotations
 
+from itertools import permutations
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -23,19 +26,24 @@ from healpix_analyse import (
     radial_filter,
     radial_filter_operator,
 )
-from healpix_analyse.radial_filter import _cell_size_m
+from healpix_analyse._neighbourhood import build_outside_domain_distances
+from healpix_analyse.radial_filter import (
+    _cell_size_m,
+    _clear_filter_caches,
+    _REFERENCE_SIGMA_CELLS,
+)
 
 _WGS84 = Geod(ellps="WGS84")
 LEVEL = 8
 CELL_M = _cell_size_m(LEVEL)
 
 
-def _patch(k: int) -> np.ndarray:
+def _patch(k: int, level: int = LEVEL) -> np.ndarray:
     centre = nested.lonlat_to_healpix(
-        np.array([10.0]), np.array([45.0]), LEVEL, ellipsoid="WGS84"
+        np.array([10.0]), np.array([45.0]), level, ellipsoid="WGS84"
     )
     ring = np.asarray(
-        nested.kth_neighbourhood(np.asarray(centre, dtype=np.uint64), LEVEL, k)
+        nested.kth_neighbourhood(np.asarray(centre, dtype=np.uint64), level, k)
     )[0]
     cells = ring[ring >= 0].astype(np.uint64)
     centre_id = np.uint64(centre[0])
@@ -444,3 +452,273 @@ def test_empty_domain(field):
         assert op.row_offsets.tolist() == [0]
         out = gaussian_filter(field, DOMAIN, LEVEL, sigma_m=CELL_M, domain=empty, **options)
         assert out.shape == (0,)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups
+# ---------------------------------------------------------------------------
+
+NAN_FIELD = np.random.default_rng(8).random((3, DOMAIN.size)) + 1.0
+NAN_FIELD[0, ::5] = np.nan
+NAN_FIELD[2, 10:40] = np.nan
+
+
+def _zero_kernel(d):
+    return 0.0 * d
+
+
+def _exp_kernel(d):
+    return np.exp(-d / CELL_M)
+
+
+def test_present_operator_with_zero_weight_row_matches_the_filter(field):
+    """``radial_filter(normalize=True)`` gives NaN for a zero-sum row; so does
+    the operator applied with ``renormalize_missing=True`` (no error)."""
+    kwargs = dict(radius_m=2 * CELL_M, kernel=_zero_kernel)
+    expected = radial_filter(field, DOMAIN, LEVEL, **kwargs)
+    assert np.all(np.isnan(expected))
+    op = radial_filter_operator(DOMAIN, LEVEL, normalization="present", **kwargs)
+    out = apply_filter_operator(field, *op, renormalize_missing=True)
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_operators_have_no_normalize_argument(field):
+    with pytest.raises(TypeError, match="normalize"):
+        radial_filter_operator(
+            DOMAIN, LEVEL, radius_m=CELL_M, kernel=_exp_kernel, normalize=False
+        )
+    with pytest.raises(TypeError, match="normalize"):
+        gaussian_filter_operator(DOMAIN, LEVEL, sigma_m=CELL_M, normalize=False)
+
+
+@pytest.mark.parametrize("use_domain", [False, True])
+def test_operator_n_columns_is_the_length_of_cell_ids(use_domain):
+    domain = DOMAIN[:50] if use_domain else None
+    op = gaussian_filter_operator(DOMAIN, LEVEL, sigma_m=CELL_M, domain=domain)
+    assert op.n_columns == DOMAIN.size
+    assert op.row_offsets.size - 1 == (50 if use_domain else DOMAIN.size)
+    rop = radial_filter_operator(
+        DOMAIN, LEVEL, radius_m=CELL_M, kernel=_exp_kernel, domain=domain
+    )
+    assert rop.n_columns == DOMAIN.size
+
+
+def test_apply_filter_operator_checks_the_signal_length(field):
+    op = gaussian_filter_operator(DOMAIN, LEVEL, sigma_m=CELL_M)
+    longer = np.concatenate((field, field[:5]))
+    with pytest.raises(ValueError, match="final axis"):
+        apply_filter_operator(longer, *op)
+    with pytest.raises(ValueError, match="final axis"):
+        apply_filter_operator(longer[:-10], *op)
+    with pytest.raises(ValueError, match="final axis"):
+        apply_filter_operator(torch.as_tensor(longer), *op)
+    with pytest.raises(ValueError, match="final axis"):
+        apply_filter_operator(
+            longer, op.row_offsets, op.column_indices, op.weights, n_columns=op.n_columns
+        )
+    # The three-array call keeps working, without the length check.
+    three = apply_filter_operator(field, op.row_offsets, op.column_indices, op.weights)
+    np.testing.assert_array_equal(three, apply_filter_operator(field, *op))
+    unchecked = apply_filter_operator(
+        longer, op.row_offsets, op.column_indices, op.weights
+    )
+    np.testing.assert_array_equal(unchecked, three)
+
+
+# -- default path against a reference made with the code before this change --
+
+_REFERENCE = np.load(Path(__file__).parent / "data" / "default_path_reference.npz")
+_REF_DOMAIN = _REFERENCE["cells"]
+_REF_VALUES = _REFERENCE["values"]  # contains NaN
+_REF_SUBSET = _REF_DOMAIN[10:200][::-1].copy()
+
+
+@pytest.mark.parametrize(
+    ("name", "call"),
+    [
+        ("gauss0", lambda: gaussian_filter(_REF_VALUES, _REF_DOMAIN, LEVEL, sigma_m=0.5 * 12700.0)),
+        ("gauss1", lambda: gaussian_filter(_REF_VALUES, _REF_DOMAIN, LEVEL, sigma_m=1.5 * 12700.0)),
+        (
+            "gauss_domain0",
+            lambda: gaussian_filter(
+                _REF_VALUES, _REF_DOMAIN, LEVEL, sigma_m=0.5 * 12700.0, domain=_REF_SUBSET
+            ),
+        ),
+        (
+            "gauss_domain1",
+            lambda: gaussian_filter(
+                _REF_VALUES, _REF_DOMAIN, LEVEL, sigma_m=1.5 * 12700.0, domain=_REF_SUBSET
+            ),
+        ),
+        (
+            "radial",
+            lambda: radial_filter(
+                _REF_VALUES, _REF_DOMAIN, LEVEL, radius_m=40000.0,
+                kernel=lambda d: np.exp(-d / 12000.0),
+            ),
+        ),
+        (
+            "radial_raw",
+            lambda: radial_filter(
+                _REF_VALUES, _REF_DOMAIN, LEVEL, radius_m=40000.0,
+                kernel=lambda d: np.exp(-d / 12000.0), normalize=False,
+            ),
+        ),
+    ],
+)
+def test_default_path_reproduces_the_reference_with_nan(name, call):
+    """``tests/data/default_path_reference.npz`` was computed with the code of
+    the commit before this feature (NaN in the input, with and without a
+    reordered domain subset).  The comparison is to 1e-13 rather than bitwise so
+    that it does not depend on the platform's ``exp``."""
+    assert np.isnan(_REF_VALUES).any()
+    np.testing.assert_allclose(call(), _REFERENCE[name], rtol=1e-13, atol=0, equal_nan=True)
+
+
+# -- matched widths: several rows, and the edge ------------------------------
+
+_RANK = np.argsort(D_WW[0])  # WIDE cells by distance from the centre cell
+_ROWS = [int(_RANK[i]) for i in (0, 1, 7, 25, 40)]
+
+
+@pytest.mark.parametrize("sigma_cells", [0.3, 1.0, 2.0])
+@pytest.mark.parametrize("row", _ROWS)
+def test_matched_row_width_for_several_rows(sigma_cells, row):
+    op = gaussian_filter_operator(
+        WIDE, LEVEL, sigma_m=sigma_cells * CELL_M,
+        normalization="full_disc", width_rule="matched",
+    )
+    assert _row_width_cells(op, row) == pytest.approx(sigma_cells, rel=1e-6)
+
+
+@pytest.mark.parametrize("normalization", ["present", "full_disc"])
+def test_matched_edge_rows_differ_from_the_requested_width(normalization):
+    """Rows whose disc leaves the domain are renormalised (present) or
+    truncated (full_disc): their width is not ``sigma_m``."""
+    sigma = 1.0
+    interior = _interior(sigma * CELL_M)
+    op = gaussian_filter_operator(
+        DOMAIN, LEVEL, sigma_m=sigma * CELL_M,
+        normalization=normalization, width_rule="matched",
+    )
+    widths = np.array([
+        np.sqrt(
+            (op.weights[a:b] * D_DD[i, op.column_indices[a:b]] ** 2).sum()
+            / op.weights[a:b].sum() / 2.0
+        ) / CELL_M
+        for i, (a, b) in enumerate(zip(op.row_offsets[:-1], op.row_offsets[1:]))
+    ])
+    assert interior.any() and (~interior).any()
+    np.testing.assert_allclose(widths[interior], sigma, rtol=1e-6)
+    # Rows that lose only a thin tail are barely affected; the corner rows
+    # lose a lot (measured: 0.17 cell narrower).
+    assert np.all(widths[~interior] < sigma)
+    assert (sigma - widths[~interior]).max() > 0.1
+
+
+# -- radial_filter with full_disc: Torch, leading dimensions, NaN -------------
+
+
+@pytest.mark.parametrize("kind", ["numpy", "torch"])
+@pytest.mark.parametrize("shape", ["flat", "stack"])
+def test_radial_full_disc_torch_leading_dims_and_nan(kind, shape):
+    radius = 2.5 * CELL_M
+    values = NAN_FIELD[0] if shape == "flat" else NAN_FIELD
+    zeroed = np.where(np.isnan(values), 0.0, values)
+    # NaN counts as zero in the full-disc rule: same as the zero-filled signal.
+    expected = radial_filter(
+        zeroed, DOMAIN, LEVEL, radius_m=radius, kernel=_exp_kernel,
+        normalization="full_disc",
+    )
+    given = torch.as_tensor(values) if kind == "torch" else values
+    out = radial_filter(
+        given, DOMAIN, LEVEL, radius_m=radius, kernel=_exp_kernel,
+        normalization="full_disc",
+    )
+    assert isinstance(out, torch.Tensor) == (kind == "torch")
+    out = np.asarray(out)
+    assert out.shape == values.shape
+    assert not np.isnan(out).any()
+    np.testing.assert_allclose(out, expected, rtol=1e-12)
+
+
+# -- renormalize_missing with NaN and an all-NaN row --------------------------
+
+
+@pytest.mark.parametrize("kind", ["numpy", "torch"])
+def test_renormalize_missing_with_nan_and_an_all_nan_row(kind):
+    op = gaussian_filter_operator(DOMAIN, LEVEL, sigma_m=1.0 * CELL_M)
+    row = 100
+    a, b = op.row_offsets[row], op.row_offsets[row + 1]
+    values = np.random.default_rng(2).random((2, DOMAIN.size)) + 1.0
+    values[:, op.column_indices[a:b]] = np.nan  # every cell of the row is NaN
+    values[1, ::9] = np.nan
+    given = torch.as_tensor(values) if kind == "torch" else values
+
+    renormalised = np.asarray(apply_filter_operator(given, *op, renormalize_missing=True))
+    plain = np.asarray(apply_filter_operator(given, *op))
+    assert np.isnan(renormalised[:, row]).all()
+    assert (plain[:, row] == 0.0).all()  # a NaN counts as zero without it
+    others = np.arange(DOMAIN.size) != row
+    # The filter agrees with the renormalised operator, rows with no valid
+    # neighbour included.
+    expected = gaussian_filter(values, DOMAIN, LEVEL, sigma_m=1.0 * CELL_M)
+    np.testing.assert_allclose(renormalised, expected, rtol=1e-12, equal_nan=True)
+    assert np.isfinite(renormalised[0][others]).sum() > 300
+
+
+# -- no stale result when the options change on the same domain ---------------
+
+_CONFIGS = [
+    {"sigma_cells": 1.0, "truncate": 4.0, "normalization": "present", "width_rule": "sampled"},
+    {"sigma_cells": 1.0, "truncate": 3.0, "normalization": "present", "width_rule": "sampled"},
+    {"sigma_cells": 1.0, "truncate": 4.0, "normalization": "full_disc", "width_rule": "sampled"},
+    {"sigma_cells": 0.4, "truncate": 5.0, "normalization": "full_disc", "width_rule": "matched"},
+    {"sigma_cells": 1.0, "truncate": 3.0, "normalization": "present", "width_rule": "matched"},
+]
+
+
+def _run(config, values):
+    options = {k: v for k, v in config.items() if k != "sigma_cells"}
+    return gaussian_filter(
+        values, DOMAIN, LEVEL, sigma_m=config["sigma_cells"] * CELL_M, **options
+    )
+
+
+@pytest.mark.parametrize(("first", "second"), list(permutations(range(len(_CONFIGS)), 2)))
+def test_changing_options_on_the_same_domain_gives_no_stale_result(field, first, second):
+    _clear_filter_caches()
+    fresh = _run(_CONFIGS[second], field)
+    _clear_filter_caches()
+    _run(_CONFIGS[first], field)
+    np.testing.assert_array_equal(_run(_CONFIGS[second], field), fresh)
+
+
+# -- column sums of the matched full-disc operator ----------------------------
+
+
+def _interior_columns(cells, level, sigma_cells, truncate=4.0):
+    """Cells whose whole kernel disc lies inside the domain."""
+    cell = _cell_size_m(level)
+    radius = truncate * max(sigma_cells, _REFERENCE_SIGMA_CELLS) * cell
+    offsets, _ = build_outside_domain_distances(cells, radius, level)
+    return np.diff(offsets) == 0
+
+
+@pytest.mark.parametrize("sigma_cells", [0.3, 1.0, 2.0])
+@pytest.mark.parametrize("level", [8, 10])
+def test_matched_full_disc_column_sums_are_close_to_one(level, sigma_cells):
+    """Interior columns (those whose disc lies inside the domain) sum to 1
+    within 2e-3 (measured: up to about 1.1e-3, at 0.3 cell); they are not
+    exactly 1 by construction.  Rows of the interior sum to 1 to rounding."""
+    cells = _patch(30, level)
+    op = gaussian_filter_operator(
+        cells, level, sigma_m=sigma_cells * _cell_size_m(level),
+        normalization="full_disc", width_rule="matched",
+    )
+    interior = _interior_columns(cells, level, sigma_cells)
+    assert interior.sum() > 500
+    columns = np.bincount(op.column_indices, weights=op.weights, minlength=cells.size)
+    assert np.abs(columns[interior] - 1.0).max() < 2e-3
+    rows = np.add.reduceat(op.weights, op.row_offsets[:-1])
+    np.testing.assert_allclose(rows[interior], 1.0, rtol=0, atol=1e-12)
