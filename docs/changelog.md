@@ -17,6 +17,20 @@
   checks the signal length when `n_columns` is given. Operators are always
   normalised. No new dependency; the result equals the filter with the same
   options.
+- `gaussian_filter_operator` and `radial_filter_operator` take
+  `blocked_cells` (land): a blocked cell neither receives nor gives weight, and
+  the kernel acts through water, on the length of the shortest path over
+  neighbouring non-blocked cells (corrected for the metrication error of the
+  8-neighbour lattice), so that probability does not cross a coast. Cells far
+  from land are untouched and keep the plain operator; only the rows near
+  blocked cells are searched. Without blocked cells the operator is the same
+  as before.
+- `normalization="source"` for the two operators: every source cell hands out
+  weights that sum to one over the cells it reaches, so that the columns sum to
+  one and the total of the signal is conserved (a reflecting coast and domain
+  edge). With `blocked_cells`, `"full_disc"` gives the lost-mass behaviour
+  (zero padding) and `"present"` renormalises per output cell. See
+  "Land barrier" in `docs/radial_filter.md`.
 - `gaussian_filter(..., width_rule="matched")` (and the operator): the
   requested width is reached below about one cell, by solving the Gaussian
   shape per cell above about 0.6 cell and blending with the identity below it.
