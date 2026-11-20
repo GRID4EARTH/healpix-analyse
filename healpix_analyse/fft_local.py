@@ -68,8 +68,8 @@ def check_kernel_width(
         f"Requested width {sigma_px:.4g} pixel is below the blur floor "
         f"{floor_px:.4g} pixel of the HEALPix -> grid -> HEALPix projection "
         f"pair; the effective width is at least "
-        f"{math.hypot(sigma_px, floor_px):.4g} pixel. Use a direct "
-        "neighbour kernel for such small widths."
+        f"{math.hypot(sigma_px, floor_px):.4g} pixel. Use "
+        "gaussian_filter(..., width_rule='matched') for such small widths."
     )
     if on_below == "error":
         raise ValueError(message)

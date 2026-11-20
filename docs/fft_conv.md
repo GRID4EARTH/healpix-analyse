@@ -218,8 +218,11 @@ for each cell (`per_axis=True` for the two axes). `set_gaussian` (or
 `layer.transform.check_width(sigma_px)`) warns when the requested width is below
 the **median** floor, recomputed at each call, so a cell whose own floor is
 larger is not flagged; the warning points at the caller's line. Pass
-`on_below="error"` to raise instead, or `"ignore"`. For such small widths use a
-direct neighbour kernel.
+`on_below="error"` to raise instead, or `"ignore"`. For such small widths use
+`gaussian_filter(..., width_rule="matched")` ({doc}`radial_filter`), which
+reaches widths below one cell; with `normalization="full_disc"` it also keeps
+the total and loses mass leaving the domain, as `projection="conservative"`
+does here.
 
 `benchmarks/benchmark_fft_total.py` reproduces these numbers.
 
