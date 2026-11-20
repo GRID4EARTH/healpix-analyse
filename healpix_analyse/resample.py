@@ -84,6 +84,16 @@ class HealPixResampler(nn.Module):
         When omitted, every step uses its native resolution-dependent values.
     weight_norm : {"l1", "l2", "none"}, default="l1"
         Normalisation used by ``HealPixDown``.
+    down_mode : {"smooth", "mean"}, default="smooth"
+        ``HealPixDown`` mode used for each downscaling step.  ``"mean"``
+        averages the 4 NESTED children, which conserves the global mean of
+        a NaN-free full-sphere map; ``"smooth"`` (Gaussian) does not.
+        Each step averages the children available at that step: missing
+        values are skipped (see Notes), and on a partial sky only the
+        children present in ``in_cell_ids`` are used.  Over several steps
+        with NaNs or incomplete parents the result is therefore a mean of
+        means, not the mean of all available descendants.  Gaussian parameters
+        are ignored with ``"mean"``.  Upscaling is unaffected.
     up_norm : {"adjoint", "col_l1", "diag_l2"}, default="col_l1"
         Normalisation used by ``HealPixUp``.
     dtype, device : optional
@@ -119,6 +129,7 @@ class HealPixResampler(nn.Module):
         dtype: torch.dtype = torch.float32,
         device: Optional[Union[str, torch.device]] = None,
         eps: float = 1e-12,
+        down_mode: str = "smooth",
     ) -> None:
         super().__init__()
 
@@ -139,6 +150,9 @@ class HealPixResampler(nn.Module):
             raise ValueError(
                 "up_norm must be 'adjoint', 'col_l1', or 'diag_l2'"
             )
+        self.down_mode = str(down_mode).lower().strip()
+        if self.down_mode not in ("smooth", "mean"):
+            raise ValueError("down_mode must be 'smooth' or 'mean'")
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         resolved_device = torch.device(device)
@@ -218,7 +232,7 @@ class HealPixResampler(nn.Module):
             while current_level > self.out_level:
                 layer = HealPixDown(
                     level=current_level,
-                    mode="smooth",
+                    mode=self.down_mode,
                     ellipsoid=self.ellipsoid,
                     radius_deg=radius_deg,
                     sigma_deg=sigma_deg,
@@ -458,6 +472,7 @@ class HealPixResampler(nn.Module):
             f"output_pixels={self.n_output}, steps={len(self.layers)}, "
             f"input_full_sphere={self.input_full_sphere}, "
             f"output_full_sphere={self.output_full_sphere}"
+            + ("" if self.down_mode == "smooth" else f", down_mode={self.down_mode!r}")
         )
 
 
@@ -476,6 +491,7 @@ def resample_healpix(
     dtype: torch.dtype = torch.float32,
     device: Optional[Union[str, torch.device]] = None,
     eps: float = 1e-12,
+    down_mode: str = "smooth",
 ) -> tuple[ArrayLike, np.ndarray]:
     """One-shot NESTED HEALPix resampling convenience function.
 
@@ -495,6 +511,7 @@ def resample_healpix(
         dtype=dtype,
         device=device,
         eps=eps,
+        down_mode=down_mode,
     )
     return operator(in_data)
 

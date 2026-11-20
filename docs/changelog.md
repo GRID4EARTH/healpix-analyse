@@ -22,6 +22,10 @@
   shape per cell above about 0.6 cell and blending with the identity below it.
   The default `"sampled"` is unchanged, and its documentation now says that its
   effective width is smaller than requested below about one cell.
+- `benchmarks/benchmark_geo_release.py` and the report and timings of the
+  HEALPIX-GEO 0.4.0 direct-sum benchmark
+  (`benchmarks/results/geo040-performance/`), so that the first-call and
+  cache timings of `gaussian_filter` can be cited and re-run.
 - `HealPixGeoFFT` / `geo_fft_convolve`: FFT convolution of a block inside one
   base face with a wide kernel sampled on geodesic distances and azimuths from
   the block centre (predefined families in metres, kilometres, degrees or
@@ -33,6 +37,19 @@
   5-30 % on Sentinel-2 tiles at level 20. The kernel `k(rho, phi)` is
   evaluated from the output cell to the input cell, as in
   `directional_filter`.
+- `HealPixDown(mode="mean")`: unweighted mean of the 4 NESTED children. It
+  conserves the global mean of a NaN-free full-sphere map, which
+  `mode="smooth"` does not (its Gaussian weights are normalised per output
+  cell only). On a partial sky, `coverage` gives the fraction of children
+  present per output cell.
+- `skipna=True` (with `mode="mean"`): NaN-skipping mean;
+  `HealPixDown.valid_fraction(x)` returns the fraction of children used for
+  that input, so a weighted mean of the output stays conservative.
+- `HealPixDown.sparse_matrix()`: the `smooth` or `mean` operator as a sparse
+  matrix. `HealPixUp(paired_down=...)` accepts a `mean` downsampler.
+- `down_mode` keyword (`"smooth"` default, or `"mean"`) on
+  `HealPixResampler`, `resample_healpix` and `HealPixDecomp`. Defaults and
+  reprs are unchanged.
 
 ### Fixed
 - `HealPixKernelPyramid` fitting accepts operators that return torch tensors

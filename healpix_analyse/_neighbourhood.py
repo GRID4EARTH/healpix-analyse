@@ -521,6 +521,14 @@ def relative_geometry_from_neighbours(
         neighbour_lat,
     )
     flat_azimuth_rad = np.deg2rad(forward_azimuth_deg)
+
+    # A centre paired with itself has no direction.  pyproj returns a
+    # round-off distance (~1e-10 m) and azimuth 180 degrees for some of these
+    # pairs, so canonicalise them by cell ID: distance, azimuth and offsets
+    # are exactly zero.
+    self_pair = flat_center_ids == flat_neighbour_ids
+    flat_distance_m = np.where(self_pair, 0.0, flat_distance_m)
+    flat_azimuth_rad = np.where(self_pair, 0.0, flat_azimuth_rad)
     flat_east_offset_m = flat_distance_m * np.sin(flat_azimuth_rad)
     flat_north_offset_m = flat_distance_m * np.cos(flat_azimuth_rad)
 

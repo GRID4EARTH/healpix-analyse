@@ -1,0 +1,29 @@
+[
+  {
+    "case": "19-600-4",
+    "seconds": [
+      2.3602144999895245,
+      2.4181298329494894,
+      2.434667667024769
+    ],
+    "module": "/tmp/analyse-main-baseline/healpix_analyse/radial_filter.py"
+  },
+  {
+    "case": "20-600-5",
+    "seconds": [
+      14.905347290972713,
+      14.945252250006888,
+      15.015710667008534
+    ],
+    "module": "/tmp/analyse-main-baseline/healpix_analyse/radial_filter.py"
+  },
+  {
+    "case": "19-3600-4",
+    "seconds": [
+      67.13684420799837,
+      66.15292229200713,
+      65.66044641600456
+    ],
+    "module": "/tmp/analyse-main-baseline/healpix_analyse/radial_filter.py"
+  }
+]

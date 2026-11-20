@@ -359,9 +359,18 @@ def _numpy_segment_sum(
         return np.zeros(output_shape, dtype=values.dtype)
 
     row_counts = np.diff(row_offsets)
-    starts = np.minimum(row_offsets[:-1], values.shape[-1] - 1)
-    result = np.add.reduceat(values, starts, axis=-1)
-    result[..., row_counts == 0] = 0
+    # ``reduceat`` sums from starts[i] to starts[i + 1] (or to the end for the
+    # last index) and returns values[starts[i]] when starts[i] >= starts[i+1].
+    # Reduce only over non-empty rows, whose starts are strictly increasing and
+    # whose segments are therefore exactly the CSR segments; empty rows are 0.
+    non_empty = row_counts > 0
+    result = np.zeros(output_shape, dtype=values.dtype)
+    if np.any(non_empty):
+        result[..., non_empty] = np.add.reduceat(
+            values,
+            row_offsets[:-1][non_empty],
+            axis=-1,
+        )
     return result
 
 
