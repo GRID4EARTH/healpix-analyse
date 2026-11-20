@@ -9,8 +9,10 @@ multiresolution operator.
 from __future__ import annotations
 
 import math
+import operator
+from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 import numpy as np
 import torch
@@ -23,6 +25,19 @@ from healpix_analyse.up import HealPixUp
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
+
+
+def _as_int(name: str, value, minimum: int) -> int:
+    """Return ``value`` as an int, rejecting bools, floats, nan and inf."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    try:
+        as_int = operator.index(value)
+    except TypeError:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}") from None
+    if as_int < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    return int(as_int)
 
 
 def _kernel_plan(
@@ -48,9 +63,7 @@ def _kernel_plan(
     fine_radius = (int(kernel_sz) - 1) // 2
     max_radius = (int(max_compact_kernel_sz) - 1) // 2
     if n_levels is not None:
-        if isinstance(n_levels, bool) or int(n_levels) != n_levels or int(n_levels) < 0:
-            raise ValueError("n_levels must be an integer >= 0")
-        n_levels = int(n_levels)
+        n_levels = _as_int("n_levels", n_levels, 0)
         return n_levels, 2 * math.ceil(fine_radius / (2**n_levels)) + 1
     if fine_radius == 0:
         return 0, 1
@@ -140,16 +153,17 @@ class LargeConv(nn.Module):
         Input and output channels per gauge.
     kernel_sz : int
         Requested positive odd fine-resolution kernel diameter.
-    max_compact_kernel_sz : int, default=7
-        Maximum positive odd kernel diameter at the coarse resolution.
+    max_compact_kernel_sz : int, optional
+        Maximum positive odd kernel diameter at the coarse resolution
+        (7 when neither this nor ``n_levels`` is given).  Cannot be combined
+        with ``n_levels``.
     n_levels : int, optional
         Number of Down/Up levels.  By default it is chosen from
         ``kernel_sz`` and ``max_compact_kernel_sz`` as described above.
-        When given, it is used as is, ``max_compact_kernel_sz`` is not
-        applied and the compact kernel size follows from ``kernel_sz``.
-        Each level adds a blur of its own (see :func:`down_up_blur`), so a
-        caller that needs a width below that blur chooses fewer levels
-        (see :func:`levels_for_width`).
+        When given, it is used as is and the compact kernel size follows
+        from ``kernel_sz``.  Each level makes the output at least as wide
+        as :func:`down_up_blur`; to build a Gaussian of a given width use
+        :func:`gaussian_plan`.
     n_gauges, gauge_type, singularity_lonlat, ref_direction :
         Passed to the internal :class:`HealPixConv`.
     cell_ids : array-like, optional
@@ -182,7 +196,7 @@ class LargeConv(nn.Module):
         out_channels: int,
         kernel_sz: int,
         *,
-        max_compact_kernel_sz: int = 7,
+        max_compact_kernel_sz: Optional[int] = None,
         n_levels: Optional[int] = None,
         n_gauges: int = 1,
         gauge_type: str = "phi",
@@ -216,7 +230,15 @@ class LargeConv(nn.Module):
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.kernel_sz = int(kernel_sz)
-        self.max_compact_kernel_sz = int(max_compact_kernel_sz)
+        if n_levels is not None and max_compact_kernel_sz is not None:
+            raise ValueError(
+                "n_levels and max_compact_kernel_sz cannot both be given: "
+                "n_levels fixes the number of levels and the compact kernel "
+                "size follows from kernel_sz"
+            )
+        self.max_compact_kernel_sz = (
+            7 if max_compact_kernel_sz is None else int(max_compact_kernel_sz)
+        )
         self.n_levels, self.compact_kernel_sz = _kernel_plan(
             self.kernel_sz, self.max_compact_kernel_sz, n_levels
         )
@@ -376,6 +398,29 @@ class LargeConv(nn.Module):
         self.bias.requires_grad_(requires_grad)
         return self
 
+    def set_gaussian_kernel(self, compact_sigma: float):
+        """Set an isotropic Gaussian compact kernel, normalised to sum 1.
+
+        ``compact_sigma`` is the width in cells of the coarse level (one
+        axis); the Gaussian is sampled on the whole compact kernel grid.
+        Each channel is smoothed on its own, so ``in_channels`` must equal
+        ``out_channels``.  See :func:`gaussian_plan` for the width to use.
+        """
+        if self.in_channels != self.out_channels:
+            raise ValueError("set_gaussian_kernel needs in_channels == out_channels")
+        compact_sigma = float(compact_sigma)
+        if not (math.isfinite(compact_sigma) and compact_sigma > 0.0):
+            raise ValueError("compact_sigma must be a positive finite number")
+        radius = (self.compact_kernel_sz - 1) // 2
+        grid = np.arange(-radius, radius + 1)
+        xx, yy = np.meshgrid(grid, grid)
+        w = np.exp(-(xx**2 + yy**2).ravel() / (2.0 * compact_sigma**2))
+        w /= w.sum()
+        weight = np.zeros((self.in_channels, self.out_channels, w.size))
+        for c in range(self.in_channels):
+            weight[c, c] = w
+        return self.set_compact_kernel(weight)
+
     def forward(self, x: ArrayLike) -> ArrayLike:
         tensor, is_numpy, was_1d = _prepare_input(
             x,
@@ -415,6 +460,91 @@ class LargeConv(nn.Module):
         )
 
 
+_PATCH_MARGIN = 3  # n_levels <= patch_depth - 3: blur ~ 2**n cells << 2**depth
+_COMPACT_SIGMA_START = 0.5  # coarse cells: smallest compact sigma used by gaussian_plan
+_COMPACT_SIGMA_MAX = 2.25  # coarse cells: largest compact sigma calibrated
+_COMPACT_SIGMA_STEP = 0.05
+
+
+def _check_options(level, n_levels, patch_depth):
+    level = _as_int("level", level, 0)
+    n_levels = _as_int("n_levels", n_levels, 0)
+    patch_depth = _as_int("patch_depth", patch_depth, 1)
+    depth = min(patch_depth, level)
+    if n_levels > level:
+        raise ValueError(f"n_levels={n_levels} exceeds level={level}")
+    if n_levels > depth - _PATCH_MARGIN:
+        raise ValueError(
+            f"n_levels={n_levels} is too large for a patch of 4**{depth} cells "
+            f"(level={level}, patch_depth={patch_depth}): the blur would reach "
+            f"the patch edge; at most {max(depth - _PATCH_MARGIN, 0)} levels "
+            "can be measured, use a larger level or patch_depth"
+        )
+    return level, n_levels, patch_depth, depth
+
+
+@lru_cache(maxsize=16)
+def _patch(level, depth, ellipsoid, parent=None):
+    """Cells of a 2**depth square patch, centre cell, angular distances.
+
+    By default the patch is the one in the middle of base face 5 (equatorial).
+    ``parent`` is the index of the aligned block (at level ``level - depth``)
+    that makes the patch.
+    """
+    import healpix_geo.nested as hgn
+
+    parent_level = level - depth
+    if parent is None:
+        parent = 5 if parent_level == 0 else 5 * 4**parent_level + 3 * 4 ** (parent_level - 1)
+    ids = parent * 4**depth + np.arange(4**depth, dtype=np.int64)
+    lon, lat = hgn.healpix_to_lonlat(ids, level, ellipsoid=ellipsoid)
+    lon, lat = np.deg2rad(lon), np.deg2rad(lat)
+    xyz = np.stack(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1
+    )
+    centre = int(np.argmax(xyz @ xyz.mean(axis=0)))
+    dist = np.arccos(np.clip(xyz @ xyz[centre], -1.0, 1.0))
+    return ids, centre, dist
+
+
+def _impulse_width(layer, centre, dist, n_cells):
+    impulse = np.zeros(n_cells)
+    impulse[centre] = 1.0
+    w = np.asarray(layer(impulse), dtype=np.float64).ravel()
+    return float(np.sqrt(np.sum(w * dist**2) / (2.0 * np.sum(w))))
+
+
+def _measure_layer(level, n_levels, depth, kernel_sz, options):
+    ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm, parent = options
+    ids, centre, dist = _patch(level, depth, ellipsoid, parent)
+    layer = LargeConv(
+        level, 1, 1, kernel_sz, n_levels=n_levels, cell_ids=ids,
+        ellipsoid=ellipsoid, radius_deg=radius_deg, sigma_deg=sigma_deg,
+        weight_norm=weight_norm, up_norm=up_norm,
+        dtype=torch.float64, device="cpu", cache_dir=None,
+    )
+    return layer, centre, dist, ids.size
+
+
+def _options(
+    ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm, level, depth, reference_cell
+):
+    parent = None
+    if reference_cell is not None:
+        cell = _as_int("reference_cell", reference_cell, 0)
+        if cell >= 12 * 4**level:
+            raise ValueError(f"reference_cell must be below 12 * 4**{level}")
+        parent = cell // 4**depth
+    return (str(ellipsoid), radius_deg, sigma_deg, str(weight_norm), str(up_norm), parent)
+
+
+@lru_cache(maxsize=64)
+def _blur_cached(level, n_levels, depth, options):
+    layer, centre, dist, n = _measure_layer(level, n_levels, depth, 1, options)
+    layer.set_compact_kernel(np.ones((1, 1, 1)))
+    return _impulse_width(layer, centre, dist, n)
+
+
 def down_up_blur(
     level: int,
     n_levels: int,
@@ -425,73 +555,189 @@ def down_up_blur(
     weight_norm: str = "l1",
     up_norm: str = "col_l1",
     patch_depth: int = 8,
+    reference_cell: Optional[int] = None,
 ) -> float:
-    """Blur of ``n_levels`` Down/Up pairs alone, in radians.
+    """Narrowest response of a :class:`LargeConv` with ``n_levels`` levels.
 
-    This is the smallest width a :class:`LargeConv` with ``n_levels`` levels
-    can produce: the compact kernel is replaced by a point-like one and the
-    response to a single cell is measured.  The result is the one-axis RMS
-    width, ``sqrt(sum(w d^2) / (2 sum(w)))`` with ``d`` the angular distance
-    to the impulse cell.  It is measured on a patch of ``4**patch_depth``
-    cells near the equator, so it is meaningful while the blur is small
-    compared with ``2**patch_depth`` cells.  ``n_levels=0`` returns 0.
+    The compact kernel is point-like (``kernel_sz=1``, weight 1) and the
+    response to a single cell is measured.  It therefore contains the
+    ``n_levels`` Down/Up pairs **and** the compact ``HealPixConv`` itself,
+    which is not the identity: at ``n_levels=0`` it already blurs by about
+    0.74 cell.  The result is in **radians**, as the one-axis RMS width
+    ``sqrt(sum(w d**2) / (2 sum(w)))`` of the response ``w`` with ``d`` the
+    angular distance to the impulse cell (not a FWHM; FWHM is 2.355 times
+    larger for a Gaussian).  To read it in cells divide by the nominal cell
+    size ``sqrt(4 pi / 12) / 2**level``.
+
+    It is measured on a patch of ``4**patch_depth`` cells, by default in the
+    middle of base face 5 (near the equator), or on the aligned block that
+    contains ``reference_cell`` (a NESTED id at ``level``), and cached per
+    ``(level, n_levels, options)``.  ``n_levels`` must be at
+    most ``min(patch_depth, level) - 3``, otherwise the blur would reach the
+    patch edge and a ``ValueError`` is raised.
     """
-    level = int(level)
-    n_levels = int(n_levels)
-    if n_levels < 0 or n_levels > level:
-        raise ValueError("n_levels must be between 0 and level")
-    if n_levels == 0:
-        return 0.0
-    import healpix_geo.nested as hgn
-
-    depth = min(int(patch_depth), level)
-    parent_level = level - depth
-    parent = 5 if parent_level == 0 else 5 * 4**parent_level + 3 * 4 ** (parent_level - 1)
-    ids = parent * 4**depth + np.arange(4**depth, dtype=np.int64)
-    lon, lat = hgn.healpix_to_lonlat(ids, level, ellipsoid=ellipsoid)
-    lon, lat = np.deg2rad(lon), np.deg2rad(lat)
-    xyz = np.stack(
-        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1
+    level, n_levels, patch_depth, depth = _check_options(level, n_levels, patch_depth)
+    opts = _options(
+        ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm, level, depth, reference_cell
     )
-    centre = int(np.argmax(xyz @ xyz.mean(axis=0)))
+    return _blur_cached(level, n_levels, depth, opts)
 
-    layer = LargeConv(
-        level,
-        1,
-        1,
-        1,
-        n_levels=n_levels,
-        cell_ids=ids,
-        ellipsoid=ellipsoid,
-        radius_deg=radius_deg,
-        sigma_deg=sigma_deg,
-        weight_norm=weight_norm,
-        up_norm=up_norm,
-        dtype=torch.float64,
-        device="cpu",
-        cache_dir=None,
+
+class GaussianPlan(NamedTuple):
+    """Result of :func:`gaussian_plan`."""
+
+    n_levels: int
+    """Number of Down/Up levels, for ``LargeConv(n_levels=...)``."""
+    compact_sigma: float
+    """Gaussian width in coarse cells, for ``LargeConv.set_gaussian_kernel``."""
+    kernel_sz: int
+    """Odd compact kernel size that covers 5 compact sigmas."""
+    fine_kernel_sz: int
+    """``kernel_sz`` argument of ``LargeConv`` that gives that compact size."""
+    sigma: float
+    """The requested width (radians)."""
+
+
+@lru_cache(maxsize=32)
+def _calibration(level, n_levels, depth, options):
+    """Width (rad) of the response for compact sigma 0, step, ..., max (cached)."""
+    radius = math.ceil(5.0 * _COMPACT_SIGMA_MAX)
+    kernel_sz = (2 * radius) * 2**n_levels + 1
+    layer, centre, dist, n = _measure_layer(level, n_levels, depth, kernel_sz, options)
+    assert layer.compact_kernel_sz == 2 * radius + 1
+    sigmas = np.arange(
+        0.0, _COMPACT_SIGMA_MAX + 0.5 * _COMPACT_SIGMA_STEP, _COMPACT_SIGMA_STEP
     )
-    layer.set_compact_kernel(np.ones((1, 1, 1)))
-    impulse = np.zeros(ids.size)
-    impulse[centre] = 1.0
-    w = np.asarray(layer(impulse), dtype=np.float64).ravel()
-    d = np.arccos(np.clip(xyz @ xyz[centre], -1.0, 1.0))
-    return float(np.sqrt(np.sum(w * d**2) / (2.0 * np.sum(w))))
+    widths = np.empty_like(sigmas)
+    for k, sc in enumerate(sigmas):
+        if sc == 0.0:
+            layer.set_compact_kernel(
+                np.eye(1, layer.conv.P, layer.conv.P // 2).reshape(1, 1, -1)
+            )
+        else:
+            layer.set_gaussian_kernel(sc)
+        widths[k] = _impulse_width(layer, centre, dist, n)
+    start = int(round(_COMPACT_SIGMA_START / _COMPACT_SIGMA_STEP))
+    if not np.all(np.diff(widths[start:]) > 0.0):  # pragma: no cover
+        raise RuntimeError("calibration of the compact Gaussian is not monotone")
+    return sigmas, widths
 
 
-def levels_for_width(level: int, width: float, max_levels: Optional[int] = None, **kwargs) -> int:
-    """Largest number of levels whose Down/Up blur does not exceed ``width``.
+def _plan_state(level, depth, max_levels):
+    top = min(level, depth - _PATCH_MARGIN)
+    if max_levels is not None:
+        top = min(top, _as_int("max_levels", max_levels, 1))
+    if top < 1:
+        raise ValueError(
+            f"level={level} is too small for LargeConv Gaussians: at least one "
+            "level needs a patch of 2**4 cells; use gaussian_filter"
+        )
+    return top
 
-    ``width`` is a one-axis RMS width in radians, ``kwargs`` are those of
-    :func:`down_up_blur`.  Adding a level only when the requested width is
-    above the blur of that level keeps the width reachable by the compact
-    kernel.  The result is at most ``max_levels`` (default ``level``).
+
+def gaussian_plan(
+    level: int,
+    sigma: float,
+    *,
+    max_levels: Optional[int] = None,
+    ellipsoid: str = "WGS84",
+    radius_deg: Optional[float] = None,
+    sigma_deg: Optional[float] = None,
+    weight_norm: str = "l1",
+    up_norm: str = "col_l1",
+    patch_depth: int = 8,
+    reference_cell: Optional[int] = None,
+) -> GaussianPlan:
+    """Levels and compact Gaussian that give a response of width ``sigma``.
+
+    ``sigma`` is the one-axis RMS width in **radians** (the sigma of a
+    Gaussian, as in :func:`down_up_blur`).  Use it as::
+
+        plan = gaussian_plan(level, sigma)
+        layer = LargeConv(level, 1, 1, plan.fine_kernel_sz,
+                          n_levels=plan.n_levels, cell_ids=cell_ids)
+        layer.set_gaussian_kernel(plan.compact_sigma)
+
+    Method.  For each number of levels ``n`` the width of the real
+    ``LargeConv`` response to one cell is measured for compact Gaussians of
+    width ``0, 0.05, ..., 2.25`` coarse cells (cached per level, ``n`` and
+    options).  This includes the blur of the Down/Up pairs and of the compact
+    convolution and the effect of sampling the Gaussian on the coarse grid,
+    so no analytic model is assumed.  The number of levels grows from ``n-1``
+    to ``n`` where level ``n`` reaches ``sigma`` with a compact Gaussian of
+    0.5 coarse cell (just wide enough that the width still grows with it),
+    and the compact width is the one for which the measured width equals
+    ``sigma``.  Both branches give ``sigma`` at the switch, so the width is
+    continuous and strictly increasing in ``sigma``.
+
+    The smallest width of this class is the one of one level with a compact
+    Gaussian of 0.5 coarse cell (about 2.2 cells at level 10).  Below it a
+    ``ValueError`` is raised; use ``gaussian_filter`` for narrower
+    widths.  The largest is set by ``max_levels`` or the patch
+    (``min(level, patch_depth) - 3`` levels) and the largest calibrated
+    compact width.
+
+    The widths are measured on one patch, by default near the equator, or
+    on the block containing ``reference_cell`` (a NESTED id at ``level``;
+    give a cell of your domain).  They are accurate on that patch to the
+    interpolation error of the calibration table (4e-4 relative in the
+    benchmark) and an approximation elsewhere: at 55 degrees latitude the
+    equatorial calibration is up to 22 % too wide below 3 cells and within
+    4 % above 9 cells (see ``benchmarks/``).
     """
-    top = level if max_levels is None else min(int(max_levels), int(level))
-    n = 0
-    while n < top and down_up_blur(level, n + 1, **kwargs) <= width:
-        n += 1
-    return n
+    level = _as_int("level", level, 0)
+    try:
+        sigma = float(sigma)
+    except (TypeError, ValueError):
+        raise ValueError(f"sigma must be a positive finite number, got {sigma!r}") from None
+    if not (math.isfinite(sigma) and sigma > 0.0):
+        raise ValueError(f"sigma must be a positive finite number, got {sigma!r}")
+    patch_depth = _as_int("patch_depth", patch_depth, 1)
+    depth = min(patch_depth, level)
+    opts = _options(
+        ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm, level, depth, reference_cell
+    )
+    top = _plan_state(level, depth, max_levels)
+
+    start = int(round(_COMPACT_SIGMA_START / _COMPACT_SIGMA_STEP))
+    sigmas, widths = _calibration(level, 1, depth, opts)
+    lowest = float(widths[start])
+    if sigma < lowest:
+        raise ValueError(
+            f"sigma={sigma:.6g} rad is below the narrowest Gaussian this method "
+            f"gives at level {level} ({lowest:.6g} rad, about "
+            f"{lowest / _nominal_cell(level):.2f} cells); use gaussian_filter "
+            "for narrower widths"
+        )
+    n = 1
+    while n < top:
+        nxt_sigmas, nxt_widths = _calibration(level, n + 1, depth, opts)
+        if float(nxt_widths[start]) <= sigma:
+            n += 1
+            sigmas, widths = nxt_sigmas, nxt_widths
+        else:
+            break
+    if sigma > float(widths[-1]):
+        raise ValueError(
+            f"sigma={sigma:.6g} rad is above the widest Gaussian available with "
+            f"{n} levels ({float(widths[-1]):.6g} rad); raise max_levels or "
+            "patch_depth, or use a larger level"
+        )
+    compact_sigma = float(np.interp(sigma, widths[start:], sigmas[start:]))
+    radius = max(1, math.ceil(5.0 * compact_sigma))
+    return GaussianPlan(
+        n_levels=n,
+        compact_sigma=compact_sigma,
+        kernel_sz=2 * radius + 1,
+        fine_kernel_sz=2 * radius * 2**n + 1,
+        sigma=sigma,
+    )
 
 
-__all__ = ["LargeConv", "down_up_blur", "levels_for_width"]
+def _nominal_cell(level: int) -> float:
+    """Nominal cell size ``sqrt(4 pi / 12) / 2**level`` in radians."""
+    return math.sqrt(4.0 * math.pi / 12.0) / 2**level
+
+
+
+__all__ = ["LargeConv", "GaussianPlan", "down_up_blur", "gaussian_plan"]

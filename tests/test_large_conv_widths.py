@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import math
 
-import healpix_geo.nested as hgn
 import numpy as np
 import pytest
 import torch
 
-from healpix_analyse import LargeConv, down_up_blur, levels_for_width
-from healpix_analyse.large_conv import _kernel_plan
-
-LEVEL = 9
-DEPTH = 7
-CELL = math.sqrt(4 * math.pi / 12) / 2**LEVEL
-
+from healpix_analyse import LargeConv, down_up_blur, gaussian_plan
+from healpix_analyse.large_conv import (
+    _blur_cached,
+    _impulse_width,
+    _kernel_plan,
+    _nominal_cell,
+    _patch,
+)
 
 def _old_plan(kernel_sz, max_compact):
     fine_radius = (kernel_sz - 1) // 2
@@ -29,47 +29,14 @@ def _old_plan(kernel_sz, max_compact):
     return n, 2 * r + 1
 
 
-def _patch():
-    parent_level = LEVEL - DEPTH
-    parent = 5 * 4**parent_level + 3 * 4 ** (parent_level - 1)
-    ids = parent * 4**DEPTH + np.arange(4**DEPTH, dtype=np.int64)
-    lon, lat = hgn.healpix_to_lonlat(ids, LEVEL, ellipsoid="WGS84")
-    lon, lat = np.deg2rad(lon), np.deg2rad(lat)
-    xyz = np.stack(
-        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1
-    )
-    centre = int(np.argmax(xyz @ xyz.mean(axis=0)))
-    d = np.arccos(np.clip(xyz @ xyz[centre], -1.0, 1.0))
-    return ids, centre, d
+
+LEVEL = 10
+DEPTH = 8
+CELL = _nominal_cell(LEVEL)
 
 
-def _gaussian(kernel_sz, sigma_coarse):
-    grid = np.arange(kernel_sz) - kernel_sz // 2
-    xx, yy = np.meshgrid(grid, grid)
-    w = np.exp(-(xx**2 + yy**2) / (2 * max(sigma_coarse, 1e-6) ** 2)).ravel()
-    return (w / w.sum()).reshape(1, 1, -1)
-
-
-def _effective_width_cells(sigma_cells, n_levels=None):
-    """Width (cells) of the response to one cell, caller recipe of the docs."""
-    ids, centre, d = _patch()
-    kernel_sz = 2 * math.ceil(3 * sigma_cells) + 1
-    if n_levels is None:
-        n_levels, _ = _kernel_plan(kernel_sz, 7)
-        explicit = None
-    else:
-        explicit = n_levels
-    blur = down_up_blur(LEVEL, n_levels, patch_depth=DEPTH) / CELL
-    sigma_c = math.sqrt(max(sigma_cells**2 - blur**2, 0.0)) / 2**n_levels
-    layer = LargeConv(
-        LEVEL, 1, 1, kernel_sz, n_levels=explicit, cell_ids=ids,
-        dtype=torch.float64, device="cpu", cache_dir=None,
-    )
-    layer.set_compact_kernel(_gaussian(layer.compact_kernel_sz, sigma_c))
-    impulse = np.zeros(ids.size)
-    impulse[centre] = 1.0
-    w = np.asarray(layer(impulse)).ravel()
-    return math.sqrt(np.sum(w * d**2) / (2 * w.sum())) / CELL
+def _width_cells(layer, centre, dist, n_cells, cell):
+    return _impulse_width(layer, centre, dist, n_cells) / cell
 
 
 @pytest.mark.parametrize("kernel_sz", [1, 3, 7, 9, 15, 17, 33, 65, 129])
@@ -95,7 +62,7 @@ def test_default_output_is_bit_identical_to_explicit_automatic_levels():
     assert np.array_equal(a(x), b(x))
 
 
-def test_explicit_levels_ignore_max_compact_kernel_size():
+def test_explicit_levels_set_the_compact_kernel_size():
     n, ksz = _kernel_plan(33, 7, n_levels=1)
     assert (n, ksz) == (1, 17)
     assert _kernel_plan(33, 7, n_levels=0) == (0, 33)
@@ -113,55 +80,176 @@ def test_too_many_levels_for_the_resolution_is_rejected():
         LargeConv(3, 1, 1, 9, n_levels=4, device="cpu", cache_dir=None)
 
 
-def test_down_up_blur_roughly_doubles_with_each_level():
-    blurs = [down_up_blur(LEVEL, n, patch_depth=DEPTH) for n in range(0, 4)]
-    assert blurs[0] == 0.0
+
+def test_n_levels_and_max_compact_kernel_sz_are_exclusive():
+    with pytest.raises(ValueError, match="cannot both be given"):
+        LargeConv(3, 1, 1, 9, n_levels=1, max_compact_kernel_sz=7, device="cpu", cache_dir=None)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1, 1.5, True, "2"])
+def test_n_levels_validation_message(bad):
+    with pytest.raises(ValueError, match="n_levels must be an integer"):
+        _kernel_plan(9, 7, n_levels=bad)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [(5, 1.5), (5, float("nan")), (5, -1), (5, 6), (3, 3), (10, 6), (10.5, 1)],
+)
+def test_down_up_blur_rejects_bad_arguments(args):
+    with pytest.raises(ValueError):
+        down_up_blur(*args)
+
+
+@pytest.mark.parametrize("sigma", [float("nan"), float("inf"), 0.0, -1e-3, "x", None])
+def test_gaussian_plan_rejects_bad_sigma(sigma):
+    with pytest.raises(ValueError, match="sigma must be"):
+        gaussian_plan(LEVEL, sigma)
+
+
+@pytest.mark.parametrize("max_levels", [-1, 0, 2.7, True, float("nan")])
+def test_gaussian_plan_rejects_bad_max_levels(max_levels):
+    with pytest.raises(ValueError, match="max_levels"):
+        gaussian_plan(LEVEL, 3 * CELL, max_levels=max_levels)
+
+
+def test_gaussian_plan_rejects_widths_below_the_class_and_names_the_alternative():
+    with pytest.raises(ValueError, match="gaussian_filter"):
+        gaussian_plan(LEVEL, 1.5 * CELL)
+
+
+def test_gaussian_plan_rejects_widths_above_the_levels_available():
+    with pytest.raises(ValueError, match="above the widest"):
+        gaussian_plan(LEVEL, 400 * CELL, max_levels=2)
+
+
+def test_gaussian_plan_rejects_a_level_that_is_too_small():
+    with pytest.raises(ValueError, match="too small"):
+        gaussian_plan(3, 0.1)
+
+
+def test_down_up_blur_is_cached():
+    down_up_blur(LEVEL, 2)
+    before = _blur_cached.cache_info().hits
+    down_up_blur(LEVEL, 2)
+    assert _blur_cached.cache_info().hits == before + 1
+
+
+def test_down_up_blur_values_and_units():
+    blurs = [down_up_blur(LEVEL, n) / CELL for n in range(0, 5)]
+    # radians: about 2e-3 rad for one level at level 10
+    assert 1.5e-3 < down_up_blur(LEVEL, 1) < 2.6e-3
+    # even zero levels blur (the compact HealPixConv is not the identity)
+    assert 0.5 < blurs[0] < 1.0
     for lo, hi in zip(blurs[1:], blurs[2:]):
         assert 1.8 < hi / lo < 2.3
-    # the first level blurs by about two cells
-    assert 1.5 < blurs[1] / CELL < 2.6
 
 
-def test_levels_for_width_picks_the_largest_level_below_the_width():
-    b = [down_up_blur(LEVEL, n, patch_depth=DEPTH) for n in range(0, 4)]
-    kw = dict(patch_depth=DEPTH)
-    assert levels_for_width(LEVEL, 0.5 * b[1], **kw) == 0
-    assert levels_for_width(LEVEL, 1.01 * b[1], **kw) == 1
-    assert levels_for_width(LEVEL, 1.01 * b[2], **kw) == 2
-    assert levels_for_width(LEVEL, 1.01 * b[3], **kw) == 3
-    assert levels_for_width(LEVEL, 1.01 * b[3], max_levels=2, **kw) == 2
+@pytest.fixture(scope="module")
+def dense():
+    """Width of real LargeConv responses over a dense sweep through 3 switches."""
+    ids, centre, dist = _patch(LEVEL, DEPTH, "WGS84")
+    sweep = list(np.arange(2.3, 19.5, 0.075))
+    # points just below / above each switch of the number of levels
+    switches = []
+    prev = gaussian_plan(LEVEL, sweep[0] * CELL).n_levels
+    for lo, hi in zip(sweep[:-1], sweep[1:]):
+        if gaussian_plan(LEVEL, hi * CELL).n_levels != prev:
+            a, b = lo, hi
+            for _ in range(30):
+                mid = 0.5 * (a + b)
+                if gaussian_plan(LEVEL, mid * CELL).n_levels == prev:
+                    a = mid
+                else:
+                    b = mid
+            switches.append(b)
+            prev = gaussian_plan(LEVEL, hi * CELL).n_levels
+    sigmas = sorted(
+        sweep + [w * (1 + e) for w in switches for e in (-2e-3, -1e-3, 1e-3, 2e-3)]
+    )
+    plans = [gaussian_plan(LEVEL, s * CELL) for s in sigmas]
+    biggest = {}
+    for p in plans:
+        biggest[p.n_levels] = max(biggest.get(p.n_levels, 1), p.fine_kernel_sz)
+    layers = {
+        n: LargeConv(LEVEL, 1, 1, k, n_levels=n, cell_ids=ids, dtype=torch.float64,
+                     device="cpu", cache_dir=None)
+        for n, k in biggest.items()
+    }
+    eff = []
+    for p in plans:
+        layer = layers[p.n_levels]
+        layer.set_gaussian_kernel(p.compact_sigma)
+        eff.append(_impulse_width(layer, centre, dist, ids.size) / CELL)
+    return np.array(sigmas), np.array(eff), switches, plans
 
 
-def test_effective_width_follows_the_requested_width_across_level_switches():
-    # sigma in cells; the blur floors are about 2, 4.2 and 8.3 cells, so the
-    # sweep crosses three switches (0 -> 1, 1 -> 2, 2 -> 3).
-    b = [down_up_blur(LEVEL, n, patch_depth=DEPTH) / CELL for n in range(0, 4)]
-    sweep = [2.2, 2.8, 3.6, 4.4, 5.0, 6.0, 7.5, 8.6, 9.5]
-    levels_used = set()
-    for sigma in sweep:
-        n = levels_for_width(LEVEL, sigma * CELL, patch_depth=DEPTH)
-        levels_used.add(n)
-        eff = _effective_width_cells(sigma, n_levels=n)
-        assert eff == pytest.approx(sigma, rel=0.06), (sigma, n, eff)
-    assert {1, 2, 3} <= levels_used
-    assert b[1] < sweep[1] and b[2] < sweep[4] and b[3] < sweep[7]
+def test_gaussian_plan_crosses_three_level_switches(dense):
+    sigmas, eff, switches, plans = dense
+    assert len(sigmas) >= 200
+    assert len(switches) == 3
+    assert [p.n_levels for p in plans[:1]] == [1]
+    assert {p.n_levels for p in plans} == {1, 2, 3, 4}
 
 
-def test_default_rule_has_the_steps_described_in_the_issue():
-    # With the default rule the width sits on the blur floor of the level
-    # chosen from kernel_sz, whatever the requested width is.
-    widths = [_effective_width_cells(s) for s in (2.2, 3.0, 3.9)]
-    assert max(widths) - min(widths) < 1e-6 * widths[0]
-    assert widths[0] > 1.5 * 2.2  # far above the requested 2.2 cells
+def test_effective_width_is_strictly_increasing_in_sigma(dense):
+    sigmas, eff, switches, plans = dense
+    d = np.diff(eff)
+    assert np.all(d > 0.0), (sigmas[np.argmin(d)], d.min())
+    # points on both sides of each switch are included and increase too
+    for w in switches:
+        near = (sigmas > w * 0.997) & (sigmas < w * 1.003)
+        assert near.sum() >= 4
+        assert np.all(np.diff(eff[near]) > 0.0)
+
+
+def test_effective_width_matches_the_requested_width(dense):
+    sigmas, eff, switches, plans = dense
+    # measured 3.6e-4 at the calibration patch; tolerance 2e-3 relative
+    assert np.max(np.abs(eff - sigmas) / sigmas) < 2e-3
+
+
+def test_no_shelf_above_a_switch(dense):
+    sigmas, eff, switches, plans = dense
+    # the increment per unit sigma never falls below a quarter of the ideal one
+    slope = np.diff(eff) / np.diff(sigmas)
+    assert slope.min() > 0.25
+
+
+def test_reference_cell_calibrates_on_another_patch():
+    level, depth = 9, 7
+    cell = _nominal_cell(level)
+    parent_level = level - depth
+    parent = 0 * 4**parent_level + 3 * 4 ** (parent_level - 1)  # centre of base face 0
+    ids, centre, dist = _patch(level, depth, "WGS84", parent)
+    ref = int(ids[centre])
+    layer = None
+    for sigma in (3.2 * cell, 4.0 * cell, 6.0 * cell):
+        plan = gaussian_plan(level, sigma, patch_depth=depth, reference_cell=ref)
+        if layer is None or layer.n_levels != plan.n_levels:
+            layer = LargeConv(level, 1, 1, plan.fine_kernel_sz, n_levels=plan.n_levels,
+                              cell_ids=ids, dtype=torch.float64, device="cpu", cache_dir=None)
+        layer.set_gaussian_kernel(plan.compact_sigma)
+        assert _impulse_width(layer, centre, dist, ids.size) == pytest.approx(sigma, rel=2e-3)
 
 
 @pytest.mark.parametrize("n_levels", [1, 2])
-def test_constants_are_preserved(n_levels):
+def test_gaussian_kernel_preserves_constants(n_levels):
     ids = np.arange(12 * 4**5, dtype=np.int64)
     layer = LargeConv(
         5, 1, 1, 9, n_levels=n_levels, cell_ids=ids,
         dtype=torch.float64, device="cpu", cache_dir=None,
     )
-    layer.set_compact_kernel(_gaussian(layer.compact_kernel_sz, 1.2))
+    layer.set_gaussian_kernel(1.2)
     y = layer(np.full(ids.size, 3.0))
     assert np.allclose(y, 3.0, rtol=1e-6)
+
+
+def test_set_gaussian_kernel_validation():
+    layer = LargeConv(4, 1, 2, 3, n_levels=0, device="cpu", cache_dir=None)
+    with pytest.raises(ValueError, match="in_channels"):
+        layer.set_gaussian_kernel(1.0)
+    layer = LargeConv(4, 1, 1, 3, n_levels=0, device="cpu", cache_dir=None)
+    for bad in (0.0, -1.0, float("nan")):
+        with pytest.raises(ValueError, match="compact_sigma"):
+            layer.set_gaussian_kernel(bad)

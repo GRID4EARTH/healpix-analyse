@@ -26,13 +26,18 @@
   HEALPIX-GEO 0.4.0 direct-sum benchmark
   (`benchmarks/results/geo040-performance/`), so that the first-call and
   cache timings of `gaussian_filter` can be cited and re-run.
-- `LargeConv(n_levels=...)`, `down_up_blur` and `levels_for_width`: the number
-  of Down/Up levels can be chosen by the caller, and the blur that `n` levels
-  add on their own (the smallest width they can produce) is measured and
-  exposed, so a fitted width no longer sits on the plateaus of the automatic
-  level rule. At level 10 the plateaus are 2.0, 4.2, 8.3 and 16.5 cells; with
-  levels chosen from the width, the effective width follows the requested
-  one within 5.5 % from 2 to 10 cells. The default behaviour is unchanged.
+- `gaussian_plan`, `LargeConv.set_gaussian_kernel`, `down_up_blur` and
+  `LargeConv(n_levels=...)`: a Gaussian smoothing of a given width, with a
+  width that is continuous and strictly increasing in sigma. The automatic
+  level rule gives a staircase (at level 10 the width sits on 2.0, 4.2, 8.3
+  and 16.5 cells: 352 flat steps out of 354 over 2.25 to 20 cells). With
+  `gaussian_plan`, measured from 2.25 to 20 cells across three level
+  switches, the effective width is strictly increasing and within 3.6e-4 of
+  the requested one on the calibration patch; at 55 degrees latitude the
+  equatorial calibration is up to 21.8 % off, 2.6e-4 with `reference_cell`.
+  Widths are one-axis RMS (sigma, not FWHM) in radians; the narrowest width
+  is about 2.2 cells, narrower ones are for `gaussian_filter`. The default
+  behaviour of `LargeConv` is unchanged.
 - `HealPixGeoFFT` / `geo_fft_convolve`: FFT convolution of a block inside one
   base face with a wide kernel sampled on geodesic distances and azimuths from
   the block centre (predefined families in metres, kilometres, degrees or

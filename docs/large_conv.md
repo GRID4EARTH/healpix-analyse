@@ -86,53 +86,109 @@ When the requested kernel already fits within the configured maximum, no
 resolution change is performed and `LargeConv` reduces to one `HealPixConv`
 plus its fine-resolution bias and optional normalisation.
 
-## Width of a smoothing: the Down/Up blur floor
+## Gaussian smoothing of a given width
 
-Each Down/Up pair blurs by itself, whatever the compact kernel is. With
-`n` levels the output cannot be narrower than the blur of those `n` pairs,
-which `down_up_blur(level, n)` measures (response to one cell with a
-point-like compact kernel; one-axis RMS width in radians):
+### The problem: the width is a staircase
 
-| Levels | Blur at level 10 (cells) | Blur (rad) |
+Every level adds a blur of its own, and so does the compact `HealPixConv`
+(it is not the identity: with a point-like kernel it already blurs by about
+0.74 cell). `down_up_blur(level, n)` measures the narrowest response of a
+`LargeConv` with `n` levels: the response to one cell with a point-like
+compact kernel.
+
+Conventions: all widths are **one-axis RMS widths**,
+`sqrt(sum(w d**2) / (2 sum(w)))` for the response `w` and the angular
+distance `d` to the impulse cell. This is the sigma of a Gaussian, not its
+FWHM (2.355 sigma). Functions take and return **radians**. "Cell" means the
+nominal cell size `sqrt(4 pi / 12) / 2**level` (0.00100 rad at level 10).
+
+| Levels | `down_up_blur`, level 10 (cells) | (rad) |
 |---:|---:|---:|
+| 0 | 0.74 | 0.00074 |
 | 1 | 2.01 | 0.00201 |
-| 2 | 4.20 | 0.00419 |
-| 3 | 8.33 | 0.00832 |
+| 2 | 4.20 | 0.00420 |
+| 3 | 8.33 | 0.00833 |
 | 4 | 16.5 | 0.0165 |
 
-With the automatic rule, a caller that fits a width (for example an
-optimiser on a Gaussian width) sees a staircase: the number of levels follows
-from `kernel_sz`, the width sits on the floor of that level, and widths
-between two floors, or just above a switch, cannot be obtained. The cost as a
-function of the width is then constant on these intervals.
+With the automatic level rule the number of levels follows from `kernel_sz`
+and the width of a fitted Gaussian sits on these values. Measured at
+level 10 over 355 requested widths from 2.25 to 20 cells
+(`benchmarks/benchmark_largeconv_widths.py`), the effective width has 352
+flat steps out of 354 and is wrong by up to 106 %. A cost function of the
+width is constant on those plateaus, which stalls an optimiser.
 
-To avoid it, pick the levels from the width and pass them:
+A first attempt, choosing the number of levels from the blur floor and
+subtracting the floor from the width, is not enough either. Just above a
+switch the compact Gaussian is much narrower than one coarse cell, the
+sampled Gaussian is a point, and the width goes through a shelf; at the
+first switch it even steps down (2.11 to 2.05 cells). The recipe below
+replaces it.
+
+### The recipe: `gaussian_plan`
 
 ```python
-from healpix_analyse import LargeConv, levels_for_width
+from healpix_analyse import LargeConv, gaussian_plan
 
-n = levels_for_width(level, sigma_rad)      # largest n with blur(n) <= sigma
-layer = LargeConv(level, 1, 1, kernel_sz, n_levels=n, cell_ids=cell_ids)
-# compact Gaussian of width sqrt(sigma**2 - blur(n)**2) / 2**n coarse cells
+plan = gaussian_plan(level, sigma_rad, reference_cell=some_cell_of_the_domain)
+layer = LargeConv(level, 1, 1, plan.fine_kernel_sz,
+                  n_levels=plan.n_levels, cell_ids=cell_ids)
+layer.set_gaussian_kernel(plan.compact_sigma)
 ```
 
-`n_levels` is optional and the default is unchanged. When it is given,
-`max_compact_kernel_sz` is not applied: the compact kernel size is
-`2 ceil(r_f / 2**n) + 1`, so a width just above a floor needs a larger
-compact kernel and a slower build than the automatic choice would allow.
-Which number of levels a width needs, and how the Gaussian is sampled,
-remain the caller's choice.
+For each number of levels `n`, `gaussian_plan` measures the real
+`LargeConv` response to one cell for compact Gaussians of width 0, 0.05, ...,
+2.25 coarse cells. The table includes everything: the Down/Up blur, the
+compact convolution, and the sampling of the Gaussian on the coarse grid.
+The number of levels goes from `n - 1` to `n` where level `n` reaches the
+requested width with a compact Gaussian of 0.5 coarse cell, and the compact
+width is the one for which the table gives the requested width. Both
+branches give exactly the requested width at the switch, so the width is
+continuous, and strictly increasing, in sigma.
 
-Measured at level 10 on a 256 x 256 cell patch near the equator
-(`benchmarks/benchmark_largeconv_widths.py`, output in
-`benchmarks/results/largeconv-widths.json`): with the automatic rule the
-effective width is 2.01, 4.20, 8.33 and 16.5 cells on the four plateaus;
-with `levels_for_width` it follows the requested width within 5.5 % from 2 to
-10 cells across three switches (largest deviation 4.0 % below, 5.5 % above at
-the edge of the first interval). Below about 1.2 cells the fine-level compact
-kernel itself blurs by about 0.8 cells (bilinear stencil) and the width cannot
-follow either. Measured on one domain, one level, on CPU and with the
-WGS84 ellipsoid only.
+Measured at level 10 on the calibration patch (256 x 256 cells near the
+equator), 355 widths from 2.25 to 20 cells including points 0.1 % and 0.2 %
+on each side of the three switches (4.7, 9.35 and 18.65 cells):
+
+- the effective width is strictly increasing (smallest step 0.048 cell for
+  a sigma step of 0.05 cell; no shelf, no step down);
+- it equals the requested width within 3.6e-4 relative (median 2.4e-5).
+
+Limits:
+
+- **Narrowest width.** Level 1 with a compact Gaussian of 0.5 coarse cell:
+  2.21 cells (0.0022 rad) at level 10 near the equator, 2.71 cells at 55
+  degrees latitude. Below it `gaussian_plan` raises `ValueError`. Narrower
+  widths are not in this class: use `gaussian_filter`.
+- **Widest width.** Set by `max_levels` and the calibration patch
+  (`min(level, patch_depth) - 3` levels, 5 at level 10) and the largest
+  calibrated compact width (2.25 coarse cells); `gaussian_plan` raises
+  `ValueError` above it.
+- **Position.** The table is measured on one patch. The compact convolution
+  samples the Gaussian on a lattice whose shape depends on the position, so
+  the table carries to other places only approximately. With the equatorial
+  calibration, the response at 55 degrees latitude is up to 21.8 % wider
+  than requested (median 1.4 %): 13 to 22 % below 3 cells, 5 to 12 % from 3
+  to 4.7 cells, 1 to 7 % from 4.7 to 9.35 cells, at most 3.6 % above. It is
+  still strictly increasing there. Passing `reference_cell` (a NESTED cell of
+  your domain) calibrates on the block that contains it: the error at 55
+  degrees becomes 2.6e-4 and the narrowest width 2.71 cells.
+- **Cost.** The first call for a level and a number of levels builds a
+  65 536-cell `LargeConv` and evaluates 46 kernels: about 15 s for the very
+  first call (it calibrates one and two levels) and a few seconds for each
+  further level count, then cached for the process (`down_up_blur` is cached the same way). Each call afterwards is a
+  table look-up. The compact kernel can be as large as 25 x 25 (one level at
+  the top of its range).
+- **Not measured.** Other levels than 9 and 10, real data, GPU, ellipsoids
+  other than WGS84, other `radius_deg`, `sigma_deg`, `weight_norm` and
+  `up_norm`.
+
+### Choosing the levels yourself
+
+`LargeConv(..., n_levels=n)` fixes the number of levels; the compact kernel
+size then follows from `kernel_sz` (`2 ceil(r_f / 2**n) + 1`). It cannot be
+combined with `max_compact_kernel_sz`. Without `n_levels` nothing changes:
+the automatic rule above is used and the results are bit-identical to
+before.
 
 ## Why the compact kernel is learned directly
 
