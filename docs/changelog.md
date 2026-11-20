@@ -54,9 +54,9 @@
   projection to the local grid is not divided by the accumulated weight and
   the grid is divided by it just before the back-projection, so a convolution
   with a normalised kernel keeps the total (a probability map stays
-  normalised; mass leaving the domain is lost, not reflected). The default `"average"` is unchanged and
-  keeps constants but not totals (response of one cell: 0.79 to 1.06 inside an
-  8125-cell domain at level 10). `HealPixFFTConv.set_gaussian` sets a
+  normalised; mass leaving the domain is lost, not reflected). The default
+  `"average"` is unchanged and keeps constants but not totals (response of one
+  cell: 0.79 to 1.06 inside an 8125-cell domain at level 10). `HealPixFFTConv.set_gaussian` sets a
   normalised Gaussian kernel on the channel pairs `c -> c` and warns when the
   window is under 3 sigma wide.
 - `LocalFFT.blur_floor_px()`, `PROJECTION_BLUR_FLOOR_PX` and
