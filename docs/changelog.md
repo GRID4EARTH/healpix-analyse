@@ -50,6 +50,20 @@
 - `down_mode` keyword (`"smooth"` default, or `"mean"`) on
   `HealPixResampler`, `resample_healpix` and `HealPixDecomp`. Defaults and
   reprs are unchanged.
+- `projection="conservative"` for `LocalFFT` and `HealPixFFTConv`: the
+  projection to the local grid is not divided by the accumulated weight and
+  the back-projection is its transpose, so a convolution with a normalised
+  kernel keeps the total (a probability map stays normalised; mass leaving the
+  domain is lost, not reflected). The default `"average"` is unchanged and
+  keeps constants but not totals (response of one cell: 0.79 to 1.06 inside an
+  8125-cell domain at level 10). `HealPixFFTConv.set_gaussian` sets a
+  normalised Gaussian kernel.
+- `LocalFFT.blur_floor_px()`, `PROJECTION_BLUR_FLOOR_PX` and
+  `check_kernel_width`: the blur of one projection and back-projection
+  (about 0.58 pixel) is documented and exposed, and `set_gaussian` warns when
+  the requested width is below it.
+- `benchmarks/benchmark_fft_total.py`: totals, constants and effective width of
+  the local FFT convolution.
 
 ### Fixed
 - `HealPixKernelPyramid` fitting accepts operators that return torch tensors

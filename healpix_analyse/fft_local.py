@@ -12,6 +12,7 @@ bilinear gridding in both directions.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Union
 
 import healpix_geo
@@ -21,6 +22,56 @@ import torch.nn as nn
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
+
+
+#: Width (standard deviation per axis, in grid pixels) of the blur added by one
+#: bilinear projection followed by one bilinear back-projection, for cell
+#: centres at random positions inside the grid cells: two passes of linear
+#: interpolation, each of variance 1/6 pixel^2 per axis.  The exact value of a
+#: given patch is :meth:`LocalFFT.blur_floor_px`.
+PROJECTION_BLUR_FLOOR_PX = math.sqrt(1.0 / 3.0)
+
+
+def check_kernel_width(
+    sigma_px: float,
+    floor_px: float = PROJECTION_BLUR_FLOOR_PX,
+    *,
+    on_below: str = "warn",
+) -> bool:
+    """Check a Gaussian width against the blur floor of the projection pair.
+
+    Parameters
+    ----------
+    sigma_px : float
+        Requested standard deviation per axis, in grid pixels.
+    floor_px : float
+        Blur floor in grid pixels.
+    on_below : {"warn", "error", "ignore"}
+        What to do when ``sigma_px < floor_px``.
+
+    Returns
+    -------
+    bool
+        True when the width can be represented (``sigma_px >= floor_px``).
+    """
+    if on_below not in ("warn", "error", "ignore"):
+        raise ValueError("on_below must be 'warn', 'error' or 'ignore'")
+    if not math.isfinite(sigma_px) or sigma_px < 0:
+        raise ValueError("sigma_px must be finite and non-negative")
+    if sigma_px >= floor_px:
+        return True
+    message = (
+        f"Requested width {sigma_px:.4g} pixel is below the blur floor "
+        f"{floor_px:.4g} pixel of the HEALPix -> grid -> HEALPix projection "
+        f"pair; the effective width is at least "
+        f"{math.hypot(sigma_px, floor_px):.4g} pixel. Use a direct "
+        "neighbour kernel for such small widths."
+    )
+    if on_below == "error":
+        raise ValueError(message)
+    if on_below == "warn":
+        warnings.warn(message, UserWarning, stacklevel=3)
+    return False
 
 
 def _is_complex_input(value: ArrayLike) -> bool:
@@ -158,6 +209,17 @@ class LocalFFT(nn.Module):
     device : torch.device or str, optional
         Device of the cached projection geometry.  CUDA is selected when it
         is available, otherwise CPU.
+    projection : {"average", "conservative"}, default="average"
+        Convention of the HEALPix <-> grid pair.  ``"average"`` divides every
+        grid point by its accumulated interpolation weight after scattering,
+        so a constant field stays constant, but the sum over the cells is not
+        kept by a convolution.  ``"conservative"`` scatters without that
+        division and divides on the back-projection side, so the two steps are
+        transposes of one another: the sum over the cells is kept (a
+        probability map stays normalised), and mass that a convolution moves
+        outside the covered grid points is lost.  A constant field is kept by
+        the pair alone but not by a convolution in this mode.  Both options
+        have the same blur floor, see :meth:`blur_floor_px`.
 
     Notes
     -----
@@ -182,8 +244,13 @@ class LocalFFT(nn.Module):
         norm: str = "ortho",
         dtype: torch.dtype = torch.float32,
         device: Optional[Union[str, torch.device]] = None,
+        projection: str = "average",
     ) -> None:
         super().__init__()
+
+        if projection not in ("average", "conservative"):
+            raise ValueError("projection must be 'average' or 'conservative'")
+        self.projection = projection
 
         if dtype not in (torch.float32, torch.float64):
             raise ValueError("dtype must be torch.float32 or torch.float64")
@@ -396,7 +463,8 @@ class LocalFFT(nn.Module):
             device=flat_data.device,
         )
         projected.scatter_add_(1, indices, sources)
-        projected = projected * self._grid_inverse_density
+        if self.projection == "average":
+            projected = projected * self._grid_inverse_density
         return projected.reshape(*leading_shape, self.grid_size, self.grid_size)
 
     def project(self, data: ArrayLike) -> ArrayLike:
@@ -412,6 +480,8 @@ class LocalFFT(nn.Module):
             )
         leading_shape = grid.shape[:-2]
         flat_grid = grid.reshape(-1, self.grid_size * self.grid_size)
+        if self.projection == "conservative":
+            flat_grid = flat_grid * self._grid_inverse_density
         batch_size = flat_grid.shape[0]
         indices = self._grid_indices.reshape(1, -1).expand(batch_size, -1)
         samples = torch.gather(flat_grid, 1, indices).reshape(
@@ -515,6 +585,60 @@ class LocalFFT(nn.Module):
             self._restore_type(power, is_numpy),
         )
 
+    def blur_floor_px(self) -> np.ndarray:
+        """Blur of the projection pair for each cell, in grid pixels.
+
+        The response of ``unproject(project(.))`` to a single cell is not a
+        single cell: it is spread over its neighbours.  This returns, for every
+        cell, the standard deviation per axis of that response (square root of
+        half its second moment about the source cell, in units of
+        ``pixel_size_rad``).  Gaussian widths below this value cannot be
+        represented by a convolution on this grid.  The values are close to
+        :data:`PROJECTION_BLUR_FLOOR_PX` and are the same for both projection
+        conventions up to the weighting of the neighbours.
+
+        Returns
+        -------
+        numpy.ndarray, shape [N]
+        """
+        import scipy.sparse as sparse
+
+        n = self.n_cells
+        g2 = self.grid_size * self.grid_size
+        indices = self._grid_indices.cpu().numpy()
+        weights = self._grid_weights.cpu().numpy().astype(np.float64)
+        inverse = self._grid_inverse_density.cpu().numpy().astype(np.float64)
+        rows = indices.reshape(-1)
+        cols = np.repeat(np.arange(n), 4)
+        scatter = sparse.csr_matrix((weights.reshape(-1), (rows, cols)), shape=(g2, n))
+        gather = scatter.T.tocsr()
+        scale = sparse.diags(inverse)
+        if self.projection == "average":
+            forward, backward = scale @ scatter, gather
+        else:
+            forward, backward = scatter, gather @ scale
+        response = (backward @ forward).tocoo()
+        x = self.projected_x.cpu().numpy().astype(np.float64) / self.pixel_size_rad
+        y = self.projected_y.cpu().numpy().astype(np.float64) / self.pixel_size_rad
+        d2 = (x[response.row] - x[response.col]) ** 2 + (
+            y[response.row] - y[response.col]
+        ) ** 2
+        mass = np.bincount(response.col, weights=response.data, minlength=n)
+        m2 = np.bincount(response.col, weights=response.data * d2, minlength=n)
+        return np.sqrt(0.5 * m2 / mass)
+
+    def check_width(self, sigma_px: float, *, on_below: str = "warn") -> bool:
+        """Check a Gaussian width (grid pixels) against this patch's blur floor.
+
+        Uses the median of :meth:`blur_floor_px`.  See
+        :func:`check_kernel_width`.
+        """
+        if not hasattr(self, "_blur_floor_median"):
+            self._blur_floor_median = float(np.median(self.blur_floor_px()))
+        return check_kernel_width(
+            sigma_px, self._blur_floor_median, on_below=on_below
+        )
+
     def extra_repr(self) -> str:
         return (
             f"level={self.level}, n_cells={self.n_cells}, "
@@ -606,4 +730,11 @@ def ps(
     return frequency, power
 
 
-__all__ = ["LocalFFT", "fft", "ifft", "ps"]
+__all__ = [
+    "LocalFFT",
+    "PROJECTION_BLUR_FLOOR_PX",
+    "check_kernel_width",
+    "fft",
+    "ifft",
+    "ps",
+]
