@@ -175,42 +175,57 @@ equator), 756 widths from 2.25 to 40 cells including the four switches
 **This accuracy is for the calibration cell.** Other cells and other places
 differ, as follows.
 
-- **Other cells of the domain.** Response to 64 random cells within 16
-  cells of the calibration cell (the same chain with the automatic rule is
-  measured for comparison; it does not aim at the requested width, so its
-  width is given relative to its own mean):
+- **Other cells of the domain.** Measured on a 512 x 512 cell patch
+  (level 10, near the equator, calibrated on its centre cell), response to 96
+  random cells (fixed seed) drawn among those at least `5 sigma + 2**n` fine
+  cells from the patch edge, so that the tail and one coarse block are
+  inside; the sampling windows cover 7.5 or more coarse blocks of the plan
+  in each direction (the automatic rule has coarser blocks: 1.9 at sigma 36,
+  10 at 18, 26 at 9, more below). Ratio to the requested width (plan) and
+  to its own mean (automatic rule, which does not aim at the requested
+  width), min / mean / max:
 
-  | sigma (cells) | width / sigma, min / mean / max | automatic rule: width / own mean, min / max |
-  |---:|:---|:---|
-  | 3 | 0.997 / 1.009 / 1.019 | 0.995 / 1.004 |
-  | 6 | 0.996 / 1.000 / 1.003 | 0.998 / 1.003 |
-  | 9 | 0.999 / 1.000 / 1.001 | 0.998 / 1.003 |
-  | 18 | 0.999 / 0.999 / 1.000 | 0.998 / 1.002 |
-  | 36 | 0.998 / 0.999 / 1.000 | 0.996 / 1.004 |
+  | sigma (cells) | plan levels | plan width / sigma | plan total | automatic rule: width / own mean | automatic rule: total |
+  |---:|---:|:---|:---|:---|:---|
+  | 3 | 1 | 0.921 / 0.986 / 1.043 | 0.948 / 0.999 / 1.046 | 0.971 / 1.000 / 1.021 | 0.932 / 0.998 / 1.045 |
+  | 6 | 2 | 0.971 / 0.991 / 1.009 | 0.945 / 0.999 / 1.047 | 0.984 / 1.000 / 1.016 | 0.945 / 0.999 / 1.048 |
+  | 9 | 2 | 0.988 / 0.996 / 1.003 | 0.943 / 1.001 / 1.047 | 0.981 / 1.000 / 1.018 | 0.941 / 1.001 / 1.047 |
+  | 18 | 3 | 0.992 / 0.997 / 1.001 | 0.931 / 0.994 / 1.046 | 0.980 / 1.000 / 1.014 | 0.920 / 0.994 / 1.044 |
+  | 36 | 4 | 0.993 / 0.999 / 1.001 | 0.940 / 0.996 / 1.040 | 0.987 / 1.000 / 1.005 | 0.917 / 0.990 / 1.024 |
 
-  The position of a cell inside its coarse block therefore changes the
-  width by less than 2 % at 3 cells and 0.5 % above, with the same spread
-  for the automatic rule: it belongs to the Down/Up chain, not to this
-  recipe. The calibration cell is not the widest: the cell-averaged width
-  is 0.9 % above the request at 3 cells and within 0.1 % from 6 cells on.
-  Calibrating on the cell-averaged width was not adopted: it would remove
-  that 0.9 % at 3 cells at the cost of many impulses per table entry.
+  The width spread of the plan is 8 % wide at 3 cells (0.92 to 1.04, up to
+  240 cells from the calibration cell, which lies at 0.9999), 3 % at 6 cells and
+  at most 1.5 % from 9 cells on. The automatic rule, which has the same
+  Down/Up chain, spreads as much around its own mean, so this is a property
+  of the chain and not of the recipe. The width ratio varies with the
+  distance from the calibration cell for narrow widths (within 16 cells of
+  it the spread at 3 cells is 0.997 to 1.019); the total of one cell is 0.93
+  to 1.05 everywhere. Calibrating on the cell-averaged width was not
+  adopted: the mean is already within 1.4 % of the request at 3 cells
+  (0.986) and within 1 % above, and averaging would not reduce the spread.
 - **The total of one cell is not conserved.** `LargeConv` is not a
-  conservative operator: the sum of the response to one cell is 0.95 to
-  1.04 of the input for the plan and for the automatic rule alike (up to 1.09 for the
-  automatic rule at 36 cells, 1.26 near the patch edge). Constants are preserved when the kernel sums to one, but the
+  conservative operator: the sum of the response to one cell is 0.92 to
+  1.05 of the input in the table above, for the plan and for the automatic
+  rule alike. Constants are preserved when the kernel sums to one, but the
   integral of a field is not. A conservative smoothing would need another
   operator, such as a conservative FFT projection; for narrow widths see
   `gaussian_filter`.
+- **Tail near the patch edge (measurement artefact and domain edge).** On
+  the same patch, cells up to 20 cells from the edge (sampling window of
+  236 cells half-width, 29 to 118 plan blocks) give width / sigma 0.985 to
+  1.003 at 9 cells, 0.925 to 1.001 at 18 and 0.851 to 1.001 at 36, and the
+  total 0.896 to 1.064 (plan) and up to 1.18 (automatic rule at 36 cells):
+  the tail that falls outside the patch is lost. Wide spreads seen with
+  impulses that close to an edge are this effect; with the margin of the
+  table above they disappear (0.988 or better at 9 cells and above). The
+  next bullet gives the same effect at the edge of a real partial domain.
 - **Domain edge (partial sky).** Down and Up use zero padding, so the tail
   that falls outside the domain is lost. In a 15-degree disc at level 8
   (13 411 cells), the response to a cell at 0.92 of the radius is
   narrower than requested by 6.4 % (sigma 3 cells) and 12.7 % (sigma 6),
   with a total of 0.91 and 0.92; at 0.8 of the radius 0.6 % and 3.0 %; at
   the centre 0.5 % and 0.04 %. A constant field stays 1 in the interior and
-  drops to 0.98 at the edge. The same effect shows when an impulse is
-  within about 4 sigma of the calibration patch edge (width / sigma down to
-  0.84 at 36 cells, 110 cells from the centre of a patch of half-width 128).
+  drops to 0.98 at the edge.
 - **Other places.** The compact convolution samples the Gaussian on a
   lattice whose shape depends on the position. With the equatorial
   calibration, the response at 55 degrees latitude is up to 21.8 % wider

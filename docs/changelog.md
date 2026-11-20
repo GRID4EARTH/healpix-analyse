@@ -34,9 +34,10 @@
   to 32 cells). Measured over 756 widths from 2.25 to 40 cells across four
   level switches, the response to the calibration cell is strictly
   increasing and within 3.8e-4 of the requested width. Other cells of the
-  domain differ by less than 2 % at 3 cells and 0.5 % above, the same spread
-  as the automatic rule; the total of one cell is not conserved (0.95 to
-  1.04); near the edge of a partial domain the width is up to 12.7 % too
+  domain spread by 8 % at 3 cells, 3 % at 6 and at most 1.5 % from 9 cells (up
+  to 240 cells from the calibration cell, clear of the patch edge), as much
+  as the automatic rule around its own mean; the total of one cell is not
+  conserved (0.92 to 1.05); near the edge of a partial domain the width is up to 12.7 % too
   narrow (zero padding); calibrated at the equator, 55 degrees latitude is
   up to 22 % too wide, so the calibration block comes from the domain by
   default. Widths are one-axis RMS (sigma, not FWHM) in radians; the

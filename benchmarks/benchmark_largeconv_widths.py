@@ -69,44 +69,58 @@ def _widths_totals(layer, xyz, impulses, cell):
     return np.array(widths), y.sum(axis=1)
 
 
-def position_study(level, depth, cell):
-    """Width and total of the response to 64 random cells near the patch centre.
+def position_study(level, cell, depth=9, n_cells=96):
+    """Width and total of the response to random cells, away from the patch edge.
 
-    ``gaussian_plan`` (ratio width / sigma) and the automatic rule on the same
-    chain (ratio to its own mean width; it does not aim at sigma).
+    Patch of ``4**depth`` cells (512 x 512 at depth 9) calibrated on its own
+    centre cell.  For each sigma the cells are drawn uniformly (fixed seed)
+    among those at least ``5 sigma + 2**n`` fine cells from the patch edge
+    (``n`` the levels of the plan), i.e. clear of the tail and one coarse
+    block.  ``window_over_blocks`` is the width of that sampling window in
+    coarse blocks of the plan and of the automatic rule.  ``plan`` is the
+    width / sigma and ``auto`` the width / its own mean (the automatic rule
+    does not aim at sigma); ``near_edge`` repeats the plan with cells up to
+    20 cells from the patch edge, to show the edge effect.
     """
     ids, centre, d0, _ = make_patch(level, depth, 5)
     xyz = _lonlat_xyz(ids, level)
-    out = {}
-    for window in (16, 60, 110):
-        cand = np.where(d0 < window * cell)[0]
-        imp = np.random.default_rng(0).choice(cand, 64, replace=False)
-        rows = {}
-        for sigma in (3, 6, 9, 18, 36):
-            layer = LargeConv.from_gaussian(
-                level, sigma * cell, ids, patch_depth=depth, dtype=torch.float64,
-                device="cpu", cache_dir=None,
-            )
+    half = 2 ** (depth - 1)
+    out = {"level": level, "patch": f"{2**depth} x {2**depth} cells", "n_cells": n_cells}
+    for sigma in (3, 6, 9, 18, 36):
+        layer = LargeConv.from_gaussian(
+            level, sigma * cell, ids, patch_depth=depth, dtype=torch.float64,
+            device="cpu", cache_dir=None,
+        )
+        ksz = 2 * math.ceil(3 * sigma) + 1
+        auto = LargeConv(level, 1, 1, ksz, cell_ids=ids, dtype=torch.float64,
+                         device="cpu", cache_dir=None)
+        rad = (auto.compact_kernel_sz - 1) // 2
+        gx, gy = np.meshgrid(np.arange(-rad, rad + 1), np.arange(-rad, rad + 1))
+        wgt = np.exp(-(gx**2 + gy**2).ravel() / (2 * max(sigma / 2**auto.n_levels, 0.3) ** 2))
+        auto.set_compact_kernel((wgt / wgt.sum()).reshape(1, 1, -1))
+        clear = half - 5 * sigma - 2**layer.n_levels
+        rows = {"plan_n_levels": layer.n_levels, "auto_n_levels": auto.n_levels}
+        for name, win in (("clear_of_edge", clear), ("near_edge", half - 20)):
+            if win < 8:
+                rows[name] = None
+                continue
+            cand = np.where(d0 < win * cell)[0]
+            imp = np.random.default_rng(0).choice(cand, n_cells, replace=False)
             w, t = _widths_totals(layer, xyz, imp, cell)
-            ksz = 2 * math.ceil(3 * sigma) + 1
-            auto = LargeConv(level, 1, 1, ksz, cell_ids=ids, dtype=torch.float64,
-                             device="cpu", cache_dir=None)
-            # truncated Gaussian on the (small) automatic compact kernel
-            rad = (auto.compact_kernel_sz - 1) // 2
-            gx, gy = np.meshgrid(np.arange(-rad, rad + 1), np.arange(-rad, rad + 1))
-            wgt = np.exp(-(gx**2 + gy**2).ravel() / (2 * max(sigma / 2**auto.n_levels, 0.3) ** 2))
-            auto.set_compact_kernel((wgt / wgt.sum()).reshape(1, 1, -1))
             wa, ta = _widths_totals(auto, xyz, imp, cell)
-            rows[str(sigma)] = {
-                "plan_n_levels": layer.n_levels,
+            rows[name] = {
+                "window_half_width_cells": float(win),
+                "window_over_blocks_plan": float(2 * win / 2**layer.n_levels),
+                "window_over_blocks_auto": float(2 * win / 2**auto.n_levels),
                 "plan_width_over_sigma": [float(w.min() / sigma), float(w.mean() / sigma), float(w.max() / sigma)],
-                "plan_total": [float(t.min()), float(t.max())],
-                "auto_n_levels": auto.n_levels,
-                "auto_width_over_own_mean": [float(wa.min() / wa.mean()), float(wa.max() / wa.mean())],
-                "auto_total": [float(ta.min()), float(ta.max())],
+                "plan_total": [float(t.min()), float(t.mean()), float(t.max())],
+                "auto_width_over_own_mean": [float(wa.min() / wa.mean()), 1.0, float(wa.max() / wa.mean())],
+                "auto_total": [float(ta.min()), float(ta.mean()), float(ta.max())],
             }
-        out[f"window_{window}_cells"] = rows
-        print("position window", window, json.dumps(rows))
+        centre_w, centre_t = _widths_totals(layer, xyz, [centre], cell)
+        rows["calibration_cell"] = {"width_over_sigma": float(centre_w[0] / sigma), "total": float(centre_t[0])}
+        out[str(sigma)] = rows
+        print("position", sigma, json.dumps(rows))
     return out
 
 
@@ -149,7 +163,17 @@ def main() -> None:
     ap.add_argument("--sigma-max", type=float, default=40.0)
     ap.add_argument("--step", type=float, default=0.05)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--position-only", action="store_true",
+                    help="recompute only the position study and merge it into --json")
     args = ap.parse_args()
+
+    if args.position_only:
+        with open(args.json) as f:
+            out = json.load(f)
+        out["position"] = position_study(args.level, _nominal_cell(args.level))
+        with open(args.json, "w") as f:
+            json.dump(out, f, separators=(",", ":"))
+        return
 
     level = args.level
     cell = _nominal_cell(level)
@@ -272,7 +296,7 @@ def main() -> None:
         "switches_cells": switches,
         "summary": summary,
         "sigma_cells": [float(round(s, 4)) for s in sigmas],
-        "position": position_study(level, args.depth, cell),
+        "position": position_study(level, cell),
         "domain_edge": edge_study(),
         "rows": rows,
         "effective_cells": {

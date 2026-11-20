@@ -331,10 +331,12 @@ def test_range_errors_state_radians_and_cells():
 
 
 def test_width_spread_over_impulse_cells_inside_the_domain():
-    # The accuracy figure is for the calibration (centre) cell.  Other cells
-    # inside the domain (up to 60 cells from the centre, so far from the
-    # patch edge) are within the bounds below (measured: 0.993-1.027 at 3
-    # cells, 0.995-1.005 at 6, 0.998-1.002 at 9, 0.999-1.000 at 18).
+    # The accuracy figure is for the calibration (centre) cell.  Cells up to
+    # 60 cells from it (patch of 256 x 256 cells) stay within the bounds
+    # below (measured: 0.993-1.027 at 3 cells, 0.995-1.005 at 6, 0.998-1.002
+    # at 9, 0.999-1.000 at 18).  A wider sample varies more: up to 240 cells
+    # from the calibration cell the spread is 0.92-1.04 at 3 cells, and
+    # impulses within 5 sigma of the patch edge lose their tail (see docs).
     ids, centre, dist0 = _patch(LEVEL, DEPTH, "WGS84")
     import healpix_geo.nested as hgn
 
