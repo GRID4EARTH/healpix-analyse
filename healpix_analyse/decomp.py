@@ -139,13 +139,15 @@ class HealPixDecomp(nn.Module):
         Matched synthesis normalisation.  Exact pyramid reconstruction does
         not depend on this choice because the prediction is stored as a
         residual, but it changes the interpretation of individual bands.
-    down_mode : {"smooth", "mean"}, default="smooth"
+    down_mode : {"smooth", "smooth_conservative", "mean"}, default="smooth"
         ``HealPixDown`` mode of every analysis step.  ``"mean"`` averages the
         4 NESTED children, so the coarse band keeps the global mean of a
         full-sphere map; with ``up_norm="col_l1"`` the paired Up copies each
         parent to its children (a Haar-like pyramid whose detail bands sum
         to zero over every group of 4 children).  Gaussian parameters are
-        ignored with ``"mean"``.  Reconstruction stays exact either way.
+        ignored with ``"mean"``.  ``"smooth_conservative"`` keeps the Gaussian
+        filter and adds one offset per step so that the coarse band keeps the
+        global mean.  Reconstruction stays exact either way.
     dtype, device : optional
         PyTorch execution options.  CUDA is selected when available.
 
@@ -189,8 +191,12 @@ class HealPixDecomp(nn.Module):
         if dtype not in (torch.float32, torch.float64):
             raise ValueError("dtype must be torch.float32 or torch.float64")
         self.down_mode = str(down_mode).lower().strip()
-        if self.down_mode not in ("smooth", "mean"):
-            raise ValueError("down_mode must be 'smooth' or 'mean'")
+        if self.down_mode not in (
+            "smooth", "smooth_conservative", "mean"
+        ):
+            raise ValueError(
+                "down_mode must be 'smooth', 'smooth_conservative' or 'mean'"
+            )
 
         self.level = int(level)
         requested_jmax = int(Jmax)
@@ -609,6 +615,8 @@ class HealPixDecomp(nn.Module):
             + (
                 "filter='symmetric Gaussian'"
                 if self.down_mode == "smooth"
+                else "filter='symmetric Gaussian + mean offset'"
+                if self.down_mode == "smooth_conservative"
                 else "filter='mean of 4 NESTED children'"
             )
             + f", up_norm={self.up_norm!r}"
