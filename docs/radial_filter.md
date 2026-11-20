@@ -411,7 +411,8 @@ straight-line distance, so a kernel that is wider than a strip of land puts
 weight on the far side of it, and land cells only act as zero padding. With it:
 
 - a blocked cell **receives nothing and gives nothing**: its row is empty (the
-  output there is zero) and it appears in no row (its input value is ignored);
+  output there is zero) and it appears in no row (its input value is ignored); the output there is zero
+  also with `renormalize_missing=True`;
 - a cell reaches another one only along a path of neighbouring non-blocked
   cells, and the kernel sees the length of the **shortest such path**, not the
   straight distance. A strait lets weight through at the water distance, an
@@ -446,7 +447,10 @@ The path on such a lattice is longer than the straight geodesic. Measured over
 the whole sphere (levels 3 to 7, `benchmarks/land_barrier_lattice.json`, no
 land): at most **1.10** within 30 degrees of the equator and up to **1.39** in
 the polar caps and just below them (above about 30 degrees), where the cells
-are more distorted; the mean is 1.04. The metrication error is therefore not
+are more distorted; the mean is 1.04. A check at levels 8 to 10 found up to
+1.42 near 41 to 45 degrees of latitude, and the ratio grows slowly with the
+level, so the search factor is 1.5 (`tests/test_land_barrier.py` guards the
+margin). The metrication error is therefore not
 the 8 % of a square lattice. It is removed instead of being tolerated: the same
 pair of cells is searched twice, with the blocked cells removed (`D`) and with
 every cell passable (`D0`), and the kernel sees
@@ -457,18 +461,21 @@ In open water `D = D0` and `d` is the straight distance. Near land `d` is the
 detour, with the lattice's own distortion divided out. `D >= D0`, so `d` is never
 shorter than the straight distance. Consequences:
 
-- A row with no blocked cell within `1.45 * truncate * sigma_m` (1.45 bounds
+- A row with no blocked cell within `1.5 * truncate * sigma_m` (1.5 bounds
   `D0 / straight`, with margin) takes a fast path, is built as without the
   barrier, and is equal to it (tested at 1e-12). With no blocked cell at all,
   or an empty `blocked_cells`, the result is identical to the operator without
   the option.
-- The search is closed on the cells within `1.45 * truncate * sigma_m` of the
+- The search is closed on the cells within `1.5 * truncate * sigma_m` of the
   row and runs, vectorised, for the rows that have a blocked cell inside that
   disc only. The cost therefore grows with the length of the coast, not with
   the size of the domain; build time and peak memory are given below. The
-  geometry is built at the 1.45 times larger radius whenever `blocked_cells` is
+  geometry is built at the 1.5 times larger radius whenever `blocked_cells` is
   given.
-- Near land the distance is the lattice detour divided by the lattice's own
+- **The water distance is a lattice path distance, corrected in open water; it is
+not a geodesic around the coast.** For example, the detour around the tip of a
+wall depends on the orientation of the wall relative to the lattice (measured
+7.9 to 11.3 cells for the same wall at different angles). Near land the distance is the lattice detour divided by the lattice's own
 factor for the unblocked pair. It equals the straight distance only where land
 does not change the shortest lattice path; where it does, the remaining error
 is the difference of the metrication of the two paths, which is not bounded
@@ -523,7 +530,7 @@ a delta at 1, 3 and 6 cells from the strip (sigma 2 cells): PR 81 0.128, 0.054,
 Time to build the operator (caches cleared, 8125 cells, strip of 192 land
 cells, `"full_disc"`): sigma 1 cell 0.42 s (PR 81) against 0.56 s, peak memory
 63 against 111 MiB; sigma 2 cells 1.4 s against 2.5 s, 194 against 366 MiB (the
-memory is that of the geometry at 1.45 times the radius).
+memory is that of the geometry at 1.5 times the radius).
 
 Real land mask of the pangeo-fish demo (tag A19124 emission file, level 10,
 39 388 cells of which 29.6 % are land, read from disk, no download; sigma 1 and
@@ -551,9 +558,14 @@ this domain (the cost grows with the square of sigma).
 
 - Sigma that is large compared with the domain or with the width of a channel:
   the disc then holds much of the domain, and the search and the geometry (at
-  1.45 times the radius) are as large as the dense operator.
-- Cost near long coasts: every row within `1.45 * truncate * sigma_m` of land is
+  1.5 times the radius) are as large as the dense operator.
+- Cost near long coasts: every row within `1.5 * truncate * sigma_m` of land is
   searched; a coast that runs through the whole domain makes this every row.
+  Measured on the 8125-cell level-10 domain with a long coast (1596 land
+  cells), `"source"` with `"matched"`, barrier against none: sigma 1 cell 0.61
+  against 0.42 s and 585 against 438 MiB; sigma 2 cells 3.6 against 1.3 s and
+  983 against 532 MiB; sigma 4 cells 25.7 against 5.2 s and 2730 against
+  1352 MiB.
 - The lattice metrication is divided out, but not for pairs whose shortest
   lattice path changes because of land (see above).
 - Real coasts were tried on one demo domain only; GPU and dask were not tried.

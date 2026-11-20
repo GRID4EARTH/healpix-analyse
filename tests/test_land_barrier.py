@@ -171,13 +171,39 @@ def _reference_column(ids, blocked_ids, source, sigma_cells=SIGMA_CELLS):
 # -------------------------------------------------------------------- tests
 
 
-def test_search_factor_covers_the_lattice():
-    """D0 / straight stays below the search factor on a sample of the grid."""
-    ids = _patch(12)
-    table = domain_neighbour_table(ids, LEVEL)
-    assert table.shape == (ids.size, 8)
-    assert np.all(table[(table >= 0)] < ids.size)
-    assert _SEARCH_FACTOR >= 1.4
+@pytest.mark.parametrize(
+    ("level", "lon", "lat"), [(8, 0.0, 45.0), (8, 10.0, 70.0), (10, 354.0, 48.0), (9, 0.0, 41.0)]
+)
+def test_search_factor_covers_the_lattice(level, lon, lat):
+    """Lattice path / straight distance stays below the search factor."""
+    from healpix_analyse._land_barrier import edge_lengths, path_distances
+    from healpix_analyse._neighbourhood import build_metric_neighbourhood_geometry
+
+    centre = np.asarray(
+        nested.lonlat_to_healpix(np.array([lon]), np.array([lat]), level, ellipsoid="WGS84"),
+        dtype=np.uint64,
+    )
+    ring = np.asarray(nested.kth_neighbourhood(centre, level, 30))[0]
+    ids = ring[ring >= 0].astype(np.uint64)
+    cell = _cell_size_m(level)
+    radius = 10.0 * cell
+    # a search disc well beyond the evaluated one, so that paths stay inside
+    geometry = build_metric_neighbourhood_geometry(ids, 1.8 * radius, level)
+    table = domain_neighbour_table(ids, level)
+    length = edge_lengths(ids, table, level)
+    allowed = passable_edges(table, np.zeros(ids.size, bool))
+    rows = np.repeat(np.arange(ids.size), np.diff(geometry.row_offsets))
+    columns = geometry.neighbour_indices.astype(np.int64)
+    _, free = path_distances(rows, columns, ids.size, table, length, allowed)
+    keep = (rows != columns) & (geometry.distance_m <= radius)
+    # centre of the patch only: the disc of a cell near its edge is cut
+    core = np.asarray(nested.kth_neighbourhood(centre, level, 14))[0]
+    inner = np.isin(ids, core[core >= 0].astype(np.uint64))
+    keep &= inner[rows]
+    ratio = free[keep] / geometry.distance_m[keep]
+    assert ratio.size > 1000
+    assert ratio.max() < _SEARCH_FACTOR - 0.03
+    assert _SEARCH_FACTOR >= 1.5
 
 
 @pytest.mark.parametrize("blocked", [None, np.array([], dtype=np.uint64)])
@@ -213,7 +239,7 @@ def test_blocked_cells_outside_the_domain_are_ignored():
 
 @pytest.mark.parametrize("normalization", ["present", "full_disc"])
 def test_open_water_far_from_land_equals_plain(normalization):
-    """Rows with no blocked cell within 1.45 R are the plain rows."""
+    """Rows with no blocked cell within 1.5 R are the plain rows."""
     land = _strip(0, 1.0, 3.0)
     plain = _dense(_operator(None, normalization=normalization))
     barrier = _dense(_operator(land, normalization=normalization))
@@ -519,3 +545,20 @@ def test_passable_edges_blocks_a_diagonal_chain():
     assert passable_edges(table, blocked)[centre, slot]
     blocked[other] = True
     assert not passable_edges(table, blocked)[centre, slot]
+
+
+@pytest.mark.parametrize("normalization", ["present", "full_disc", "source"])
+@pytest.mark.parametrize("renormalize_missing", [False, True])
+def test_blocked_cells_are_zero_not_nan(normalization, renormalize_missing):
+    land = _strip(0, 3.0, 10.0)
+    op = _operator(land, normalization=normalization)
+    blocked = np.isin(IDS, land)
+    values = np.random.default_rng(1).random((2, IDS.size))
+    out = apply_filter_operator(values, *op, renormalize_missing=renormalize_missing)
+    assert not np.isnan(out).any()
+    assert np.all(out[:, blocked] == 0.0)
+    out_torch = apply_filter_operator(
+        torch.from_numpy(values), *op, renormalize_missing=renormalize_missing
+    )
+    assert not torch.isnan(out_torch).any()
+    assert torch.all(out_torch[:, torch.from_numpy(blocked)] == 0.0)

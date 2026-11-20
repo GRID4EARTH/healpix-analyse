@@ -1190,7 +1190,7 @@ def gaussian_filter_operator(
     path between the same two cells when nothing is blocked, which removes
     the metrication error of the lattice (up to 10 % in the equatorial belt
     and 40 % in the polar caps of the grid).  Far from blocked cells (no
-    blocked cell within ``1.45 * truncate * sigma_m``) the operator is the one
+    blocked cell within ``1.5 * truncate * sigma_m``) the operator is the one
     without ``blocked_cells``; near them the distance equals the straight one
     wherever blocking does not change the shortest lattice path.  Only the
     rows near blocked cells are searched, so the cost grows with the length
@@ -1386,7 +1386,9 @@ def apply_filter_operator(
     Returns
     -------
     numpy.ndarray or torch.Tensor
-        Shape ``values.shape[:-1] + (len(row_offsets) - 1,)``.  NumPy input
+        Shape ``values.shape[:-1] + (len(row_offsets) - 1,)``.  A row without
+        entries (a blocked cell) is zero, also with ``renormalize_missing=True``.
+        NumPy input
         gives NumPy output; Torch input stays on its device and keeps
         autograd with respect to ``values``.
     """
@@ -1398,13 +1400,23 @@ def apply_filter_operator(
             f"{values.shape[-1]}, but the operator was built for "
             f"{n_columns} cells."
         )
-    return compact_weighted_neighbourhood_reduce(
+    result = compact_weighted_neighbourhood_reduce(
         values,
         column_indices,
         row_offsets,
         weights,
         normalize=bool(renormalize_missing),
     )
+    # A row without any entry (the row of a blocked cell) is zero, also with
+    # renormalize_missing=True, where 0 / 0 would give NaN.
+    empty = np.diff(np.asarray(row_offsets)) == 0
+    if empty.any():
+        if isinstance(result, torch.Tensor):
+            mask = torch.from_numpy(empty).to(result.device)
+            result = result.masked_fill(mask, 0.0)
+        else:
+            result = np.where(empty, 0.0, result)
+    return result
 
 
 def radial_filter(

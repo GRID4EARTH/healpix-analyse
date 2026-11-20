@@ -54,9 +54,11 @@ from healpix_geo import nested
 
 # Bound of ``D0 / straight`` over the pairs of the search disc.  Measured on
 # the whole sphere, levels 3 to 7 (benchmarks/land_barrier_lattice.json): at
-# most 1.10 within 30 degrees of the equator and 1.40 in the polar caps,
-# where the cells are more distorted.  1.45 leaves a margin.
-_SEARCH_FACTOR = 1.45
+# most 1.10 within 30 degrees of the equator and 1.39 in the polar caps and
+# just below them; an independent check found 1.422 at level 8 near lon 0,
+# lat 45.  The ratio grows slowly with the level.  1.5 leaves a margin, which
+# tests/test_land_barrier.py checks on a patch at level 8 and 10.
+_SEARCH_FACTOR = 1.5
 
 # Candidate pairs handled at once; bounds the temporary (pairs, 8) tables.
 _CHUNK_PAIRS = 200_000
