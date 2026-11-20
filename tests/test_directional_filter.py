@@ -846,3 +846,49 @@ def test_torch_empty_domain_returns_empty_tensor():
     assert result.shape == (0,)
     assert result.dtype == values.dtype
     assert result.device == values.device
+
+
+@pytest.mark.parametrize("level", [5, 7, 9])
+@pytest.mark.parametrize("first_cell", [0, 3000, 9000])
+def test_centre_cell_has_exact_zero_distance_and_bearing(level, first_cell):
+    """pyproj returns ~1e-10 m self-distances for some cells; the convention
+    "centre cell has distance 0 and relative bearing 0" must hold for all."""
+    from healpix_analyse._neighbourhood import (
+        relative_geometry_from_neighbours,
+    )
+    from healpix_analyse.directional_filter import _wrap_relative_bearing
+
+    npix = 12 * 4**level
+    cells = (first_cell + np.arange(2000, dtype=np.int64)) % npix
+    neighbours = np.stack([cells, (cells + 1) % npix], axis=1)
+
+    geometry = relative_geometry_from_neighbours(cells, neighbours, level)
+
+    assert np.all(geometry.distance_m[:, 0] == 0.0)
+    assert np.all(geometry.east_offset_m[:, 0] == 0.0)
+    assert np.all(geometry.north_offset_m[:, 0] == 0.0)
+    bearing = _wrap_relative_bearing(
+        geometry.azimuth_rad, 1.0, geometry.valid_mask, geometry.distance_m
+    )
+    assert np.all(bearing[:, 0] == 0.0)
+
+
+def test_directional_filter_sector_kernel_has_no_nan_at_self_distance_noise():
+    """Regression: 1360 of 6000 cells returned NaN at level 7."""
+    import healpix_geo
+
+    level = 7
+    cells = np.arange(3000, 9000, dtype=np.uint64)
+    _, lat = healpix_geo.nested.healpix_to_lonlat(cells, level)
+
+    result = directional_filter(
+        lat,
+        cells,
+        level,
+        max_distance_m=40000.0,
+        azimuth_rad=0.0,
+        kernel=lambda d, th: (np.abs(th) <= np.deg2rad(20.0)) * 1.0,
+        normalize=True,
+    )
+
+    assert not np.any(np.isnan(result))
