@@ -98,9 +98,15 @@ compact kernel.
 
 Conventions: all widths are **one-axis RMS widths**,
 `sqrt(sum(w d**2) / (2 sum(w)))` for the response `w` and the angular
-distance `d` to the impulse cell. This is the sigma of a Gaussian, not its
-FWHM (2.355 sigma). Functions take and return **radians**. "Cell" means the
-nominal cell size `sqrt(4 pi / 12) / 2**level` (0.00100 rad at level 10).
+distance `d` to the impulse cell. This is the standard deviation of a
+Gaussian, the same quantity as `sigma_m` of {doc}`gaussian_filter
+<radial_filter>`, not its FWHM (2.355 sigma). Functions take and return
+**radians**; `gaussian_plan` and `LargeConv.from_gaussian` also accept
+`sigma_m` in metres, converted with the cell size of `gaussian_filter`
+(square root of the cell area on the authalic sphere), so that a width in
+metres means the same in both. "Cell" means the nominal cell size
+`sqrt(4 pi / 12) / 2**level` (0.00100 rad at level 10), which is that cell
+size divided by the authalic radius.
 
 | Levels | `down_up_blur`, level 10 (cells) | (rad) |
 |---:|---:|---:|
@@ -208,8 +214,10 @@ differ, as follows.
   1.05 of the input in the table above, for the plan and for the automatic
   rule alike. Constants are preserved when the kernel sums to one, but the
   integral of a field is not. A conservative smoothing would need another
-  operator, such as a conservative FFT projection; for narrow widths see
-  `gaussian_filter`.
+  operator, such as a conservative FFT projection; `gaussian_filter` with
+  `normalization="present"` normalises each row to one over the cells present
+  (and `"full_disc"` loses the mass that leaves the domain), see
+  {doc}`radial_filter`.
 - **Tail near the patch edge (measurement artefact and domain edge).** On
   the same patch, cells up to 20 cells from the edge (sampling window of
   236 cells half-width, 29 to 118 plan blocks) give width / sigma 0.985 to
@@ -242,7 +250,9 @@ Limits:
   2.21 cells (0.0022 rad) at level 10 near the equator, 2.75 cells at 55
   degrees latitude. Below it `gaussian_plan` raises `ValueError` (the message
   gives radians and cells). Narrower widths are not in this class: use
-  `gaussian_filter`.
+  `gaussian_filter` ({doc}`radial_filter`), which with `width_rule="matched"`
+  reaches the requested width down to about half a cell (its default `"sampled"` is narrower than requested
+  below about one cell).
 - **Widest width.** Set by `max_levels` and the calibration patch
   (`min(level, patch_depth) - 3` levels, 5 at level 10) and the largest
   calibrated compact width (2.25 coarse cells); `gaussian_plan` raises

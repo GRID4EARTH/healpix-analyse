@@ -398,3 +398,24 @@ def test_partial_domain_edge_is_a_zero_padding_effect():
     const = np.asarray(layer(np.ones(ids.size))).ravel()
     assert const[np.argmin(r)] == pytest.approx(1.0, abs=1e-3)
     assert 0.9 < const.min() < 1.0     # a constant drops near the edge
+
+
+def test_sigma_m_is_the_sigma_m_of_gaussian_filter():
+    from healpix_analyse.radial_filter import _cell_size_m
+
+    level = 8
+    sigma_m = 4.0 * _cell_size_m(level)  # four cells of gaussian_filter
+    plan_m = gaussian_plan(level, sigma_m=sigma_m, patch_depth=7)
+    plan_rad = gaussian_plan(level, 4.0 * _nominal_cell(level), patch_depth=7)
+    assert plan_m.n_levels == plan_rad.n_levels
+    assert plan_m.compact_sigma == pytest.approx(plan_rad.compact_sigma, rel=1e-12)
+    assert plan_m.sigma == pytest.approx(plan_rad.sigma, rel=1e-12)
+
+
+def test_exactly_one_of_sigma_and_sigma_m():
+    with pytest.raises(ValueError, match="exactly one"):
+        gaussian_plan(LEVEL)
+    with pytest.raises(ValueError, match="exactly one"):
+        gaussian_plan(LEVEL, 3 * CELL, sigma_m=1000.0)
+    with pytest.raises(ValueError, match="sigma_m must be"):
+        gaussian_plan(LEVEL, sigma_m=-1.0)

@@ -445,9 +445,10 @@ class LargeConv(nn.Module):
     def from_gaussian(
         cls,
         level: int,
-        sigma: float,
+        sigma: Optional[float] = None,
         cell_ids=None,
         *,
+        sigma_m: Optional[float] = None,
         channels: int = 1,
         reference_cell: Optional[int] = None,
         max_levels: Optional[int] = None,
@@ -463,6 +464,11 @@ class LargeConv(nn.Module):
     ) -> "LargeConv":
         """Gaussian smoothing layer of width ``sigma`` (radians, one-axis RMS).
 
+        The width is given in radians as ``sigma`` or in metres as
+        ``sigma_m`` (the standard deviation of ``gaussian_filter``, converted
+        with its cell size: square root of the cell area on the authalic
+        sphere).
+
         One call: it computes :func:`gaussian_plan`, builds the layer with the
         same options and sets the kernel.  The calibration location is the
         block that contains ``reference_cell``; by default a cell at the
@@ -473,7 +479,7 @@ class LargeConv(nn.Module):
         and the limits.
         """
         plan = gaussian_plan(
-            level, sigma, max_levels=max_levels, ellipsoid=ellipsoid,
+            level, sigma, sigma_m=sigma_m, max_levels=max_levels, ellipsoid=ellipsoid,
             radius_deg=radius_deg, sigma_deg=sigma_deg, weight_norm=weight_norm,
             up_norm=up_norm, patch_depth=patch_depth,
             reference_cell=reference_cell, cell_ids=cell_ids,
@@ -720,10 +726,42 @@ def _plan_state(level, depth, max_levels):
     return top
 
 
+def _resolve_sigma(level: int, sigma, sigma_m) -> float:
+    """Width in radians from ``sigma`` (radians) or ``sigma_m`` (metres).
+
+    Metres are converted with the cell size of ``gaussian_filter`` (square
+    root of the cell area on the authalic sphere), so that ``sigma_m`` means
+    the same here and there.
+    """
+    if (sigma is None) == (sigma_m is None):
+        raise ValueError(
+            "sigma must be given as exactly one of sigma (radians) or sigma_m (metres)"
+        )
+    if sigma_m is not None:
+        from healpix_analyse.radial_filter import _cell_size_m
+
+        try:
+            sigma_m = float(sigma_m)
+        except (TypeError, ValueError):
+            raise ValueError(f"sigma_m must be a positive finite number, got {sigma_m!r}") from None
+        if not (math.isfinite(sigma_m) and sigma_m > 0.0):
+            raise ValueError(f"sigma_m must be a positive finite number, got {sigma_m!r}")
+        level = _as_int("level", level, 0)
+        return sigma_m / _cell_size_m(level) * _nominal_cell(level)
+    try:
+        sigma = float(sigma)
+    except (TypeError, ValueError):
+        raise ValueError(f"sigma must be a positive finite number, got {sigma!r}") from None
+    if not (math.isfinite(sigma) and sigma > 0.0):
+        raise ValueError(f"sigma must be a positive finite number, got {sigma!r}")
+    return sigma
+
+
 def gaussian_plan(
     level: int,
-    sigma: float,
+    sigma: Optional[float] = None,
     *,
+    sigma_m: Optional[float] = None,
     max_levels: Optional[int] = None,
     ellipsoid: str = "WGS84",
     radius_deg: Optional[float] = None,
@@ -736,8 +774,11 @@ def gaussian_plan(
 ) -> GaussianPlan:
     """Levels and compact Gaussian that give a response of width ``sigma``.
 
-    ``sigma`` is the one-axis RMS width in **radians** (the sigma of a
-    Gaussian, as in :func:`down_up_blur`).  This function is for inspection;
+    ``sigma`` is the one-axis RMS width in **radians** (the standard
+    deviation of a Gaussian, as in :func:`down_up_blur`); ``sigma_m`` is the
+    same width in **metres**, the ``sigma_m`` of ``gaussian_filter``, which
+    is converted with the same cell size (square root of the cell area on the
+    authalic sphere); give exactly one of them.  This function is for inspection;
     to build a layer use ``LargeConv.from_gaussian(level, sigma, cell_ids)``,
     which is the same as::
 
@@ -775,12 +816,7 @@ def gaussian_plan(
     :meth:`LargeConv.from_gaussian` does all of this in one call.
     """
     level = _as_int("level", level, 0)
-    try:
-        sigma = float(sigma)
-    except (TypeError, ValueError):
-        raise ValueError(f"sigma must be a positive finite number, got {sigma!r}") from None
-    if not (math.isfinite(sigma) and sigma > 0.0):
-        raise ValueError(f"sigma must be a positive finite number, got {sigma!r}")
+    sigma = _resolve_sigma(level, sigma, sigma_m)
     patch_depth = _as_int("patch_depth", patch_depth, 1)
     depth = min(patch_depth, level)
     if reference_cell is None and cell_ids is not None:
