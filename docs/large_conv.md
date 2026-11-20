@@ -86,6 +86,54 @@ When the requested kernel already fits within the configured maximum, no
 resolution change is performed and `LargeConv` reduces to one `HealPixConv`
 plus its fine-resolution bias and optional normalisation.
 
+## Width of a smoothing: the Down/Up blur floor
+
+Each Down/Up pair blurs by itself, whatever the compact kernel is. With
+`n` levels the output cannot be narrower than the blur of those `n` pairs,
+which `down_up_blur(level, n)` measures (response to one cell with a
+point-like compact kernel; one-axis RMS width in radians):
+
+| Levels | Blur at level 10 (cells) | Blur (rad) |
+|---:|---:|---:|
+| 1 | 2.01 | 0.00201 |
+| 2 | 4.20 | 0.00419 |
+| 3 | 8.33 | 0.00832 |
+| 4 | 16.5 | 0.0165 |
+
+With the automatic rule, a caller that fits a width (for example an
+optimiser on a Gaussian width) sees a staircase: the number of levels follows
+from `kernel_sz`, the width sits on the floor of that level, and widths
+between two floors, or just above a switch, cannot be obtained. The cost as a
+function of the width is then constant on these intervals.
+
+To avoid it, pick the levels from the width and pass them:
+
+```python
+from healpix_analyse import LargeConv, levels_for_width
+
+n = levels_for_width(level, sigma_rad)      # largest n with blur(n) <= sigma
+layer = LargeConv(level, 1, 1, kernel_sz, n_levels=n, cell_ids=cell_ids)
+# compact Gaussian of width sqrt(sigma**2 - blur(n)**2) / 2**n coarse cells
+```
+
+`n_levels` is optional and the default is unchanged. When it is given,
+`max_compact_kernel_sz` is not applied: the compact kernel size is
+`2 ceil(r_f / 2**n) + 1`, so a width just above a floor needs a larger
+compact kernel and a slower build than the automatic choice would allow.
+Which number of levels a width needs, and how the Gaussian is sampled,
+remain the caller's choice.
+
+Measured at level 10 on a 256 x 256 cell patch near the equator
+(`benchmarks/benchmark_largeconv_widths.py`, output in
+`benchmarks/results/largeconv-widths.json`): with the automatic rule the
+effective width is 2.01, 4.20, 8.33 and 16.5 cells on the four plateaus;
+with `levels_for_width` it follows the requested width within 5.5 % from 2 to
+10 cells across three switches (largest deviation 4.0 % below, 5.5 % above at
+the edge of the first interval). Below about 1.2 cells the fine-level compact
+kernel itself blurs by about 0.8 cells (bilinear stencil) and the width cannot
+follow either. Measured on one domain, one level, on CPU and with the
+WGS84 ellipsoid only.
+
 ## Why the compact kernel is learned directly
 
 Naively resizing a `33×33` array to `5×5` would ignore:

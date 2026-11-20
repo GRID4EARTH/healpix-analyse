@@ -26,6 +26,13 @@
   HEALPIX-GEO 0.4.0 direct-sum benchmark
   (`benchmarks/results/geo040-performance/`), so that the first-call and
   cache timings of `gaussian_filter` can be cited and re-run.
+- `LargeConv(n_levels=...)`, `down_up_blur` and `levels_for_width`: the number
+  of Down/Up levels can be chosen by the caller, and the blur that `n` levels
+  add on their own (the smallest width they can produce) is measured and
+  exposed, so a fitted width no longer sits on the plateaus of the automatic
+  level rule. At level 10 the plateaus are 2.0, 4.2, 8.3 and 16.5 cells; with
+  levels chosen from the width, the effective width follows the requested
+  one within 5.5 % from 2 to 10 cells. The default behaviour is unchanged.
 - `HealPixGeoFFT` / `geo_fft_convolve`: FFT convolution of a block inside one
   base face with a wide kernel sampled on geodesic distances and azimuths from
   the block centre (predefined families in metres, kilometres, degrees or

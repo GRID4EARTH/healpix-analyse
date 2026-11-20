@@ -1,0 +1,798 @@
+{
+ "level": 10,
+ "patch_cells": 65536,
+ "cell_rad": 0.0009993424882289927,
+ "down_up_blur_cells": {
+  "0": 0.0,
+  "1": 2.012412988236407,
+  "2": 4.196386012975376,
+  "3": 8.330359459720349,
+  "4": 16.486733128034988
+ },
+ "rows": [
+  {
+   "sigma_cells": 0.4,
+   "kernel_sz": 5,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.4,
+    "effective_cells": 0.7857365036077187,
+    "mass": 0.9958856733222814
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.4,
+    "effective_cells": 0.7857365036077187,
+    "mass": 0.9958856733222814
+   }
+  },
+  {
+   "sigma_cells": 0.4277,
+   "kernel_sz": 5,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.4277,
+    "effective_cells": 0.8044258381959408,
+    "mass": 0.995885706810236
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.4277,
+    "effective_cells": 0.8044258381959408,
+    "mass": 0.995885706810236
+   }
+  },
+  {
+   "sigma_cells": 0.4574,
+   "kernel_sz": 5,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.4574,
+    "effective_cells": 0.8260131828400931,
+    "mass": 0.9958857341955998
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.4574,
+    "effective_cells": 0.8260131828400931,
+    "mass": 0.9958857341955998
+   }
+  },
+  {
+   "sigma_cells": 0.4891,
+   "kernel_sz": 5,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.4891,
+    "effective_cells": 0.8495569405147654,
+    "mass": 0.9958858376337574
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.4891,
+    "effective_cells": 0.8495569405147654,
+    "mass": 0.9958858376337574
+   }
+  },
+  {
+   "sigma_cells": 0.5231,
+   "kernel_sz": 5,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.5231,
+    "effective_cells": 0.8744452911220029,
+    "mass": 0.9958858796476079
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.5231,
+    "effective_cells": 0.8744452911220029,
+    "mass": 0.9958858796476079
+   }
+  },
+  {
+   "sigma_cells": 0.5593,
+   "kernel_sz": 5,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.5593,
+    "effective_cells": 0.9001268557046499,
+    "mass": 0.9958859293261655
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.5593,
+    "effective_cells": 0.9001268557046499,
+    "mass": 0.9958859293261655
+   }
+  },
+  {
+   "sigma_cells": 0.5981,
+   "kernel_sz": 5,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.5981,
+    "effective_cells": 0.9268441343354933,
+    "mass": 0.9958859780346955
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.5981,
+    "effective_cells": 0.9268441343354933,
+    "mass": 0.9958859780346955
+   }
+  },
+  {
+   "sigma_cells": 0.6396,
+   "kernel_sz": 5,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.6396,
+    "effective_cells": 0.9549638537822303,
+    "mass": 0.9958860183525943
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.6396,
+    "effective_cells": 0.9549638537822303,
+    "mass": 0.9958860183525943
+   }
+  },
+  {
+   "sigma_cells": 0.684,
+   "kernel_sz": 7,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.684,
+    "effective_cells": 0.98538150536337,
+    "mass": 0.995886071515143
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.684,
+    "effective_cells": 0.98538150536337,
+    "mass": 0.995886071515143
+   }
+  },
+  {
+   "sigma_cells": 0.7314,
+   "kernel_sz": 7,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.7314,
+    "effective_cells": 1.0184508361326632,
+    "mass": 0.9958860980773059
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.7314,
+    "effective_cells": 1.0184508361326632,
+    "mass": 0.9958860980773059
+   }
+  },
+  {
+   "sigma_cells": 0.7822,
+   "kernel_sz": 7,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.7822,
+    "effective_cells": 1.0549721409350288,
+    "mass": 0.9958861512760382
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.7822,
+    "effective_cells": 1.0549721409350288,
+    "mass": 0.9958861512760382
+   }
+  },
+  {
+   "sigma_cells": 0.8364,
+   "kernel_sz": 7,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.8364,
+    "effective_cells": 1.0952026423878627,
+    "mass": 0.9958861717563544
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.8364,
+    "effective_cells": 1.0952026423878627,
+    "mass": 0.9958861717563544
+   }
+  },
+  {
+   "sigma_cells": 0.8944,
+   "kernel_sz": 7,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.8944,
+    "effective_cells": 1.139514059813447,
+    "mass": 0.9958861586892372
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.8944,
+    "effective_cells": 1.139514059813447,
+    "mass": 0.9958861586892372
+   }
+  },
+  {
+   "sigma_cells": 0.9565,
+   "kernel_sz": 7,
+   "default": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.9565,
+    "effective_cells": 1.1880085988529185,
+    "mass": 0.9958861757629773
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 0.9565,
+    "effective_cells": 1.1880085988529185,
+    "mass": 0.9958861757629773
+   }
+  },
+  {
+   "sigma_cells": 1.0228,
+   "kernel_sz": 9,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.0228,
+    "effective_cells": 1.2426081012995467,
+    "mass": 0.9958861835880037
+   }
+  },
+  {
+   "sigma_cells": 1.0937,
+   "kernel_sz": 9,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.0937,
+    "effective_cells": 1.30135040051587,
+    "mass": 0.995886192729055
+   }
+  },
+  {
+   "sigma_cells": 1.1696,
+   "kernel_sz": 9,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.1696,
+    "effective_cells": 1.3652590838669458,
+    "mass": 0.9958861957980244
+   }
+  },
+  {
+   "sigma_cells": 1.2507,
+   "kernel_sz": 9,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.2507,
+    "effective_cells": 1.4341195307524273,
+    "mass": 0.995886169343105
+   }
+  },
+  {
+   "sigma_cells": 1.3375,
+   "kernel_sz": 11,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.3375,
+    "effective_cells": 1.5118800834507746,
+    "mass": 0.9958861912444356
+   }
+  },
+  {
+   "sigma_cells": 1.4302,
+   "kernel_sz": 11,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.4302,
+    "effective_cells": 1.5938234353700098,
+    "mass": 0.9958861685344607
+   }
+  },
+  {
+   "sigma_cells": 1.5294,
+   "kernel_sz": 11,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.5294,
+    "effective_cells": 1.6817335432756493,
+    "mass": 0.995886165489348
+   }
+  },
+  {
+   "sigma_cells": 1.6355,
+   "kernel_sz": 11,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.6355,
+    "effective_cells": 1.7750427702549942,
+    "mass": 0.9958861658774201
+   }
+  },
+  {
+   "sigma_cells": 1.749,
+   "kernel_sz": 13,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.749,
+    "effective_cells": 1.8839172127631147,
+    "mass": 0.9958861754223942
+   }
+  },
+  {
+   "sigma_cells": 1.8703,
+   "kernel_sz": 13,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 1.8703,
+    "effective_cells": 1.9938263824639404,
+    "mass": 0.9958861585620717
+   }
+  },
+  {
+   "sigma_cells": 2.0,
+   "kernel_sz": 13,
+   "default": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 2.012412988236407,
+    "mass": 0.9505076101286788
+   },
+   "levels_for_width": {
+    "n_levels": 0,
+    "compact_sigma_coarse": 2.0,
+    "effective_cells": 2.109359298884483,
+    "mass": 0.99588615083764
+   }
+  },
+  {
+   "sigma_cells": 2.1387,
+   "kernel_sz": 15,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.36201921729979186,
+    "effective_cells": 2.053195895412774,
+    "mass": 0.9505075284283229
+   }
+  },
+  {
+   "sigma_cells": 2.2871,
+   "kernel_sz": 15,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.5433738065957486,
+    "effective_cells": 2.266267445853486,
+    "mass": 0.9505068876259988
+   }
+  },
+  {
+   "sigma_cells": 2.4457,
+   "kernel_sz": 17,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.6949177028212434,
+    "effective_cells": 2.441597564102546,
+    "mass": 0.9505065566382871
+   }
+  },
+  {
+   "sigma_cells": 2.6153,
+   "kernel_sz": 17,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.8351628665681646,
+    "effective_cells": 2.6136074491210057,
+    "mass": 0.9505063973006818
+   }
+  },
+  {
+   "sigma_cells": 2.7967,
+   "kernel_sz": 19,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 0.9710464529024109,
+    "effective_cells": 2.7965744541858126,
+    "mass": 0.9505063382069241
+   }
+  },
+  {
+   "sigma_cells": 2.9907,
+   "kernel_sz": 19,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 1.1061736363222339,
+    "effective_cells": 2.9917744780724043,
+    "mass": 0.950506295015623
+   }
+  },
+  {
+   "sigma_cells": 3.1981,
+   "kernel_sz": 21,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 1.242782922997558,
+    "effective_cells": 3.199818250000642,
+    "mass": 0.9505062868697514
+   }
+  },
+  {
+   "sigma_cells": 3.42,
+   "kernel_sz": 23,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 1.3826237706601003,
+    "effective_cells": 3.4221915778619647,
+    "mass": 0.950506266941151
+   }
+  },
+  {
+   "sigma_cells": 3.6572,
+   "kernel_sz": 23,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 1.5268681839616522,
+    "effective_cells": 3.6592125224674197,
+    "mass": 0.9505062417589693
+   }
+  },
+  {
+   "sigma_cells": 3.9108,
+   "kernel_sz": 25,
+   "default": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 4.196386012975376,
+    "mass": 0.9544849218359509
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 1.6766447599877423,
+    "effective_cells": 3.9112054505254394,
+    "mass": 0.9505062310838002
+   }
+  },
+  {
+   "sigma_cells": 4.1821,
+   "kernel_sz": 27,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 1,
+    "compact_sigma_coarse": 1.8330408052453044,
+    "effective_cells": 4.183480195104943,
+    "mass": 0.9505062107603
+   }
+  },
+  {
+   "sigma_cells": 4.4721,
+   "kernel_sz": 29,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.38649246759353467,
+    "effective_cells": 4.344029240195779,
+    "mass": 0.9544852428062225
+   }
+  },
+  {
+   "sigma_cells": 4.7823,
+   "kernel_sz": 31,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.5734074533057096,
+    "effective_cells": 4.8519384785649455,
+    "mass": 0.9544862883914442
+   }
+  },
+  {
+   "sigma_cells": 5.114,
+   "kernel_sz": 33,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.7307248297967842,
+    "effective_cells": 5.231116607463986,
+    "mass": 0.9544868142244335
+   }
+  },
+  {
+   "sigma_cells": 5.4687,
+   "kernel_sz": 35,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 0.8766778242356421,
+    "effective_cells": 5.595892215231922,
+    "mass": 0.9544870327636551
+   }
+  },
+  {
+   "sigma_cells": 5.848,
+   "kernel_sz": 37,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 1.018253665292465,
+    "effective_cells": 5.976325701873253,
+    "mass": 0.9544870500855318
+   }
+  },
+  {
+   "sigma_cells": 6.2537,
+   "kernel_sz": 39,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 1.1591782682169898,
+    "effective_cells": 6.378884487553204,
+    "mass": 0.9544870393184539
+   }
+  },
+  {
+   "sigma_cells": 6.6874,
+   "kernel_sz": 43,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 1.301721532963767,
+    "effective_cells": 6.807376341495755,
+    "mass": 0.9544869954390783
+   }
+  },
+  {
+   "sigma_cells": 7.1512,
+   "kernel_sz": 45,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 1.4476274958985613,
+    "effective_cells": 7.264764013940663,
+    "mass": 0.954486915232392
+   }
+  },
+  {
+   "sigma_cells": 7.6472,
+   "kernel_sz": 47,
+   "default": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 8.330359459720349,
+    "mass": 0.9560493713534612
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 1.5982414607566464,
+    "effective_cells": 7.752785193392679,
+    "mass": 0.9544868490474523
+   }
+  },
+  {
+   "sigma_cells": 8.1777,
+   "kernel_sz": 51,
+   "default": {
+    "n_levels": 4,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 16.486733128034988,
+    "mass": 0.9571973308161374
+   },
+   "levels_for_width": {
+    "n_levels": 2,
+    "compact_sigma_coarse": 1.7547279297676148,
+    "effective_cells": 8.277731755256013,
+    "mass": 0.9544867552115637
+   }
+  },
+  {
+   "sigma_cells": 8.7449,
+   "kernel_sz": 55,
+   "default": {
+    "n_levels": 4,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 16.486733128034988,
+    "mass": 0.9571973308161374
+   },
+   "levels_for_width": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.3325654841965267,
+    "effective_cells": 8.438234290656922,
+    "mass": 0.9560495823578071
+   }
+  },
+  {
+   "sigma_cells": 9.3514,
+   "kernel_sz": 59,
+   "default": {
+    "n_levels": 4,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 16.486733128034988,
+    "mass": 0.9571973308161374
+   },
+   "levels_for_width": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.5311219438581128,
+    "effective_cells": 9.525416781278263,
+    "mass": 0.9560520108531758
+   }
+  },
+  {
+   "sigma_cells": 10.0,
+   "kernel_sz": 61,
+   "default": {
+    "n_levels": 4,
+    "compact_sigma_coarse": 0.0,
+    "effective_cells": 16.486733128034988,
+    "mass": 0.9571973308161374
+   },
+   "levels_for_width": {
+    "n_levels": 3,
+    "compact_sigma_coarse": 0.691523581393014,
+    "effective_cells": 10.358027191056605,
+    "mass": 0.9560535466950495
+   }
+  }
+ ]
+}

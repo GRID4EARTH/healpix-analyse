@@ -25,8 +25,17 @@ from healpix_analyse.up import HealPixUp
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
 
-def _kernel_plan(kernel_sz: int, max_compact_kernel_sz: int) -> tuple[int, int]:
-    """Return ``(n_levels, compact_kernel_sz)`` from fine-scale radii."""
+def _kernel_plan(
+    kernel_sz: int,
+    max_compact_kernel_sz: int,
+    n_levels: Optional[int] = None,
+) -> tuple[int, int]:
+    """Return ``(n_levels, compact_kernel_sz)`` from fine-scale radii.
+
+    With ``n_levels=None`` the smallest number of levels whose compact kernel
+    fits in ``max_compact_kernel_sz`` is chosen.  An explicit ``n_levels``
+    is used as given and ``max_compact_kernel_sz`` is not applied to it.
+    """
     if int(kernel_sz) != kernel_sz or int(kernel_sz) < 1 or int(kernel_sz) % 2 == 0:
         raise ValueError("kernel_sz must be a positive odd integer")
     if (
@@ -38,6 +47,11 @@ def _kernel_plan(kernel_sz: int, max_compact_kernel_sz: int) -> tuple[int, int]:
 
     fine_radius = (int(kernel_sz) - 1) // 2
     max_radius = (int(max_compact_kernel_sz) - 1) // 2
+    if n_levels is not None:
+        if isinstance(n_levels, bool) or int(n_levels) != n_levels or int(n_levels) < 0:
+            raise ValueError("n_levels must be an integer >= 0")
+        n_levels = int(n_levels)
+        return n_levels, 2 * math.ceil(fine_radius / (2**n_levels)) + 1
     if fine_radius == 0:
         return 0, 1
     if max_radius == 0:
@@ -128,6 +142,14 @@ class LargeConv(nn.Module):
         Requested positive odd fine-resolution kernel diameter.
     max_compact_kernel_sz : int, default=7
         Maximum positive odd kernel diameter at the coarse resolution.
+    n_levels : int, optional
+        Number of Down/Up levels.  By default it is chosen from
+        ``kernel_sz`` and ``max_compact_kernel_sz`` as described above.
+        When given, it is used as is, ``max_compact_kernel_sz`` is not
+        applied and the compact kernel size follows from ``kernel_sz``.
+        Each level adds a blur of its own (see :func:`down_up_blur`), so a
+        caller that needs a width below that blur chooses fewer levels
+        (see :func:`levels_for_width`).
     n_gauges, gauge_type, singularity_lonlat, ref_direction :
         Passed to the internal :class:`HealPixConv`.
     cell_ids : array-like, optional
@@ -161,6 +183,7 @@ class LargeConv(nn.Module):
         kernel_sz: int,
         *,
         max_compact_kernel_sz: int = 7,
+        n_levels: Optional[int] = None,
         n_gauges: int = 1,
         gauge_type: str = "phi",
         singularity_lonlat: Optional[tuple[float, float]] = None,
@@ -195,7 +218,7 @@ class LargeConv(nn.Module):
         self.kernel_sz = int(kernel_sz)
         self.max_compact_kernel_sz = int(max_compact_kernel_sz)
         self.n_levels, self.compact_kernel_sz = _kernel_plan(
-            self.kernel_sz, self.max_compact_kernel_sz
+            self.kernel_sz, self.max_compact_kernel_sz, n_levels
         )
         if self.nside // (2**self.n_levels) < 1:
             raise ValueError(
@@ -392,4 +415,83 @@ class LargeConv(nn.Module):
         )
 
 
-__all__ = ["LargeConv"]
+def down_up_blur(
+    level: int,
+    n_levels: int,
+    *,
+    ellipsoid: str = "WGS84",
+    radius_deg: Optional[float] = None,
+    sigma_deg: Optional[float] = None,
+    weight_norm: str = "l1",
+    up_norm: str = "col_l1",
+    patch_depth: int = 8,
+) -> float:
+    """Blur of ``n_levels`` Down/Up pairs alone, in radians.
+
+    This is the smallest width a :class:`LargeConv` with ``n_levels`` levels
+    can produce: the compact kernel is replaced by a point-like one and the
+    response to a single cell is measured.  The result is the one-axis RMS
+    width, ``sqrt(sum(w d^2) / (2 sum(w)))`` with ``d`` the angular distance
+    to the impulse cell.  It is measured on a patch of ``4**patch_depth``
+    cells near the equator, so it is meaningful while the blur is small
+    compared with ``2**patch_depth`` cells.  ``n_levels=0`` returns 0.
+    """
+    level = int(level)
+    n_levels = int(n_levels)
+    if n_levels < 0 or n_levels > level:
+        raise ValueError("n_levels must be between 0 and level")
+    if n_levels == 0:
+        return 0.0
+    import healpix_geo.nested as hgn
+
+    depth = min(int(patch_depth), level)
+    parent_level = level - depth
+    parent = 5 if parent_level == 0 else 5 * 4**parent_level + 3 * 4 ** (parent_level - 1)
+    ids = parent * 4**depth + np.arange(4**depth, dtype=np.int64)
+    lon, lat = hgn.healpix_to_lonlat(ids, level, ellipsoid=ellipsoid)
+    lon, lat = np.deg2rad(lon), np.deg2rad(lat)
+    xyz = np.stack(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1
+    )
+    centre = int(np.argmax(xyz @ xyz.mean(axis=0)))
+
+    layer = LargeConv(
+        level,
+        1,
+        1,
+        1,
+        n_levels=n_levels,
+        cell_ids=ids,
+        ellipsoid=ellipsoid,
+        radius_deg=radius_deg,
+        sigma_deg=sigma_deg,
+        weight_norm=weight_norm,
+        up_norm=up_norm,
+        dtype=torch.float64,
+        device="cpu",
+        cache_dir=None,
+    )
+    layer.set_compact_kernel(np.ones((1, 1, 1)))
+    impulse = np.zeros(ids.size)
+    impulse[centre] = 1.0
+    w = np.asarray(layer(impulse), dtype=np.float64).ravel()
+    d = np.arccos(np.clip(xyz @ xyz[centre], -1.0, 1.0))
+    return float(np.sqrt(np.sum(w * d**2) / (2.0 * np.sum(w))))
+
+
+def levels_for_width(level: int, width: float, max_levels: Optional[int] = None, **kwargs) -> int:
+    """Largest number of levels whose Down/Up blur does not exceed ``width``.
+
+    ``width`` is a one-axis RMS width in radians, ``kwargs`` are those of
+    :func:`down_up_blur`.  Adding a level only when the requested width is
+    above the blur of that level keeps the width reachable by the compact
+    kernel.  The result is at most ``max_levels`` (default ``level``).
+    """
+    top = level if max_levels is None else min(int(max_levels), int(level))
+    n = 0
+    while n < top and down_up_blur(level, n + 1, **kwargs) <= width:
+        n += 1
+    return n
+
+
+__all__ = ["LargeConv", "down_up_blur", "levels_for_width"]
