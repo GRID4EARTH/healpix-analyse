@@ -143,6 +143,12 @@ parent. On a partial sky, only one step is conservative by itself (weight
 the coarse band by `down_layers[0].coverage`); over several steps with
 incomplete parents the coarse band is a mean of means.
 
+With `down_mode="smooth_conservative"`, the analysis filter is the Gaussian of
+`HealPixDown(mode="smooth_conservative")`: the same weights as `"smooth"`
+plus one offset per step, so that the coarse band keeps the global mean of a
+NaN-free full-sphere map. Reconstruction stays exact; the paired `HealPixUp`
+uses the Gaussian matrix without the offset.
+
 The default combination is:
 
 ```python

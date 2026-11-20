@@ -366,7 +366,7 @@ def test_up_paired_with_mean_down_partial_sky(up_norm, expected):
 
 def test_up_rejects_maxpool_paired_down():
     down = HealPixDown(3, mode="maxpool", device="cpu")
-    with pytest.raises(ValueError, match="paired_down must use mode='smooth' or 'mean'"):
+    with pytest.raises(ValueError, match="paired_down must use mode='smooth', 'smooth_conservative' or 'mean'"):
         HealPixUp(2, paired_down=down, device="cpu")
 
 
@@ -400,7 +400,7 @@ def test_resampler_default_is_unchanged():
 @pytest.mark.parametrize("cls", [HealPixResampler, HealPixDecomp])
 def test_invalid_down_mode(cls):
     args = (5, 4) if cls is HealPixResampler else (5,)
-    with pytest.raises(ValueError, match="down_mode must be 'smooth' or 'mean'"):
+    with pytest.raises(ValueError, match="down_mode must be 'smooth', 'smooth_conservative' or 'mean'"):
         cls(*args, down_mode="maxpool", device="cpu")
 
 

@@ -84,10 +84,14 @@ class HealPixResampler(nn.Module):
         When omitted, every step uses its native resolution-dependent values.
     weight_norm : {"l1", "l2", "none"}, default="l1"
         Normalisation used by ``HealPixDown``.
-    down_mode : {"smooth", "mean"}, default="smooth"
+    down_mode : {"smooth", "smooth_conservative", "mean"}, default="smooth"
         ``HealPixDown`` mode used for each downscaling step.  ``"mean"``
         averages the 4 NESTED children, which conserves the global mean of
         a NaN-free full-sphere map; ``"smooth"`` (Gaussian) does not.
+        ``"smooth_conservative"`` is the Gaussian plus one global offset per
+        step that conserves the mean of a NaN-free map (see
+        :class:`~healpix_analyse.down.HealPixDown`); with missing values the
+        mean is not conserved.
         Each step averages the children available at that step: missing
         values are skipped (see Notes), and on a partial sky only the
         children present in ``in_cell_ids`` are used.  Over several steps
@@ -151,8 +155,12 @@ class HealPixResampler(nn.Module):
                 "up_norm must be 'adjoint', 'col_l1', or 'diag_l2'"
             )
         self.down_mode = str(down_mode).lower().strip()
-        if self.down_mode not in ("smooth", "mean"):
-            raise ValueError("down_mode must be 'smooth' or 'mean'")
+        if self.down_mode not in (
+            "smooth", "smooth_conservative", "mean"
+        ):
+            raise ValueError(
+                "down_mode must be 'smooth', 'smooth_conservative' or 'mean'"
+            )
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         resolved_device = torch.device(device)

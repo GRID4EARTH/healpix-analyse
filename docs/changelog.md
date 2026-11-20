@@ -3,6 +3,18 @@
 ## Unreleased
 
 ### Added
+- `HealPixDown(mode="smooth_conservative")`: the Gaussian smoothing of
+  `smooth` plus one global additive offset per input map, so that the mean of
+  the output equals the mean of the input (to round-off, full sphere; on a
+  partial sky the `coverage`-weighted mean). Constants are preserved and
+  information still crosses parent boundaries, which `mean` does not allow.
+  `delta` is built from finite values only, so a NaN stays local (the finite
+  output cells have the mean of the finite input cells, over different
+  cells). The shift is uniform, so a negative `delta` can make a
+  non-negative field slightly negative. No new dependency.
+  `sparse_matrix()` returns the Gaussian part without the offset.
+  Accepted as `down_mode` by `HealPixResampler`, `resample_healpix` and
+  `HealPixDecomp`, and by `HealPixUp(paired_down=...)`.
 - `radial_filter` and `gaussian_filter` take `normalization="present"`
   (default, the existing behaviour) or `"full_disc"`: the weights are divided
   by their sum over the whole kernel disc, cells outside the domain included
