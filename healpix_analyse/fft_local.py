@@ -37,6 +37,7 @@ def check_kernel_width(
     floor_px: float = PROJECTION_BLUR_FLOOR_PX,
     *,
     on_below: str = "warn",
+    stacklevel: int = 2,
 ) -> bool:
     """Check a Gaussian width against the blur floor of the projection pair.
 
@@ -48,6 +49,9 @@ def check_kernel_width(
         Blur floor in grid pixels.
     on_below : {"warn", "error", "ignore"}
         What to do when ``sigma_px < floor_px``.
+    stacklevel : int, default=2
+        Passed to :func:`warnings.warn`; the default points the warning at the
+        caller of this function.
 
     Returns
     -------
@@ -70,7 +74,7 @@ def check_kernel_width(
     if on_below == "error":
         raise ValueError(message)
     if on_below == "warn":
-        warnings.warn(message, UserWarning, stacklevel=3)
+        warnings.warn(message, UserWarning, stacklevel=stacklevel)
     return False
 
 
@@ -214,12 +218,15 @@ class LocalFFT(nn.Module):
         grid point by its accumulated interpolation weight after scattering,
         so a constant field stays constant, but the sum over the cells is not
         kept by a convolution.  ``"conservative"`` scatters without that
-        division and divides on the back-projection side, so the two steps are
-        transposes of one another: the sum over the cells is kept (a
-        probability map stays normalised), and mass that a convolution moves
-        outside the covered grid points is lost.  A constant field is kept by
+        division and divides the grid by that weight just before the
+        back-projection gather, so each grid point hands its whole content to
+        the cells around it: the sum over the cells is kept by a convolution
+        with a normalised kernel (a probability map stays normalised), and
+        mass that the convolution moves to grid points not covered by the
+        patch is lost.  The two steps are not transposes of one another; the
+        round trip is symmetric and its column sums are one.  A constant field is kept by
         the pair alone but not by a convolution in this mode.  Both options
-        have the same blur floor, see :meth:`blur_floor_px`.
+        have exactly the same blur floor, see :meth:`blur_floor_px`.
 
     Notes
     -----
@@ -585,21 +592,32 @@ class LocalFFT(nn.Module):
             self._restore_type(power, is_numpy),
         )
 
-    def blur_floor_px(self) -> np.ndarray:
+    def blur_floor_px(self, *, per_axis: bool = False) -> np.ndarray:
         """Blur of the projection pair for each cell, in grid pixels.
 
         The response of ``unproject(project(.))`` to a single cell is not a
         single cell: it is spread over its neighbours.  This returns, for every
-        cell, the standard deviation per axis of that response (square root of
-        half its second moment about the source cell, in units of
-        ``pixel_size_rad``).  Gaussian widths below this value cannot be
-        represented by a convolution on this grid.  The values are close to
-        :data:`PROJECTION_BLUR_FLOOR_PX` and are the same for both projection
-        conventions up to the weighting of the neighbours.
+        cell, the standard deviation of that response about the source cell, in
+        units of ``pixel_size_rad``, as the square root of half its second
+        moment (the standard deviation per axis for an isotropic response).
+        Gaussian widths below this value cannot be represented by a
+        convolution on this grid.
+
+        The round trip is the same operator for both projection conventions,
+        so the floor does not depend on ``projection``.  It varies from cell to
+        cell with the position of the cell centre inside its grid pixel and is
+        not isotropic: see ``per_axis``.
+
+        Parameters
+        ----------
+        per_axis : bool, default=False
+            Return the standard deviation along the two axes of the gnomonic
+            plane separately, shape ``[N, 2]`` (x, y), instead of the
+            isotropic value.
 
         Returns
         -------
-        numpy.ndarray, shape [N]
+        numpy.ndarray, shape [N] or [N, 2]
         """
         import scipy.sparse as sparse
 
@@ -610,33 +628,35 @@ class LocalFFT(nn.Module):
         inverse = self._grid_inverse_density.cpu().numpy().astype(np.float64)
         rows = indices.reshape(-1)
         cols = np.repeat(np.arange(n), 4)
-        scatter = sparse.csr_matrix((weights.reshape(-1), (rows, cols)), shape=(g2, n))
-        gather = scatter.T.tocsr()
-        scale = sparse.diags(inverse)
-        if self.projection == "average":
-            forward, backward = scale @ scatter, gather
-        else:
-            forward, backward = scatter, gather @ scale
-        response = (backward @ forward).tocoo()
+        gather = sparse.csr_matrix((weights.reshape(-1), (cols, rows)), shape=(n, g2))
+        response = (gather @ sparse.diags(inverse) @ gather.T).tocoo()
         x = self.projected_x.cpu().numpy().astype(np.float64) / self.pixel_size_rad
         y = self.projected_y.cpu().numpy().astype(np.float64) / self.pixel_size_rad
-        d2 = (x[response.row] - x[response.col]) ** 2 + (
-            y[response.row] - y[response.col]
-        ) ** 2
         mass = np.bincount(response.col, weights=response.data, minlength=n)
-        m2 = np.bincount(response.col, weights=response.data * d2, minlength=n)
-        return np.sqrt(0.5 * m2 / mass)
+        m2 = []
+        for axis in (x, y):
+            d2 = (axis[response.row] - axis[response.col]) ** 2
+            m2.append(np.bincount(response.col, weights=response.data * d2, minlength=n) / mass)
+        m2 = np.stack(m2, axis=-1)
+        if per_axis:
+            return np.sqrt(m2)
+        return np.sqrt(0.5 * m2.sum(axis=-1))
 
-    def check_width(self, sigma_px: float, *, on_below: str = "warn") -> bool:
+    def check_width(
+        self, sigma_px: float, *, on_below: str = "warn", stacklevel: int = 2
+    ) -> bool:
         """Check a Gaussian width (grid pixels) against this patch's blur floor.
 
-        Uses the median of :meth:`blur_floor_px`.  See
+        The floor used is the median over the cells of :meth:`blur_floor_px`,
+        computed at each call (the geometry is not cached), so cells whose own
+        floor is larger are not flagged individually.  See
         :func:`check_kernel_width`.
         """
-        if not hasattr(self, "_blur_floor_median"):
-            self._blur_floor_median = float(np.median(self.blur_floor_px()))
         return check_kernel_width(
-            sigma_px, self._blur_floor_median, on_below=on_below
+            sigma_px,
+            float(np.median(self.blur_floor_px())),
+            on_below=on_below,
+            stacklevel=stacklevel + 1,
         )
 
     def extra_repr(self) -> str:

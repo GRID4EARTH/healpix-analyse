@@ -52,16 +52,18 @@
   reprs are unchanged.
 - `projection="conservative"` for `LocalFFT` and `HealPixFFTConv`: the
   projection to the local grid is not divided by the accumulated weight and
-  the back-projection is its transpose, so a convolution with a normalised
-  kernel keeps the total (a probability map stays normalised; mass leaving the
+  the grid is divided by it just before the back-projection, so a convolution
+  with a normalised kernel keeps the total (a probability map stays normalised; mass leaving the
   domain is lost, not reflected). The default `"average"` is unchanged and
   keeps constants but not totals (response of one cell: 0.79 to 1.06 inside an
   8125-cell domain at level 10). `HealPixFFTConv.set_gaussian` sets a
-  normalised Gaussian kernel.
+  normalised Gaussian kernel on the channel pairs `c -> c` and warns when the
+  window is under 3 sigma wide.
 - `LocalFFT.blur_floor_px()`, `PROJECTION_BLUR_FLOOR_PX` and
   `check_kernel_width`: the blur of one projection and back-projection
-  (about 0.58 pixel) is documented and exposed, and `set_gaussian` warns when
-  the requested width is below it.
+  (about 0.58 pixel, 0.23 to 0.69 per cell on the benchmark domain, the same
+  for both conventions) is documented and exposed, and `set_gaussian` warns
+  when the requested width is below its median.
 - `benchmarks/benchmark_fft_total.py`: totals, constants and effective width of
   the local FFT convolution.
 

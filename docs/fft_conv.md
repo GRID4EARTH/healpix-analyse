@@ -161,7 +161,7 @@ only one of them.
 | `projection=` | Scatter | Back-projection | Constant field | Total (sum over cells) |
 |---|---|---|---|---|
 | `"average"` (default) | divided by the accumulated weight | bilinear gather | kept | **not kept** |
-| `"conservative"` | plain bilinear scatter | gather of the grid divided by the accumulated weight (transpose of the scatter) | **not kept** | kept |
+| `"conservative"` | plain bilinear scatter | bilinear gather of the grid divided by the accumulated weight | **not kept** | kept |
 
 - With `"average"` a uniform field stays uniform, but the response to a single
   cell does not sum to one. Measured at level 10 on an 8125-cell domain with a
@@ -174,6 +174,11 @@ only one of them.
   (0.39 to 0.98 for edge cells at 1 to 3 pixels in the same domain), never above. Use this
   option for densities and probability maps; a caller that renormalises
   afterwards should not need to.
+- The two steps of either convention are not transposes of one another. What
+  holds for `"conservative"` is that the round trip (scatter, then divide and
+  gather) is a symmetric matrix whose column sums are one at every cell. The
+  round trip is the same matrix for both conventions; they differ in where the
+  convolution acts (on the plain scatter, or on its average).
 - Without a kernel (identity), the conservative pair keeps both the total and a
   constant; with a kernel, a constant is changed by as much as the total is
   changed with `"average"` (0.79 to 1.06 inside the same domain).
@@ -188,16 +193,31 @@ layer.set_gaussian(2.0)                  # pixels of the projected grid
 layer.set_gaussian(0.002, unit="rad")    # or radians in the tangent plane
 ```
 
+`set_gaussian` fills only the channel pairs `c → c` (other pairs and the bias
+are zero). `unit="rad"` divides by `pixel_size_rad`, the pixel size of the
+gnomonic plane, which equals the angular distance on the sphere at the patch
+centre only. The kernel is normalised after truncation to `kernel_sz`; when
+`kernel_sz // 2` is under 3 sigma it warns (`on_truncated="error"` or
+`"ignore"` to change that), because for a large sigma the truncated kernel is
+nearly a flat box. Use `kernel_sz >= 2 * ceil(5 * sigma) + 1`.
+
 **Blur floor.** Projection followed by back-projection spreads a single cell
-over its neighbours, even with an identity kernel. The standard deviation per
-axis of this response is about $\sqrt{1/3} = 0.577$ pixel
-(`PROJECTION_BLUR_FLOOR_PX` in `healpix_analyse.fft_local`; 0.58 measured
-at level 10, in both conventions). It is `0.00058` rad at level 10. The widths
-add in quadrature, $\sqrt{\sigma^2 + 0.58^2}$, so Gaussian widths
-below the floor cannot be represented; at 0.25 pixel the effective width is
-0.57 pixel. `layer.blur_floor_px()` returns the exact value for each cell of
-the patch, and `set_gaussian` (or `layer.transform.check_width(sigma_px)`)
-warns when the requested width is below the median floor. Pass
+over its neighbours, even with an identity kernel. The nominal standard
+deviation per axis of this response is $\sqrt{1/3} = 0.577$ pixel
+(`PROJECTION_BLUR_FLOOR_PX` in `healpix_analyse.fft_local`), which is
+`0.00058` rad at level 10. It is exactly the same for both conventions, because
+the round trip is the same matrix. It is not the same for every cell: on the
+level-10, 8125-cell domain of the benchmark it ranges from 0.23 to 0.69 pixel
+over the cells (median 0.569), with the position of the cell centre inside its
+grid pixel; and it is not isotropic: along the two axes of the gnomonic plane
+the medians are 0.568 and 0.591 pixel. The widths add in quadrature,
+$\sqrt{\sigma^2 + 0.58^2}$ (to 0.03 pixel from 0.5 pixel upwards), so
+Gaussian widths below the floor cannot be represented; at 0.25 pixel the
+effective width is 0.57 pixel. `layer.blur_floor_px()` returns the exact value
+for each cell (`per_axis=True` for the two axes). `set_gaussian` (or
+`layer.transform.check_width(sigma_px)`) warns when the requested width is below
+the **median** floor, recomputed at each call, so a cell whose own floor is
+larger is not flagged; the warning points at the caller's line. Pass
 `on_below="error"` to raise instead, or `"ignore"`. For such small widths use a
 direct neighbour kernel.
 

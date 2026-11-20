@@ -203,3 +203,173 @@ def test_check_kernel_width_function():
         check_kernel_width(-1.0)
     with pytest.raises(ValueError):
         check_kernel_width(1.0, on_below="x")
+
+
+# ---------------------------------------------------------------------------
+# Review additions
+# ---------------------------------------------------------------------------
+
+BOTH = ["average", "conservative"]
+
+
+def test_round_trip_is_symmetric_and_has_unit_column_sums(ids):
+    """The pair is not a transpose pair; the round trip is symmetric."""
+    tr = LocalFFT(ids, LEVEL, dtype=torch.float64, device="cpu", projection="conservative")
+    n = ids.size
+    eye = torch.eye(n, dtype=torch.float64)
+    # row j of `rt` is the response to cell j, i.e. column j of the operator
+    rt = tr._unproject_tensor(tr._project_tensor(eye)).numpy()
+    np.testing.assert_allclose(rt, rt.T, atol=1e-14)
+    np.testing.assert_allclose(rt.sum(axis=1), 1.0, atol=1e-12)
+    # the two steps are not transposes of one another
+    rng = np.random.default_rng(0)
+    x = torch.as_tensor(rng.standard_normal(n))
+    g = torch.as_tensor(rng.standard_normal((tr.grid_size, tr.grid_size)))
+    lhs = float((tr._project_tensor(x) * g).sum())
+    rhs = float((x * tr._unproject_tensor(g)).sum())
+    assert abs(lhs - rhs) > 1e-3
+    # the round trip of the two conventions is the same operator
+    avg = LocalFFT(ids, LEVEL, dtype=torch.float64, device="cpu")
+    rt_avg = avg._unproject_tensor(avg._project_tensor(eye)).numpy()
+    np.testing.assert_allclose(rt_avg, rt, atol=1e-14)
+
+
+def test_blur_floor_is_the_same_for_both_and_not_isotropic(ids):
+    floors = []
+    for mode in BOTH:
+        tr = LocalFFT(ids, LEVEL, dtype=torch.float64, device="cpu", projection=mode)
+        floors.append((tr.blur_floor_px(), tr.blur_floor_px(per_axis=True)))
+    np.testing.assert_array_equal(floors[0][0], floors[1][0])
+    per_axis = floors[0][1]
+    assert per_axis.shape == (ids.size, 2)
+    np.testing.assert_allclose(
+        floors[0][0], np.sqrt(0.5 * (per_axis**2).sum(axis=1)), rtol=1e-12
+    )
+    assert abs(np.median(per_axis[:, 0]) - np.median(per_axis[:, 1])) > 1e-3
+
+
+def test_default_path_matches_reference_made_with_main(ids):
+    """Reference written by tests/data/make_fft_default_reference.py on 272df21."""
+    from pathlib import Path
+
+    ref = np.load(Path(__file__).parent / "data" / "fft_default_reference.npz")
+    np.testing.assert_array_equal(ref["ids"], ids)
+    x = ref["x"]
+    half = 4
+    axis = np.arange(-half, half + 1, dtype=np.float64)
+    profile = np.exp(-0.5 * (axis / 1.5) ** 2)
+    kernel = np.outer(profile, profile)
+    kernel /= kernel.sum()
+    layer = HealPixFFTConv(
+        LEVEL, 1, 1, 9, cell_ids=ids, dtype=torch.float64, device="cpu"
+    ).eval()
+    layer.set_kernel(kernel[None, None])
+    tr = LocalFFT(ids, LEVEL, dtype=torch.float64, device="cpu")
+    # bit-identical on the machine that made the file; the tolerance only
+    # covers a different FFT backend
+    kw = dict(rtol=1e-12, atol=1e-13)
+    np.testing.assert_allclose(layer(torch.as_tensor(x)).detach().numpy(), ref["conv"], **kw)
+    np.testing.assert_allclose(tr.project(x), ref["projected"], **kw)
+    np.testing.assert_allclose(tr.ifft(tr.fft(x)), ref["round_trip"], **kw)
+
+
+@pytest.mark.parametrize("projection", BOTH)
+def test_float32(ids, projection):
+    layer = HealPixFFTConv(
+        LEVEL, 1, 1, 11, cell_ids=ids, dtype=torch.float32, device="cpu",
+        projection=projection,
+    ).eval()
+    layer.set_gaussian(1.0)
+    inside = np.flatnonzero(_interior(layer, 1.0))[:30]
+    n = layer.n_cells
+    eye = torch.zeros(len(inside), n)
+    eye[torch.arange(len(inside)), torch.as_tensor(inside)] = 1.0
+    with torch.no_grad():
+        out = layer(eye)
+    assert out.dtype == torch.float32
+    if projection == "conservative":
+        np.testing.assert_allclose(out.reshape(len(inside), n).sum(1).numpy(), 1.0, atol=1e-4)
+
+
+@pytest.mark.parametrize("projection", BOTH)
+def test_nan_propagates_as_on_main(ids, projection):
+    layer = _layer(ids, 1.0, projection)
+    x = torch.ones(ids.size, dtype=torch.float64)
+    x[3] = float("nan")
+    assert torch.isnan(layer(x)).all()  # same on 272df21: the FFT spreads it
+
+
+@pytest.mark.parametrize("projection", BOTH)
+def test_gradients_reach_input_and_weight(ids, projection):
+    layer = _layer(ids, 1.0, projection).train()
+    layer.weight.requires_grad_(True)
+    x = torch.as_tensor(np.random.default_rng(3).random(ids.size)).requires_grad_(True)
+    layer(x).square().sum().backward()
+    for grad in (x.grad, layer.weight.grad):
+        assert grad is not None and torch.isfinite(grad).all() and grad.abs().max() > 0
+
+
+@pytest.mark.parametrize("sigma,size", [(1.0, 11), (2.0, 5), (10.0, 5)])
+def test_kernel_sums_to_one_after_truncation(ids, sigma, size):
+    layer = HealPixFFTConv(
+        LEVEL, 2, 2, size, cell_ids=ids, dtype=torch.float64, device="cpu"
+    )
+    layer.set_gaussian(sigma, on_below="ignore", on_truncated="ignore")
+    w = layer.weight.detach()
+    assert float(w[0, 0].sum()) == pytest.approx(1.0, abs=1e-14)
+    assert float(w[1, 1].sum()) == pytest.approx(1.0, abs=1e-14)
+    assert float(w[0, 1].abs().sum()) == 0.0 and float(w[1, 0].abs().sum()) == 0.0
+
+
+@pytest.mark.parametrize("projection", BOTH)
+def test_wide_kernel_never_wraps_around_the_domain(ids, projection):
+    """Kernel 33 pixels wide: no response sum above 1 anywhere (no wrap)."""
+    layer = HealPixFFTConv(
+        LEVEL, 1, 1, 33, cell_ids=ids, dtype=torch.float64, device="cpu",
+        projection=projection,
+    ).eval()
+    layer.set_gaussian(5.0)
+    cells = np.arange(0, ids.size, 7)
+    sums = _responses(layer, cells).sum(axis=1)
+    if projection == "conservative":
+        assert sums.max() <= 1.0 + 1e-9
+    assert sums.min() > 0.0
+    # edge cells lose mass, far cells keep it
+    assert sums.min() < 0.9 and sums.max() > 0.99
+
+
+def test_truncated_kernel_warning(ids):
+    layer = HealPixFFTConv(
+        LEVEL, 1, 1, 5, cell_ids=ids, dtype=torch.float64, device="cpu"
+    )
+    with pytest.warns(UserWarning, match="truncated"):
+        layer.set_gaussian(10.0)
+    with pytest.raises(ValueError, match="truncated"):
+        layer.set_gaussian(10.0, on_truncated="error")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        layer.set_gaussian(10.0, on_truncated="ignore")
+        layer.set_gaussian(0.6)  # 3 sigma = 1.8 <= half-width 2
+    with pytest.raises(ValueError):
+        layer.set_gaussian(1.0, on_truncated="x")
+
+
+def test_warnings_point_at_the_caller(ids):
+    layer = HealPixFFTConv(
+        LEVEL, 1, 1, 9, cell_ids=ids, dtype=torch.float64, device="cpu"
+    )
+    for call in (
+        lambda: layer.set_gaussian(0.3),
+        lambda: layer.transform.check_width(0.3),
+        lambda: check_kernel_width(0.3),
+    ):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            call()
+        assert len(caught) == 1
+        assert caught[0].filename == __file__
+    layer5 = HealPixFFTConv(LEVEL, 1, 1, 5, cell_ids=ids, dtype=torch.float64, device="cpu")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        layer5.set_gaussian(10.0)
+    assert len(caught) == 1 and caught[0].filename == __file__

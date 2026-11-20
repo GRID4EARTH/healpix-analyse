@@ -54,7 +54,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 0.6370996782293961,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.6
    },
    {
     "sigma_px": 0.5,
@@ -103,7 +103,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 0.7703220105903764,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.3
    },
    {
     "sigma_px": 0.75,
@@ -152,7 +152,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 0.9517856901634947,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.2
    },
    {
     "sigma_px": 1.0,
@@ -201,7 +201,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 1.1590496106724681,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.5
    },
    {
     "sigma_px": 1.5,
@@ -250,7 +250,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 1.6104024341760044,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.4
    },
    {
     "sigma_px": 2.0,
@@ -299,7 +299,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 2.0840815722998944,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.3
    },
    {
     "sigma_px": 3.0,
@@ -348,7 +348,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 3.05669691006485,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.3
    }
   ],
   "conservative": [
@@ -399,7 +399,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 0.6370996782293961,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.3
    },
    {
     "sigma_px": 0.5,
@@ -448,7 +448,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 0.7703220105903764,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.4
    },
    {
     "sigma_px": 0.75,
@@ -497,7 +497,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 0.9517856901634947,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.1
+    "seconds": 8.3
    },
    {
     "sigma_px": 1.0,
@@ -546,7 +546,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 1.1590496106724681,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.0
+    "seconds": 8.2
    },
    {
     "sigma_px": 1.5,
@@ -595,7 +595,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 1.6104024341760044,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.1
+    "seconds": 8.3
    },
    {
     "sigma_px": 2.0,
@@ -644,7 +644,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 2.0840815722998944,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 8.6
+    "seconds": 8.3
    },
    {
     "sigma_px": 3.0,
@@ -693,7 +693,7 @@
     },
     "expected_width_px_sqrt_sigma2_plus_floor2": 3.05669691006485,
     "blur_floor_px_median_from_geometry": 0.5688269096325551,
-    "seconds": 9.5
+    "seconds": 8.3
    }
   ]
  }
