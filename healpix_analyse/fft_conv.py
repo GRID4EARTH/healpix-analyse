@@ -9,6 +9,7 @@ with PyTorch and remain differentiable.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Union
 
 import numpy as np
@@ -100,6 +101,12 @@ class HealPixFFTConv(nn.Module):
     cache_kernel_fft : bool, default=True
         Cache the transformed kernel during no-gradient inference.  Training
         always recomputes it so gradients reach the spatial kernel.
+    projection : {"average", "conservative"}, default="average"
+        Convention of the HEALPix <-> grid pair, forwarded to
+        :class:`LocalFFT`.  With ``"average"`` a constant field stays constant
+        and the total is not kept; with ``"conservative"`` a kernel whose
+        weights sum to one keeps the total (mass leaving the domain is lost)
+        and a constant field is not kept.
 
     Notes
     -----
@@ -130,6 +137,7 @@ class HealPixFFTConv(nn.Module):
         dtype: torch.dtype = torch.float32,
         device: Optional[Union[str, torch.device]] = None,
         cache_kernel_fft: bool = True,
+        projection: str = "average",
     ) -> None:
         super().__init__()
 
@@ -164,6 +172,7 @@ class HealPixFFTConv(nn.Module):
             norm="backward",
             dtype=dtype,
             device=resolved_device,
+            projection=projection,
         )
         self.n_cells = self.transform.n_cells
         self.grid_size = self.transform.grid_size
@@ -269,6 +278,88 @@ class HealPixFFTConv(nn.Module):
         self.bias.requires_grad_(requires_grad)
         self._clear_kernel_cache()
         return self
+
+    def blur_floor_px(self) -> np.ndarray:
+        """Per-cell blur floor of the projection pair, in grid pixels.
+
+        See :meth:`healpix_analyse.fft_local.LocalFFT.blur_floor_px`.
+        """
+        return self.transform.blur_floor_px()
+
+    def set_gaussian(
+        self,
+        sigma: float,
+        *,
+        unit: str = "pixel",
+        on_below: str = "warn",
+        on_truncated: str = "warn",
+    ):
+        """Set a normalised isotropic Gaussian kernel on every channel pair ``c -> c``.
+
+        The kernel weights sum to one over the ``kernel_sz`` window (after
+        truncation), so with ``projection="conservative"`` the total is kept.
+        Only the channel pairs ``c -> c`` are filled; cross-channel weights and
+        the bias are set to zero.
+
+        Parameters
+        ----------
+        sigma : float
+            Standard deviation per axis.
+        unit : {"pixel", "rad"}
+            Grid pixels, or radians in the gnomonic plane (divided by
+            ``pixel_size_rad``).
+        on_below : {"warn", "error", "ignore"}
+            Action when ``sigma`` is below the blur floor of the projection
+            pair (see :meth:`blur_floor_px`; the median over the cells is
+            used).  The kernel is set in every case except ``"error"``.
+        on_truncated : {"warn", "error", "ignore"}
+            Action when the half-width of the window, ``kernel_sz // 2``, is
+            under 3 sigma: the Gaussian is then cut and renormalised, and
+            for a very large sigma it is nearly a flat box.  Use
+            ``kernel_sz >= 2 * ceil(5 * sigma) + 1`` for an accurate Gaussian.
+
+        Notes
+        -----
+        ``unit="rad"`` divides by ``pixel_size_rad``, the pixel size of the
+        gnomonic plane, which equals the angular distance on the sphere at the
+        patch centre only.
+        """
+        if on_truncated not in ("warn", "error", "ignore"):
+            raise ValueError("on_truncated must be 'warn', 'error' or 'ignore'")
+        if unit not in ("pixel", "rad"):
+            raise ValueError("unit must be 'pixel' or 'rad'")
+        sigma_px = float(sigma) / (
+            self.transform.pixel_size_rad if unit == "rad" else 1.0
+        )
+        self.transform.check_width(sigma_px, on_below=on_below, stacklevel=3)
+        half = self.kernel_sz // 2
+        if half < 3.0 * sigma_px and on_truncated != "ignore":
+            message = (
+                f"kernel_sz={self.kernel_sz} (half-width {half} pixel) is under "
+                f"3 sigma for sigma={sigma_px:.4g} pixel: the Gaussian is "
+                "truncated and renormalised, and is not a Gaussian any more. "
+                f"Use kernel_sz >= {2 * math.ceil(5 * sigma_px) + 1}."
+            )
+            if on_truncated == "error":
+                raise ValueError(message)
+            warnings.warn(message, UserWarning, stacklevel=2)
+        axis = torch.arange(-half, half + 1, dtype=torch.float64)
+        if sigma_px > 0:
+            profile = torch.exp(-0.5 * (axis / sigma_px) ** 2)
+        else:
+            profile = (axis == 0).to(torch.float64)
+        kernel = profile[:, None] * profile[None, :]
+        kernel = kernel / kernel.sum()
+        weight = torch.zeros(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_sz,
+            self.kernel_sz,
+            dtype=torch.float64,
+        )
+        for channel in range(min(self.in_channels, self.out_channels)):
+            weight[channel, channel] = kernel
+        return self.set_kernel(weight)
 
     def _kernel_fft(self) -> torch.Tensor:
         """Return flipped-kernel spectra as ``[C_out,C_in,FH,FW//2+1]``."""
