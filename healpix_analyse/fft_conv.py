@@ -282,7 +282,7 @@ class HealPixFFTConv(nn.Module):
     def blur_floor_px(self) -> np.ndarray:
         """Per-cell blur floor of the projection pair, in grid pixels.
 
-        See :meth:`LocalFFT.blur_floor_px`.
+        See :meth:`healpix_analyse.fft_local.LocalFFT.blur_floor_px`.
         """
         return self.transform.blur_floor_px()
 

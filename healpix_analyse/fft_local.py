@@ -28,7 +28,7 @@ ArrayLike = Union[np.ndarray, torch.Tensor]
 #: bilinear projection followed by one bilinear back-projection, for cell
 #: centres at random positions inside the grid cells: two passes of linear
 #: interpolation, each of variance 1/6 pixel^2 per axis.  The exact value of a
-#: given patch is :meth:`LocalFFT.blur_floor_px`.
+#: given patch is :meth:`healpix_analyse.fft_local.LocalFFT.blur_floor_px`.
 PROJECTION_BLUR_FLOOR_PX = math.sqrt(1.0 / 3.0)
 
 

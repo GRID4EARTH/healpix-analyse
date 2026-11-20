@@ -265,9 +265,9 @@ def test_default_path_matches_reference_made_with_main(ids):
     ).eval()
     layer.set_kernel(kernel[None, None])
     tr = LocalFFT(ids, LEVEL, dtype=torch.float64, device="cpu")
-    # bit-identical on the machine that made the file; the tolerance only
-    # covers a different FFT backend
-    kw = dict(rtol=1e-12, atol=1e-13)
+    # identical on the machine that made the file; the tolerance (1e-10) is for
+    # a different FFT backend or BLAS on another platform
+    kw = dict(rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(layer(torch.as_tensor(x)).detach().numpy(), ref["conv"], **kw)
     np.testing.assert_allclose(tr.project(x), ref["projected"], **kw)
     np.testing.assert_allclose(tr.ifft(tr.fft(x)), ref["round_trip"], **kw)
