@@ -50,12 +50,103 @@ def make_patch(level: int, depth: int, face_centre: int):
     return ids, centre, d, float(np.rad2deg(lat[centre]))
 
 
+def _lonlat_xyz(ids, level):
+    lon, lat = hgn.healpix_to_lonlat(ids, level, ellipsoid="WGS84")
+    lon, lat = np.deg2rad(lon), np.deg2rad(lat)
+    return np.stack(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1
+    )
+
+
+def _widths_totals(layer, xyz, impulses, cell):
+    batch = np.zeros((len(impulses), len(xyz)))
+    batch[np.arange(len(impulses)), impulses] = 1.0
+    y = np.asarray(layer(batch))[:, 0]
+    widths = []
+    for k, c in enumerate(impulses):
+        d = np.arccos(np.clip(xyz @ xyz[c], -1.0, 1.0))
+        widths.append(math.sqrt(np.sum(y[k] * d**2) / (2 * y[k].sum())) / cell)
+    return np.array(widths), y.sum(axis=1)
+
+
+def position_study(level, depth, cell):
+    """Width and total of the response to 64 random cells near the patch centre.
+
+    ``gaussian_plan`` (ratio width / sigma) and the automatic rule on the same
+    chain (ratio to its own mean width; it does not aim at sigma).
+    """
+    ids, centre, d0, _ = make_patch(level, depth, 5)
+    xyz = _lonlat_xyz(ids, level)
+    out = {}
+    for window in (16, 60, 110):
+        cand = np.where(d0 < window * cell)[0]
+        imp = np.random.default_rng(0).choice(cand, 64, replace=False)
+        rows = {}
+        for sigma in (3, 6, 9, 18, 36):
+            layer = LargeConv.from_gaussian(
+                level, sigma * cell, ids, patch_depth=depth, dtype=torch.float64,
+                device="cpu", cache_dir=None,
+            )
+            w, t = _widths_totals(layer, xyz, imp, cell)
+            ksz = 2 * math.ceil(3 * sigma) + 1
+            auto = LargeConv(level, 1, 1, ksz, cell_ids=ids, dtype=torch.float64,
+                             device="cpu", cache_dir=None)
+            # truncated Gaussian on the (small) automatic compact kernel
+            rad = (auto.compact_kernel_sz - 1) // 2
+            gx, gy = np.meshgrid(np.arange(-rad, rad + 1), np.arange(-rad, rad + 1))
+            wgt = np.exp(-(gx**2 + gy**2).ravel() / (2 * max(sigma / 2**auto.n_levels, 0.3) ** 2))
+            auto.set_compact_kernel((wgt / wgt.sum()).reshape(1, 1, -1))
+            wa, ta = _widths_totals(auto, xyz, imp, cell)
+            rows[str(sigma)] = {
+                "plan_n_levels": layer.n_levels,
+                "plan_width_over_sigma": [float(w.min() / sigma), float(w.mean() / sigma), float(w.max() / sigma)],
+                "plan_total": [float(t.min()), float(t.max())],
+                "auto_n_levels": auto.n_levels,
+                "auto_width_over_own_mean": [float(wa.min() / wa.mean()), float(wa.max() / wa.mean())],
+                "auto_total": [float(ta.min()), float(ta.max())],
+            }
+        out[f"window_{window}_cells"] = rows
+        print("position window", window, json.dumps(rows))
+    return out
+
+
+def edge_study(level=8, radius_deg=15.0):
+    """Response near the edge of a partial domain (disc), zero padding."""
+    cell = _nominal_cell(level)
+    allids = np.arange(12 * 4**level)
+    xyz_all = _lonlat_xyz(allids, level)
+    c0 = np.array([math.cos(math.radians(40)) * math.cos(0.5),
+                   math.cos(math.radians(40)) * math.sin(0.5), math.sin(math.radians(40))])
+    ids = allids[np.arccos(np.clip(xyz_all @ c0, -1, 1)) < math.radians(radius_deg)]
+    pos = xyz_all[ids]
+    r = np.arccos(np.clip(pos @ c0, -1, 1))
+    out = {"level": level, "radius_deg": radius_deg, "cells": int(ids.size)}
+    for sigma in (3, 6):
+        layer = LargeConv.from_gaussian(
+            level, sigma * cell, ids, dtype=torch.float64, device="cpu", cache_dir=None
+        )
+        rows = {}
+        for frac in (0.0, 0.5, 0.8, 0.92):
+            k = int(np.argmin(np.abs(r - frac * math.radians(radius_deg))))
+            w, t = _widths_totals(layer, pos, [k], cell)
+            rows[str(frac)] = {"width_over_sigma": float(w[0] / sigma), "total": float(t[0])}
+        const = np.asarray(layer(np.ones(ids.size))).ravel()
+        rows["constant"] = {
+            "centre": float(const[np.argmin(r)]),
+            "at_0.92R": float(const[np.argmin(np.abs(r - 0.92 * math.radians(radius_deg)))]),
+            "min": float(const.min()),
+        }
+        out[f"sigma_{sigma}"] = rows
+    print("edge", json.dumps(out))
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--level", type=int, default=10)
     ap.add_argument("--depth", type=int, default=8, help="patch of 4**depth cells")
     ap.add_argument("--sigma-min", type=float, default=2.25)
-    ap.add_argument("--sigma-max", type=float, default=20.0)
+    ap.add_argument("--sigma-max", type=float, default=40.0)
     ap.add_argument("--step", type=float, default=0.05)
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
@@ -70,6 +161,9 @@ def main() -> None:
     for s in sigmas:
         kernel_sz = 2 * math.ceil(3 * s) + 1
         n, _ = _kernel_plan(kernel_sz, 7)
+        if n not in floors:  # more levels than the calibration patch allows
+            defaults.append(None)
+            continue
         sc = math.sqrt(max(s**2 - floors[n] ** 2, 0.0)) / 2**n if n else s
         defaults.append((n, kernel_sz, max(sc, 1e-3)))
 
@@ -121,11 +215,13 @@ def main() -> None:
             for p in local_plans
         ]
         biggest_default = {}
-        for n, ksz, _ in defaults:
-            biggest_default[n] = max(biggest_default.get(n, 1), ksz)
+        for dflt in defaults:
+            if dflt is not None:
+                biggest_default[dflt[0]] = max(biggest_default.get(dflt[0], 1), dflt[1])
         old = [
-            width(n, biggest_default[n], lambda L, sc=sc: L.set_gaussian_kernel(sc))
-            for n, ksz, sc in defaults
+            float("nan") if dflt is None else
+            width(dflt[0], biggest_default[dflt[0]], lambda L, sc=dflt[2]: L.set_gaussian_kernel(sc))
+            for dflt in defaults
         ]
         result_loc[name] = {
             "latitude_deg": lat, "gaussian_plan": new,
@@ -138,7 +234,7 @@ def main() -> None:
             "sigma_cells": float(round(s, 4)),
             "n_levels_plan": plans[k].n_levels,
             "compact_sigma": plans[k].compact_sigma,
-            "n_levels_default": defaults[k][0],
+            "n_levels_default": None if defaults[k] is None else defaults[k][0],
         })
     summary = {}
     for name, r in result_loc.items():
@@ -155,9 +251,11 @@ def main() -> None:
             "reference_cell_sigma_from_cells": float(sigmas[~np.isnan(loc)][0]),
             "reference_cell_min_diff": float(np.diff(loc[~np.isnan(loc)]).min()),
             "reference_cell_max_rel_error": float(np.nanmax(np.abs(loc - sigmas) / sigmas)),
-            "default_min_diff": float(np.diff(old).min()),
-            "default_strictly_increasing": bool(np.all(np.diff(old) > 0)),
-            "default_max_rel_error": float((np.abs(old - sigmas) / sigmas).max()),
+            "default_sigma_up_to_cells": float(sigmas[~np.isnan(old)][-1]),
+            "default_flat_steps": int((np.diff(old[~np.isnan(old)]) == 0).sum()),
+            "default_steps": int(np.diff(old[~np.isnan(old)]).size),
+            "default_strictly_increasing": bool(np.all(np.diff(old[~np.isnan(old)]) > 0)),
+            "default_max_rel_error": float(np.nanmax(np.abs(old - sigmas) / sigmas)),
         }
         print(name, json.dumps(summary[name], indent=1))
     switches = [
@@ -174,6 +272,8 @@ def main() -> None:
         "switches_cells": switches,
         "summary": summary,
         "sigma_cells": [float(round(s, 4)) for s in sigmas],
+        "position": position_study(level, args.depth, cell),
+        "domain_edge": edge_study(),
         "rows": rows,
         "effective_cells": {
             name: {

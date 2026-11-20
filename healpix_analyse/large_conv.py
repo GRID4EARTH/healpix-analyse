@@ -398,20 +398,40 @@ class LargeConv(nn.Module):
         self.bias.requires_grad_(requires_grad)
         return self
 
-    def set_gaussian_kernel(self, compact_sigma: float):
+    def set_gaussian_kernel(self, compact_sigma):
         """Set an isotropic Gaussian compact kernel, normalised to sum 1.
 
         ``compact_sigma`` is the width in cells of the coarse level (one
-        axis); the Gaussian is sampled on the whole compact kernel grid.
-        Each channel is smoothed on its own, so ``in_channels`` must equal
-        ``out_channels``.  See :func:`gaussian_plan` for the width to use.
+        axis), or a :class:`GaussianPlan`, in which case the layer must have
+        the plan's ``n_levels`` and a compact kernel at least ``plan.kernel_sz``
+        wide (build it with ``LargeConv.from_gaussian``, or pass
+        ``n_levels=plan.n_levels`` and ``plan.fine_kernel_sz``).  The Gaussian
+        is sampled on the whole compact kernel grid and must fit in it
+        (radius of at least four sigmas).  Each channel is smoothed on its
+        own, so ``in_channels`` must equal ``out_channels``.
         """
+        if isinstance(compact_sigma, GaussianPlan):
+            plan = compact_sigma
+            if self.n_levels != plan.n_levels:
+                raise ValueError(
+                    f"the plan needs n_levels={plan.n_levels}, this layer has "
+                    f"{self.n_levels}: build it with n_levels=plan.n_levels and "
+                    "kernel_sz=plan.fine_kernel_sz, or use LargeConv.from_gaussian"
+                )
+            compact_sigma = plan.compact_sigma
         if self.in_channels != self.out_channels:
             raise ValueError("set_gaussian_kernel needs in_channels == out_channels")
         compact_sigma = float(compact_sigma)
         if not (math.isfinite(compact_sigma) and compact_sigma > 0.0):
             raise ValueError("compact_sigma must be a positive finite number")
         radius = (self.compact_kernel_sz - 1) // 2
+        if radius < math.ceil(4.0 * compact_sigma):
+            raise ValueError(
+                f"the compact kernel ({self.compact_kernel_sz} x {self.compact_kernel_sz}) "
+                f"is too small for a Gaussian of {compact_sigma:.4g} coarse cells: it "
+                f"needs a radius of {math.ceil(4.0 * compact_sigma)}; build the layer "
+                "with kernel_sz=plan.fine_kernel_sz (not plan.kernel_sz)"
+            )
         grid = np.arange(-radius, radius + 1)
         xx, yy = np.meshgrid(grid, grid)
         w = np.exp(-(xx**2 + yy**2).ravel() / (2.0 * compact_sigma**2))
@@ -420,6 +440,53 @@ class LargeConv(nn.Module):
         for c in range(self.in_channels):
             weight[c, c] = w
         return self.set_compact_kernel(weight)
+
+    @classmethod
+    def from_gaussian(
+        cls,
+        level: int,
+        sigma: float,
+        cell_ids=None,
+        *,
+        channels: int = 1,
+        reference_cell: Optional[int] = None,
+        max_levels: Optional[int] = None,
+        patch_depth: int = 8,
+        ellipsoid: str = "WGS84",
+        radius_deg: Optional[float] = None,
+        sigma_deg: Optional[float] = None,
+        weight_norm: str = "l1",
+        up_norm: str = "col_l1",
+        dtype: torch.dtype = torch.float32,
+        device: Optional[Union[str, torch.device]] = None,
+        **kwargs,
+    ) -> "LargeConv":
+        """Gaussian smoothing layer of width ``sigma`` (radians, one-axis RMS).
+
+        One call: it computes :func:`gaussian_plan`, builds the layer with the
+        same options and sets the kernel.  The calibration location is the
+        block that contains ``reference_cell``; by default a cell at the
+        centre of ``cell_ids`` (the equatorial block when ``cell_ids`` is
+        ``None``).  ``channels`` smooths each channel on its own; other
+        keyword arguments (``n_gauges``, ``gauge_type``, ``cache_dir`` ...)
+        go to :class:`LargeConv`.  See :func:`gaussian_plan` for the accuracy
+        and the limits.
+        """
+        plan = gaussian_plan(
+            level, sigma, max_levels=max_levels, ellipsoid=ellipsoid,
+            radius_deg=radius_deg, sigma_deg=sigma_deg, weight_norm=weight_norm,
+            up_norm=up_norm, patch_depth=patch_depth,
+            reference_cell=reference_cell, cell_ids=cell_ids,
+        )
+        layer = cls(
+            level, channels, channels, plan.fine_kernel_sz, n_levels=plan.n_levels,
+            cell_ids=cell_ids, ellipsoid=ellipsoid, radius_deg=radius_deg,
+            sigma_deg=sigma_deg, weight_norm=weight_norm, up_norm=up_norm,
+            dtype=dtype, device=device, **kwargs,
+        )
+        layer.set_gaussian_kernel(plan)
+        layer.gaussian_plan = plan
+        return layer
 
     def forward(self, x: ArrayLike) -> ArrayLike:
         tensor, is_numpy, was_1d = _prepare_input(
@@ -526,10 +593,28 @@ def _measure_layer(level, n_levels, depth, kernel_sz, options):
     return layer, centre, dist, ids.size
 
 
+def _centre_cell(level, cell_ids, ellipsoid):
+    """NESTED id of the cell of ``cell_ids`` closest to their mean direction."""
+    import healpix_geo.nested as hgn
+
+    ids = np.asarray(cell_ids, dtype=np.int64).ravel()
+    if ids.size == 0:
+        raise ValueError("cell_ids must not be empty")
+    if ids.min() < 0 or ids.max() >= 12 * 4**level:
+        raise ValueError("cell_ids contain invalid identifiers")
+    lon, lat = hgn.healpix_to_lonlat(ids, level, ellipsoid=ellipsoid)
+    lon, lat = np.deg2rad(lon), np.deg2rad(lat)
+    xyz = np.stack(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1
+    )
+    return int(ids[int(np.argmax(xyz @ xyz.mean(axis=0)))])
+
+
 def _options(
     ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm, level, depth, reference_cell
 ):
-    parent = None
+    parent_level = level - depth
+    parent = 5 if parent_level == 0 else 5 * 4**parent_level + 3 * 4 ** (parent_level - 1)
     if reference_cell is not None:
         cell = _as_int("reference_cell", reference_cell, 0)
         if cell >= 12 * 4**level:
@@ -647,16 +732,19 @@ def gaussian_plan(
     up_norm: str = "col_l1",
     patch_depth: int = 8,
     reference_cell: Optional[int] = None,
+    cell_ids=None,
 ) -> GaussianPlan:
     """Levels and compact Gaussian that give a response of width ``sigma``.
 
     ``sigma`` is the one-axis RMS width in **radians** (the sigma of a
-    Gaussian, as in :func:`down_up_blur`).  Use it as::
+    Gaussian, as in :func:`down_up_blur`).  This function is for inspection;
+    to build a layer use ``LargeConv.from_gaussian(level, sigma, cell_ids)``,
+    which is the same as::
 
-        plan = gaussian_plan(level, sigma)
+        plan = gaussian_plan(level, sigma, cell_ids=cell_ids)
         layer = LargeConv(level, 1, 1, plan.fine_kernel_sz,
                           n_levels=plan.n_levels, cell_ids=cell_ids)
-        layer.set_gaussian_kernel(plan.compact_sigma)
+        layer.set_gaussian_kernel(plan)
 
     Method.  For each number of levels ``n`` the width of the real
     ``LargeConv`` response to one cell is measured for compact Gaussians of
@@ -677,13 +765,14 @@ def gaussian_plan(
     (``min(level, patch_depth) - 3`` levels) and the largest calibrated
     compact width.
 
-    The widths are measured on one patch, by default near the equator, or
-    on the block containing ``reference_cell`` (a NESTED id at ``level``;
-    give a cell of your domain).  They are accurate on that patch to the
-    interpolation error of the calibration table (4e-4 relative in the
-    benchmark) and an approximation elsewhere: at 55 degrees latitude the
-    equatorial calibration is up to 22 % too wide below 3 cells and within
-    4 % above 9 cells (see ``benchmarks/``).
+    The widths are measured on one patch: the aligned block of
+    ``4**patch_depth`` cells that contains ``reference_cell`` (a NESTED id at
+    ``level``), by default the block of a cell at the centre of ``cell_ids``,
+    and the equatorial block when neither is given.  The width is exact for
+    the response to the centre cell of that patch (interpolation error of
+    the table 4e-4 relative in the benchmark) and an approximation for
+    other cells and other places; see ``docs/large_conv.md``.
+    :meth:`LargeConv.from_gaussian` does all of this in one call.
     """
     level = _as_int("level", level, 0)
     try:
@@ -694,6 +783,8 @@ def gaussian_plan(
         raise ValueError(f"sigma must be a positive finite number, got {sigma!r}")
     patch_depth = _as_int("patch_depth", patch_depth, 1)
     depth = min(patch_depth, level)
+    if reference_cell is None and cell_ids is not None:
+        reference_cell = _centre_cell(level, cell_ids, str(ellipsoid))
     opts = _options(
         ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm, level, depth, reference_cell
     )
@@ -704,10 +795,9 @@ def gaussian_plan(
     lowest = float(widths[start])
     if sigma < lowest:
         raise ValueError(
-            f"sigma={sigma:.6g} rad is below the narrowest Gaussian this method "
-            f"gives at level {level} ({lowest:.6g} rad, about "
-            f"{lowest / _nominal_cell(level):.2f} cells); use gaussian_filter "
-            "for narrower widths"
+            f"sigma={_fmt_width(level, sigma)} is below the narrowest Gaussian this "
+            f"method gives at level {level} ({_fmt_width(level, lowest)}); use "
+            "gaussian_filter for narrower widths"
         )
     n = 1
     while n < top:
@@ -719,9 +809,9 @@ def gaussian_plan(
             break
     if sigma > float(widths[-1]):
         raise ValueError(
-            f"sigma={sigma:.6g} rad is above the widest Gaussian available with "
-            f"{n} levels ({float(widths[-1]):.6g} rad); raise max_levels or "
-            "patch_depth, or use a larger level"
+            f"sigma={_fmt_width(level, sigma)} is above the widest Gaussian "
+            f"available with {n} levels ({_fmt_width(level, float(widths[-1]))}); "
+            "raise max_levels or patch_depth, or use a larger level"
         )
     compact_sigma = float(np.interp(sigma, widths[start:], sigmas[start:]))
     radius = max(1, math.ceil(5.0 * compact_sigma))
@@ -732,6 +822,11 @@ def gaussian_plan(
         fine_kernel_sz=2 * radius * 2**n + 1,
         sigma=sigma,
     )
+
+
+def _fmt_width(level: int, width: float) -> str:
+    cell = _nominal_cell(level)
+    return f"{width:.6g} rad (= {width / cell:.3g} cells of {cell:.3g} rad)"
 
 
 def _nominal_cell(level: int) -> float:
