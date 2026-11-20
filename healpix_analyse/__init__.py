@@ -171,9 +171,13 @@ from healpix_analyse.components import (
 )
 
 from healpix_analyse.radial_filter import (
+    FilterOperator,
+    apply_filter_operator,
     configure_radial_filter_cache,
     gaussian_filter,
+    gaussian_filter_operator,
     radial_filter,
+    radial_filter_operator,
     radial_filter_cache_info,
 )
 
@@ -276,6 +280,10 @@ __all__ = [
     # ------------------------------------------------------------------
     "radial_filter",
     "gaussian_filter",
+    "FilterOperator",
+    "apply_filter_operator",
+    "gaussian_filter_operator",
+    "radial_filter_operator",
     "configure_radial_filter_cache",
     "radial_filter_cache_info",
 

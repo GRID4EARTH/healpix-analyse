@@ -3,6 +3,25 @@
 ## Unreleased
 
 ### Added
+- `radial_filter` and `gaussian_filter` take `normalization="present"`
+  (default, the existing behaviour) or `"full_disc"`: the weights are divided
+  by their sum over the whole kernel disc, cells outside the domain included
+  and contributing zero, so that mass diffusing out of the domain is lost (the
+  `mode="constant", cval=0` of a raster filter). A `NaN` inside the domain
+  counts as zero in that mode.
+- `gaussian_filter_operator`, `radial_filter_operator` and
+  `apply_filter_operator`: the weights of a filter as three plain arrays in
+  compressed-row form plus the number of columns (`FilterOperator`: row
+  offsets, column indices, weights, `n_columns`), built once and applied to
+  values with leading dimensions (NumPy or Torch). `apply_filter_operator`
+  checks the signal length when `n_columns` is given. Operators are always
+  normalised. No new dependency; the result equals the filter with the same
+  options.
+- `gaussian_filter(..., width_rule="matched")` (and the operator): the
+  requested width is reached below about one cell, by solving the Gaussian
+  shape per cell above about 0.6 cell and blending with the identity below it.
+  The default `"sampled"` is unchanged, and its documentation now says that its
+  effective width is smaller than requested below about one cell.
 - `benchmarks/benchmark_geo_release.py` and the report and timings of the
   HEALPIX-GEO 0.4.0 direct-sum benchmark
   (`benchmarks/results/geo040-performance/`), so that the first-call and
