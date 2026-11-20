@@ -44,7 +44,7 @@ Connected components::
 
 from healpix_analyse.down import HealPixDown
 from healpix_analyse.up import HealPixUp
-from healpix_analyse.large_conv import LargeConv
+from healpix_analyse.large_conv import GaussianPlan, LargeConv, down_up_blur, gaussian_plan
 from healpix_analyse.fft_conv import HealPixFFTConv
 from healpix_analyse.geo_fft import HealPixGeoFFT, geo_fft_convolve
 
@@ -204,6 +204,9 @@ __all__ = [
     "HealPixDown",
     "HealPixUp",
     "LargeConv",
+    "down_up_blur",
+    "gaussian_plan",
+    "GaussianPlan",
     "HealPixFFTConv",
     "HealPixGeoFFT",
     "geo_fft_convolve",
