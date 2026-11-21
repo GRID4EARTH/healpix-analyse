@@ -612,6 +612,11 @@ state = apply_filter_operator(state, *op)   # probability per leaf, conserved
   any mix of levels. A place without a leaf adds nothing to `D` or `D0`, so the
   ratio ignores it and it does not lengthen `d`: in this mode **only blocked
   leaves are land**; supply the dry leaves of a full tessellation as `blocked`.
+  A hole in the set is **not** a barrier with `correction="lattice"`: the
+  distance across it is the straight distance, and the pair is dropped only
+  when `D0` is beyond the search limit `1.5 * radius`, so the effect of a hole
+  depends on its length. For land made of absent leaves use
+  `correction="none"`.
   Contacts are still only between leaves, and a corner contact still needs a
   common leaf. The search is sized with `D0 / straight <= 1.5`; on a mixed set
   at levels 11 to 15 along a wavy coast (22765 leaves, 400 sources, 2.6 million

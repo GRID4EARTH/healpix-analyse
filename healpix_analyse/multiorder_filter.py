@@ -38,7 +38,12 @@ with every leaf passable, and multiplied by the straight geodesic, so that
 matter.  Only blocked leaves are land in that mode: a place without a leaf
 adds nothing to ``D`` or to ``D0``, so the ratio ignores it and it does not
 lengthen ``d``.  (Contacts are still only between leaves, and a corner
-contact still needs a common leaf.)
+contact still needs a common leaf.)  **Land must therefore be given as
+``blocked`` leaves in this mode.**  A hole in the set is not a barrier: the
+distance across it is the straight distance, and the pair is dropped only
+when ``D0`` exceeds the search limit ``1.5 * radius``, so what a hole does
+depends on its length.  Use ``correction="none"`` for land made of absent
+leaves.
 """
 
 from __future__ import annotations
@@ -445,6 +450,8 @@ def multiorder_filter_operator(
         their area, so a signal of densities is averaged over area.
     correction
         ``"none"`` (default) or ``"lattice"``; see the module description.
+        With ``"lattice"`` land must be given as ``blocked`` leaves, not as
+        holes in the set.
     blocked
         Optional array of dtype ``bool`` (else ``TypeError``) over the
         leaves: blocked leaves are land
