@@ -170,6 +170,7 @@ from healpix_analyse.components import (
     remove_small_components,
 )
 
+from healpix_analyse.multiorder_filter import multiorder_filter_operator
 from healpix_analyse.radial_filter import (
     FilterOperator,
     apply_filter_operator,
@@ -283,6 +284,7 @@ __all__ = [
     "FilterOperator",
     "apply_filter_operator",
     "gaussian_filter_operator",
+    "multiorder_filter_operator",
     "radial_filter_operator",
     "configure_radial_filter_cache",
     "radial_filter_cache_info",

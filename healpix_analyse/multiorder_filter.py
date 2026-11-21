@@ -1,0 +1,412 @@
+"""Gaussian filter operator on a mixed-level (multi-order) HEALPix cell set.
+
+The cells are *leaves* of a quad-tree: every leaf has its own refinement
+level, leaves do not overlap, and a place that is not covered by any leaf is
+land (or simply outside the domain).  The operator spreads weight through
+water: the kernel sees the length of the shortest path over neighbouring
+leaves, never a straight line over land.
+
+Graph
+-----
+Two leaves are neighbours when they share an edge or a corner, whatever their
+levels.  For a leaf at level ``l`` the eight neighbouring cells at level ``l``
+are taken from ``healpix-geo`` (via :func:`nested_neighbours`); each is then
+looked up in the set: the cell itself, or its parent.  A leaf that is finer
+than its neighbour finds the neighbour as the parent of one of its own
+neighbours, so the coarse side needs no search of its own.
+
+The input must be *2:1 balanced*: two leaves that touch differ by at most one
+level.  A leaf whose neighbour is covered by an ancestor two or more levels
+up raises ``ValueError``.
+
+A contact through a corner only is passable when the two leaves have a common
+neighbour that is not blocked: a diagonal chain of land would otherwise leak,
+the rule of :func:`gaussian_filter_operator` with ``blocked_cells``.
+
+Distance
+--------
+Edge lengths are the geodesic distance between the centres of the two leaves.
+``correction="none"`` uses the shortest path as it is: absence of a leaf
+and blocked leaves both force detours, and the metrication error of the
+lattice (a path along cells is longer than the straight line, by about
+4 % on average and up to 40 % in the worst direction) stays.
+``correction="lattice"`` is the correction of ``blocked_cells``: the
+path through water ``D`` is divided by the path ``D0`` over the same graph
+with every leaf passable, and multiplied by the straight geodesic, so that
+``d`` is exactly the straight distance wherever blocked leaves do not
+matter.  Only blocked leaves are land in that mode; a place without leaf
+lengthens ``D`` and ``D0`` alike and is crossed as if it were water.
+"""
+
+from __future__ import annotations
+
+import heapq
+
+import numpy as np
+
+from healpix_geo import nested
+
+from ._neighbourhood import _wgs84_distance
+from ._topology import nested_neighbours
+from .radial_filter import (
+    FilterOperator,
+    _normalise,
+    _validate_normalization,
+    _validate_positive_finite,
+)
+
+_NORMALIZATIONS = ("present", "source")
+_CORRECTIONS = ("none", "lattice")
+_EDGE_SLOTS = (0, 2, 4, 6)
+
+# Bound of D0 / straight on the HEALPix 8-neighbour lattice, as in the land
+# barrier of the one-level operators (measured at one level, see
+# ``healpix_analyse._land_barrier``).  Used only with ``correction="lattice"``.
+_SEARCH_FACTOR = 1.5
+
+
+def _validate_leaves(
+    levels: np.ndarray, cell_ids: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    levels = np.asarray(levels)
+    cell_ids = np.asarray(cell_ids)
+    if levels.ndim != 1 or cell_ids.shape != levels.shape:
+        raise ValueError(
+            "'levels' and 'cell_ids' must be one-dimensional arrays of the "
+            "same length."
+        )
+    if levels.size == 0:
+        raise ValueError("The cell set is empty.")
+    if not np.issubdtype(levels.dtype, np.integer) or not np.issubdtype(
+        cell_ids.dtype, np.integer
+    ):
+        raise ValueError("'levels' and 'cell_ids' must be integer arrays.")
+    if levels.min() < 0 or levels.max() > 29:
+        raise ValueError("Refinement levels must lie between 0 and 29.")
+    if cell_ids.min() < 0:
+        raise ValueError("Cell ids must be non-negative.")
+    levels = levels.astype(np.int64)
+    cell_ids = cell_ids.astype(np.int64)
+    if np.any(cell_ids >= 12 * 4**levels):
+        raise ValueError("A cell id is out of range for its level.")
+    return levels, cell_ids
+
+
+def _key(level: np.ndarray | int, ids: np.ndarray) -> np.ndarray:
+    """Unique key of a cell (NUNIQ: ``4 * 4**level + id``)."""
+    return 4 * np.int64(4) ** level + ids
+
+
+def _check_no_overlap(levels: np.ndarray, cell_ids: np.ndarray) -> None:
+    keys = _key(levels, cell_ids)
+    if np.unique(keys).size != keys.size:
+        raise ValueError("The cell set contains duplicate cells.")
+    present = set(keys.tolist())
+    for level in np.unique(levels):
+        if level == 0:
+            continue
+        ids = cell_ids[levels == level]
+        for up in range(1, int(level) + 1):
+            ancestors = _key(level - up, ids >> (2 * up))
+            if any(a in present for a in ancestors.tolist()):
+                raise ValueError(
+                    "The cell set overlaps: a leaf lies inside another leaf."
+                )
+
+
+def leaf_adjacency(
+    levels: np.ndarray, cell_ids: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the neighbour pairs of a mixed-level leaf set.
+
+    Returns ``(first, second, edge)``: positions in the input with
+    ``first < second``, and a boolean that is ``True`` when the two leaves
+    share (part of) an edge and ``False`` when they only touch at a corner.
+    Raises ``ValueError`` when the set overlaps or is not 2:1 balanced.
+    """
+    levels, cell_ids = _validate_leaves(levels, cell_ids)
+    _check_no_overlap(levels, cell_ids)
+    position = {k: i for i, k in enumerate(_key(levels, cell_ids).tolist())}
+
+    firsts: list[np.ndarray] = []
+    seconds: list[np.ndarray] = []
+    edges: list[np.ndarray] = []
+    for level in np.unique(levels):
+        level = int(level)
+        member = np.flatnonzero(levels == level)
+        ids = cell_ids[member]
+        neighbours = nested_neighbours(ids, level)
+        for slot in range(8):
+            cell = neighbours[:, slot]
+            valid = cell >= 0
+            if not valid.any():
+                continue
+            source = member[valid]
+            cell = cell[valid]
+            found = np.full(cell.size, -1, dtype=np.int64)
+            for up in range(0, level + 1):
+                key = _key(level - up, cell >> (2 * up)).tolist()
+                hit = np.array([position.get(k, -1) for k in key], np.int64)
+                if up >= 2 and np.any(hit >= 0):
+                    bad = source[hit >= 0][0]
+                    raise ValueError(
+                        "The cell set is not 2:1 balanced: the leaf of level "
+                        f"{level} with id {int(cell_ids[bad])} touches a leaf "
+                        f"{up} levels coarser."
+                    )
+                found = np.where((found < 0) & (hit >= 0), hit, found)
+            keep = (found >= 0) & (found != source)
+            if keep.any():
+                firsts.append(source[keep])
+                seconds.append(found[keep])
+                edges.append(np.full(int(keep.sum()), slot in _EDGE_SLOTS))
+    if not firsts:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty, np.empty(0, dtype=bool)
+
+    first = np.concatenate(firsts)
+    second = np.concatenate(seconds)
+    edge = np.concatenate(edges)
+    low = np.minimum(first, second)
+    high = np.maximum(first, second)
+    n = levels.size
+    pair = low * n + high
+    order = np.lexsort((~edge, pair))  # edge contacts first within a pair
+    pair, low, high, edge = pair[order], low[order], high[order], edge[order]
+    first_of_pair = np.concatenate(([True], pair[1:] != pair[:-1]))
+    return low[first_of_pair], high[first_of_pair], edge[first_of_pair]
+
+
+def _centres(levels: np.ndarray, cell_ids: np.ndarray, ellipsoid: str):
+    lon = np.empty(levels.size)
+    lat = np.empty(levels.size)
+    for level in np.unique(levels):
+        member = levels == level
+        x, y = nested.healpix_to_lonlat(
+            cell_ids[member], int(level), ellipsoid=ellipsoid
+        )
+        lon[member] = np.asarray(x)
+        lat[member] = np.asarray(y)
+    return lon, lat
+
+
+class _Graph:
+    """Undirected graph in compressed form, with a per-edge lookup."""
+
+    def __init__(self, n, first, second, length):
+        src = np.concatenate((first, second))
+        dst = np.concatenate((second, first))
+        weight = np.concatenate((length, length))
+        order = np.argsort(src, kind="stable")
+        self.src = src[order]
+        self.dst = dst[order]
+        self.length = weight[order]
+        self.indptr = np.concatenate(
+            ([0], np.cumsum(np.bincount(self.src, minlength=n)))
+        )
+
+    def lists(self):
+        """Python adjacency lists: ``[(neighbour, length), ...]`` per node."""
+        out = []
+        for i in range(self.indptr.size - 1):
+            a, b = self.indptr[i], self.indptr[i + 1]
+            out.append(list(zip(self.dst[a:b].tolist(), self.length[a:b].tolist())))
+        return out
+
+
+def _dijkstra(adjacency, source: int, limit: float) -> dict[int, float]:
+    """Heap Dijkstra from ``source``, cells farther than ``limit`` are left out."""
+    best = {source: 0.0}
+    heap = [(0.0, source)]
+    done = set()
+    while heap:
+        dist, node = heapq.heappop(heap)
+        if node in done:
+            continue
+        done.add(node)
+        for other, step in adjacency[node]:
+            new = dist + step
+            if new <= limit and new < best.get(other, np.inf):
+                best[other] = new
+                heapq.heappush(heap, (new, other))
+    return best
+
+
+def _passable(first, second, edge, blocked):
+    """Per pair: usable when blocked leaves are removed.
+
+    A pair with a blocked end is not usable.  A corner-only contact needs a
+    common neighbour that is not blocked.
+    """
+    ok = ~blocked[first] & ~blocked[second]
+    free_neighbours: dict[int, set] = {}
+    for a, b in zip(first[ok].tolist(), second[ok].tolist()):
+        free_neighbours.setdefault(a, set()).add(b)
+        free_neighbours.setdefault(b, set()).add(a)
+    for k in np.flatnonzero(ok & ~edge):
+        a, b = int(first[k]), int(second[k])
+        if not (free_neighbours.get(a, set()) & free_neighbours.get(b, set())):
+            ok[k] = False
+    return ok
+
+
+def _water_pairs(
+    levels, cell_ids, radius, correction, blocked_mask, water_contacts, ellipsoid
+):
+    """Pairs ``(target, source, distance)`` within ``radius`` through water."""
+    n = levels.size
+    first, second, edge = leaf_adjacency(levels, cell_ids)
+    if water_contacts is not None:
+        listed = np.asarray(water_contacts[0], dtype=np.int64), np.asarray(
+            water_contacts[1], dtype=np.int64
+        )
+        listed_key = np.minimum(*listed) * n + np.maximum(*listed)
+        keep = np.isin(first * n + second, listed_key)
+        first, second = first[keep], second[keep]
+        edge = np.ones(first.size, dtype=bool)
+    lon, lat = _centres(levels, cell_ids, ellipsoid)
+    length = _wgs84_distance(lon[first], lat[first], lon[second], lat[second])
+    ok = _passable(first, second, edge, blocked_mask)
+    water = _Graph(n, first[ok], second[ok], length[ok]).lists()
+
+    lattice = correction == "lattice"
+    limit = radius * _SEARCH_FACTOR if lattice else radius
+    free = _Graph(n, first, second, length).lists() if lattice else None
+
+    rows: list[int] = []
+    columns: list[int] = []
+    d_water_list: list[float] = []
+    d_free_list: list[float] = []
+    for target in range(n):
+        if blocked_mask[target]:
+            continue
+        through = _dijkstra(water, target, limit)
+        reference = _dijkstra(free, target, limit) if lattice else through
+        for source, d_water in through.items():
+            if blocked_mask[source] or source not in reference:
+                continue
+            rows.append(target)
+            columns.append(source)
+            d_water_list.append(d_water)
+            d_free_list.append(reference[source])
+
+    rows_a = np.asarray(rows, dtype=np.int64)
+    columns_a = np.asarray(columns, dtype=np.int64)
+    distance_a = np.asarray(d_water_list, dtype=np.float64)
+    if lattice:
+        d_free_a = np.asarray(d_free_list, dtype=np.float64)
+        straight = _wgs84_distance(
+            lon[rows_a], lat[rows_a], lon[columns_a], lat[columns_a]
+        )
+        with np.errstate(invalid="ignore", divide="ignore"):
+            distance_a = np.where(rows_a == columns_a, 0.0, straight * distance_a / d_free_a)
+    keep = distance_a <= radius
+    rows_a, columns_a, distance_a = rows_a[keep], columns_a[keep], distance_a[keep]
+    order = np.lexsort((columns_a, rows_a))
+    rows_a, columns_a, distance_a = rows_a[order], columns_a[order], distance_a[order]
+
+    return rows_a, columns_a, distance_a
+
+
+def multiorder_filter_operator(
+    levels: np.ndarray,
+    cell_ids: np.ndarray,
+    *,
+    sigma_m: float,
+    truncate: float = 4.0,
+    normalization: str = "source",
+    correction: str = "none",
+    blocked: np.ndarray | None = None,
+    area_weights: bool = True,
+    wet_fraction: np.ndarray | None = None,
+    water_contacts: tuple[np.ndarray, np.ndarray] | None = None,
+    ellipsoid: str = "WGS84",
+) -> FilterOperator:
+    """Return a Gaussian filter operator on a mixed-level set of leaves.
+
+    Parameters
+    ----------
+    levels, cell_ids
+        One-dimensional integer arrays: the refinement level of each leaf and
+        its NESTED id at that level.  Leaves must not overlap and must be
+        2:1 balanced (touching leaves differ by at most one level).  A place
+        without a leaf is land.
+    sigma_m
+        Standard deviation of the Gaussian, in metres of distance through
+        water.
+    truncate
+        The kernel is cut at ``truncate * sigma_m``.
+    normalization
+        ``"source"`` (default): the weights that leave one leaf sum to one,
+        so the total of a signal of masses (one value per leaf, such as a
+        probability) is conserved exactly.  The weight to a target leaf is
+        proportional to its area.  ``"present"``: the weights that reach one
+        leaf sum to one; with ``area_weights`` the source leaves count with
+        their area, so a signal of densities is averaged over area.
+    correction
+        ``"none"`` (default) or ``"lattice"``; see the module description.
+    blocked
+        Optional boolean array over the leaves: blocked leaves are land
+        inside the set.  They neither receive nor give weight, their row is
+        empty, and the output there is 0.
+    area_weights
+        Use the area of the leaves (``4**-level``) in the weights.  With
+        ``False`` every leaf counts the same, which makes a coarse leaf as
+        heavy as a fine one.
+    wet_fraction
+        Optional array over the leaves with the share of each leaf that is
+        water, in ``(0, 1]``; the area weight of a leaf is multiplied by it
+        (a leaf that is mostly land, such as a river cell, counts for the
+        water it holds).  Ignored without ``area_weights``.
+    water_contacts
+        Optional ``(first, second)``: positions of pairs of leaves that the
+        caller knows to be joined by water.  Two leaves touch in the graph
+        only when they touch geometrically *and* the pair is listed, and
+        every listed pair counts as an edge contact.  Use it when the leaves
+        are larger than the water they hold (a river a few cells wide), where
+        two leaves that touch may hold water that does not meet.
+    ellipsoid
+        Ellipsoid of the centres and of the geodesic lengths.
+
+    Returns
+    -------
+    FilterOperator
+        Rows and columns follow the input order.  Apply with
+        :func:`apply_filter_operator`.
+    """
+    normalization = _validate_normalization(normalization, _NORMALIZATIONS)
+    if correction not in _CORRECTIONS:
+        raise ValueError(
+            f"'correction' must be one of {_CORRECTIONS}; got {correction!r}."
+        )
+    _validate_positive_finite(sigma_m, name="sigma_m")
+    _validate_positive_finite(truncate, name="truncate")
+    levels, cell_ids = _validate_leaves(levels, cell_ids)
+    n = levels.size
+    blocked_mask = (
+        np.zeros(n, bool) if blocked is None else np.asarray(blocked, bool)
+    )
+    if blocked_mask.shape != (n,):
+        raise ValueError("'blocked' must be a boolean array over the leaves.")
+
+    radius = truncate * sigma_m
+    rows_a, columns_a, distance_a = _water_pairs(
+        levels, cell_ids, radius, correction, blocked_mask, water_contacts, ellipsoid
+    )
+
+    area = 4.0 ** (-levels.astype(np.float64)) if area_weights else np.ones(n)
+    if wet_fraction is not None and area_weights:
+        wet = np.asarray(wet_fraction, dtype=np.float64)
+        if wet.shape != (n,) or not np.all((wet > 0.0) & (wet <= 1.0)):
+            raise ValueError(
+                "'wet_fraction' must be an array over the leaves with "
+                "values in (0, 1]."
+            )
+        area = area * wet
+    weights = np.exp(-0.5 * (distance_a / sigma_m) ** 2)
+    weights = weights * (area[rows_a] if normalization == "source" else area[columns_a])
+    weights = _normalise(weights, rows_a, columns_a, n, n, normalization)
+    row_offsets = np.concatenate(
+        ([0], np.cumsum(np.bincount(rows_a, minlength=n), dtype=np.int64))
+    ).astype(np.int64)
+    return FilterOperator(row_offsets, columns_a, weights, n)

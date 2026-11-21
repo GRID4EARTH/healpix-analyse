@@ -575,6 +575,70 @@ this domain (the cost grows with the square of sigma).
   lattice path changes because of land (see above).
 - Real coasts were tried on one demo domain only; GPU and dask were not tried.
 
+## Mixed-level sets (multi-order)
+
+`multiorder_filter_operator(levels, cell_ids, sigma_m=...)` builds the same kind
+of operator on a set of *leaves* of different refinement levels, such as a
+river refined to level 15 that opens into a sea held at level 11. `levels` and
+`cell_ids` are two integer arrays (the level of each leaf and its NESTED id at
+that level); the result is a `FilterOperator` over the leaves in input order, to
+be applied with `apply_filter_operator`. **Land is a place without a leaf**,
+and leaves listed in the optional boolean `blocked` are land inside the set.
+
+```python
+op = multiorder_filter_operator(
+    levels, cell_ids, sigma_m=5_000.0, normalization="source",
+)
+state = apply_filter_operator(state, *op)   # probability per leaf, conserved
+```
+
+- **Graph.** Two leaves are neighbours when they share an edge or a corner,
+  at any levels: the eight neighbours of a leaf at its own level come from
+  healpix-geo, and each is looked up in the set (the cell itself, or its parent).
+  The input must be **2:1 balanced** (touching leaves differ by at most one
+  level) and must not overlap; a clear `ValueError` is raised otherwise. A
+  contact through a corner only is usable when the two leaves have a common
+  neighbour that is not land, so a diagonal chain of land does not leak (the
+  rule of the one-level barrier).
+- **Distance.** Edge lengths are geodesic distances between leaf centres, and
+  the kernel sees the length of the shortest path (a heap Dijkstra, no scipy).
+  With `correction="none"` (default) the path is used as it is: it is longer
+  than the straight distance by the usual lattice metrication, up to about
+  10 % within 30 degrees of the equator and about 40 % in the worst direction
+  elsewhere, and the width of the kernel is smaller by that factor.
+  With `correction="lattice"` the correction of `blocked_cells` is applied,
+  `d = straight * D / D0`, where `D0` is the path over the same graph with the
+  blocked leaves passable. In open water `d` is exactly the straight distance, at
+  any mix of levels. A leaf that is absent lengthens `D` and `D0` alike, so in
+  this mode **only blocked leaves are land**; supply the dry leaves of a full
+  tessellation as `blocked`. With one level, `correction="lattice"` gives the
+  operator of `gaussian_filter_operator(..., blocked_cells=...)` to rounding
+  (tested at `rtol=1e-12`).
+- **Weights.** A leaf of level `l` has the area `4**-l`, and `wet_fraction`
+  (optional, per leaf, in `(0, 1]`) multiplies it for leaves that are mostly
+  land. `normalization="source"` makes the weights that leave one leaf sum to
+  one, so the total of a signal of masses (one value per leaf) is conserved
+  exactly; the weight to a target is proportional to the target's area, so a
+  coarse leaf receives more than a fine one at the same distance.
+  `normalization="present"` makes the weights that reach a leaf sum to one, with
+  the source areas as weights: it averages a signal of densities over area. With
+  `area_weights=False` every leaf counts the same.
+- **Leaves larger than the water.** Two leaves may touch while the water they
+  hold does not meet (a river a few hundred metres wide in leaves of 200 m,
+  with an embankment between two meanders). The leaf graph alone cannot know,
+  and it shortens the path across such a spot. `water_contacts=(first, second)`
+  restricts the graph to pairs that the caller knows to be joined by water.
+- Tested against a brute-force reference that expands every leaf to its finest
+  descendants and runs an unbounded Dijkstra: strait, island, closed bay,
+  diagonal chain, conservation with `"source"`, and the one-level case. The cost
+  is a Python heap search per leaf, fine for thousands of leaves and not meant
+  for millions.
+- Not done: a width rule below one leaf (the Gaussian is evaluated as it is, so
+  a `sigma_m` below the distance to the nearest neighbour leaves each leaf
+  nearly alone), a `domain` argument, and a measured bound of
+  `D0 / straight` across level steps for `correction="lattice"` (the one-level
+  bound 1.5 is used to size the search).
+
 ## Custom radial kernels
 
 A user-defined kernel receives a one-dimensional NumPy array containing the distances of valid target-neighbour pairs:

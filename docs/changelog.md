@@ -28,6 +28,14 @@
   around it stays inside the candidate disc of 1.5 radii around the source; a
   longer detour drops the pair, so a long hole then acts as a barrier. Without blocked cells
   the operator is the same as before.
+- `multiorder_filter_operator`: a Gaussian filter operator on a mixed-level set of
+  HEALPix leaves (a river at a fine level opening into a sea at a coarse one).
+  Land is a place without a leaf, or a blocked leaf; the kernel acts on the
+  shortest path through water over edge and corner contacts across levels (2:1
+  balanced input, checked), with leaf areas (and an optional wet fraction) in
+  the weights. `normalization="source"` conserves the total exactly; with one
+  level and `correction="lattice"` the result equals the one-level operator with
+  `blocked_cells`. No new dependency.
 - `normalization="source"` for the two operators: every source cell hands out
   weights that sum to one over the cells it reaches, so that the columns sum to
   one and the total of the signal is conserved (a reflecting coast and domain
