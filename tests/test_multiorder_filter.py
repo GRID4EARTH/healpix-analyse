@@ -426,3 +426,25 @@ def test_argument_validation():
         _operator(levels[:-1], ids)
     with pytest.raises(ValueError, match="out of range"):
         _operator(np.array([2]), np.array([200]))
+
+
+@pytest.mark.parametrize("correction", ["none", "lattice"])
+def test_scipy_and_builtin_paths_give_the_same_operator(correction):
+    pytest.importorskip("scipy")
+    levels, ids = _mixed(10)
+    u, v = _plane(levels, ids)
+    keep = ~(np.hypot(u + 2.0, v - 1.0) <= 1.5)
+    levels, ids, u, v = levels[keep], ids[keep], u[keep], v[keep]
+    blocked = (np.abs(u - 2.5) <= 0.6) & (np.abs(v) <= 3.0)
+    a = _operator(levels, ids, blocked=blocked, correction=correction)
+    b = _operator(
+        levels, ids, blocked=blocked, correction=correction, shortest_path="scipy"
+    )
+    np.testing.assert_allclose(_dense(a), _dense(b), rtol=1e-12, atol=1e-15)
+    assert np.array_equal(_dense(a) != 0, _dense(b) != 0)
+
+
+def test_shortest_path_validation():
+    levels, ids = _uniform(3)
+    with pytest.raises(ValueError, match="shortest_path"):
+        _operator(levels, ids, shortest_path="networkx")

@@ -57,6 +57,8 @@ from .radial_filter import (
 
 _NORMALIZATIONS = ("present", "source")
 _CORRECTIONS = ("none", "lattice")
+_SHORTEST_PATHS = ("builtin", "scipy")
+_SCIPY_CHUNK = 256
 _EDGE_SLOTS = (0, 2, 4, 6)
 
 # Bound of D0 / straight on the HEALPix 8-neighbour lattice, as in the land
@@ -250,8 +252,45 @@ def _passable(first, second, edge, blocked):
     return ok
 
 
+def _scipy_paths(n, first, second, length, targets, limit):
+    """Yield ``(target, sources, distances)`` with scipy's Dijkstra."""
+    try:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import dijkstra
+    except ImportError as error:  # pragma: no cover - depends on the install
+        raise ImportError(
+            "shortest_path='scipy' needs SciPy; install it "
+            "(pip install 'healpix-analyse[scipy]') or use "
+            "shortest_path='builtin'."
+        ) from error
+    graph = coo_matrix((length, (first, second)), shape=(n, n)).tocsr()
+    for start in range(0, len(targets), _SCIPY_CHUNK):
+        chunk = targets[start : start + _SCIPY_CHUNK]
+        dist = dijkstra(graph, directed=False, indices=chunk, limit=limit)
+        for target, row in zip(chunk, dist):
+            sources = np.flatnonzero(np.isfinite(row))
+            yield int(target), sources, row[sources]
+
+
+def _builtin_paths(adjacency, targets, limit):
+    for target in targets:
+        reached = _dijkstra(adjacency, int(target), limit)
+        yield (
+            int(target),
+            np.fromiter(reached.keys(), np.int64, len(reached)),
+            np.fromiter(reached.values(), np.float64, len(reached)),
+        )
+
+
 def _water_pairs(
-    levels, cell_ids, radius, correction, blocked_mask, water_contacts, ellipsoid
+    levels,
+    cell_ids,
+    radius,
+    correction,
+    blocked_mask,
+    water_contacts,
+    ellipsoid,
+    shortest_path="builtin",
 ):
     """Pairs ``(target, source, distance)`` within ``radius`` through water."""
     n = levels.size
@@ -267,28 +306,47 @@ def _water_pairs(
     lon, lat = _centres(levels, cell_ids, ellipsoid)
     length = _wgs84_distance(lon[first], lat[first], lon[second], lat[second])
     ok = _passable(first, second, edge, blocked_mask)
-    water = _Graph(n, first[ok], second[ok], length[ok]).lists()
-
     lattice = correction == "lattice"
     limit = radius * _SEARCH_FACTOR if lattice else radius
-    free = _Graph(n, first, second, length).lists() if lattice else None
+    targets = np.flatnonzero(~blocked_mask)
+    if shortest_path == "scipy":
+        water_runs = _scipy_paths(n, first[ok], second[ok], length[ok], targets, limit)
+        free_runs = (
+            _scipy_paths(n, first, second, length, targets, limit) if lattice else None
+        )
+    else:
+        water_runs = _builtin_paths(
+            _Graph(n, first[ok], second[ok], length[ok]).lists(), targets, limit
+        )
+        free_runs = (
+            _builtin_paths(_Graph(n, first, second, length).lists(), targets, limit)
+            if lattice
+            else None
+        )
 
-    rows: list[int] = []
-    columns: list[int] = []
-    d_water_list: list[float] = []
-    d_free_list: list[float] = []
-    for target in range(n):
-        if blocked_mask[target]:
-            continue
-        through = _dijkstra(water, target, limit)
-        reference = _dijkstra(free, target, limit) if lattice else through
-        for source, d_water in through.items():
-            if blocked_mask[source] or source not in reference:
-                continue
-            rows.append(target)
-            columns.append(source)
-            d_water_list.append(d_water)
-            d_free_list.append(reference[source])
+    rows_l: list[np.ndarray] = []
+    cols_l: list[np.ndarray] = []
+    dw_l: list[np.ndarray] = []
+    df_l: list[np.ndarray] = []
+    if not lattice:
+        free_runs = [None] * targets.size
+    for (target, src, dist), free_run in zip(water_runs, free_runs):
+        if lattice:
+            _, src_f, dist_f = free_run
+            lookup = dict(zip(src_f.tolist(), dist_f.tolist()))
+            d_free = np.array([lookup.get(x, np.nan) for x in src.tolist()])
+        else:
+            d_free = dist
+        keep = ~blocked_mask[src] & np.isfinite(d_free)
+        rows_l.append(np.full(int(keep.sum()), target, np.int64))
+        cols_l.append(src[keep].astype(np.int64))
+        dw_l.append(dist[keep])
+        df_l.append(d_free[keep])
+    empty = np.empty(0)
+    rows = np.concatenate(rows_l) if rows_l else empty
+    columns = np.concatenate(cols_l) if cols_l else empty
+    d_water_list = np.concatenate(dw_l) if dw_l else empty
+    d_free_list = np.concatenate(df_l) if df_l else empty
 
     rows_a = np.asarray(rows, dtype=np.int64)
     columns_a = np.asarray(columns, dtype=np.int64)
@@ -317,6 +375,7 @@ def multiorder_filter_operator(
     normalization: str = "source",
     correction: str = "none",
     blocked: np.ndarray | None = None,
+    shortest_path: str = "builtin",
     area_weights: bool = True,
     wet_fraction: np.ndarray | None = None,
     water_contacts: tuple[np.ndarray, np.ndarray] | None = None,
@@ -349,6 +408,11 @@ def multiorder_filter_operator(
         Optional boolean array over the leaves: blocked leaves are land
         inside the set.  They neither receive nor give weight, their row is
         empty, and the output there is 0.
+    shortest_path
+        ``"builtin"`` (default): the heap Dijkstra of this module, no SciPy.
+        ``"scipy"``: ``scipy.sparse.csgraph.dijkstra`` on the same graph,
+        imported only then (``ImportError`` if SciPy is missing; the
+        ``scipy`` extra installs it).  Both give the same operator.
     area_weights
         Use the area of the leaves (``4**-level``) in the weights.  With
         ``False`` every leaf counts the same, which makes a coarse leaf as
@@ -375,6 +439,11 @@ def multiorder_filter_operator(
         :func:`apply_filter_operator`.
     """
     normalization = _validate_normalization(normalization, _NORMALIZATIONS)
+    if shortest_path not in _SHORTEST_PATHS:
+        raise ValueError(
+            f"'shortest_path' must be one of {_SHORTEST_PATHS}; "
+            f"got {shortest_path!r}."
+        )
     if correction not in _CORRECTIONS:
         raise ValueError(
             f"'correction' must be one of {_CORRECTIONS}; got {correction!r}."
@@ -391,7 +460,14 @@ def multiorder_filter_operator(
 
     radius = truncate * sigma_m
     rows_a, columns_a, distance_a = _water_pairs(
-        levels, cell_ids, radius, correction, blocked_mask, water_contacts, ellipsoid
+        levels,
+        cell_ids,
+        radius,
+        correction,
+        blocked_mask,
+        water_contacts,
+        ellipsoid,
+        shortest_path,
     )
 
     area = 4.0 ** (-levels.astype(np.float64)) if area_weights else np.ones(n)

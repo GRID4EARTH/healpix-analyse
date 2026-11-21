@@ -614,6 +614,7 @@ state = apply_filter_operator(state, *op)   # probability per leaf, conserved
   tessellation as `blocked`. With one level, `correction="lattice"` gives the
   operator of `gaussian_filter_operator(..., blocked_cells=...)` to rounding
   (tested at `rtol=1e-12`).
+- **SciPy is optional.** `shortest_path="scipy"` runs `scipy.sparse.csgraph.dijkstra` on the same graph (install the `scipy` extra); it is only imported then, and the default `"builtin"` needs no SciPy.
 - **Weights.** A leaf of level `l` has the area `4**-l`, and `wet_fraction`
   (optional, per leaf, in `(0, 1]`) multiplies it for leaves that are mostly
   land. `normalization="source"` makes the weights that leave one leaf sum to

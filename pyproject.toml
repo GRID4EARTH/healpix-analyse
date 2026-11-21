@@ -38,6 +38,10 @@ test = [
   "pytest>=8",
 ]
 
+scipy = [
+  "scipy>=1.11",
+]
+
 benchmark = [
   "scipy>=1.11",
 ]
