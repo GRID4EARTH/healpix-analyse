@@ -119,7 +119,7 @@ def _reference_pairs(levels, ids):
     return pairs
 
 
-def _reference_graph(levels, ids, blocked):
+def _reference_graph(levels, ids, blocked, corner_rule=True):
     """Adjacency lists ``[(neighbour, length_m), ...]`` through water."""
     n = ids.size
     pairs = _reference_pairs(levels, ids)
@@ -138,7 +138,7 @@ def _reference_graph(levels, ids, blocked):
     for (a, b), is_edge in pairs.items():
         if blocked[a] or blocked[b]:
             continue
-        if not is_edge and not (touching[a] & touching[b]):
+        if corner_rule and not is_edge and not (touching[a] & touching[b]):
             continue
         length = _WGS84.inv(lon[a], lat[a], lon[b], lat[b])[2]
         adjacency[a].append((b, length))
@@ -188,6 +188,81 @@ def _reference_operator(
         sums = matrix.sum(axis=0, keepdims=True)
         matrix = np.divide(matrix, sums, out=np.zeros_like(matrix), where=sums > 0)
     return matrix
+
+
+def _reference_lattice_operator(levels, ids, blocked, normalization="source"):
+    """``d = straight * D / D0``: D through water, D0 with land passable and
+    no corner rule (every geometric contact)."""
+    n = ids.size
+    radius = 4.0 * SIGMA
+    a = 4.0 ** (-levels.astype(float))
+    lon = np.empty(n)
+    lat = np.empty(n)
+    for level in np.unique(levels):
+        m = levels == level
+        x, y = nested.healpix_to_lonlat(ids[m], int(level), ellipsoid="WGS84")
+        lon[m], lat[m] = np.asarray(x), np.asarray(y)
+    water = _reference_graph(levels, ids, blocked)
+    free = _reference_graph(levels, ids, np.zeros(n, bool), corner_rule=False)
+    matrix = np.zeros((n, n))
+    for target in range(n):
+        if blocked[target]:
+            continue
+        d_w = _reference_distance(water, target)
+        d_f = _reference_distance(free, target)
+        straight = np.array(
+            [_WGS84.inv(lon[target], lat[target], lon[j], lat[j])[2] for j in range(n)]
+        )
+        with np.errstate(invalid="ignore", divide="ignore"):
+            d = np.where(np.arange(n) == target, 0.0, straight * d_w / d_f)
+        ok = np.isfinite(d) & (d <= radius) & ~blocked
+        g = np.where(ok, np.exp(-0.5 * (np.where(ok, d, 0.0) / SIGMA) ** 2), 0.0)
+        matrix[target] = g * (a if normalization == "present" else a[target])
+    sums = matrix.sum(axis=0 if normalization == "source" else 1, keepdims=True)
+    return np.divide(matrix, sums, out=np.zeros_like(matrix), where=sums > 0)
+
+
+def _balance(leaves):
+    """Split coarse leaves until the set (a set of (level, id)) is 2:1."""
+    leaves = set(leaves)
+    while True:
+        split = set()
+        for level in sorted({lv for lv, _ in leaves}):
+            if level < 2:
+                continue
+            ids = np.array([i for lv, i in leaves if lv == level], dtype=np.uint64)
+            neigh = np.asarray(nested.neighbours(ids, level, connectivity="all"))
+            for cell in np.unique(neigh[neigh >= 0]).tolist():
+                for up in range(2, level + 1):
+                    if (level - up, cell >> (2 * up)) in leaves:
+                        split.add((level - up, cell >> (2 * up)))
+        if not split:
+            return leaves
+        for lv, i in split:
+            leaves.remove((lv, i))
+            leaves |= {(lv + 1, 4 * i + k) for k in range(4)}
+
+
+def _arrays(leaves):
+    leaves = sorted(leaves)
+    return (
+        np.array([lv for lv, _ in leaves], dtype=np.int64),
+        np.array([i for _, i in leaves], dtype=np.int64),
+    )
+
+
+def _three_levels(k: int = 5):
+    """Levels 8, 9 and 10 in one set: finer towards the centre line."""
+    leaves = {(LEVEL, int(i)) for i in _patch(k)}
+    for _ in range(2):
+        levels, ids = _arrays(leaves)
+        u, v = _plane(levels, ids)
+        near = np.hypot(u, v) < (3.0 if levels.max() == LEVEL else 1.6)
+        for lv, i, flag in zip(levels.tolist(), ids.tolist(), near):
+            if flag and lv == levels.max():
+                leaves.remove((lv, i))
+                leaves |= {(lv + 1, 4 * i + c) for c in range(4)}
+    return _arrays(_balance(leaves))
 
 
 # -------------------------------------------------------------- equivalence
@@ -402,8 +477,9 @@ def test_unbalanced_set_is_refused():
     neighbour = int(np.asarray(nested.neighbours(np.array([centre]), LEVEL, connectivity="all"))[0, 3])
     fine = neighbour * 16
     levels = np.array([LEVEL, LEVEL + 2])
-    with pytest.raises(ValueError, match="2:1"):
+    with pytest.raises(ValueError, match="2:1") as info:
         leaf_adjacency(levels, np.array([centre, fine]))
+    assert f"level {LEVEL + 2} with id {fine}" in str(info.value)
 
 
 def test_overlapping_and_duplicate_leaves_are_refused():
@@ -429,16 +505,23 @@ def test_argument_validation():
 
 
 @pytest.mark.parametrize("correction", ["none", "lattice"])
-def test_scipy_and_builtin_paths_give_the_same_operator(correction):
+@pytest.mark.parametrize("with_contacts", [False, True])
+def test_scipy_and_builtin_paths_give_the_same_operator(correction, with_contacts):
     pytest.importorskip("scipy")
     levels, ids = _mixed(10)
     u, v = _plane(levels, ids)
     keep = ~(np.hypot(u + 2.0, v - 1.0) <= 1.5)
     levels, ids, u, v = levels[keep], ids[keep], u[keep], v[keep]
     blocked = (np.abs(u - 2.5) <= 0.6) & (np.abs(v) <= 3.0)
-    a = _operator(levels, ids, blocked=blocked, correction=correction)
+    kw = {}
+    if with_contacts:
+        first, second, _ = leaf_adjacency(levels, ids)
+        drop = (np.abs(v[first] - 4.0) < 0.5) & (np.abs(v[second] - 4.0) < 0.5)
+        kw["water_contacts"] = (first[~drop], second[~drop])
+    a = _operator(levels, ids, blocked=blocked, correction=correction, **kw)
     b = _operator(
-        levels, ids, blocked=blocked, correction=correction, shortest_path="scipy"
+        levels, ids, blocked=blocked, correction=correction,
+        shortest_path="scipy", **kw
     )
     np.testing.assert_allclose(_dense(a), _dense(b), rtol=1e-12, atol=1e-15)
     assert np.array_equal(_dense(a) != 0, _dense(b) != 0)
@@ -448,3 +531,159 @@ def test_shortest_path_validation():
     levels, ids = _uniform(3)
     with pytest.raises(ValueError, match="shortest_path"):
         _operator(levels, ids, shortest_path="networkx")
+
+
+# ------------------------------------------------------- review additions
+
+
+def _corner_pair():
+    """A level-8 leaf and a neighbour that touches it at a corner only."""
+    centre = 44131
+    around = np.asarray(
+        nested.neighbours(np.array([centre]), LEVEL, connectivity="all")
+    )[0]
+    around = around[around >= 0].astype(np.int64)
+    levels = np.full(around.size + 1, LEVEL)
+    ids = np.concatenate(([centre], around))
+    first, second, edge = leaf_adjacency(levels, ids)
+    mine = (first == 0) & ~edge
+    assert mine.any()
+    return centre, int(ids[second[mine][0]]), around
+
+
+@pytest.mark.parametrize("correction", ["none", "lattice"])
+def test_corner_contact_needs_a_common_leaf_in_both_modes(correction):
+    centre, corner, around = _corner_pair()
+    # two leaves that touch at a corner only: closed, nothing crosses
+    levels = np.array([LEVEL, LEVEL])
+    dense = _dense(_operator(levels, np.array([centre, corner]), correction=correction))
+    assert dense[0, 1] == 0.0 and dense[1, 0] == 0.0
+    # with a leaf that touches both, the contact opens
+    ca = np.asarray(nested.neighbours(np.array([centre]), LEVEL, connectivity="all"))[0]
+    cb = np.asarray(nested.neighbours(np.array([corner]), LEVEL, connectivity="all"))[0]
+    common = sorted(set(ca[ca >= 0].tolist()) & set(cb[cb >= 0].tolist()))
+    assert common
+    ids = np.array([centre, corner, common[0]])
+    dense = _dense(_operator(np.full(3, LEVEL), ids, correction=correction))
+    assert dense[0, 1] > 0.0 and dense[1, 0] > 0.0
+    # the same common leaf blocked: closed again
+    blocked = np.array([False, False, True])
+    dense = _dense(
+        _operator(np.full(3, LEVEL), ids, correction=correction, blocked=blocked)
+    )
+    assert dense[0, 1] == 0.0 and dense[1, 0] == 0.0
+
+
+def test_three_or_more_levels_against_brute_force():
+    levels, ids = _three_levels(5)
+    assert np.unique(levels).size >= 3
+    for normalization in ("present", "source"):
+        got = _dense(_operator(levels, ids, normalization=normalization))
+        want = _reference_operator(levels, ids, normalization)
+        np.testing.assert_allclose(got, want, rtol=1e-9, atol=1e-13)
+
+
+def test_lattice_correction_against_brute_force_at_mixed_levels():
+    levels, ids = _mixed(6)
+    u, v = _plane(levels, ids)
+    blocked = (np.abs(u - 1.5) <= 0.7) & (np.abs(v) <= 2.5)
+    blocked |= np.hypot(u + 2.5, v - 1.0) <= 0.8
+    got = _dense(_operator(levels, ids, blocked=blocked, correction="lattice"))
+    want = _reference_lattice_operator(levels, ids, blocked)
+    np.testing.assert_allclose(got, want, rtol=1e-9, atol=1e-13)
+
+
+def test_random_whole_sphere_set_adjacency_equals_brute_force():
+    rng = np.random.default_rng(3)
+    leaves = set()
+    stack = [(2, i) for i in range(12 * 4**2)]
+    while stack:
+        lv, i = stack.pop()
+        if lv < 5 and rng.random() < 0.5:
+            stack += [(lv + 1, 4 * i + c) for c in range(4)]
+        else:
+            leaves.add((lv, i))
+    leaves = sorted(_balance(leaves))
+    keep = rng.random(len(leaves)) > 0.15
+    leaves = [leaf for leaf, k in zip(leaves, keep) if k]
+    leaves = [leaves[j] for j in rng.permutation(len(leaves))]
+    levels, ids = _arrays(leaves)
+    assert np.unique(levels).size >= 3
+    first, second, edge = leaf_adjacency(levels, ids)
+    got = {(int(a), int(b)): bool(e) for a, b, e in zip(first, second, edge)}
+    assert got == _reference_pairs(levels, ids)
+
+
+def test_extreme_levels_single_leaf_and_empty_contacts():
+    # level 0: the twelve base cells
+    ids = np.arange(12)
+    dense = _dense(multiorder_filter_operator(np.zeros(12, int), ids, sigma_m=2.0e6))
+    np.testing.assert_allclose(dense.sum(axis=0), 1.0, rtol=1e-12)
+    # level 29: a leaf and its neighbour
+    big = 12 * 4**29 // 3
+    around = np.asarray(
+        nested.neighbours(np.array([big], dtype=np.uint64), 29, connectivity="edge")
+    )[0]
+    pair = np.array([big, int(around[around >= 0][0])], dtype=np.int64)
+    first, second, edge = leaf_adjacency(np.full(2, 29), pair)
+    assert (first.tolist(), second.tolist(), edge.tolist()) == ([0], [1], [True])
+    dense = _dense(multiorder_filter_operator(np.full(2, 29), pair, sigma_m=0.01))
+    assert dense.shape == (2, 2) and np.all(np.isfinite(dense))
+    # a single leaf keeps all of its weight
+    dense = _dense(_operator(np.array([LEVEL]), np.array([44131])))
+    np.testing.assert_allclose(dense, [[1.0]])
+    # every leaf blocked: empty operator, no error
+    levels, ids = _uniform(2)
+    op = _operator(levels, ids, blocked=np.ones(ids.size, bool))
+    assert op.weights.size == 0 and np.all(op.row_offsets == 0)
+    # no listed water contact: every leaf stays alone
+    empty = (np.empty(0, int), np.empty(0, int))
+    dense = _dense(_operator(levels, ids, water_contacts=empty))
+    np.testing.assert_allclose(dense, np.eye(ids.size))
+
+
+def test_water_contacts_are_validated():
+    levels, ids = _mixed(3)
+    n = ids.size
+    first, second, _ = leaf_adjacency(levels, ids)
+    for bad in ([-1], [n]):
+        with pytest.raises(ValueError, match="water_contacts"):
+            _operator(levels, ids, water_contacts=(np.array(bad), np.array([0])))
+    with pytest.raises(ValueError, match="water_contacts"):
+        _operator(levels, ids, water_contacts=([0, 1], [1]))
+    with pytest.raises(ValueError, match="water_contacts"):
+        _operator(levels, ids, water_contacts=(np.zeros((2, 2), int), np.zeros((2, 2), int)))
+    with pytest.raises(ValueError, match="water_contacts"):
+        _operator(levels, ids, water_contacts=([0.5], [1.5]))
+    with pytest.raises(ValueError, match="water_contacts"):
+        _operator(levels, ids, water_contacts=first)
+    # a listed pair that is not a geometric contact is reported
+    far = np.flatnonzero(
+        ~np.isin(np.arange(n), np.concatenate((first[first == 0], second[first == 0])))
+    )[-1]
+    with pytest.warns(UserWarning, match="not geometric neighbours"):
+        _operator(levels, ids, water_contacts=(np.array([0]), np.array([far])))
+    # a valid list does not warn
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _operator(levels, ids, water_contacts=(first, second))
+
+
+def test_blocked_must_be_boolean():
+    levels, ids = _uniform(3)
+    with pytest.raises(TypeError, match="boolean"):
+        _operator(levels, ids, blocked=np.full(ids.size, 0.5))
+    with pytest.raises(TypeError, match="boolean"):
+        _operator(levels, ids, blocked=np.zeros(ids.size, int))
+
+
+@pytest.mark.parametrize("area_weights", [True, False])
+def test_wet_fraction_is_validated_whenever_given(area_weights):
+    levels, ids = _uniform(3)
+    n = ids.size
+    for bad in (np.zeros(n), np.full(n, 1.5), np.full(n, np.nan), np.ones(n + 1)):
+        with pytest.raises(ValueError, match="wet_fraction"):
+            _operator(levels, ids, wet_fraction=bad, area_weights=area_weights)
+    _operator(levels, ids, wet_fraction=np.full(n, 0.5), area_weights=area_weights)

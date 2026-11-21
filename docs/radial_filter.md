@@ -598,23 +598,30 @@ state = apply_filter_operator(state, *op)   # probability per leaf, conserved
   The input must be **2:1 balanced** (touching leaves differ by at most one
   level) and must not overlap; a clear `ValueError` is raised otherwise. A
   contact through a corner only is usable when the two leaves have a common
-  neighbour that is not land, so a diagonal chain of land does not leak (the
-  rule of the one-level barrier).
+  neighbouring leaf that is not blocked, in both `correction` modes, so a
+  diagonal chain of land does not leak (the rule of the one-level barrier).
 - **Distance.** Edge lengths are geodesic distances between leaf centres, and
-  the kernel sees the length of the shortest path (a heap Dijkstra, no scipy).
+  the kernel sees the length of the shortest path (a heap Dijkstra).
   With `correction="none"` (default) the path is used as it is: it is longer
-  than the straight distance by the usual lattice metrication, up to about
-  10 % within 30 degrees of the equator and about 40 % in the worst direction
-  elsewhere, and the width of the kernel is smaller by that factor.
+  than the straight distance by the usual lattice metrication, up to 10 %
+  within 30 degrees of the equator and up to 40 % elsewhere, and the width of
+  the kernel is smaller by that factor.
   With `correction="lattice"` the correction of `blocked_cells` is applied,
   `d = straight * D / D0`, where `D0` is the path over the same graph with the
   blocked leaves passable. In open water `d` is exactly the straight distance, at
-  any mix of levels. A leaf that is absent lengthens `D` and `D0` alike, so in
-  this mode **only blocked leaves are land**; supply the dry leaves of a full
-  tessellation as `blocked`. With one level, `correction="lattice"` gives the
+  any mix of levels. A place without a leaf adds nothing to `D` or `D0`, so the
+  ratio ignores it and it does not lengthen `d`: in this mode **only blocked
+  leaves are land**; supply the dry leaves of a full tessellation as `blocked`.
+  Contacts are still only between leaves, and a corner contact still needs a
+  common leaf. The search is sized with `D0 / straight <= 1.5`; on a mixed set
+  at levels 11 to 15 along a wavy coast (22765 leaves, 400 sources, 2.6 million
+  pairs) the largest ratio measured was 1.38. With one level, `correction="lattice"` gives the
   operator of `gaussian_filter_operator(..., blocked_cells=...)` to rounding
   (tested at `rtol=1e-12`).
-- **SciPy is optional.** `shortest_path="scipy"` runs `scipy.sparse.csgraph.dijkstra` on the same graph (install the `scipy` extra); it is only imported then, and the default `"builtin"` needs no SciPy.
+- **SciPy is optional.** `shortest_path="scipy"` runs
+  `scipy.sparse.csgraph.dijkstra` on the same graph (install the `scipy`
+  extra); it is only imported then, and the default `"builtin"` needs no
+  SciPy.
 - **Weights.** A leaf of level `l` has the area `4**-l`, and `wet_fraction`
   (optional, per leaf, in `(0, 1]`) multiplies it for leaves that are mostly
   land. `normalization="source"` makes the weights that leave one leaf sum to
@@ -636,9 +643,9 @@ state = apply_filter_operator(state, *op)   # probability per leaf, conserved
   for millions.
 - Not done: a width rule below one leaf (the Gaussian is evaluated as it is, so
   a `sigma_m` below the distance to the nearest neighbour leaves each leaf
-  nearly alone), a `domain` argument, and a measured bound of
-  `D0 / straight` across level steps for `correction="lattice"` (the one-level
-  bound 1.5 is used to size the search).
+  nearly alone), a `domain` argument, and a proof of the
+  `D0 / straight <= 1.5` bound across level steps for `correction="lattice"`
+  (it is measured, see above, not proved).
 
 ## Custom radial kernels
 

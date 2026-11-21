@@ -20,27 +20,31 @@ level.  A leaf whose neighbour is covered by an ancestor two or more levels
 up raises ``ValueError``.
 
 A contact through a corner only is passable when the two leaves have a common
-neighbour that is not blocked: a diagonal chain of land would otherwise leak,
-the rule of :func:`gaussian_filter_operator` with ``blocked_cells``.
+neighbouring *leaf* that is not blocked, in both ``correction`` modes: a
+diagonal chain of land would otherwise leak, the rule of
+:func:`gaussian_filter_operator` with ``blocked_cells``.
 
 Distance
 --------
 Edge lengths are the geodesic distance between the centres of the two leaves.
 ``correction="none"`` uses the shortest path as it is: absence of a leaf
 and blocked leaves both force detours, and the metrication error of the
-lattice (a path along cells is longer than the straight line, by about
-4 % on average and up to 40 % in the worst direction) stays.
+lattice (a path along cells is longer than the straight line, by up to
+10 % within 30 degrees of the equator and up to 40 % elsewhere) stays.
 ``correction="lattice"`` is the correction of ``blocked_cells``: the
 path through water ``D`` is divided by the path ``D0`` over the same graph
 with every leaf passable, and multiplied by the straight geodesic, so that
 ``d`` is exactly the straight distance wherever blocked leaves do not
-matter.  Only blocked leaves are land in that mode; a place without leaf
-lengthens ``D`` and ``D0`` alike and is crossed as if it were water.
+matter.  Only blocked leaves are land in that mode: a place without a leaf
+adds nothing to ``D`` or to ``D0``, so the ratio ignores it and it does not
+lengthen ``d``.  (Contacts are still only between leaves, and a corner
+contact still needs a common leaf.)
 """
 
 from __future__ import annotations
 
 import heapq
+import warnings
 
 import numpy as np
 
@@ -282,6 +286,37 @@ def _builtin_paths(adjacency, targets, limit):
         )
 
 
+def _validate_water_contacts(water_contacts, n):
+    """Return the listed pairs as two int64 arrays, or raise ``ValueError``."""
+    try:
+        first, second = water_contacts
+    except (TypeError, ValueError):
+        raise ValueError(
+            "'water_contacts' must be a pair (first, second) of arrays."
+        ) from None
+    first, second = np.asarray(first), np.asarray(second)
+    if first.ndim != 1 or second.ndim != 1 or first.shape != second.shape:
+        raise ValueError(
+            "'water_contacts' must be two one-dimensional arrays of the "
+            "same length."
+        )
+    if first.size == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty
+    if not (
+        np.issubdtype(first.dtype, np.integer)
+        and np.issubdtype(second.dtype, np.integer)
+    ):
+        raise ValueError("'water_contacts' must hold integer positions.")
+    first, second = first.astype(np.int64), second.astype(np.int64)
+    if min(first.min(), second.min()) < 0 or max(first.max(), second.max()) >= n:
+        raise ValueError(
+            "'water_contacts' positions must lie in [0, n) with n the number "
+            "of leaves."
+        )
+    return first, second
+
+
 def _water_pairs(
     levels,
     cell_ids,
@@ -296,10 +331,16 @@ def _water_pairs(
     n = levels.size
     first, second, edge = leaf_adjacency(levels, cell_ids)
     if water_contacts is not None:
-        listed = np.asarray(water_contacts[0], dtype=np.int64), np.asarray(
-            water_contacts[1], dtype=np.int64
-        )
+        listed = water_contacts  # already validated: int64 arrays in [0, n)
         listed_key = np.minimum(*listed) * n + np.maximum(*listed)
+        known = np.isin(listed_key, first * n + second)
+        if not known.all():
+            warnings.warn(
+                f"{int((~known).sum())} pair(s) of 'water_contacts' are not "
+                "geometric neighbours and are ignored.",
+                UserWarning,
+                stacklevel=3,
+            )
         keep = np.isin(first * n + second, listed_key)
         first, second = first[keep], second[keep]
         edge = np.ones(first.size, dtype=bool)
@@ -405,7 +446,8 @@ def multiorder_filter_operator(
     correction
         ``"none"`` (default) or ``"lattice"``; see the module description.
     blocked
-        Optional boolean array over the leaves: blocked leaves are land
+        Optional array of dtype ``bool`` (else ``TypeError``) over the
+        leaves: blocked leaves are land
         inside the set.  They neither receive nor give weight, their row is
         empty, and the output there is 0.
     shortest_path
@@ -421,12 +463,15 @@ def multiorder_filter_operator(
         Optional array over the leaves with the share of each leaf that is
         water, in ``(0, 1]``; the area weight of a leaf is multiplied by it
         (a leaf that is mostly land, such as a river cell, counts for the
-        water it holds).  Ignored without ``area_weights``.
+        water it holds).  Validated whenever given, but used only with
+        ``area_weights``.
     water_contacts
         Optional ``(first, second)``: positions of pairs of leaves that the
         caller knows to be joined by water.  Two leaves touch in the graph
         only when they touch geometrically *and* the pair is listed, and
-        every listed pair counts as an edge contact.  Use it when the leaves
+        every listed pair counts as an edge contact.  Two one-dimensional integer
+        arrays of equal length with values in ``[0, n)``; a pair that is not a
+        geometric contact is ignored with a ``UserWarning``.  Use it when the leaves
         are larger than the water they hold (a river a few cells wide), where
         two leaves that touch may hold water that does not meet.
     ellipsoid
@@ -452,11 +497,26 @@ def multiorder_filter_operator(
     _validate_positive_finite(truncate, name="truncate")
     levels, cell_ids = _validate_leaves(levels, cell_ids)
     n = levels.size
-    blocked_mask = (
-        np.zeros(n, bool) if blocked is None else np.asarray(blocked, bool)
-    )
-    if blocked_mask.shape != (n,):
-        raise ValueError("'blocked' must be a boolean array over the leaves.")
+    if blocked is None:
+        blocked_mask = np.zeros(n, bool)
+    else:
+        blocked_mask = np.asarray(blocked)
+        if blocked_mask.dtype != np.bool_:
+            raise TypeError("'blocked' must be a boolean array.")
+        if blocked_mask.shape != (n,):
+            raise ValueError(
+                "'blocked' must be a boolean array over the leaves."
+            )
+    wet = None
+    if wet_fraction is not None:
+        wet = np.asarray(wet_fraction, dtype=np.float64)
+        if wet.shape != (n,) or not np.all((wet > 0.0) & (wet <= 1.0)):
+            raise ValueError(
+                "'wet_fraction' must be a finite array over the leaves with "
+                "values in (0, 1]."
+            )
+    if water_contacts is not None:
+        water_contacts = _validate_water_contacts(water_contacts, n)
 
     radius = truncate * sigma_m
     rows_a, columns_a, distance_a = _water_pairs(
@@ -471,13 +531,7 @@ def multiorder_filter_operator(
     )
 
     area = 4.0 ** (-levels.astype(np.float64)) if area_weights else np.ones(n)
-    if wet_fraction is not None and area_weights:
-        wet = np.asarray(wet_fraction, dtype=np.float64)
-        if wet.shape != (n,) or not np.all((wet > 0.0) & (wet <= 1.0)):
-            raise ValueError(
-                "'wet_fraction' must be an array over the leaves with "
-                "values in (0, 1]."
-            )
+    if wet is not None and area_weights:
         area = area * wet
     weights = np.exp(-0.5 * (distance_a / sigma_m) ** 2)
     weights = weights * (area[rows_a] if normalization == "source" else area[columns_a])

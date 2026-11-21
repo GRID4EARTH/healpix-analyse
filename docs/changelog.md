@@ -35,7 +35,8 @@
   balanced input, checked), with leaf areas (and an optional wet fraction) in
   the weights. `normalization="source"` conserves the total exactly; with one
   level and `correction="lattice"` the result equals the one-level operator with
-  `blocked_cells`. No new dependency (`shortest_path="scipy"` can use SciPy, optional extra `scipy`, imported only then).
+  `blocked_cells`. No new dependency: `shortest_path="scipy"` can use SciPy
+  (optional extra `scipy`, imported only then).
 - `normalization="source"` for the two operators: every source cell hands out
   weights that sum to one over the cells it reaches, so that the columns sum to
   one and the total of the signal is conserved (a reflecting coast and domain
