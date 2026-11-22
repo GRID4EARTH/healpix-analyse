@@ -30,6 +30,7 @@ from healpix_analyse._land_barrier import (
     domain_neighbour_table,
     passable_edges,
 )
+from healpix_analyse._topology import nested_neighbours
 from healpix_analyse.radial_filter import _cell_size_m
 
 _WGS84 = Geod(ellps="WGS84")
@@ -194,7 +195,9 @@ def test_search_factor_covers_the_lattice(level, lon, lat):
     allowed = passable_edges(table, np.zeros(ids.size, bool))
     rows = np.repeat(np.arange(ids.size), np.diff(geometry.row_offsets))
     columns = geometry.neighbour_indices.astype(np.int64)
-    _, free = path_distances(rows, columns, ids.size, table, length, allowed)
+    _, free = path_distances(
+        rows, columns, ids.size, table, length, allowed, allowed
+    )
     keep = (rows != columns) & (geometry.distance_m <= radius)
     # centre of the patch only: the disc of a cell near its edge is cut
     core = np.asarray(nested.kth_neighbourhood(centre, level, 14))[0]
@@ -562,3 +565,91 @@ def test_blocked_cells_are_zero_not_nan(normalization, renormalize_missing):
     )
     assert not torch.isnan(out_torch).any()
     assert torch.all(out_torch[:, torch.from_numpy(blocked)] == 0.0)
+
+
+def _corner_scene():
+    """A cell ``a``, its vertex neighbour ``b`` and their two common cells."""
+    ids = _patch(6)
+    position = {int(c): i for i, c in enumerate(ids)}
+    table = nested_neighbours(ids, LEVEL)  # slots as in the library
+    a = _nearest_in(ids, (0.0, 0.0))
+    for slot in (1, 3, 5, 7):  # W, N, E, S: vertex contacts
+        b_id = int(table[a, slot])
+        common = {int(table[a, slot - 1]), int(table[a, (slot + 1) % 8])}
+        if b_id in position and all(c in position for c in common):
+            return ids, int(ids[a]), b_id, common
+    raise AssertionError("no vertex pair with two common cells")
+
+
+def _nearest_in(ids, point):
+    lon, lat = (np.asarray(x) for x in nested.healpix_to_lonlat(ids, LEVEL, ellipsoid="WGS84"))
+    u = np.radians(lon - 10.0) * np.cos(np.radians(45.0)) * EARTH / CELL
+    v = np.radians(lat - 45.0) * EARTH / CELL
+    return int(np.argmin((u - point[0]) ** 2 + (v - point[1]) ** 2))
+
+
+def _barrier_distance(ids, blocked_ids, a_id, b_id):
+    from healpix_analyse._land_barrier import barrier_pairs
+    from healpix_analyse._neighbourhood import build_metric_neighbourhood_geometry
+
+    radius = 4.0 * CELL
+    geometry = build_metric_neighbourhood_geometry(ids, _SEARCH_FACTOR * radius, LEVEL)
+    blocked = np.isin(ids, np.asarray(blocked_ids, dtype=np.uint64))
+    rows, columns, distance, _, _ = barrier_pairs(geometry, blocked, radius, LEVEL)
+    pa = int(np.flatnonzero(ids == a_id)[0])
+    pb = int(np.flatnonzero(ids == b_id)[0])
+    hit = (rows == pa) & (columns == pb)
+    la = [float(np.asarray(x)[0]) for x in nested.healpix_to_lonlat(np.array([a_id], np.uint64), LEVEL, ellipsoid="WGS84")]
+    lb = [float(np.asarray(x)[0]) for x in nested.healpix_to_lonlat(np.array([b_id], np.uint64), LEVEL, ellipsoid="WGS84")]
+    straight = _WGS84.inv(la[0], la[1], lb[0], lb[1])[2]
+    return (float(distance[hit][0]) if hit.any() else np.inf), straight
+
+
+def test_diagonal_hole_of_the_domain_is_no_barrier():
+    ids, a, b, common = _corner_scene()
+    far = int(ids[_nearest_in(ids, (3.0, 3.0))])  # a blocked cell nearby, off the pair
+    assert far not in common | {a, b}
+    # the two common cells are outside the domain: no barrier
+    holed = ids[~np.isin(ids, np.array(sorted(common), dtype=np.uint64))]
+    d, straight = _barrier_distance(holed, [far], a, b)
+    assert d == pytest.approx(straight, rel=1e-9)
+    # the same two cells in the domain and blocked: still a barrier
+    d, straight = _barrier_distance(ids, [far, *common], a, b)
+    assert d > 1.2 * straight
+
+
+def test_holes_do_not_change_open_water_paths():
+    """With no blocked cell, ``D`` and ``D0`` are the same (exactly)."""
+    from healpix_analyse._land_barrier import edge_lengths, path_distances
+    from healpix_analyse._neighbourhood import build_metric_neighbourhood_geometry
+
+    rng = np.random.default_rng(3)
+    ids = _patch(8)
+    ids = ids[rng.random(ids.size) > 0.1]
+    geometry = build_metric_neighbourhood_geometry(ids, 5.0 * CELL, LEVEL)
+    table = domain_neighbour_table(ids, LEVEL)
+    length = edge_lengths(ids, table, LEVEL)
+    free_rule = passable_edges(table, np.zeros(ids.size, bool))
+    rows = np.repeat(np.arange(ids.size), np.diff(geometry.row_offsets))
+    columns = geometry.neighbour_indices.astype(np.int64)
+    path, free = path_distances(rows, columns, ids.size, table, length, free_rule, free_rule)
+    np.testing.assert_array_equal(path, free)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_search_factor_is_enough_with_holes(seed, monkeypatch):
+    """Random holes in the domain and a blocked band: a larger search disc
+    changes nothing (the ratio ``D / D0`` cancels the detours around holes)."""
+    import importlib
+
+    radial = importlib.import_module("healpix_analyse.radial_filter")
+    ids = _patch(14)
+    u, v = _plane(ids, 0.0)
+    keep = np.random.default_rng(seed).random(ids.size) > 0.1
+    ids, u, v = ids[keep], u[keep], v[keep]
+    band = ids[(np.abs(u) < 1.0) & (np.abs(v) < 12) & (np.abs(v) > 2.5)]
+    result = {}
+    for factor in (_SEARCH_FACTOR, 3.0):
+        monkeypatch.setattr(radial, "_SEARCH_FACTOR", factor)
+        result[factor] = _dense(_operator(band, ids=ids, sigma=3.0))
+    np.testing.assert_allclose(result[_SEARCH_FACTOR], result[3.0], rtol=0, atol=1e-13)

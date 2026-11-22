@@ -23,8 +23,9 @@
   neighbouring non-blocked cells (corrected for the metrication error of the
   8-neighbour lattice), so that probability does not cross a coast. Cells far
   from land are untouched and keep the plain operator; only the rows near
-  blocked cells are searched. Without blocked cells the operator is the same
-  as before.
+  blocked cells are searched. Cells outside the domain are not land: a hole in
+  the domain, at an edge or at a vertex, is no barrier. Without blocked cells
+  the operator is the same as before.
 - `normalization="source"` for the two operators: every source cell hands out
   weights that sum to one over the cells it reaches, so that the columns sum to
   one and the total of the signal is conserved (a reflecting coast and domain

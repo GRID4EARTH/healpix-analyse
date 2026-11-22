@@ -441,7 +441,10 @@ Of the eight neighbours of a HEALPix cell, four share an edge and four only a
 vertex. A vertex edge is removed when both cells that touch that vertex between
 the two ends are blocked (or outside the domain), so that a diagonal chain of
 land cells, which is what a coast along a line of constant latitude looks like
-on this grid, does not leak.
+on this grid, does not leak. The same rule applies to the path with every cell
+passable (`D0` below), so a hole in the domain, whether the two cells meet at
+an edge or at a vertex, is never a barrier: it lengthens `D` and `D0` alike and
+the correction cancels it. Only blocked cells are land.
 
 The path on such a lattice is longer than the straight geodesic. Measured over
 the whole sphere (levels 3 to 7, `benchmarks/land_barrier_lattice.json`, no

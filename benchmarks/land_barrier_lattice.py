@@ -34,7 +34,9 @@ for level, radii in CASES.items():
         geom = build_metric_neighbourhood_geometry(cells, 1.6 * radius, level)
         rows = np.repeat(np.arange(cells.size), np.diff(geom.row_offsets))
         cols = geom.neighbour_indices.astype(np.int64)
-        _, free = lb.path_distances(rows, cols, cells.size, table, length, allowed)
+        _, free = lb.path_distances(
+            rows, cols, cells.size, table, length, allowed, allowed
+        )
         ok = (rows != cols) & (geom.distance_m <= radius)
         ratio = free[ok] / geom.distance_m[ok]
         band = np.abs(lat[rows[ok]]) // 15 * 15

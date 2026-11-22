@@ -22,7 +22,8 @@ A path on an 8-connected lattice is longer than the straight geodesic: by up
 to 10 % in the equatorial belt of the grid and up to 40 % in the polar caps
 (measured, ``benchmarks/land_barrier_lattice.json``).  The same pair of cells is therefore searched twice, once
 with the blocked cells removed (``D``) and once with every domain cell
-passable (``D0``).  The distance used is::
+passable (``D0``; the vertex rule applies to both, so cells outside the domain
+are no barrier: a hole costs the same in ``D`` and ``D0``).  The distance used is::
 
     d = straight * D / D0
 
@@ -123,6 +124,7 @@ def _search_chunk(
     table: np.ndarray,
     length: np.ndarray,
     allowed: np.ndarray,
+    allowed_free: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(D, D0)`` for candidate pairs (sources are ``rows``)."""
     n_pairs = rows.size
@@ -137,7 +139,7 @@ def _search_chunk(
     hit = valid & (sorted_key[position] == probe)
     source = np.where(hit, order[position], n_pairs)
     step = length[cols]
-    step_free = np.where(hit, step, np.inf)
+    step_free = np.where(hit & allowed_free[cols], step, np.inf)
     step_blocked = np.where(hit & allowed[cols], step, np.inf)
     del neighbour, valid, probe, position, step
 
@@ -164,6 +166,7 @@ def path_distances(
     table: np.ndarray,
     length: np.ndarray,
     allowed: np.ndarray,
+    allowed_free: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``(D, D0)`` for candidate pairs, processed in row-aligned chunks.
 
@@ -180,7 +183,13 @@ def path_distances(
             # extend to the end of the current source row
             stop = int(np.searchsorted(rows, rows[stop - 1], side="right"))
         path[start:stop], free[start:stop] = _search_chunk(
-            rows[start:stop], cols[start:stop], n_cells, table, length, allowed
+            rows[start:stop],
+            cols[start:stop],
+            n_cells,
+            table,
+            length,
+            allowed,
+            allowed_free,
         )
         start = stop
     return path, free
@@ -221,8 +230,17 @@ def barrier_pairs(
         table = domain_neighbour_table(geometry.center_ids, refinement_level)
         length = edge_lengths(geometry.center_ids, table, refinement_level)
         allowed = passable_edges(table, blocked)
+        # D0: no blocked cell, but the vertex rule still applies, so a hole
+        # of the domain is never a barrier (edge or vertex contact alike).
+        allowed_free = passable_edges(table, np.zeros(n_cells, dtype=bool))
         path, free = path_distances(
-            rows[index], columns[index], n_cells, table, length, allowed
+            rows[index],
+            columns[index],
+            n_cells,
+            table,
+            length,
+            allowed,
+            allowed_free,
         )
         with np.errstate(invalid="ignore", divide="ignore"):
             through_water = straight[index] * (path / free)
