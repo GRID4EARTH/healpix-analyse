@@ -22,8 +22,9 @@ A path on an 8-connected lattice is longer than the straight geodesic: by up
 to 10 % in the equatorial belt of the grid and up to 40 % in the polar caps
 (measured, ``benchmarks/land_barrier_lattice.json``).  The same pair of cells is therefore searched twice, once
 with the blocked cells removed (``D``) and once with every domain cell
-passable (``D0``; the vertex rule applies to both, so cells outside the domain
-are no barrier: a hole costs the same in ``D`` and ``D0``).  The distance used is::
+passable (``D0``; the vertex rule applies to both, so a hole of the domain costs the
+same in ``D`` and ``D0`` and is no barrier, as long as the detour around it
+stays inside the candidate disc described under Search).  The distance used is::
 
     d = straight * D / D0
 
@@ -40,9 +41,12 @@ are candidates: a pair with ``d <= radius`` has a lattice path of length
 ``D <= radius * D0 / straight``, and ``D0 / straight`` is bounded by
 ``_SEARCH_FACTOR`` on the HEALPix grid.  Every cell of a
 shortest path of length at most ``_SEARCH_FACTOR * radius`` lies itself in the
-candidate disc (triangle inequality), so the search is closed on the
-candidate pairs and runs as a vectorised Bellman-Ford iteration on them,
-for the source cells whose candidate disc contains a blocked cell only.
+candidate disc (triangle inequality) when the path is free to go anywhere on
+the grid.  The search itself is restricted to the cells of the domain that are
+candidates of the source, so it runs as a vectorised Bellman-Ford iteration on
+them, for the source cells whose candidate disc contains a blocked cell only.
+A detour around a hole of the domain or a wall that leaves the candidate disc
+is not seen: such a pair is dropped, so a long hole then acts as a barrier.
 """
 
 from __future__ import annotations

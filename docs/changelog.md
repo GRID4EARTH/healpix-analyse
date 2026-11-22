@@ -24,7 +24,9 @@
   8-neighbour lattice), so that probability does not cross a coast. Cells far
   from land are untouched and keep the plain operator; only the rows near
   blocked cells are searched. Cells outside the domain are not land: a hole in
-  the domain, at an edge or at a vertex, is no barrier. Without blocked cells
+  the domain, at an edge or at a vertex, is no barrier as long as the detour
+  around it stays inside the candidate disc of 1.5 radii around the source; a
+  longer detour drops the pair, so a long hole then acts as a barrier. Without blocked cells
   the operator is the same as before.
 - `normalization="source"` for the two operators: every source cell hands out
   weights that sum to one over the cells it reaches, so that the columns sum to

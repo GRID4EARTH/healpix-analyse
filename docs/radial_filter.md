@@ -443,8 +443,10 @@ the two ends are blocked (or outside the domain), so that a diagonal chain of
 land cells, which is what a coast along a line of constant latitude looks like
 on this grid, does not leak. The same rule applies to the path with every cell
 passable (`D0` below), so a hole in the domain, whether the two cells meet at
-an edge or at a vertex, is never a barrier: it lengthens `D` and `D0` alike and
-the correction cancels it. Only blocked cells are land.
+an edge or at a vertex, is no barrier as long as the detour around it stays inside the candidate
+disc of 1.5 radii around the source: it lengthens `D` and `D0` alike and the
+correction cancels it. A longer detour leaves the disc and the pair is dropped,
+so a long hole then acts as a barrier. Only blocked cells are land.
 
 The path on such a lattice is longer than the straight geodesic. Measured over
 the whole sphere (levels 3 to 7, `benchmarks/land_barrier_lattice.json`, no
@@ -469,8 +471,8 @@ shorter than the straight distance. Consequences:
   barrier, and is equal to it (tested at 1e-12). With no blocked cell at all,
   or an empty `blocked_cells`, the result is identical to the operator without
   the option.
-- The search is closed on the cells within `1.5 * truncate * sigma_m` of the
-  row and runs, vectorised, for the rows that have a blocked cell inside that
+- The search is restricted to the cells within `1.5 * truncate * sigma_m` of the
+  row (a path that must leave this disc is not found, see the hole note above) and runs, vectorised, for the rows that have a blocked cell inside that
   disc only. The cost therefore grows with the length of the coast, not with
   the size of the domain; build time and peak memory are given below. The
   geometry is built at the 1.5 times larger radius whenever `blocked_cells` is

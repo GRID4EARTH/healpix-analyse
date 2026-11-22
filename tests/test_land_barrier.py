@@ -653,3 +653,24 @@ def test_search_factor_is_enough_with_holes(seed, monkeypatch):
         monkeypatch.setattr(radial, "_SEARCH_FACTOR", factor)
         result[factor] = _dense(_operator(band, ids=ids, sigma=3.0))
     np.testing.assert_allclose(result[_SEARCH_FACTOR], result[3.0], rtol=0, atol=1e-13)
+
+
+def test_short_wall_of_absent_cells_matches_brute_force():
+    """A short wall of absent cells (a hole of the domain) next to a small
+    blocked patch: the detour stays inside the candidate disc, so the
+    operator equals the unbounded brute force column by column."""
+    ids = _patch(14)
+    u, v = _plane(ids, 0.0)
+    wall = (np.abs(u) <= 0.6) & (np.abs(v) <= 3.0)
+    ids, u, v = ids[~wall], u[~wall], v[~wall]
+    blocked = ids[(np.abs(u - 4.0) <= 0.6) & (np.abs(v) <= 1.0)]
+    assert blocked.size
+    dense = _dense(_operator(blocked, ids=ids))
+    # sources on both sides of the wall and next to the blocked patch
+    for point in [(-2.0, 0.0), (2.0, 0.5), (-1.5, 3.5), (3.0, -2.0)]:
+        source = int(np.argmin((u - point[0]) ** 2 + (v - point[1]) ** 2))
+        column = _reference_column(ids, blocked, source)
+        keep = ~np.isin(ids, blocked)
+        np.testing.assert_allclose(
+            dense[:, source][keep], column[keep], rtol=1e-9, atol=1e-12
+        )
