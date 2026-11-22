@@ -33,17 +33,16 @@ lattice (a path along cells is longer than the straight line, by up to
 10 % within 30 degrees of the equator and up to 40 % elsewhere) stays.
 ``correction="lattice"`` is the correction of ``blocked_cells``: the
 path through water ``D`` is divided by the path ``D0`` over the same graph
-with every leaf passable, and multiplied by the straight geodesic, so that
-``d`` is exactly the straight distance wherever blocked leaves do not
-matter.  Only blocked leaves are land in that mode: a place without a leaf
-adds nothing to ``D`` or to ``D0``, so the ratio ignores it and it does not
-lengthen ``d``.  (Contacts are still only between leaves, and a corner
-contact still needs a common leaf.)  **Land must therefore be given as
-``blocked`` leaves in this mode.**  A hole in the set is not a barrier: the
-distance across it is the straight distance, and the pair is dropped only
-when ``D0`` exceeds the search limit ``1.5 * radius``, so what a hole does
-depends on its length.  Use ``correction="none"`` for land made of absent
-leaves.
+with the blocked leaves made passable (the corner rule still applies to
+``D0``), and multiplied by the straight geodesic, so that ``d`` is exactly
+the straight distance wherever blocked leaves do not matter.  Only blocked
+leaves are land in that mode: a place without a leaf adds nothing to ``D`` or
+to ``D0``, so the ratio ignores it and it does not lengthen ``d``, across an
+edge or a corner contact alike.  **Land must therefore be given as ``blocked``
+leaves in this mode.**  A hole in the set is not a barrier: the distance
+across it is the straight distance, and the pair is dropped only when ``D0``
+exceeds the search limit ``1.5 * radius``, so what a hole does depends on its
+length.  Use ``correction="none"`` for land made of absent leaves.
 """
 
 from __future__ import annotations
@@ -314,7 +313,9 @@ def _validate_water_contacts(water_contacts, n):
     ):
         raise ValueError("'water_contacts' must hold integer positions.")
     first, second = first.astype(np.int64), second.astype(np.int64)
-    if min(first.min(), second.min()) < 0 or max(first.max(), second.max()) >= n:
+    low = min(first.min(), second.min())
+    high = max(first.max(), second.max())
+    if low < 0 or high >= n:
         raise ValueError(
             "'water_contacts' positions must lie in [0, n) with n the number "
             "of leaves."
@@ -352,20 +353,31 @@ def _water_pairs(
     lon, lat = _centres(levels, cell_ids, ellipsoid)
     length = _wgs84_distance(lon[first], lat[first], lon[second], lat[second])
     ok = _passable(first, second, edge, blocked_mask)
+    # D0: every leaf passable, but the corner rule still applies (a corner
+    # contact needs a common leaf), so a hole is no barrier in lattice mode.
+    ok_free = _passable(first, second, edge, np.zeros(n, dtype=bool))
     lattice = correction == "lattice"
     limit = radius * _SEARCH_FACTOR if lattice else radius
     targets = np.flatnonzero(~blocked_mask)
     if shortest_path == "scipy":
         water_runs = _scipy_paths(n, first[ok], second[ok], length[ok], targets, limit)
         free_runs = (
-            _scipy_paths(n, first, second, length, targets, limit) if lattice else None
+            _scipy_paths(
+                n, first[ok_free], second[ok_free], length[ok_free], targets, limit
+            )
+            if lattice
+            else None
         )
     else:
         water_runs = _builtin_paths(
             _Graph(n, first[ok], second[ok], length[ok]).lists(), targets, limit
         )
         free_runs = (
-            _builtin_paths(_Graph(n, first, second, length).lists(), targets, limit)
+            _builtin_paths(
+                _Graph(n, first[ok_free], second[ok_free], length[ok_free]).lists(),
+                targets,
+                limit,
+            )
             if lattice
             else None
         )
@@ -403,7 +415,9 @@ def _water_pairs(
             lon[rows_a], lat[rows_a], lon[columns_a], lat[columns_a]
         )
         with np.errstate(invalid="ignore", divide="ignore"):
-            distance_a = np.where(rows_a == columns_a, 0.0, straight * distance_a / d_free_a)
+            distance_a = np.where(
+                rows_a == columns_a, 0.0, straight * distance_a / d_free_a
+            )
     keep = distance_a <= radius
     rows_a, columns_a, distance_a = rows_a[keep], columns_a[keep], distance_a[keep]
     order = np.lexsort((columns_a, rows_a))
@@ -453,10 +467,10 @@ def multiorder_filter_operator(
         With ``"lattice"`` land must be given as ``blocked`` leaves, not as
         holes in the set.
     blocked
-        Optional array of dtype ``bool`` (else ``TypeError``) over the
-        leaves: blocked leaves are land
-        inside the set.  They neither receive nor give weight, their row is
-        empty, and the output there is 0.
+        Optional array of dtype ``bool`` over the leaves (``TypeError``
+        otherwise): blocked leaves are land inside the set.  They neither
+        receive nor give weight, their row is empty, and the output there
+        is 0.
     shortest_path
         ``"builtin"`` (default): the heap Dijkstra of this module, no SciPy.
         ``"scipy"``: ``scipy.sparse.csgraph.dijkstra`` on the same graph,
@@ -473,14 +487,14 @@ def multiorder_filter_operator(
         water it holds).  Validated whenever given, but used only with
         ``area_weights``.
     water_contacts
-        Optional ``(first, second)``: positions of pairs of leaves that the
-        caller knows to be joined by water.  Two leaves touch in the graph
-        only when they touch geometrically *and* the pair is listed, and
-        every listed pair counts as an edge contact.  Two one-dimensional integer
-        arrays of equal length with values in ``[0, n)``; a pair that is not a
-        geometric contact is ignored with a ``UserWarning``.  Use it when the leaves
-        are larger than the water they hold (a river a few cells wide), where
-        two leaves that touch may hold water that does not meet.
+        Optional ``(first, second)``: two one-dimensional integer arrays of
+        equal length, with values in ``[0, n)``, listing pairs of leaves that
+        the caller knows to be joined by water.  Two leaves touch in the graph
+        only when they touch geometrically *and* the pair is listed, and every
+        listed pair counts as an edge contact.  A pair that is not a geometric
+        contact is ignored with a ``UserWarning``.  Use it when the leaves are
+        larger than the water they hold (a river a few cells wide), where two
+        leaves that touch may hold water that does not meet.
     ellipsoid
         Ellipsoid of the centres and of the geodesic lengths.
 

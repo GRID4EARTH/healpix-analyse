@@ -687,3 +687,45 @@ def test_wet_fraction_is_validated_whenever_given(area_weights):
         with pytest.raises(ValueError, match="wet_fraction"):
             _operator(levels, ids, wet_fraction=bad, area_weights=area_weights)
     _operator(levels, ids, wet_fraction=np.full(n, 0.5), area_weights=area_weights)
+
+
+def test_diagonal_hole_is_no_barrier_in_lattice_mode():
+    # two leaves meet at a corner and both leaves next to them are absent: the
+    # lattice correction gives the straight distance, "none" the detour
+    from healpix_analyse.multiorder_filter import _centres, _water_pairs
+
+    levels, ids = _uniform(4)
+    first, second, edge = leaf_adjacency(levels, ids)
+    n = ids.size
+    nbrs = [set() for _ in range(n)]
+    for a, b, e in zip(first.tolist(), second.tolist(), edge.tolist()):
+        if e:
+            nbrs[a].add(b)
+            nbrs[b].add(a)
+    centre = _nearest(levels, ids, (0.0, 0.0))
+    pair = None
+    for a, b, e in zip(first.tolist(), second.tolist(), edge.tolist()):
+        common = nbrs[a] & nbrs[b]
+        if not e and len(common) == 2 and centre not in ({a, b} | common):
+            pair = (a, b, common)
+            break
+    assert pair is not None
+    a, b, common = pair
+    keep = np.ones(n, bool)
+    keep[list(common)] = False
+    levels2, ids2 = levels[keep], ids[keep]
+    ia = int(np.where(ids2 == ids[a])[0][0])
+    ib = int(np.where(ids2 == ids[b])[0][0])
+    no_block = np.zeros(ids2.size, bool)
+    out = {}
+    for mode in ("none", "lattice"):
+        rows, cols, dist = _water_pairs(
+            levels2, ids2, 6.0 * CELL, mode, no_block, None, "WGS84"
+        )
+        hit = (rows == ia) & (cols == ib)
+        assert hit.sum() == 1
+        out[mode] = float(dist[hit][0])
+    lon, lat = _centres(levels2, ids2, "WGS84")
+    straight = _WGS84.inv(lon[ia], lat[ia], lon[ib], lat[ib])[2]
+    assert out["lattice"] == pytest.approx(straight, rel=1e-6)
+    assert out["none"] > 1.5 * straight
