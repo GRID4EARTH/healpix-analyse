@@ -615,7 +615,8 @@ state = apply_filter_operator(state, *op)   # probability per leaf, conserved
   lengthen `d`, across an edge or a corner contact alike: in this mode **only
   blocked leaves are land**; supply the dry leaves of a full tessellation as
   `blocked`. A hole in the set is **not** a barrier with
-  `correction="lattice"`: the distance across it is the straight distance.
+  `correction="lattice"` as long as the detour around it stays within the
+  limits below: the distance across it is then the straight distance.
   The search is sized with `D0 / straight <= 1.5`, which holds without holes:
   on a mixed set at levels 11 to 15 along a wavy coast (22765 leaves, 400
   sources, 2.6 million pairs, no hole) the largest ratio measured was 1.38.
@@ -627,9 +628,13 @@ state = apply_filter_operator(state, *op)   # probability per leaf, conserved
   repeat costs 8 % (SciPy, 12.0 to 12.9 s) and 12 % (built-in, 44 to 50 s);
   searching every source up to `3 * radius` would cost 2.2 and 2.7 times. For
   land made of absent leaves use `correction="none"`. With one level,
-  `correction="lattice"`
-  gives the operator of `gaussian_filter_operator(..., blocked_cells=...)` to
-  rounding (tested at `rtol=1e-12`).
+  `correction="lattice"` gives the operator of
+  `gaussian_filter_operator(..., blocked_cells=...)` to rounding (tested at
+  `rtol=1e-12`) without holes, and with holes whose detours stay within both
+  limits: the one-level operator limits the search by the candidate disc of
+  1.5 radii around the source, this one by a path length of three radii, so
+  for a long hole (a detour of about two to three radii or more) they can
+  differ, and each acts as a barrier beyond its own limit.
 - **SciPy is optional.** `shortest_path="scipy"` runs
   `scipy.sparse.csgraph.dijkstra` on the same graph (install the `scipy`
   extra); it is only imported then, and the default `"builtin"` needs no

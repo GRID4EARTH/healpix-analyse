@@ -181,10 +181,21 @@ def _leaf_contacts(levels: np.ndarray, cell_ids: np.ndarray):
                     )
                 found = np.where((found < 0) & (hit >= 0), hit, found)
             covered = found >= 0
-            if level < 29:  # a neighbouring cell that is split into leaves
+            if level < 29:
+                # A neighbouring cell that is split into leaves: only its
+                # children that touch this leaf count (a child touches the
+                # leaf when it neighbours one of the leaf's own children).
+                own = 4 * ids[valid][:, None] + np.arange(4)
+                near = nested_neighbours(own.ravel(), level + 1).reshape(
+                    own.shape[0], -1
+                )
                 for child in range(4):
+                    touches = np.any(
+                        near == (4 * cell + child)[:, None], axis=1
+                    )
                     key = _key(level + 1, 4 * cell + child).tolist()
-                    covered |= np.array([k in position for k in key])
+                    present = np.array([k in position for k in key])
+                    covered |= touches & present
             rim[source[~covered]] = True
             keep = (found >= 0) & (found != source)
             if keep.any():

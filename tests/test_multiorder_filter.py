@@ -758,3 +758,51 @@ def test_diagonal_hole_is_no_barrier_in_lattice_mode():
     straight = _WGS84.inv(lon[ia], lat[ia], lon[ib], lat[ib])[2]
     assert out["lattice"] == pytest.approx(straight, rel=1e-6)
     assert out["none"] > 1.5 * straight
+
+
+def _wall_scene(k, half_length):
+    """One level, a wall of absent leaves (``|u| <= 0.6``, ``|v| <= half_length``)
+    and a small blocked patch at ``u = 6``."""
+    levels, ids = _uniform(k)
+    u, v = _plane(levels, ids)
+    keep = ~((np.abs(u) <= 0.6) & (np.abs(v) <= half_length))
+    levels, ids, u, v = levels[keep], ids[keep], u[keep], v[keep]
+    blocked = (np.abs(u - 6.0) <= 0.6) & (np.abs(v) <= 1.0)
+    return levels, ids, u, v, blocked
+
+
+def test_short_wall_of_absent_leaves_matches_brute_force_and_one_level():
+    """A hole whose detour stays within both limits: no barrier, and the
+    operator equals the brute force and the one-level operator."""
+    levels, ids, u, v, blocked = _wall_scene(12, 3.0)
+    got = _dense(_operator(levels, ids, blocked=blocked, correction="lattice"))
+    want = _reference_lattice_operator(levels, ids, blocked)
+    np.testing.assert_allclose(got, want, rtol=1e-9, atol=1e-13)
+    one_level = gaussian_filter_operator(
+        ids.astype(np.uint64),
+        LEVEL,
+        sigma_m=SIGMA,
+        normalization="source",
+        blocked_cells=ids[blocked].astype(np.uint64),
+    )
+    np.testing.assert_allclose(got, _dense(one_level), rtol=1e-9, atol=1e-13)
+
+
+def test_long_wall_of_absent_leaves_drops_the_pair_across():
+    """A hole whose detour is above three radii acts as a barrier (documented):
+    the pair across is dropped although the brute force keeps it (the hole
+    costs the same in D and D0); pairs with short detours match the brute
+    force."""
+    levels, ids, u, v, blocked = _wall_scene(20, 16.0)
+    got = _dense(_operator(levels, ids, blocked=blocked, correction="lattice"))
+    want = _reference_lattice_operator(levels, ids, blocked)
+    left = _nearest(levels, ids, (-1.0, 0.0))
+    right = _nearest(levels, ids, (1.0, 0.0))
+    assert want[right, left] > 0 and want[left, right] > 0
+    assert got[right, left] == 0 and got[left, right] == 0
+    # sources far from the wall, or beyond its end, have only short detours
+    safe = (np.abs(u) >= 9.0) | (np.abs(v) >= 18.0)
+    assert safe.sum() > 50
+    np.testing.assert_allclose(
+        got[:, safe], want[:, safe], rtol=1e-9, atol=1e-13
+    )

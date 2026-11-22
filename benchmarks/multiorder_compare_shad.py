@@ -53,12 +53,16 @@ def locate(data=None):
             with handle, urllib.request.urlopen(URL + name, timeout=60) as reply:
                 handle.write(reply.read())
             np.load(part).close()  # a broken file raises here
+            os.chmod(part, 0o644)  # NamedTemporaryFile makes it 0600
             os.replace(part, target)
         except Exception as error:
             part.unlink(missing_ok=True)
             if target.exists():  # another run finished the download meanwhile
                 continue
             raise RuntimeError(f"could not download {URL + name}: {error}") from error
+        except BaseException:  # Ctrl-C and the like: leave no .part file
+            part.unlink(missing_ok=True)
+            raise
     return folder
 
 

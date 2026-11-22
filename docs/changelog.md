@@ -36,8 +36,11 @@
   balanced input, checked), with leaf areas (and an optional wet fraction) in
   the weights. `normalization="source"` conserves the total exactly; with one
   level and `correction="lattice"` the result equals the one-level operator with
-  `blocked_cells`, also with holes in the set (a source with a hole or the edge
-  of the set within reach is searched again up to three radii). No new
+  `blocked_cells` without holes, and with holes whose detours stay within both
+  limits (the one-level operator limits the search by the disc of 1.5 radii,
+  this one by a path length of three radii; a source with a hole or the edge of
+  the set within reach is searched again up to three radii). For a long hole
+  the two can differ, and a detour longer than the limit acts as a barrier. No new
   dependency: `shortest_path="scipy"` can use SciPy
   (optional extra `scipy`, imported only then).
 - `normalization="source"` for the two operators: every source cell hands out
