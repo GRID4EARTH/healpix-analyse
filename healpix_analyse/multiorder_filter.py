@@ -39,8 +39,9 @@ the straight distance wherever blocked leaves do not matter.  Only blocked
 leaves are land in that mode: a place without a leaf adds nothing to ``D`` or
 to ``D0``, so the ratio ignores it and it does not lengthen ``d``, across an
 edge or a corner contact alike.  **Land must therefore be given as ``blocked``
-leaves in this mode.**  A hole in the set is not a barrier: the distance
-across it is the straight distance.  The search stops at ``1.5 * radius``
+leaves in this mode.**  A hole in the set is not a barrier as long as the
+detour around it stays within the limits below: the distance across it is
+the straight distance.  The search stops at ``1.5 * radius``
 (``D0 / straight`` is below 1.5 without holes); when a hole, or the edge of the
 set, lies within reach of a source, that source is searched again up to
 ``3 * radius``.  A pair whose ``D`` or ``D0`` exceeds the limit is dropped, so
@@ -386,7 +387,8 @@ def _water_pairs(
     length = _wgs84_distance(lon[first], lat[first], lon[second], lat[second])
     ok = _passable(first, second, edge, blocked_mask)
     # D0: every leaf passable, but the corner rule still applies (a corner
-    # contact needs a common leaf), so a hole is no barrier in lattice mode.
+    # contact needs a common leaf), so a hole is no barrier in lattice mode
+    # while its detour stays within the search limit.
     ok_free = _passable(first, second, edge, np.zeros(n, dtype=bool))
     lattice = correction == "lattice"
     limit = radius * _SEARCH_FACTOR if lattice else radius
