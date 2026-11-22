@@ -235,7 +235,8 @@ def barrier_pairs(
         length = edge_lengths(geometry.center_ids, table, refinement_level)
         allowed = passable_edges(table, blocked)
         # D0: no blocked cell, but the vertex rule still applies, so a hole
-        # of the domain is never a barrier (edge or vertex contact alike).
+        # of the domain is no barrier (edge or vertex contact alike) while
+        # its detour stays in the candidate disc.
         allowed_free = passable_edges(table, np.zeros(n_cells, dtype=bool))
         path, free = path_distances(
             rows[index],
