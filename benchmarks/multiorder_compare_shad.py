@@ -43,13 +43,21 @@ def locate(data=None):
         target = folder / name
         if target.exists():
             continue
-        part = folder / (name + ".part")
+        # a part file of our own (unique name), so that two runs or a broken
+        # download never leave a half file under the real name
+        handle = tempfile.NamedTemporaryFile(
+            dir=folder, prefix=name + ".", suffix=".part", delete=False
+        )
+        part = Path(handle.name)
         try:
-            with urllib.request.urlopen(URL + name, timeout=60) as reply:
-                part.write_bytes(reply.read())
+            with handle, urllib.request.urlopen(URL + name, timeout=60) as reply:
+                handle.write(reply.read())
+            np.load(part).close()  # a broken file raises here
             os.replace(part, target)
         except Exception as error:
             part.unlink(missing_ok=True)
+            if target.exists():  # another run finished the download meanwhile
+                continue
             raise RuntimeError(f"could not download {URL + name}: {error}") from error
     return folder
 

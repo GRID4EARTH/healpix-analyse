@@ -40,9 +40,12 @@ leaves are land in that mode: a place without a leaf adds nothing to ``D`` or
 to ``D0``, so the ratio ignores it and it does not lengthen ``d``, across an
 edge or a corner contact alike.  **Land must therefore be given as ``blocked``
 leaves in this mode.**  A hole in the set is not a barrier: the distance
-across it is the straight distance, and the pair is dropped only when ``D0``
-exceeds the search limit ``1.5 * radius``, so what a hole does depends on its
-length.  Use ``correction="none"`` for land made of absent leaves.
+across it is the straight distance.  The search stops at ``1.5 * radius``
+(``D0 / straight`` is below 1.5 without holes); when a hole, or the edge of the
+set, lies within reach of a source, that source is searched again up to
+``3 * radius``.  A pair whose ``D`` or ``D0`` exceeds the limit is dropped, so
+a hole that forces a detour longer than three radii acts as a barrier.  Use
+``correction="none"`` for land made of absent leaves.
 """
 
 from __future__ import annotations
@@ -73,6 +76,11 @@ _EDGE_SLOTS = (0, 2, 4, 6)
 # barrier of the one-level operators (measured at one level, see
 # ``healpix_analyse._land_barrier``).  Used only with ``correction="lattice"``.
 _SEARCH_FACTOR = 1.5
+
+# Search limit, in radii, for the sources that have a hole (or the edge of the
+# set) within reach of the first search: the paths around a hole are longer
+# than ``_SEARCH_FACTOR`` allows, in ``D`` and in ``D0``.
+_HOLE_SEARCH_FACTOR = 3.0
 
 
 def _validate_leaves(
@@ -134,6 +142,12 @@ def leaf_adjacency(
     share (part of) an edge and ``False`` when they only touch at a corner.
     Raises ``ValueError`` when the set overlaps or is not 2:1 balanced.
     """
+    return _leaf_contacts(levels, cell_ids)[:3]
+
+
+def _leaf_contacts(levels: np.ndarray, cell_ids: np.ndarray):
+    """``leaf_adjacency`` plus ``rim``: leaves with a neighbouring place that
+    no leaf covers (a hole of the set, or its edge)."""
     levels, cell_ids = _validate_leaves(levels, cell_ids)
     _check_no_overlap(levels, cell_ids)
     position = {k: i for i, k in enumerate(_key(levels, cell_ids).tolist())}
@@ -141,6 +155,7 @@ def leaf_adjacency(
     firsts: list[np.ndarray] = []
     seconds: list[np.ndarray] = []
     edges: list[np.ndarray] = []
+    rim = np.zeros(levels.size, dtype=bool)
     for level in np.unique(levels):
         level = int(level)
         member = np.flatnonzero(levels == level)
@@ -165,6 +180,12 @@ def leaf_adjacency(
                         f"{up} levels coarser."
                     )
                 found = np.where((found < 0) & (hit >= 0), hit, found)
+            covered = found >= 0
+            if level < 29:  # a neighbouring cell that is split into leaves
+                for child in range(4):
+                    key = _key(level + 1, 4 * cell + child).tolist()
+                    covered |= np.array([k in position for k in key])
+            rim[source[~covered]] = True
             keep = (found >= 0) & (found != source)
             if keep.any():
                 firsts.append(source[keep])
@@ -172,7 +193,7 @@ def leaf_adjacency(
                 edges.append(np.full(int(keep.sum()), slot in _EDGE_SLOTS))
     if not firsts:
         empty = np.empty(0, dtype=np.int64)
-        return empty, empty, np.empty(0, dtype=bool)
+        return empty, empty, np.empty(0, dtype=bool), rim
 
     first = np.concatenate(firsts)
     second = np.concatenate(seconds)
@@ -184,7 +205,7 @@ def leaf_adjacency(
     order = np.lexsort((~edge, pair))  # edge contacts first within a pair
     pair, low, high, edge = pair[order], low[order], high[order], edge[order]
     first_of_pair = np.concatenate(([True], pair[1:] != pair[:-1]))
-    return low[first_of_pair], high[first_of_pair], edge[first_of_pair]
+    return low[first_of_pair], high[first_of_pair], edge[first_of_pair], rim
 
 
 def _centres(levels: np.ndarray, cell_ids: np.ndarray, ellipsoid: str):
@@ -335,7 +356,7 @@ def _water_pairs(
 ):
     """Pairs ``(target, source, distance)`` within ``radius`` through water."""
     n = levels.size
-    first, second, edge = leaf_adjacency(levels, cell_ids)
+    first, second, edge, rim = _leaf_contacts(levels, cell_ids)
     if water_contacts is not None:
         listed = water_contacts  # already validated: int64 arrays in [0, n)
         listed_key = np.minimum(*listed) * n + np.maximum(*listed)
@@ -359,47 +380,63 @@ def _water_pairs(
     lattice = correction == "lattice"
     limit = radius * _SEARCH_FACTOR if lattice else radius
     targets = np.flatnonzero(~blocked_mask)
-    if shortest_path == "scipy":
-        water_runs = _scipy_paths(n, first[ok], second[ok], length[ok], targets, limit)
-        free_runs = (
-            _scipy_paths(
-                n, first[ok_free], second[ok_free], length[ok_free], targets, limit
-            )
+    if shortest_path == "builtin":
+        water_lists = _Graph(n, first[ok], second[ok], length[ok]).lists()
+        free_lists = (
+            _Graph(n, first[ok_free], second[ok_free], length[ok_free]).lists()
             if lattice
             else None
         )
-    else:
-        water_runs = _builtin_paths(
-            _Graph(n, first[ok], second[ok], length[ok]).lists(), targets, limit
-        )
-        free_runs = (
-            _builtin_paths(
-                _Graph(n, first[ok_free], second[ok_free], length[ok_free]).lists(),
-                targets,
-                limit,
+
+    def searches(at, at_limit):
+        """Water and free runs (the free ones only with ``lattice``)."""
+        if shortest_path == "scipy":
+            water = _scipy_paths(n, first[ok], second[ok], length[ok], at, at_limit)
+            free = (
+                _scipy_paths(
+                    n, first[ok_free], second[ok_free], length[ok_free], at, at_limit
+                )
+                if lattice
+                else [None] * at.size
             )
-            if lattice
-            else None
-        )
+        else:
+            water = _builtin_paths(water_lists, at, at_limit)
+            free = (
+                _builtin_paths(free_lists, at, at_limit)
+                if lattice
+                else [None] * at.size
+            )
+        return water, free
 
     rows_l: list[np.ndarray] = []
     cols_l: list[np.ndarray] = []
     dw_l: list[np.ndarray] = []
     df_l: list[np.ndarray] = []
-    if not lattice:
-        free_runs = [None] * targets.size
-    for (target, src, dist), free_run in zip(water_runs, free_runs):
-        if lattice:
-            _, src_f, dist_f = free_run
-            lookup = dict(zip(src_f.tolist(), dist_f.tolist()))
-            d_free = np.array([lookup.get(x, np.nan) for x in src.tolist()])
-        else:
-            d_free = dist
-        keep = ~blocked_mask[src] & np.isfinite(d_free)
-        rows_l.append(np.full(int(keep.sum()), target, np.int64))
-        cols_l.append(src[keep].astype(np.int64))
-        dw_l.append(dist[keep])
-        df_l.append(d_free[keep])
+    retry: list[int] = []
+
+    def collect(water_runs, free_runs, may_retry):
+        for (target, src, dist), free_run in zip(water_runs, free_runs):
+            if lattice:
+                _, src_f, dist_f = free_run
+                if may_retry and rim[src_f].any():
+                    # a hole or the edge of the set is within reach: the
+                    # detours around it may exceed the search limit
+                    retry.append(target)
+                    continue
+                lookup = dict(zip(src_f.tolist(), dist_f.tolist()))
+                d_free = np.array([lookup.get(x, np.nan) for x in src.tolist()])
+            else:
+                d_free = dist
+            keep = ~blocked_mask[src] & np.isfinite(d_free)
+            rows_l.append(np.full(int(keep.sum()), target, np.int64))
+            cols_l.append(src[keep].astype(np.int64))
+            dw_l.append(dist[keep])
+            df_l.append(d_free[keep])
+
+    collect(*searches(targets, limit), may_retry=True)
+    if retry:
+        again = np.asarray(retry, dtype=np.int64)
+        collect(*searches(again, radius * _HOLE_SEARCH_FACTOR), may_retry=False)
     empty = np.empty(0)
     rows = np.concatenate(rows_l) if rows_l else empty
     columns = np.concatenate(cols_l) if cols_l else empty

@@ -191,8 +191,8 @@ def _reference_operator(
 
 
 def _reference_lattice_operator(levels, ids, blocked, normalization="source"):
-    """``d = straight * D / D0``: D through water, D0 with land passable and
-    no corner rule (every geometric contact)."""
+    """``d = straight * D / D0``: D through water, D0 with land passable (the
+    corner rule applies to both, so a hole of the set is no barrier)."""
     n = ids.size
     radius = 4.0 * SIGMA
     a = 4.0 ** (-levels.astype(float))
@@ -203,7 +203,7 @@ def _reference_lattice_operator(levels, ids, blocked, normalization="source"):
         x, y = nested.healpix_to_lonlat(ids[m], int(level), ellipsoid="WGS84")
         lon[m], lat[m] = np.asarray(x), np.asarray(y)
     water = _reference_graph(levels, ids, blocked)
-    free = _reference_graph(levels, ids, np.zeros(n, bool), corner_rule=False)
+    free = _reference_graph(levels, ids, np.zeros(n, bool))
     matrix = np.zeros((n, n))
     for target in range(n):
         if blocked[target]:
@@ -270,8 +270,14 @@ def _three_levels(k: int = 5):
 
 @pytest.mark.parametrize("normalization", ["present", "source"])
 @pytest.mark.parametrize("with_wall", [False, True])
-def test_one_level_equals_the_one_level_operator(normalization, with_wall):
+@pytest.mark.parametrize("with_holes", [False, True])
+def test_one_level_equals_the_one_level_operator(
+    normalization, with_wall, with_holes
+):
     levels, ids = _uniform(12)
+    if with_holes:  # about 8 % of the cells are outside the domain
+        keep = np.random.default_rng(1).random(ids.size) > 0.08
+        levels, ids = levels[keep], ids[keep]
     u, v = _plane(levels, ids)
     wall = (np.abs(u - 0.4 * v) <= 1.0) & (np.abs(v) <= 6.0) if with_wall else None
     reference = gaussian_filter_operator(
@@ -589,6 +595,29 @@ def test_lattice_correction_against_brute_force_at_mixed_levels():
     blocked = (np.abs(u - 1.5) <= 0.7) & (np.abs(v) <= 2.5)
     blocked |= np.hypot(u + 2.5, v - 1.0) <= 0.8
     got = _dense(_operator(levels, ids, blocked=blocked, correction="lattice"))
+    want = _reference_lattice_operator(levels, ids, blocked)
+    np.testing.assert_allclose(got, want, rtol=1e-9, atol=1e-13)
+
+
+@pytest.mark.parametrize("shortest_path", ["builtin", "scipy"])
+@pytest.mark.parametrize("seed", [0, 2, 5])
+def test_lattice_correction_with_holes_against_brute_force(seed, shortest_path):
+    if shortest_path == "scipy":
+        pytest.importorskip("scipy")
+    levels, ids = _mixed(6)
+    keep = np.random.default_rng(seed).random(ids.size) > 0.08  # holes
+    levels, ids = levels[keep], ids[keep]
+    u, v = _plane(levels, ids)
+    blocked = (np.abs(u - v) < 0.8) & (np.abs(u + v) < 6.0)  # diagonal band
+    got = _dense(
+        _operator(
+            levels,
+            ids,
+            blocked=blocked,
+            correction="lattice",
+            shortest_path=shortest_path,
+        )
+    )
     want = _reference_lattice_operator(levels, ids, blocked)
     np.testing.assert_allclose(got, want, rtol=1e-9, atol=1e-13)
 

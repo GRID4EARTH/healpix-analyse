@@ -615,13 +615,19 @@ state = apply_filter_operator(state, *op)   # probability per leaf, conserved
   lengthen `d`, across an edge or a corner contact alike: in this mode **only
   blocked leaves are land**; supply the dry leaves of a full tessellation as
   `blocked`. A hole in the set is **not** a barrier with
-  `correction="lattice"`: the distance across it is the straight distance, and
-  the pair is dropped only when `D0` is beyond the search limit
-  `1.5 * radius`, so the effect of a hole depends on its length. For land made
-  of absent leaves use `correction="none"`.
-  The search is sized with `D0 / straight <= 1.5`; on a mixed set at levels
-  11 to 15 along a wavy coast (22765 leaves, 400 sources, 2.6 million pairs)
-  the largest ratio measured was 1.38. With one level, `correction="lattice"`
+  `correction="lattice"`: the distance across it is the straight distance.
+  The search is sized with `D0 / straight <= 1.5`, which holds without holes:
+  on a mixed set at levels 11 to 15 along a wavy coast (22765 leaves, 400
+  sources, 2.6 million pairs, no hole) the largest ratio measured was 1.38.
+  Paths around a hole are longer, in `D` and in `D0`, so a source that has a
+  hole or the edge of the set within reach of that search is searched again up
+  to `3 * radius`; a pair whose `D` or `D0` is beyond the limit is dropped, so
+  a hole that forces a detour longer than three radii acts as a barrier. On
+  the 22765-leaf coast (3175 blocked leaves, sigma 1.2 km, same operator) the
+  repeat costs 8 % (SciPy, 12.0 to 12.9 s) and 12 % (built-in, 44 to 50 s);
+  searching every source up to `3 * radius` would cost 2.2 and 2.7 times. For
+  land made of absent leaves use `correction="none"`. With one level,
+  `correction="lattice"`
   gives the operator of `gaussian_filter_operator(..., blocked_cells=...)` to
   rounding (tested at `rtol=1e-12`).
 - **SciPy is optional.** `shortest_path="scipy"` runs
@@ -651,7 +657,7 @@ state = apply_filter_operator(state, *op)   # probability per leaf, conserved
   a `sigma_m` below the distance to the nearest neighbour leaves each leaf
   nearly alone), a `domain` argument, and a proof of the
   `D0 / straight <= 1.5` bound across level steps for `correction="lattice"`
-  (it is measured, see above, not proved).
+  (it is measured on sets without holes, see above, not proved).
 
 ## Custom radial kernels
 
