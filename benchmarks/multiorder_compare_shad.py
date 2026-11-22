@@ -40,8 +40,17 @@ def locate(data=None):
     folder = Path(tempfile.gettempdir()) / "healpix-analyse-multiorder-2026-11-22"
     folder.mkdir(exist_ok=True)
     for name in FILES:
-        if not (folder / name).exists():
-            urllib.request.urlretrieve(URL + name, folder / name)
+        target = folder / name
+        if target.exists():
+            continue
+        part = folder / (name + ".part")
+        try:
+            with urllib.request.urlopen(URL + name, timeout=60) as reply:
+                part.write_bytes(reply.read())
+            os.replace(part, target)
+        except Exception as error:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"could not download {URL + name}: {error}") from error
     return folder
 
 
