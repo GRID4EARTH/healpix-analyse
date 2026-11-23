@@ -91,7 +91,8 @@ class HealPixResampler(nn.Module):
         ``"smooth_conservative"`` is the Gaussian plus one global offset per
         step that conserves the mean of a NaN-free map (see
         :class:`~healpix_analyse.down.HealPixDown`); with missing values the
-        mean is not conserved.
+        mean is not conserved, and on a partial sky it is conserved per step
+        (coverage-weighted), so a chain of steps gives a mean of means.
         Each step averages the children available at that step: missing
         values are skipped (see Notes), and on a partial sky only the
         children present in ``in_cell_ids`` are used.  Over several steps

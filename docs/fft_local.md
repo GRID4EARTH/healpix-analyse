@@ -61,7 +61,11 @@ still returns a constant for a constant, and a filter between the two steps
 keeps the sum over the cells. The round trip is the same in both conventions
 and has a blur floor of about 0.58 grid pixel (`blur_floor_px()` per cell,
 `PROJECTION_BLUR_FLOOR_PX` for the nominal value, not isotropic); see
-{doc}`fft_conv` for the measured consequences.
+{doc}`fft_conv` for the measured consequences. `fft()` and `ps()` act on the
+projected grid, so with `"conservative"` they return the spectrum of the
+plain scatter, not of the averaged grid: near the patch edge and where cells
+are sparse they differ by order one, and spectra are not comparable between
+the two conventions.
 
 ## Functional interface
 

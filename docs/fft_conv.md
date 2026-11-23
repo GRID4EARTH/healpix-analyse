@@ -182,6 +182,11 @@ only one of them.
 - Without a kernel (identity), the conservative pair keeps both the total and a
   constant; with a kernel, a constant is changed by as much as the total is
   changed with `"average"` (0.79 to 1.06 inside the same domain).
+- The total is kept by the projection pair and the convolution only. A
+  non-zero `bias` (added after the back-projection) or `use_norm=True` breaks
+  it; `set_gaussian` sets the bias to zero. Grid points inside the patch that
+  no cell covers (a domain with holes, such as land masked out of an ocean
+  domain) take mass like the grid points outside the domain, and it is lost.
 
 The default results are unchanged. `set_gaussian` sets a normalised Gaussian
 kernel on every channel pair `c → c`:
