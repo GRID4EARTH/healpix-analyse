@@ -95,8 +95,9 @@ class HealPixUp(nn.Module):
         Floating-point dtype for the sparse matrix values.
     paired_down : HealPixDown or None
         Reuse the exact sparse matrix and fine-cell domain of an existing
-        ``smooth`` or ``mean`` downsampler.  This is the strictest way to
-        construct a matched Up operator for a partial patch.  ``cell_ids``
+        ``smooth``, ``smooth_conservative`` or ``mean`` downsampler.  This is
+        the strictest way to construct a matched Up operator for a partial
+        patch.  ``cell_ids``
         must then be omitted; the ellipsoid and weight normalisation are
         inherited.
 
@@ -180,8 +181,11 @@ class HealPixUp(nn.Module):
                 raise ValueError(
                     "cell_ids must be omitted when paired_down is given."
                 )
-            if paired_down.mode not in ("smooth", "mean"):
-                raise ValueError("paired_down must use mode='smooth' or 'mean'.")
+            if paired_down.mode not in ("smooth", "smooth_conservative", "mean"):
+                raise ValueError(
+                    "paired_down must use mode='smooth', "
+                    "'smooth_conservative' or 'mean'."
+                )
             if paired_down.nside_out != self.nside_in:
                 raise ValueError(
                     f"paired_down outputs nside={paired_down.nside_out}, "

@@ -7,13 +7,14 @@ Reduces the HEALPix resolution by a factor of 2:
     nside_out = nside_in // 2
     N_out     = N_in // 4
 
-Three modes:
-    "smooth"  -- weighted Gaussian average over a disc (linear, differentiable).
-    "maxpool" -- non-linear max over the 4 direct NESTED children.
-    "mean"    -- unweighted mean over the 4 direct NESTED children.
+Four modes:
+    "smooth"              -- weighted Gaussian average over a disc.
+    "smooth_conservative" -- "smooth" plus one global additive correction.
+    "maxpool"             -- non-linear max over the 4 direct NESTED children.
+    "mean"                -- unweighted mean over the 4 direct NESTED children.
 
-HEALPix cells have equal area, so "mean" is the only mode that conserves
-the global mean of a NaN-free full-sphere field.
+HEALPix cells have equal area, so "mean" and "smooth_conservative" conserve
+the global mean of a NaN-free full-sphere field; "smooth" does not.
 
 Works on the full sphere or on a partial-sky subset.  Resolution is exposed
 through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
@@ -102,7 +103,9 @@ class HealPixDown(nn.Module):
     HEALPix downsampling: reduce resolution by a factor of 2.
 
     Reduces ``level`` → ``level - 1`` using either a
-    Gaussian-weighted sparse matrix (``mode="smooth"``), a max-pooling
+    Gaussian-weighted sparse matrix (``mode="smooth"``), the same smoothing
+    with a global correction that conserves the mean
+    (``mode="smooth_conservative"``), a max-pooling
     over the 4 direct NESTED children (``mode="maxpool"``), or their
     unweighted mean (``mode="mean"``).
 
@@ -115,7 +118,7 @@ class HealPixDown(nn.Module):
         corresponding HEALPix resolution is ``nside_in = 2**level``.
         When ``cell_ids`` is ``None``, the input is expected to have
         ``N = 12 * nside_in**2`` pixels.
-    mode : {"smooth", "maxpool", "mean"}, default "smooth"
+    mode : {"smooth", "smooth_conservative", "maxpool", "mean"}, default "smooth"
         Downsampling strategy.
         *smooth*   -- differentiable Gaussian-weighted average (linear).
         *maxpool*  -- non-linear max over 4 NESTED children (fast).
@@ -136,6 +139,23 @@ class HealPixDown(nn.Module):
         output by that step's :attr:`coverage`, and divide the two at the
         end: the ratio is the mean of the descendants present.
         NaN values propagate to the parent cell unless ``skipna=True``.
+        *smooth_conservative* -- *smooth*, then one number is added to every
+        output cell so that the mean of the output equals the mean of the
+        input: ``y = M x + delta``, ``delta = mean(x) - mean(M x)``.  The
+        smoothing, and the way information crosses parent boundaries, are
+        those of *smooth*; only a uniform offset (the drift of one step) is
+        added.  A constant field is preserved (``delta`` is then zero up to
+        round-off).  The shift is the same for every cell, so a negative
+        ``delta`` can make a non-negative field (a probability, say)
+        slightly negative: positivity is not kept.  On a partial sky the
+        means are weighted by :attr:`coverage` (the fraction of the 4
+        children present), as for *mean*.  NaN: ``delta`` is built from
+        finite values only, so a NaN stays local and the finite output
+        cells have the same (coverage-weighted) mean as the finite input
+        cells, although they are not the same cells; the mean of a NaN-free
+        input is conserved over all cells.  ``weight_norm`` must be
+        ``"l1"``.  :meth:`sparse_matrix` is the Gaussian part ``M`` without
+        the offset.
     skipna : bool, default False
         Only for ``mode="mean"``.  If True, non-finite children are left
         out of the mean (a NaN-skipping mean); a parent with no finite
@@ -146,12 +166,12 @@ class HealPixDown(nn.Module):
     radius_deg : float or None
         Angular radius of the Gaussian kernel (degrees).
         Defaults to ~3 times the fine pixel size.
-        Only used for ``mode="smooth"``.
+        Only used for the Gaussian modes (``"smooth"``, ``"smooth_conservative"``).
     sigma_deg : float or None
         Gaussian sigma (degrees).  Defaults to ``radius_deg / 2``.
-        Only used for ``mode="smooth"``.
+        Only used for the Gaussian modes (``"smooth"``, ``"smooth_conservative"``).
     weight_norm : {"l1", "l2", "none"}, default "l1"
-        Normalisation applied per output pixel in ``mode="smooth"``:
+        Normalisation applied per output pixel in the Gaussian modes:
         *l1*   -- sum of weights = 1  (preserves constant fields).
         *l2*   -- sum of squares = 1  (preserves local energy).
         *none* -- raw Gaussian weights (not recommended).
@@ -221,14 +241,21 @@ class HealPixDown(nn.Module):
 
         # ---- validate mode / weight_norm ----
         self.mode = mode.lower().strip()
-        if self.mode not in ("smooth", "maxpool", "mean"):
-            raise ValueError("mode must be 'smooth', 'maxpool' or 'mean'.")
+        if self.mode not in ("smooth", "smooth_conservative", "maxpool", "mean"):
+            raise ValueError(
+                "mode must be 'smooth', 'smooth_conservative', 'maxpool' or "
+                "'mean'."
+            )
         self.skipna = bool(skipna)
         if self.skipna and self.mode != "mean":
             raise ValueError("skipna is only supported with mode='mean'.")
         self.weight_norm = weight_norm.lower().strip()
         if self.weight_norm not in ("l1", "l2", "none"):
             raise ValueError("weight_norm must be 'l1', 'l2', or 'none'.")
+        if self.mode == "smooth_conservative" and self.weight_norm != "l1":
+            raise ValueError(
+                "mode='smooth_conservative' requires weight_norm='l1'."
+            )
 
         # ---- partial sky ----
         self.partial = cell_ids is not None
@@ -255,7 +282,7 @@ class HealPixDown(nn.Module):
             self.N_out = self.N_out_full
 
         # ---- Gaussian scale (smooth mode) ----
-        if self.mode == "smooth":
+        if self.mode in ("smooth", "smooth_conservative"):
             pix_area = 4.0 * np.pi / self.N_in_full
             pix_deg  = np.degrees(np.sqrt(pix_area))
             self.radius_deg = float(radius_deg) if radius_deg is not None else 3.0 * pix_deg
@@ -267,6 +294,17 @@ class HealPixDown(nn.Module):
             self.register_buffer("_M_indices", M.indices().clone())
             self.register_buffer("_M_values",  M.values().clone())
             self._M_size = M.size()
+            if self.mode == "smooth_conservative":
+                children = 4 * self._cell_ids_out[:, None] + np.arange(4)
+                if self.partial:
+                    present = np.isin(children, self._cell_ids_in)
+                else:
+                    present = np.ones(children.shape, dtype=bool)
+                self.register_buffer(
+                    "_coverage",
+                    torch.as_tensor(present.sum(axis=1) / 4.0,
+                                    dtype=torch.float64, device=self.device),
+                )
         elif self.mode == "mean":
             self._build_mean_children()
         else:
@@ -685,6 +723,28 @@ class HealPixDown(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
+    def _conserve_mean(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Add ``delta = mean(x) - mean_cov(y)`` to every output cell
+        (``mode="smooth_conservative"``), per batch row.
+
+        ``mean_cov`` weights the output cells by :attr:`coverage`, so that
+        on the full sphere it is the plain mean.  Only finite values enter
+        the means (sums in float64), so a NaN does not spread through the
+        offset.
+        """
+        cov = self._coverage.to(device=y.device)
+        fin_x = torch.isfinite(t)
+        fin_y = torch.isfinite(y)
+        sum_x = torch.where(fin_x, t, torch.zeros_like(t)).double().sum(-1)
+        mean_x = sum_x / fin_x.sum(-1)
+        wy = cov * fin_y
+        sum_y = (torch.where(fin_y, y, torch.zeros_like(y)).double() * cov).sum(-1)
+        mean_y = sum_y / wy.sum(-1)
+        delta = mean_x - mean_y
+        delta = torch.where(torch.isfinite(delta), delta, torch.zeros_like(delta))
+        return y + delta.to(y.dtype)[:, None]
+
     def _gather_children(
         self, t: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -745,12 +805,14 @@ class HealPixDown(nn.Module):
         """
         The linear operator as a coalesced sparse ``[N_out, N_in]`` matrix.
 
-        ``mode="smooth"``: the Gaussian weights.  ``mode="mean"``: weight
+        ``mode="smooth"``: the Gaussian weights.  ``mode="smooth_conservative"``:
+        the same Gaussian weights, without the global offset of ``forward``
+        (the offset is not sparse).  ``mode="mean"``: weight
         ``1 / n`` on each of the ``n`` children present in ``cell_ids``
         (the data-independent part; ``skipna`` is not represented).  Used
         by :class:`~healpix_analyse.up.HealPixUp` (``paired_down=...``).
         """
-        if self.mode == "smooth":
+        if self.mode in ("smooth", "smooth_conservative"):
             return torch.sparse_coo_tensor(
                 self._M_indices, self._M_values, size=self._M_size,
                 device=self._M_values.device, dtype=self._M_values.dtype,
@@ -772,15 +834,21 @@ class HealPixDown(nn.Module):
     def coverage(self) -> np.ndarray:
         """
         Fraction of the 4 NESTED children of each output cell that are
-        present in ``cell_ids`` (``mode="mean"`` only).
+        present in ``cell_ids`` (``mode="mean"`` and
+        ``"smooth_conservative"``).
 
         All ones on the full sphere.  On a partial sky, the mean of the
         output weighted by this array equals the mean of the input.  It
         does not depend on the data; for the NaN-skipping mean use
         :meth:`valid_fraction`.
         """
+        if self.mode == "smooth_conservative":
+            return self._coverage.cpu().numpy()
         if self.mode != "mean":
-            raise ValueError("coverage is only defined for mode='mean'.")
+            raise ValueError(
+                "coverage is only defined for mode='mean' or "
+                "'smooth_conservative'."
+            )
         return self._children_valid.sum(dim=-1).cpu().numpy() / 4.0
 
     @property
@@ -816,7 +884,7 @@ class HealPixDown(nn.Module):
                 f"Expected input with {self.N_in} pixels, got {N}."
             )
 
-        if self.mode == "smooth":
+        if self.mode in ("smooth", "smooth_conservative"):
             M = torch.sparse_coo_tensor(
                 self._M_indices.to(device=t.device),
                 self._M_values.to(device=t.device, dtype=t.dtype),
@@ -827,6 +895,8 @@ class HealPixDown(nn.Module):
             # M: [N_out, N_in];  t: [B, N_in]
             # y_T = M @ t.T  →  [N_out, B]
             y = torch.sparse.mm(M, t.T).T   # [B, N_out]
+            if self.mode == "smooth_conservative":
+                y = self._conserve_mean(t, y)
 
         elif self.mode == "mean":
             gathered, valid = self._gather_children(t)          # [B, N_out, 4]

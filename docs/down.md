@@ -12,14 +12,19 @@
 
 $$n_{\text{side,out}} = n_{\text{side,in}} \mathbin{/} 2, \qquad N_{\text{out}} = N_{\text{in}} \mathbin{/} 4$$
 
-Two strategies are available:
+Four strategies are available:
 
 - **`"smooth"`** — Gaussian-weighted average over a disc.  Implemented as
   a sparse linear operator `M @ x` (differentiable, usable in autograd).
+- **`"smooth_conservative"`** — the same Gaussian smoothing, plus one number
+  added to every output cell so that the mean of the output equals the mean
+  of the input.
+- **`"mean"`** — unweighted mean of the 4 direct NESTED children; conserves
+  the global mean exactly, but nothing crosses parent boundaries.
 - **`"maxpool"`** — Non-linear maximum over the 4 direct NESTED children
   of each coarse pixel.  Faster, no gradient.
 
-Both modes work on the full sphere or on a partial-sky subset defined by
+All modes work on the full sphere or on a partial-sky subset defined by
 `cell_ids`.
 
 Input shapes `[N]` and `[B, N]` are both accepted; numpy arrays and torch
@@ -45,7 +50,7 @@ HealPixDown(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `level` | `int` | — | Input Grid4Earth/HEALPix level, integer ≥ 1. Internally, `nside_in = 2**level`. |
-| `mode` | `str` | `"smooth"` | Downsampling strategy: `"smooth"` or `"maxpool"`. |
+| `mode` | `str` | `"smooth"` | Downsampling strategy: `"smooth"`, `"smooth_conservative"`, `"maxpool"` or `"mean"`. |
 | `radius_deg` | `float` or `None` | auto | Angular radius of the Gaussian disc (degrees). Default ≈ 3 × pixel size. Used only with `"smooth"`. |
 | `sigma_deg` | `float` or `None` | auto | Gaussian sigma (degrees). Default = `radius_deg / 2`. Used only with `"smooth"`. |
 | `weight_norm` | `str` | `"l1"` | Per-output-pixel weight normalisation in `"smooth"` mode: `"l1"` (sum=1, preserves constants), `"l2"` (sum of squares=1, preserves energy), `"none"` (raw Gaussian). |
@@ -97,6 +102,64 @@ buffer — `forward` only applies it.
 | `"l1"` *(default)* | Sum of weights = 1. A constant input map returns a constant output. Recommended for standard downsampling. |
 | `"l2"` | Sum of squares = 1. Preserves local signal energy rather than amplitude. |
 | `"none"` | Raw Gaussian weights (sum < 1 near boundaries). |
+
+### `"smooth_conservative"` — Gaussian average with the mean conserved
+
+The rows of the `"smooth"` matrix sum to 1 (a constant field is preserved),
+but its column sums are not uniform (4 × column sum is between 0.90 and
+1.08), so every step moves the global mean and the drift accumulates over a
+chain of levels. HEALPix cells have equal area, so conserving the global mean
+means conserving the plain mean. `"smooth_conservative"` does it in the
+simplest way:
+
+$$y = M x + \delta, \qquad \delta = \overline{x} - \overline{M x}$$
+
+with one $\delta$ per input map (per row of a batch), added to every output
+cell. The smoothing, the weights and the way information crosses parent
+boundaries are those of `"smooth"`; the output differs from `"smooth"` by a
+uniform offset (−1e-4 K at level 8 → 7 and −0.30 K at level 1 → 0 on the test
+field below). The offset is linear in `x`, and a constant field is preserved
+(`δ` is zero up to round-off). It is not local: a cell far from where the
+drift comes from is shifted as much as any other. `weight_norm` must be
+`"l1"`.
+
+- **Partial sky:** the means are weighted by `coverage` (the fraction of the 4
+  children present in `cell_ids`), as for `"mean"`: the coverage-weighted mean
+  of the output equals the mean of the input. As for `"mean"`, this holds for
+  one step; chaining operators over incomplete parents gives a mean of means.
+- **NaN:** `δ` is built from finite values only, so a NaN stays where
+  `"smooth"` puts it (it reaches the output cells whose disc contains it) and
+  does not spread through `δ`. The finite output cells then have the same
+  mean as the finite input cells (to round-off, coverage-weighted on a partial
+  sky), but they are not the same cells; the conservation of the mean of the
+  whole map is a statement for NaN-free input. `skipna` is not available.
+- **Positivity:** the correction is one uniform shift. A negative `δ` can make
+  a non-negative field (a probability, say) slightly negative, so positivity
+  is not kept.
+- `sparse_matrix()` returns the Gaussian matrix `M`, without the offset (the
+  offset is a dense rank-one term). `HealPixUp(paired_down=...)` therefore
+  pairs with `M`.
+- With `HealPixResampler` and a NaN-free map the mean is conserved. With
+  missing values the resampler renormalises by the coverage and the mean is
+  not conserved.
+
+### Which mode conserves what
+
+Synthetic temperature-like field (288 − 45 sin²(lat) + zonal terms), level 8
+to level 0, float64, `ellipsoid="sphere"`, one CPU thread
+(`benchmarks/benchmark_smooth_conservative.py`):
+
+| | `"smooth"` | `"smooth_conservative"` | `"mean"` |
+|---|---|---|---|
+| Drift of the global mean, level 8 → 0 | +0.48 K | 6e-14 K | 0 |
+| Constant field preserved | yes | yes | yes |
+| Coarse cells reached by a fine cell (level 5 → 4; min / median / max over all fine cells) | 5 / 7 / 9 | 5 / 7 / 9 | 1 |
+| Partial sky | yes | yes (coverage-weighted mean) | yes |
+| Build the level-8 operator | 1.5 s | 1.6 s | 0.003 s |
+| Apply, level 8 → 7 | 56 ms | 54 ms | a reshape and a mean |
+
+The extra work in `forward` is two sums over the input and the output.
+Real data were not tested.
 
 ### `"maxpool"` — Maximum over NESTED children
 
@@ -243,7 +306,7 @@ f2_down, _ = down2(f2)                      # [B, 64, N/16]
 | `nside_out` | Coarse output resolution (`nside_in // 2`). |
 | `N_in` | Number of input pixels (full sphere or `len(cell_ids)`). |
 | `N_out` | Number of output pixels. |
-| `mode` | `"smooth"` or `"maxpool"`. |
+| `mode` | `"smooth"`, `"smooth_conservative"`, `"maxpool"` or `"mean"`. |
 | `partial` | `True` when `cell_ids` was provided. |
 | `cell_ids_out` | Output pixel indices (coarse NESTED ids). |
 
