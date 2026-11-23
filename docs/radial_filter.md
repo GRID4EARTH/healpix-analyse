@@ -4,6 +4,10 @@
 
 A convenience `gaussian_filter` wrapper provides normalized Gaussian smoothing using `sigma_m` rather than a pixel-based standard deviation.
 
+Candidate cells and cell-centre coordinates come from healpix-geo (one batched
+`healpix_geo.nested.cone_coverage` call for all centres); the distance cutoff
+and the kernel weights use WGS84 geodesic distances from `pyproj.Geod`.
+
 The central spatial contract is:
 
 ```text
@@ -97,7 +101,16 @@ With the default `truncate=4.0`, `sigma_m=240.0` therefore uses a physical suppo
 960 m
 ```
 
-The Gaussian wrapper is normalized by construction, so a constant finite field remains constant after filtering.
+With the default `normalization="present"` the Gaussian wrapper is normalized by construction, so a constant finite field remains constant after filtering (with `"full_disc"` it decays near the edge of the domain, see below).
+
+```{warning}
+The default Gaussian is sampled at the cell centres. When `sigma_m` is below
+about one cell, the response of the filter to a single cell is narrower than
+`sigma_m`: at 0.3 cell the effective width (one-axis RMS) is about 0.11 cell
+and the centre cell keeps 96 to 97 % of the weight, and below about 0.2 cell the
+filter is the identity. Use `width_rule="matched"` (see
+[Widths below one cell](#widths-below-one-cell)) when the width itself matters.
+```
 
 ## Physical-distance semantics
 
@@ -255,6 +268,402 @@ A single missing neighbour therefore does not contaminate the complete neighbour
 
 If the effective weight sum is zero under `normalize=True`, the result is `NaN`.
 
+## Fixed normalisation at the edge of the domain
+
+`normalization` chooses what the weights are divided by, in `radial_filter`
+and `gaussian_filter`:
+
+| value | divided by | at the edge of the domain |
+|---|---|---|
+| `"present"` (default, same as `normalize=True`) | sum of the weights of the cells present | a constant field stays constant; no mass leaves |
+| `"full_disc"` | sum of the weights over the whole kernel disc, cells outside the domain included | cells outside the domain contribute zero; mass that diffuses out is lost |
+
+`"full_disc"` is the `mode="constant", cval=0` of a raster filter. The row of
+a cell whose disc crosses the edge sums to the fraction of the disc weight
+that lies inside the domain, and `filter(ones)` shows that fraction.
+
+```python
+out = gaussian_filter(
+    probability,
+    cell_ids,
+    refinement_level=10,
+    sigma_m=6000.0,
+    normalization="full_disc",
+)
+```
+
+Cells of `cell_ids` that are not in `domain` count as outside the domain. The
+kernel of `radial_filter` is also evaluated on the distances to the cells
+outside the domain. A `ValueError` is raised if the weights of some disc sum to
+zero. Passing `normalization` with `normalize=False` is an error.
+
+**Missing values with `"full_disc"`.** A `NaN` inside the domain is left out of
+the numerator and kept in the denominator: it counts as zero, and the result is
+never `NaN` because of `NaN` input. With `"present"` the weights of the
+remaining cells are renormalised, as described under *Missing values*.
+
+## Reusable weights
+
+The weights of a filter can be built once and applied many times, for example
+to every time step of a model, or chunk by chunk:
+
+```python
+from healpix_analyse import apply_filter_operator, gaussian_filter_operator
+
+op = gaussian_filter_operator(
+    cell_ids,
+    refinement_level=10,
+    sigma_m=6000.0,
+    normalization="full_disc",
+)
+row_offsets, column_indices, weights, n_columns = op   # three arrays and N
+
+out = apply_filter_operator(values, *op)         # values: (time, N) or (N,)
+```
+
+`radial_filter_operator` does the same for a kernel. The result is a
+`FilterOperator`, a named tuple of three arrays in compressed-row form and the
+number of columns `n_columns` (`len(cell_ids)`):
+
+```text
+out[..., i] = sum_k weights[k] * values[..., column_indices[k]]
+              for k in row_offsets[i]:row_offsets[i + 1]
+```
+
+Row `i` is the output cell `domain[i]` and the column indices point into
+`cell_ids`. The weights already contain the normalisation (an operator is always
+normalised: there is no `normalize=False`), and
+`apply_filter_operator` gives the same values as the filter with the same
+options (NumPy and Torch input; leading dimensions are kept). No SciPy or
+`sparse` import is needed. A caller that has one of them can wrap the arrays:
+
+```python
+import scipy.sparse as sp
+
+matrix = sp.csr_matrix(
+    (op.weights, op.column_indices, op.row_offsets),
+    shape=(len(op.row_offsets) - 1, op.n_columns),   # (len(domain), len(cell_ids))
+)
+out = matrix @ values
+```
+
+`apply_filter_operator(values, *op)` checks that the final axis of `values` has
+length `n_columns`; with the three-array call the length is not checked.
+
+`normalization="full_disc"` and `width_rule="matched"` rebuild their weights at
+every `gaussian_filter` / `radial_filter` call (only the geometry is cached), so
+in a loop over time steps build the operator once.
+
+`apply_filter_operator` leaves `NaN` values out of the sum, so a `NaN` counts as
+zero, which is the rule of `"full_disc"`; the equality with the filter for an
+operator built with `"present"` holds for data without `NaN`. With `renormalize_missing=True` the weights of the remaining cells are
+divided by their sum, which is what the filters do with
+`normalization="present"`.
+
+xarray and dask wrappers are left to the calling package.
+
+## Widths below one cell
+
+With `width_rule="sampled"` (default) the Gaussian is sampled at the cell
+centres and a width below about one cell is not reached. With
+`width_rule="matched"`:
+
+- where `sigma_m` is above the effective width of a reference operator `G0`
+  (the sampled Gaussian with a width of 0.6 cell, whose effective width is
+  about 0.58 cell), the shape parameter `s` of
+  `w = exp(-d^2 / (2 s^2))` is solved per cell so that the discrete second
+  moment `sum(w d^2) / sum(w)` over the disc equals `2 sigma_m^2`;
+- below it, the cell uses `T = I + (sigma_m / sigma_0)^2 (G0 - I)`, with
+  `sigma_0` the effective width of `G0` at that cell.
+
+The effective width of the row of every cell whose disc lies inside the domain
+is then equal to `sigma_m`; rows at the edge are renormalised (`"present"`) or
+truncated (`"full_disc"`), and their width differs. The
+response to one cell is within a few per cent of it (one-axis RMS, the
+anisotropy of the response is about 1.06), the width is continuous and monotone
+in `sigma_m`, and the filter tends to the identity when `sigma_m` tends to
+zero. The support is `truncate * max(sigma_m, 0.6 cell)`, and `truncate` must be at least 3 (a `ValueError` otherwise). The option works with
+both normalisations and with `gaussian_filter_operator`. Rows of the matched operator sum to 1 away from the edge; its column sums,
+which carry the conservation of the total, are close to 1 but not exactly 1.
+Measured for `"full_disc"` over the columns whose whole disc lies inside the
+domain: within 1.1e-4 of 1 on the 8125-cell level-10 domain above (0.3, 1 and 2
+cells), and within 1.2e-3 on regular patches of about 7900 cells at levels 8 and
+10 (worst at 0.3 cell). The tests require 2e-3 on both levels. It is not meant for
+widths of several cells, where the sampled Gaussian is already accurate and the
+solve costs extra time.
+
+Measured for one real domain at level 10 (8125 cells), response to one cell, in
+cells:
+
+| requested | `"sampled"` | `"matched"` |
+|---|---|---|
+| 0.1 | 0.00 | 0.10 |
+| 0.3 | 0.11 | 0.30 |
+| 0.5 | 0.45 | 0.50 |
+| 1.0 | 1.00 | 1.00 |
+| 2.0 | 2.00 | 2.01 |
+
+## Land barrier
+
+`gaussian_filter_operator` and `radial_filter_operator` take `blocked_cells`,
+an array of HEALPix cell ids (land). Without it the kernel acts on the
+straight-line distance, so a kernel that is wider than a strip of land puts
+weight on the far side of it, and land cells only act as zero padding. With it:
+
+- a blocked cell **receives nothing and gives nothing**: its row is empty (the
+  output there is zero) and it appears in no row (its input value is ignored); the output there is zero
+  also with `renormalize_missing=True`;
+- a cell reaches another one only along a path of neighbouring non-blocked
+  cells, and the kernel sees the length of the **shortest such path**, not the
+  straight distance. A strait lets weight through at the water distance, an
+  unbroken coast lets none through, and an island is gone around.
+
+The blocked cells must be part of the domain (`cell_ids`, or `domain`), as land
+cells with a mask are in the pangeo-fish estimator. Cells that are not in the
+domain are never crossed, but they do not start the search by themselves: a
+coast made of absent cells does not stop weight that jumps over it. Ids in
+`blocked_cells` that are not in the domain are ignored.
+
+```python
+op = gaussian_filter_operator(
+    cell_ids, level, sigma_m=2 * cell, width_rule="matched",
+    normalization="source",            # or "full_disc", see below
+    blocked_cells=cell_ids[land_mask],
+)
+state = apply_filter_operator(state, *op)
+```
+
+### Distance through water
+
+The graph has the cells of the domain as nodes and the eight immediate
+neighbours as edges, with the geodesic distance between the centres as length.
+Of the eight neighbours of a HEALPix cell, four share an edge and four only a
+vertex. A vertex edge is removed when both cells that touch that vertex between
+the two ends are blocked (or outside the domain), so that a diagonal chain of
+land cells, which is what a coast along a line of constant latitude looks like
+on this grid, does not leak. The same rule applies to the path with every cell
+passable (`D0` below), so a hole in the domain, whether the two cells meet at
+an edge or at a vertex, is no barrier as long as the detour around it stays inside the candidate
+disc of 1.5 radii around the source: it lengthens `D` and `D0` alike and the
+correction cancels it. A longer detour leaves the disc and the pair is dropped,
+so a long hole then acts as a barrier. Only blocked cells are land.
+
+The path on such a lattice is longer than the straight geodesic. Measured over
+the whole sphere (levels 3 to 7, `benchmarks/land_barrier_lattice.json`, no
+land): at most **1.10** within 30 degrees of the equator and up to **1.39** in
+the polar caps and just below them (above about 30 degrees), where the cells
+are more distorted; the mean is 1.04. A check at levels 8 to 10 found up to
+1.42 near 41 to 45 degrees of latitude, and the ratio grows slowly with the
+level, so the search factor is 1.5 (`tests/test_land_barrier.py` guards the
+margin). The metrication error is therefore not
+the 8 % of a square lattice. It is removed instead of being tolerated: the same
+pair of cells is searched twice, with the blocked cells removed (`D`) and with
+every cell passable (`D0`), and the kernel sees
+
+    d = straight * D / D0
+
+In open water `D = D0` and `d` is the straight distance. Near land `d` is the
+detour, with the lattice's own distortion divided out. `D >= D0`, so `d` is never
+shorter than the straight distance. Consequences:
+
+- A row with no blocked cell within `1.5 * truncate * sigma_m` (1.5 bounds
+  `D0 / straight`, with margin) takes a fast path, is built as without the
+  barrier, and is equal to it (tested at 1e-12). With no blocked cell at all,
+  or an empty `blocked_cells`, the result is identical to the operator without
+  the option.
+- The search is restricted to the cells within `1.5 * truncate * sigma_m` of the
+  row (a path that must leave this disc is not found, see the hole note above) and runs, vectorised, for the rows that have a blocked cell inside that
+  disc only. The cost therefore grows with the length of the coast, not with
+  the size of the domain; build time and peak memory are given below. The
+  geometry is built at the 1.5 times larger radius whenever `blocked_cells` is
+  given.
+- **The water distance is a lattice path distance, corrected in open water; it is
+not a geodesic around the coast.** For example, the detour around the tip of a
+wall depends on the orientation of the wall relative to the lattice (measured
+7.9 to 11.3 cells for the same wall at different angles). Near land the distance is the lattice detour divided by the lattice's own
+factor for the unblocked pair. It equals the straight distance only where land
+does not change the shortest lattice path; where it does, the remaining error
+is the difference of the metrication of the two paths, which is not bounded
+here. The tests compare the operator with an unbounded Dijkstra on the same
+graph (to 1e-10), not with true geodesics around a coast.
+
+### What happens to the mass that would go to land or behind it
+
+The option `normalization` decides. Two operators with the same `blocked_cells`
+differ only in it:
+
+| `normalization` | mass that cannot be reached | rows | columns | constant field |
+|---|---|---|---|---|
+| `"full_disc"` | **lost** (zero padding, as today in pangeo-fish: rows are divided by the open-water disc, so the likelihood penalises coasts) | sum to the reachable fraction of the open-water disc, below 1 near land | sum to at most about 1 | decays next to land |
+| `"source"` | **kept** (reflecting coast): every source cell divides its outgoing weights by their sum over the cells it reaches | free | sum to exactly 1 (to rounding): the total is conserved, and never above 1 for a non-negative signal | not preserved (rises or falls next to land) |
+| `"present"` | renormalised per output cell over the cells that reach it | sum to 1 | free | preserved on water |
+
+`"source"` is new and works without `blocked_cells` too, where it makes the
+domain edge reflecting. In the interior it differs from `"present"` only
+through the cell-to-cell variation (about 1e-4) of the kernel sum. With
+`width_rule="matched"` the blend with the identity below about 0.6 cell is
+applied per source cell, so that the columns still sum to 1. `gaussian_filter`
+and `radial_filter` do not take `"source"` or `blocked_cells`: they are
+operator options.
+
+For `radial_filter_operator` the kernel is called once on the distances
+through water, and once more on the straight distances of the whole disc when
+`normalization="full_disc"` (to get the open-water normalisation).
+
+### Measured
+
+Synthetic coast on the 8125-cell level-10 domain of the small-sigma check
+(`benchmarks/land_barrier_experiment.py`, results and figure next to it): a
+strip of two cells across the whole domain with and without a four-cell strait,
+and an island of radius four cells; delta 3 cells from the strip, `"matched"`.
+Mass on the far side of the unbroken strip (PR 81 operator with land masked
+after every step, against the barrier):
+
+| sigma (cells) | after 1 step, PR 81 | after 40 steps, PR 81 | barrier |
+|---|---|---|---|
+| 0.7 | 0 | 0.0009 | 0 |
+| 1 | 0 | 0.0062 | 0 |
+| 2 | 0.0037 | 0.032 | 0 |
+| 4 | 0.094 | 0.060 | 0 |
+
+Total mass after 1 and 40 steps for sigma 2 cells (PR 81 / `"full_disc"` /
+`"source"`): 0.946 / 0.930 / 1.000 and 0.283 / 0.241 / 1.000; for sigma 4
+cells: 0.891 / 0.757 / 1.000 and 0.178 / 0.085 / 1.000. Mass lost in one step by
+a delta at 1, 3 and 6 cells from the strip (sigma 2 cells): PR 81 0.128, 0.054,
+0.0005; `"full_disc"` 0.188, 0.070, 0.0005; `"source"` 0 (4e-16).
+
+Time to build the operator (caches cleared, 8125 cells, strip of 192 land
+cells, `"full_disc"`): sigma 1 cell 0.42 s (PR 81) against 0.56 s, peak memory
+63 against 111 MiB; sigma 2 cells 1.4 s against 2.5 s, 194 against 366 MiB (the
+memory is that of the geometry at 1.5 times the radius).
+
+Real land mask of the pangeo-fish demo (tag A19124 emission file, level 10,
+39 388 cells of which 29.6 % are land, read from disk, no download; sigma 1 and
+2 cells, `"matched"`, `"full_disc"`). Weight that the PR 81 operator puts on
+water cells the barrier does not connect, per source cell, one step, by
+distance of the source to the nearest land cell:
+
+| distance to land | sources | sigma 1: mean / max | sigma 2: mean / max |
+|---|---|---|---|
+| up to 1 cell | 2089 | 0.0025 / 0.28 | 0.0051 / 0.50 |
+| 1 to 3 cells | 3441 | 0.0001 / 0.012 | 0.0008 / 0.082 |
+| 3 to 6 cells | 4172 | 0 / 0 | 0 / 0.004 |
+
+The maxima are sources next to a thin or narrow piece of coast (a spit, an
+inlet), where up to half of the weight sits on cells that are close in a
+straight line and far through water. Mean mass lost per step by sources up to
+1 cell from land, PR 81 / `"full_disc"` barrier: 0.287 / 0.292 (sigma 1) and
+0.382 / 0.399 (sigma 2); the columns of `"source"` sum to 1 (largest deviation
+0, to rounding). Build time: 1.8 s against 2.8 s (sigma 1) and 7.6 s against
+15.7 s (sigma 2), 1.98 M and 7.62 M non-zeros for PR 81 against 1.34 M and 4.97 M
+with the barrier (blocked cells carry no weight). Sigma 4 cells was not run on
+this domain (the cost grows with the square of sigma).
+
+### Limits
+
+- Sigma that is large compared with the domain or with the width of a channel:
+  the disc then holds much of the domain, and the search and the geometry (at
+  1.5 times the radius) are as large as the dense operator.
+- Cost near long coasts: every row within `1.5 * truncate * sigma_m` of land is
+  searched; a coast that runs through the whole domain makes this every row.
+  Measured on the 8125-cell level-10 domain with a long coast (1596 land
+  cells), `"source"` with `"matched"`, barrier against none: sigma 1 cell 0.61
+  against 0.42 s and 585 against 438 MiB; sigma 2 cells 3.6 against 1.3 s and
+  983 against 532 MiB; sigma 4 cells 25.7 against 5.2 s and 2730 against
+  1352 MiB.
+- The lattice metrication is divided out, but not for pairs whose shortest
+  lattice path changes because of land (see above).
+- Real coasts were tried on one demo domain only; GPU and dask were not tried.
+
+## Mixed-level sets (multi-order)
+
+`multiorder_filter_operator(levels, cell_ids, sigma_m=...)` builds the same kind
+of operator on a set of *leaves* of different refinement levels, such as a
+river refined to level 15 that opens into a sea held at level 11. `levels` and
+`cell_ids` are two integer arrays (the level of each leaf and its NESTED id at
+that level); the result is a `FilterOperator` over the leaves in input order, to
+be applied with `apply_filter_operator`. **Land is a place without a leaf**,
+and leaves listed in the optional boolean `blocked` are land inside the set.
+
+```python
+op = multiorder_filter_operator(
+    levels, cell_ids, sigma_m=5_000.0, normalization="source",
+)
+state = apply_filter_operator(state, *op)   # probability per leaf, conserved
+```
+
+- **Graph.** Two leaves are neighbours when they share an edge or a corner,
+  at any levels: the eight neighbours of a leaf at its own level come from
+  healpix-geo, and each is looked up in the set (the cell itself, or its
+  parent).
+  The input must be **2:1 balanced** (touching leaves differ by at most one
+  level) and must not overlap; a clear `ValueError` is raised otherwise. A
+  contact through a corner only is usable when the two leaves have a common
+  neighbouring leaf that is not blocked, in both `correction` modes, so a
+  diagonal chain of land does not leak (the rule of the one-level barrier).
+- **Distance.** Edge lengths are geodesic distances between leaf centres, and
+  the kernel sees the length of the shortest path (a heap Dijkstra).
+  With `correction="none"` (default) the path is used as it is: it is longer
+  than the straight distance by the usual lattice metrication, up to 10 %
+  within 30 degrees of the equator and up to 40 % elsewhere, and the width of
+  the kernel is smaller by that factor.
+  With `correction="lattice"` the correction of `blocked_cells` is applied,
+  `d = straight * D / D0`, where `D0` is the path over the same graph with the
+  blocked leaves passable (the corner rule applies to `D0` too). In open water
+  `d` is exactly the straight distance, at any mix of levels. A place without
+  a leaf adds nothing to `D` or `D0`, so the ratio ignores it and it does not
+  lengthen `d`, across an edge or a corner contact alike: in this mode **only
+  blocked leaves are land**; supply the dry leaves of a full tessellation as
+  `blocked`. A hole in the set is **not** a barrier with
+  `correction="lattice"` as long as the detour around it stays within the
+  limits below: the distance across it is then the straight distance.
+  The search is sized with `D0 / straight <= 1.5`, which holds without holes:
+  on a mixed set at levels 11 to 15 along a wavy coast (22765 leaves, 400
+  sources, 2.6 million pairs, no hole) the largest ratio measured was 1.38.
+  Paths around a hole are longer, in `D` and in `D0`, so a source that has a
+  hole or the edge of the set within reach of that search is searched again up
+  to `3 * radius`; a pair whose `D` or `D0` is beyond the limit is dropped, so
+  a hole that forces a detour longer than three radii acts as a barrier. On
+  the 22765-leaf coast (3175 blocked leaves, sigma 1.2 km, same operator) the
+  repeat costs 8 % (SciPy, 12.0 to 12.9 s) and 12 % (built-in, 44 to 50 s);
+  searching every source up to `3 * radius` would cost 2.2 and 2.7 times. For
+  land made of absent leaves use `correction="none"`. With one level,
+  `correction="lattice"` gives the operator of
+  `gaussian_filter_operator(..., blocked_cells=...)` to rounding (tested at
+  `rtol=1e-12`) without holes, and with holes whose detours stay within both
+  limits: the one-level operator limits the search by the candidate disc of
+  1.5 radii around the source, this one by a path length of three radii, so
+  for a long hole (a detour of about two to three radii or more) they can
+  differ, and each acts as a barrier beyond its own limit.
+- **SciPy is optional.** `shortest_path="scipy"` runs
+  `scipy.sparse.csgraph.dijkstra` on the same graph (install the `scipy`
+  extra); it is only imported then, and the default `"builtin"` needs no
+  SciPy.
+- **Weights.** A leaf of level `l` has the area `4**-l`, and `wet_fraction`
+  (optional, per leaf, in `(0, 1]`) multiplies it for leaves that are mostly
+  land. `normalization="source"` makes the weights that leave one leaf sum to
+  one, so the total of a signal of masses (one value per leaf) is conserved
+  exactly; the weight to a target is proportional to the target's area, so a
+  coarse leaf receives more than a fine one at the same distance.
+  `normalization="present"` makes the weights that reach a leaf sum to one, with
+  the source areas as weights: it averages a signal of densities over area. With
+  `area_weights=False` every leaf counts the same.
+- **Leaves larger than the water.** Two leaves may touch while the water they
+  hold does not meet (a river a few hundred metres wide in leaves of 200 m,
+  with an embankment between two meanders). The leaf graph alone cannot know,
+  and it shortens the path across such a spot. `water_contacts=(first, second)`
+  restricts the graph to pairs that the caller knows to be joined by water.
+- Tested against a brute-force reference that expands every leaf to its finest
+  descendants and runs an unbounded Dijkstra: strait, island, closed bay,
+  diagonal chain, a diagonal hole, conservation with `"source"`, and the
+  one-level case. The cost is a Python heap search per leaf, fine for
+  thousands of leaves and not meant for millions.
+- Not done: a width rule below one leaf (the Gaussian is evaluated as it is, so
+  a `sigma_m` below the distance to the nearest neighbour leaves each leaf
+  nearly alone), a `domain` argument, and a proof of the
+  `D0 / straight <= 1.5` bound across level steps for `correction="lattice"`
+  (it is measured on sets without holes, see above, not proved).
+
 ## Custom radial kernels
 
 A user-defined kernel receives a one-dimensional NumPy array containing the distances of valid target-neighbour pairs:
@@ -359,6 +768,66 @@ smoothed = gaussian_filter(
 loss = smoothed.sum()
 loss.backward()
 ```
+
+## Geometry and weight cache sizing
+
+`radial_filter` and `gaussian_filter` keep bounded least-recently-used caches
+for value-independent metric geometry and Gaussian weights. The defaults are:
+
+```text
+geometry: 192 MiB
+weights:   96 MiB
+```
+
+If one filter plan exceeds either limit, that entry is not cached. A
+`RuntimeWarning` reports the required and configured sizes, explains that a
+repeat will rebuild the data, and gives two safe options:
+
+1. increase the relevant limit after checking available process memory; or
+2. process spatial tiles with a halo of at least
+   `radius_m = sigma_m * truncate`, discard halo outputs, and stitch only the
+   tile interiors.
+
+Splitting without a halo changes neighbourhoods at tile boundaries and does
+not preserve the filtering result.
+
+Configure or inspect the caches with:
+
+```python
+from healpix_analyse import (
+    configure_radial_filter_cache,
+    radial_filter_cache_info,
+)
+
+configure_radial_filter_cache(
+    geometry_max_mib=576,
+    weight_max_mib=384,
+)
+
+print(radial_filter_cache_info())
+```
+
+`None` leaves a limit unchanged, while zero disables that cache. Reducing a
+limit immediately evicts least-recently-used entries until retained data fits.
+The limits cover retained arrays only; temporary arrays used while building
+exact WGS84 geometry require additional memory.
+
+The following measurements use a patch centred at 2 degrees East, 48 degrees
+North with `sigma_m=20` and `truncate=5` (100 m support):
+
+| Level | patch size | cells | neighbour pairs | geometry | weights | total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 19 | 600 m | 3,883 | 705,275 | 8.13 MiB | 5.38 MiB | 13.51 MiB |
+| 19 | 1,200 m | 15,075 | 2,881,729 | 33.21 MiB | 21.99 MiB | 55.19 MiB |
+| 20 | 600 m | 15,069 | 10,942,451 | 125.46 MiB | 83.48 MiB | 208.94 MiB |
+| 20 | 1,200 m | 59,426 | 45,475,888 | 521.34 MiB | 346.95 MiB | 868.29 MiB |
+
+These are planning estimates, not fixed formulas. Memory depends on physical
+radius, domain shape, latitude, HEALPix topology, and boundary-to-interior
+ratio. A larger `sigma_m` or `truncate` increases the number of neighbour
+pairs approximately with the square of the support radius. Use the warning's
+measured requirement for the actual workload and leave headroom for values,
+outputs, coordinate arrays, and concurrent filters.
 
 ## Relationship to neighbourhood reductions
 

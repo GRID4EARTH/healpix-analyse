@@ -7,9 +7,14 @@ Reduces the HEALPix resolution by a factor of 2:
     nside_out = nside_in // 2
     N_out     = N_in // 4
 
-Two modes:
-    "smooth"  -- weighted Gaussian average over a disc (linear, differentiable).
-    "maxpool" -- non-linear max over the 4 direct NESTED children.
+Four modes:
+    "smooth"              -- weighted Gaussian average over a disc.
+    "smooth_conservative" -- "smooth" plus one global additive correction.
+    "maxpool"             -- non-linear max over the 4 direct NESTED children.
+    "mean"                -- unweighted mean over the 4 direct NESTED children.
+
+HEALPix cells have equal area, so "mean" and "smooth_conservative" conserve
+the global mean of a NaN-free full-sphere field; "smooth" does not.
 
 Works on the full sphere or on a partial-sky subset.  Resolution is exposed
 through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
@@ -31,9 +36,6 @@ import torch.nn as nn
 import healpix_geo
 from pyproj import Transformer
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
-
-import os
-from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
 # Type alias
@@ -101,8 +103,11 @@ class HealPixDown(nn.Module):
     HEALPix downsampling: reduce resolution by a factor of 2.
 
     Reduces ``level`` → ``level - 1`` using either a
-    Gaussian-weighted sparse matrix (``mode="smooth"``) or a max-pooling
-    over the 4 direct NESTED children (``mode="maxpool"``).
+    Gaussian-weighted sparse matrix (``mode="smooth"``), the same smoothing
+    with a global correction that conserves the mean
+    (``mode="smooth_conservative"``), a max-pooling
+    over the 4 direct NESTED children (``mode="maxpool"``), or their
+    unweighted mean (``mode="mean"``).
 
     Can operate on the full sphere or on a partial-sky subset.
 
@@ -113,19 +118,60 @@ class HealPixDown(nn.Module):
         corresponding HEALPix resolution is ``nside_in = 2**level``.
         When ``cell_ids`` is ``None``, the input is expected to have
         ``N = 12 * nside_in**2`` pixels.
-    mode : {"smooth", "maxpool"}, default "smooth"
+    mode : {"smooth", "smooth_conservative", "maxpool", "mean"}, default "smooth"
         Downsampling strategy.
         *smooth*   -- differentiable Gaussian-weighted average (linear).
         *maxpool*  -- non-linear max over 4 NESTED children (fast).
+        *mean*     -- unweighted mean over the 4 NESTED children (linear,
+        differentiable).  For a NaN-free full-sphere input the global
+        mean of the output equals the global mean of the input (with
+        NaNs, see ``skipna``), so this is the mode
+        to use for a hierarchy of maps.  *smooth* does not have this
+        property: its weights are normalised per output cell only, which
+        preserves constant fields but not the global mean.
+        On a partial sky, a coarse cell is the mean of the children
+        present in ``cell_ids``; :attr:`coverage` gives the fraction of
+        children present, and the mean of the output weighted by
+        :attr:`coverage` equals the mean of the input.  This holds for one
+        step: chaining partial-sky operators with incomplete parents gives
+        a mean of means.  To stay conservative over several steps, run the
+        data and a map of ones through the chain, multiply each step's
+        output by that step's :attr:`coverage`, and divide the two at the
+        end: the ratio is the mean of the descendants present.
+        NaN values propagate to the parent cell unless ``skipna=True``.
+        *smooth_conservative* -- *smooth*, then one number is added to every
+        output cell so that the mean of the output equals the mean of the
+        input: ``y = M x + delta``, ``delta = mean(x) - mean(M x)``.  The
+        smoothing, and the way information crosses parent boundaries, are
+        those of *smooth*; only a uniform offset (the drift of one step) is
+        added.  A constant field is preserved (``delta`` is then zero up to
+        round-off).  The shift is the same for every cell, so a negative
+        ``delta`` can make a non-negative field (a probability, say)
+        slightly negative: positivity is not kept.  On a partial sky the
+        means are weighted by :attr:`coverage` (the fraction of the 4
+        children present), as for *mean*.  NaN: ``delta`` is built from
+        finite values only, so a NaN stays local and the finite output
+        cells have the same (coverage-weighted) mean as the finite input
+        cells, although they are not the same cells; the mean of a NaN-free
+        input is conserved over all cells.  ``weight_norm`` must be
+        ``"l1"``.  :meth:`sparse_matrix` is the Gaussian part ``M`` without
+        the offset.
+    skipna : bool, default False
+        Only for ``mode="mean"``.  If True, non-finite children are left
+        out of the mean (a NaN-skipping mean); a parent with no finite
+        child is NaN.  The number of children used then depends on the
+        data: :meth:`valid_fraction` returns it per output cell, and the
+        mean of the output weighted by ``valid_fraction(x)`` equals the
+        mean of the finite input values.
     radius_deg : float or None
         Angular radius of the Gaussian kernel (degrees).
         Defaults to ~3 times the fine pixel size.
-        Only used for ``mode="smooth"``.
+        Only used for the Gaussian modes (``"smooth"``, ``"smooth_conservative"``).
     sigma_deg : float or None
         Gaussian sigma (degrees).  Defaults to ``radius_deg / 2``.
-        Only used for ``mode="smooth"``.
+        Only used for the Gaussian modes (``"smooth"``, ``"smooth_conservative"``).
     weight_norm : {"l1", "l2", "none"}, default "l1"
-        Normalisation applied per output pixel in ``mode="smooth"``:
+        Normalisation applied per output pixel in the Gaussian modes:
         *l1*   -- sum of weights = 1  (preserves constant fields).
         *l2*   -- sum of squares = 1  (preserves local energy).
         *none* -- raw Gaussian weights (not recommended).
@@ -171,6 +217,7 @@ class HealPixDown(nn.Module):
         cell_ids: Optional[ArrayLike] = None,
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
+        skipna: bool = False,
     ) -> None:
         super().__init__()
 
@@ -194,11 +241,21 @@ class HealPixDown(nn.Module):
 
         # ---- validate mode / weight_norm ----
         self.mode = mode.lower().strip()
-        if self.mode not in ("smooth", "maxpool"):
-            raise ValueError("mode must be 'smooth' or 'maxpool'.")
+        if self.mode not in ("smooth", "smooth_conservative", "maxpool", "mean"):
+            raise ValueError(
+                "mode must be 'smooth', 'smooth_conservative', 'maxpool' or "
+                "'mean'."
+            )
+        self.skipna = bool(skipna)
+        if self.skipna and self.mode != "mean":
+            raise ValueError("skipna is only supported with mode='mean'.")
         self.weight_norm = weight_norm.lower().strip()
         if self.weight_norm not in ("l1", "l2", "none"):
             raise ValueError("weight_norm must be 'l1', 'l2', or 'none'.")
+        if self.mode == "smooth_conservative" and self.weight_norm != "l1":
+            raise ValueError(
+                "mode='smooth_conservative' requires weight_norm='l1'."
+            )
 
         # ---- partial sky ----
         self.partial = cell_ids is not None
@@ -225,7 +282,7 @@ class HealPixDown(nn.Module):
             self.N_out = self.N_out_full
 
         # ---- Gaussian scale (smooth mode) ----
-        if self.mode == "smooth":
+        if self.mode in ("smooth", "smooth_conservative"):
             pix_area = 4.0 * np.pi / self.N_in_full
             pix_deg  = np.degrees(np.sqrt(pix_area))
             self.radius_deg = float(radius_deg) if radius_deg is not None else 3.0 * pix_deg
@@ -237,6 +294,19 @@ class HealPixDown(nn.Module):
             self.register_buffer("_M_indices", M.indices().clone())
             self.register_buffer("_M_values",  M.values().clone())
             self._M_size = M.size()
+            if self.mode == "smooth_conservative":
+                children = 4 * self._cell_ids_out[:, None] + np.arange(4)
+                if self.partial:
+                    present = np.isin(children, self._cell_ids_in)
+                else:
+                    present = np.ones(children.shape, dtype=bool)
+                self.register_buffer(
+                    "_coverage",
+                    torch.as_tensor(present.sum(axis=1) / 4.0,
+                                    dtype=torch.float64, device=self.device),
+                )
+        elif self.mode == "mean":
+            self._build_mean_children()
         else:
             # maxpool: precompute children indices
             self._build_maxpool_children()
@@ -256,32 +326,13 @@ class HealPixDown(nn.Module):
         )
         return 2.0 * np.arcsin(np.sqrt(a))
 
-    """
-    Optimized replacement for HealPixDown._build_smooth_matrix().
-
-    Drop this method directly into the HealPixDown class to replace the original.
-
-    Performance improvements vs the original loop:
-    ──────────────────────────────────────────────────────────────────────────
-      Bottleneck                     Before              After
-    ──────────────────────────────────────────────────────────────────────────
-      healpix_to_lonlat (centers)    N_out scalar calls  1 vectorised call
-      cone_coverage                  N_out sequential    N_out parallel (threads)
-      healpix_to_lonlat (fine pix)   N_out batch calls   1 batch call (unique)
-      Weight computation             Python for loop     numpy (N_out, K) matrix
-      COO accumulation               list.append         pre-allocated arrays
-    ──────────────────────────────────────────────────────────────────────────
-
-    Expected speed-up: 20x–200x depending on N_out and number of CPU cores.
-    """
-
-
     def _build_smooth_matrix(self) -> torch.Tensor:
         """
         Build sparse weight matrix M of shape (N_out, N_in):
             y[i_out] = Σ_j  M[i_out, j_in] * x[j_in]
 
-        Vectorised & parallelised — replaces the original per-pixel Python loop.
+        Vectorised, with one batched ``cone_coverage`` call for all output
+        cells.
         """
         cell_ids_out = self._cell_ids_out   # (N_out,) int64
         cell_ids_in  = self._cell_ids_in    # (N_in,)  int64 | None
@@ -293,14 +344,17 @@ class HealPixDown(nn.Module):
         # Partial-sky column lookup  (vectorisable via searchsorted)
         # ------------------------------------------------------------------
         if self.partial:
-            ids_in_sorted = np.sort(cell_ids_in)
+            # Columns index the *input array*, i.e. the order of cell_ids_in,
+            # not the sorted ids used for the lookup.
+            order = np.argsort(cell_ids_in, kind="stable")
+            ids_in_sorted = cell_ids_in[order]
 
             def _col_vec(pix_arr: np.ndarray):
                 """Map pixel ids → (column_index, availability_mask) — vectorised."""
                 idx  = np.searchsorted(ids_in_sorted, pix_arr)
                 idx  = np.clip(idx, 0, len(ids_in_sorted) - 1)
                 mask = ids_in_sorted[idx] == pix_arr
-                return idx, mask
+                return order[idx], mask
         else:
             def _col_vec(pix_arr: np.ndarray):
                 return pix_arr.astype(np.int64), np.ones(len(pix_arr), dtype=bool)
@@ -318,26 +372,24 @@ class HealPixDown(nn.Module):
         lats0_rad = np.deg2rad(lats0_deg)
 
         # ------------------------------------------------------------------
-        # 2. Parallel cone_coverage
-        #    healpix-geo is backed by Rust → releases the GIL → true parallelism
-        #    (was: N_out sequential calls)
+        # 2. Batched cone_coverage — ONE native call for all coarse centres
+        #    (was: N_out calls from a Python thread pool)
         # ------------------------------------------------------------------
         radius_deg = np.rad2deg(self.radius_rad)
-        ellipsoid  = self.ellipsoid
+        cones, _, _ = healpix_geo.nested.cone_coverage(
+            np.column_stack((lons0_deg, lats0_deg)),
+            radius_deg, ilevel, ellipsoid=self.ellipsoid,
+        )
+        cone_offsets = np.asarray(cones.offsets, dtype=np.int64)
+        cone_cells   = np.asarray(cones.data, dtype=np.int64)
 
-        def _query_cone(i_out: int) -> np.ndarray:
-            cand, _, _ = healpix_geo.nested.cone_coverage(
-                (float(lons0_deg[i_out]), float(lats0_deg[i_out])),
-                radius_deg, ilevel, ellipsoid=ellipsoid,
-            )
+        all_cands = []
+        for i_out in range(N_out):
+            cand = cone_cells[cone_offsets[i_out]:cone_offsets[i_out + 1]]
             if cand.size == 0:                                   # fallback: 4 children
                 p_out = int(cell_ids_out[i_out])
                 cand  = (4 * p_out + np.arange(4, dtype=np.int64))
-            return cand.astype(np.int64)
-
-        n_workers  = min(os.cpu_count() or 1, N_out)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            all_cands = list(pool.map(_query_cone, range(N_out)))
+            all_cands.append(cand)
         # all_cands[i] : array of fine NESTED pixel ids for coarse pixel i
 
         sizes   = np.array([len(c) for c in all_cands], dtype=np.int64)   # (N_out,)
@@ -612,12 +664,14 @@ class HealPixDown(nn.Module):
                 ch_avail = [c if c in ids_in_set else fallback for c in ch]
                 children_list.append(ch_avail)
 
-            # Map absolute pixel ids → column indices in cell_ids_in
-            ids_in_sorted = np.sort(self._cell_ids_in)
+            # Map absolute pixel ids → column indices in cell_ids_in (input
+            # array order, hence the argsort after the sorted lookup)
+            order         = np.argsort(self._cell_ids_in, kind="stable")
+            ids_in_sorted = self._cell_ids_in[order]
             children_np   = np.array(children_list, dtype=np.int64)  # [N_out, 4]
             flat           = children_np.ravel()
-            col_idx        = np.searchsorted(ids_in_sorted, flat).reshape(children_np.shape)
-            children_idx   = col_idx
+            col_idx        = order[np.searchsorted(ids_in_sorted, flat)]
+            children_idx   = col_idx.reshape(children_np.shape)
         else:
             children_idx = np.stack([
                 4 * cell_ids_out,
@@ -631,9 +685,171 @@ class HealPixDown(nn.Module):
             torch.as_tensor(children_idx, dtype=torch.long, device=self.device),
         )
 
+    def _build_mean_children(self) -> None:
+        """
+        Precompute the child index mapping for the mean mode.
+
+        Registers ``_children_idx`` of shape [N_out, 4] (positions in the
+        input array, in the order of ``cell_ids``) and ``_children_valid``
+        of shape [N_out, 4] (False where a child is absent from a
+        partial-sky ``cell_ids``).
+        """
+        children = 4 * self._cell_ids_out[:, None] + np.arange(4, dtype=np.int64)
+
+        if self.partial:
+            # position of each child in the input array; cell_ids need not
+            # be sorted
+            order = np.argsort(self._cell_ids_in, kind="stable")
+            ids_sorted = self._cell_ids_in[order]
+            pos = np.clip(
+                np.searchsorted(ids_sorted, children), 0, len(ids_sorted) - 1
+            )
+            valid = ids_sorted[pos] == children
+            children_idx = np.where(valid, order[pos], 0)
+        else:
+            valid = np.ones(children.shape, dtype=bool)
+            children_idx = children
+
+        self.register_buffer(
+            "_children_idx",
+            torch.as_tensor(children_idx, dtype=torch.long, device=self.device),
+        )
+        self.register_buffer(
+            "_children_valid",
+            torch.as_tensor(valid, dtype=torch.bool, device=self.device),
+        )
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+
+    def _conserve_mean(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Add ``delta = mean(x) - mean_cov(y)`` to every output cell
+        (``mode="smooth_conservative"``), per batch row.
+
+        ``mean_cov`` weights the output cells by :attr:`coverage`, so that
+        on the full sphere it is the plain mean.  Only finite values enter
+        the means (sums in float64), so a NaN does not spread through the
+        offset.
+        """
+        cov = self._coverage.to(device=y.device)
+        fin_x = torch.isfinite(t)
+        fin_y = torch.isfinite(y)
+        sum_x = torch.where(fin_x, t, torch.zeros_like(t)).double().sum(-1)
+        mean_x = sum_x / fin_x.sum(-1)
+        wy = cov * fin_y
+        sum_y = (torch.where(fin_y, y, torch.zeros_like(y)).double() * cov).sum(-1)
+        mean_y = sum_y / wy.sum(-1)
+        delta = mean_x - mean_y
+        delta = torch.where(torch.isfinite(delta), delta, torch.zeros_like(delta))
+        return y + delta.to(y.dtype)[:, None]
+
+    def _gather_children(
+        self, t: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Gather the 4 NESTED children of every output cell (``mode="mean"``).
+
+        Returns ``(gathered, valid)`` with shape ``[B, N_out, 4]``.  ``valid``
+        marks the children that take part in the mean: present in
+        ``cell_ids`` and, with ``skipna``, finite.  It is ``None`` when every
+        child takes part (full sphere, ``skipna=False``).
+        """
+        idx = self._children_idx.to(device=t.device)            # [N_out, 4]
+        gathered = t[:, idx]                                     # [B, N_out, 4]
+        valid = None
+        if self.partial:
+            valid = self._children_valid.to(device=t.device).expand_as(gathered)
+        if self.skipna:
+            finite = torch.isfinite(gathered)
+            valid = finite if valid is None else valid & finite
+        return gathered, valid
+
+    def valid_fraction(self, x: ArrayLike) -> ArrayLike:
+        """
+        Fraction of the 4 NESTED children of each output cell that enter
+        the mean for this input ``x`` (``mode="mean"`` only).
+
+        A child counts when it is present in ``cell_ids`` and its value is
+        finite.  With ``skipna=True``, the mean of ``self(x)[0]`` weighted
+        by this array equals the mean of the finite values of ``x``.  To
+        chain levels conservatively, carry the weights along: downsample
+        ``where(isfinite(x), x, 0)`` and ``isfinite(x)`` with a plain
+        ``mode="mean"`` operator and divide at the end.
+
+        Parameters
+        ----------
+        x : numpy.ndarray or torch.Tensor, shape [N] or [B, N]
+            The input that is (or will be) passed to :meth:`forward`.
+
+        Returns
+        -------
+        same type as x, shape [N_out] or [B, N_out], values in {0, .25, .5, .75, 1}
+        """
+        if self.mode != "mean":
+            raise ValueError("valid_fraction is only defined for mode='mean'.")
+        t, is_numpy, was_1d = _prepare_input(x, self.device, self.dtype)
+        if t.shape[1] != self.N_in:
+            raise ValueError(
+                f"Expected input with {self.N_in} pixels, got {t.shape[1]}."
+            )
+        gathered = t[:, self._children_idx.to(device=t.device)]
+        valid = torch.isfinite(gathered)
+        if self.partial:
+            valid = valid & self._children_valid.to(device=t.device)
+        frac = valid.sum(dim=-1).to(t.dtype) / 4.0
+        return _restore_output(frac, is_numpy, was_1d)
+
+    def sparse_matrix(self) -> torch.Tensor:
+        """
+        The linear operator as a coalesced sparse ``[N_out, N_in]`` matrix.
+
+        ``mode="smooth"``: the Gaussian weights.  ``mode="smooth_conservative"``:
+        the same Gaussian weights, without the global offset of ``forward``
+        (the offset is not sparse).  ``mode="mean"``: weight
+        ``1 / n`` on each of the ``n`` children present in ``cell_ids``
+        (the data-independent part; ``skipna`` is not represented).  Used
+        by :class:`~healpix_analyse.up.HealPixUp` (``paired_down=...``).
+        """
+        if self.mode in ("smooth", "smooth_conservative"):
+            return torch.sparse_coo_tensor(
+                self._M_indices, self._M_values, size=self._M_size,
+                device=self._M_values.device, dtype=self._M_values.dtype,
+            ).coalesce()
+        if self.mode != "mean":
+            raise ValueError("maxpool is not linear; it has no sparse matrix.")
+        idx = self._children_idx
+        valid = self._children_valid
+        rows = torch.arange(self.N_out, device=idx.device)[:, None].expand_as(idx)
+        n = valid.sum(dim=-1, keepdim=True).to(self.dtype).expand(idx.shape)
+        return torch.sparse_coo_tensor(
+            torch.stack([rows[valid], idx[valid]]),
+            1.0 / n[valid],
+            size=(self.N_out, self.N_in),
+            device=idx.device, dtype=self.dtype,
+        ).coalesce()
+
+    @property
+    def coverage(self) -> np.ndarray:
+        """
+        Fraction of the 4 NESTED children of each output cell that are
+        present in ``cell_ids`` (``mode="mean"`` and
+        ``"smooth_conservative"``).
+
+        All ones on the full sphere.  On a partial sky, the mean of the
+        output weighted by this array equals the mean of the input.  It
+        does not depend on the data; for the NaN-skipping mean use
+        :meth:`valid_fraction`.
+        """
+        if self.mode == "smooth_conservative":
+            return self._coverage.cpu().numpy()
+        if self.mode != "mean":
+            raise ValueError(
+                "coverage is only defined for mode='mean' or "
+                "'smooth_conservative'."
+            )
+        return self._children_valid.sum(dim=-1).cpu().numpy() / 4.0
 
     @property
     def cell_ids_out(self) -> np.ndarray:
@@ -668,7 +884,7 @@ class HealPixDown(nn.Module):
                 f"Expected input with {self.N_in} pixels, got {N}."
             )
 
-        if self.mode == "smooth":
+        if self.mode in ("smooth", "smooth_conservative"):
             M = torch.sparse_coo_tensor(
                 self._M_indices.to(device=t.device),
                 self._M_values.to(device=t.device, dtype=t.dtype),
@@ -679,6 +895,18 @@ class HealPixDown(nn.Module):
             # M: [N_out, N_in];  t: [B, N_in]
             # y_T = M @ t.T  →  [N_out, B]
             y = torch.sparse.mm(M, t.T).T   # [B, N_out]
+            if self.mode == "smooth_conservative":
+                y = self._conserve_mean(t, y)
+
+        elif self.mode == "mean":
+            gathered, valid = self._gather_children(t)          # [B, N_out, 4]
+            if valid is None:
+                y = gathered.mean(dim=-1)                       # [B, N_out]
+            else:
+                gathered = torch.where(
+                    valid, gathered, torch.zeros((), dtype=t.dtype, device=t.device)
+                )
+                y = gathered.sum(dim=-1) / valid.sum(dim=-1).to(t.dtype)
 
         else:  # maxpool
             idx = self._children_idx.to(device=t.device)   # [N_out, 4]

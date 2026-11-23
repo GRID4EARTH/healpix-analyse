@@ -5,7 +5,12 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("healpix_geo")
 
-from healpix_analyse.healpix_sht import HEALPixSHT
+from healpix_analyse.healpix_sht import _HAS_SPHERICAL, HEALPixSHT
+
+requires_spin = pytest.mark.skipif(
+    not _HAS_SPHERICAL,
+    reason="spin transforms need the optional quaternionic and spherical packages",
+)
 
 
 def _ring_to_nested_by_assignment(sht, ring_map):
@@ -41,6 +46,7 @@ def test_map2alm_nest_reads_the_same_physical_map_as_ring():
     torch.testing.assert_close(nested_alm, ring_alm, rtol=0.0, atol=0.0)
 
 
+@requires_spin
 def test_spin_synthesis_nest_matches_ring_to_nested_assignment():
     sht = HEALPixSHT(level=1, lmax=3, dtype=torch.float64, device="cpu")
     generator = torch.Generator(device="cpu").manual_seed(11)
@@ -70,6 +76,7 @@ def test_spin_synthesis_nest_matches_ring_to_nested_assignment():
     )
 
 
+@requires_spin
 def test_spin_analysis_nest_reads_the_same_physical_maps_as_ring():
     sht = HEALPixSHT(level=1, lmax=3, dtype=torch.float64, device="cpu")
     q_ring = torch.arange(sht.n_pix, dtype=sht.dtype)

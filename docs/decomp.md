@@ -128,10 +128,26 @@ introduced.
 
 ## Filtering
 
-The analysis filter is the angularly symmetric Gaussian used by
-`HealPixDown(mode="smooth")`. With omitted `radius_deg` and `sigma_deg`, each
-level selects defaults proportional to its own HEALPix pixel size. A fixed
-angular filter can instead be supplied explicitly.
+With the default `down_mode="smooth"`, the analysis filter is the angularly
+symmetric Gaussian used by `HealPixDown(mode="smooth")`. With omitted
+`radius_deg` and `sigma_deg`, each level selects defaults proportional to its
+own HEALPix pixel size. A fixed angular filter can instead be supplied
+explicitly.
+
+With `down_mode="mean"`, the analysis filter is the unweighted mean of the 4
+NESTED children (`HealPixDown(mode="mean")`) and the Gaussian parameters are
+ignored. The coarse band then keeps the global mean of a NaN-free full-sphere
+map, and with `up_norm="col_l1"` the prediction copies each parent to its
+children, so every detail band sums to zero over the children of each
+parent. On a partial sky, only one step is conservative by itself (weight
+the coarse band by `down_layers[0].coverage`); over several steps with
+incomplete parents the coarse band is a mean of means.
+
+With `down_mode="smooth_conservative"`, the analysis filter is the Gaussian of
+`HealPixDown(mode="smooth_conservative")`: the same weights as `"smooth"`
+plus one offset per step, so that the coarse band keeps the global mean of a
+NaN-free full-sphere map. Reconstruction stays exact; the paired `HealPixUp`
+uses the Gaussian matrix without the offset.
 
 The default combination is:
 

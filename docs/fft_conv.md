@@ -70,6 +70,7 @@ HealPixFFTConv(
 | `pixel_size_rad`, `grid_size` | Optional `LocalFFT` grid overrides |
 | `use_norm` | Apply GroupNorm and ReLU at the HEALPix output |
 | `cache_kernel_fft` | Cache the kernel spectrum during no-gradient inference |
+| `projection` | `"average"` (default, keeps constants) or `"conservative"` (keeps the total) |
 
 Accepted input shapes are `[N]`, `[B, N]` for a single input channel, and
 `[B, C_in, N]`. The output contains `C_out` channels and follows the same
@@ -149,6 +150,86 @@ Uncovered grid points and values beyond the supplied patch are zero. For
 scientific output near a boundary, supply a halo at least half the kernel
 width and crop the halo after convolution. A smooth apodization can also
 reduce edge discontinuities.
+
+## Constants, totals and the blur floor
+
+The HEALPix → grid → HEALPix pair has two conventions, chosen with
+`projection=` (also accepted by `LocalFFT`). A convolution cannot keep both a
+constant and the total at the edge of the domain, and in the interior it keeps
+only one of them.
+
+| `projection=` | Scatter | Back-projection | Constant field | Total (sum over cells) |
+|---|---|---|---|---|
+| `"average"` (default) | divided by the accumulated weight | bilinear gather | kept | **not kept** |
+| `"conservative"` | plain bilinear scatter | bilinear gather of the grid divided by the accumulated weight | **not kept** | kept |
+
+- With `"average"` a uniform field stays uniform, but the response to a single
+  cell does not sum to one. Measured at level 10 on an 8125-cell domain with a
+  Gaussian kernel of 1 to 3 pixels, the sum of the response of an interior cell
+  lies between 0.79 and 1.06, and up to 1.4 at the domain edge.
+- With `"conservative"` and a kernel whose weights sum to one, the response of
+  a cell with at least `5 sigma + 2` pixels of margin sums to 1 to better than
+  1e-8 (float64). Mass that the kernel moves outside the covered grid points is
+  lost, not reflected: the sum of the response of an edge cell is below one
+  (0.39 to 0.98 for edge cells at 1 to 3 pixels in the same domain), never above. Use this
+  option for densities and probability maps; a caller that renormalises
+  afterwards should not need to.
+- The two steps of either convention are not transposes of one another. What
+  holds for `"conservative"` is that the round trip (scatter, then divide and
+  gather) is a symmetric matrix whose column sums are one at every cell. The
+  round trip is the same matrix for both conventions; they differ in where the
+  convolution acts (on the plain scatter, or on its average).
+- Without a kernel (identity), the conservative pair keeps both the total and a
+  constant; with a kernel, a constant is changed by as much as the total is
+  changed with `"average"` (0.79 to 1.06 inside the same domain).
+- The total is kept by the projection pair and the convolution only. A
+  non-zero `bias` (added after the back-projection) or `use_norm=True` breaks
+  it; `set_gaussian` sets the bias to zero. Grid points inside the patch that
+  no cell covers (a domain with holes, such as land masked out of an ocean
+  domain) take mass like the grid points outside the domain, and it is lost.
+
+The default results are unchanged. `set_gaussian` sets a normalised Gaussian
+kernel on every channel pair `c → c`:
+
+```python
+layer = HealPixFFTConv(level, 1, 1, kernel_sz=21, cell_ids=cell_ids,
+                       projection="conservative")
+layer.set_gaussian(2.0)                  # pixels of the projected grid
+layer.set_gaussian(0.002, unit="rad")    # or radians in the tangent plane
+```
+
+`set_gaussian` fills only the channel pairs `c → c` (other pairs and the bias
+are zero). `unit="rad"` divides by `pixel_size_rad`, the pixel size of the
+gnomonic plane, which equals the angular distance on the sphere at the patch
+centre only. The kernel is normalised after truncation to `kernel_sz`; when
+`kernel_sz // 2` is under 3 sigma it warns (`on_truncated="error"` or
+`"ignore"` to change that), because for a large sigma the truncated kernel is
+nearly a flat box. Use `kernel_sz >= 2 * ceil(5 * sigma) + 1`.
+
+**Blur floor.** Projection followed by back-projection spreads a single cell
+over its neighbours, even with an identity kernel. The nominal standard
+deviation per axis of this response is $\sqrt{1/3} = 0.577$ pixel
+(`PROJECTION_BLUR_FLOOR_PX` in `healpix_analyse.fft_local`), which is
+`0.00058` rad at level 10. It is exactly the same for both conventions, because
+the round trip is the same matrix. It is not the same for every cell: on the
+level-10, 8125-cell domain of the benchmark it ranges from 0.23 to 0.69 pixel
+over the cells (median 0.569), with the position of the cell centre inside its
+grid pixel; and it is not isotropic: along the two axes of the gnomonic plane
+the medians are 0.568 and 0.591 pixel. The widths add in quadrature,
+$\sqrt{\sigma^2 + 0.58^2}$ (to 0.03 pixel from 0.5 pixel upwards), so
+Gaussian widths below the floor cannot be represented; at 0.25 pixel the
+effective width is 0.57 pixel. `layer.blur_floor_px()` returns the exact value
+for each cell (`per_axis=True` for the two axes). `set_gaussian` (or
+`layer.transform.check_width(sigma_px)`) warns when the requested width is below
+the **median** floor, recomputed at each call, so a cell whose own floor is
+larger is not flagged; the warning points at the caller's line. Pass
+`on_below="error"` to raise instead, or `"ignore"`. For such small widths use
+`gaussian_filter(..., width_rule="matched")` ({doc}`radial_filter`), which
+reaches widths below one cell; with `normalization="full_disc"` it also keeps
+the total and loses mass leaving the domain, as `projection="conservative"`
+does here.
+
+`benchmarks/benchmark_fft_total.py` reproduces these numbers.
 
 ## Performance
 

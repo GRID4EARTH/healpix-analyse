@@ -25,9 +25,45 @@ import pytest
 import torch
 
 from healpix_analyse._weighted_neighbourhood import (
+    compact_weighted_neighbourhood_reduce,
     neighbour_positions,
     weighted_neighbourhood_reduce,
 )
+
+
+def test_compact_reduction_matches_padded_reduction():
+    cell_ids = np.array([30, 10, 20], dtype=np.uint64)
+    values = np.array(
+        [[3.0, 1.0, np.nan], [6.0, 2.0, 4.0]],
+        dtype=np.float64,
+    )
+    neighbour_ids = np.array(
+        [[10, 20, 30], [30, -1, -1], [20, 10, -1]],
+        dtype=np.int64,
+    )
+    valid_mask = neighbour_ids >= 0
+    weights = np.array(
+        [[0.5, 0.25, 0.125], [2.0, 0.0, 0.0], [1.5, -0.5, 0.0]],
+        dtype=np.float64,
+    )
+
+    padded = weighted_neighbourhood_reduce(
+        values,
+        cell_ids,
+        neighbour_ids,
+        valid_mask,
+        weights,
+        normalize=True,
+    )
+    compact = compact_weighted_neighbourhood_reduce(
+        values,
+        np.array([1, 2, 0, 0, 2, 1], dtype=np.int64),
+        np.array([0, 3, 4, 6], dtype=np.int64),
+        weights[valid_mask],
+        normalize=True,
+    )
+
+    np.testing.assert_array_equal(compact, padded)
 
 
 # ---------------------------------------------------------------------------
@@ -1040,4 +1076,33 @@ def test_torch_cuda_device_preserved():
             [1.5],
             dtype=torch.float32,
         ),
+    )
+
+
+def test_numpy_segment_sum_with_empty_rows_at_start_middle_and_end():
+    from healpix_analyse._weighted_neighbourhood import _numpy_segment_sum
+
+    values = np.array([1.0, 2.0, 3.0, 4.0])
+
+    # Trailing empty row must not drop the last element of the last
+    # non-empty row.
+    np.testing.assert_array_equal(
+        _numpy_segment_sum(values, np.array([0, 4, 4])),
+        [10.0, 0.0],
+    )
+    # Empty rows at the start, in the middle and at the end.
+    np.testing.assert_array_equal(
+        _numpy_segment_sum(values, np.array([0, 0, 2, 2, 4, 4, 4])),
+        [0.0, 3.0, 0.0, 7.0, 0.0, 0.0],
+    )
+    # Leading dimensions are preserved.
+    stacked = np.stack([values, 10 * values])
+    np.testing.assert_array_equal(
+        _numpy_segment_sum(stacked, np.array([0, 0, 1, 1, 4, 4])),
+        [[0.0, 1.0, 0.0, 9.0, 0.0], [0.0, 10.0, 0.0, 90.0, 0.0]],
+    )
+    # All rows empty.
+    np.testing.assert_array_equal(
+        _numpy_segment_sum(values, np.array([4, 4, 4])),
+        [0.0, 0.0],
     )

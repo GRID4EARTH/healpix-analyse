@@ -30,6 +30,7 @@ completely absent from the filter because it lies outside ``domain``.
 from __future__ import annotations
 
 import importlib
+import warnings
 
 import numpy as np
 import pytest
@@ -37,7 +38,10 @@ import torch
 from healpix_geo import nested
 from pyproj import Geod
 
-from healpix_analyse._neighbourhood import RelativeNeighbourhoodGeometry
+from healpix_analyse._neighbourhood import (
+    CompactMetricNeighbourhoodGeometry,
+    RelativeNeighbourhoodGeometry,
+)
 from healpix_analyse.radial_filter import gaussian_filter, radial_filter
 
 
@@ -653,6 +657,104 @@ def test_gaussian_filter_matches_explicit_radial_gaussian():
     )
 
 
+def test_gaussian_reuses_geometry_and_weights(monkeypatch):
+    """Repeated filtering of new values must reuse the spatial plan."""
+    module = importlib.import_module("healpix_analyse.radial_filter")
+    module._clear_filter_caches()
+
+    refinement_level = 7
+    center = 12 * 4**refinement_level // 2
+    cell_ids = _domain_around_center(center, refinement_level)
+    values = np.arange(cell_ids.size, dtype=np.float64)
+    sigma_m = 50_000.0
+
+    calls = 0
+    original = module.build_metric_neighbourhood_geometry
+
+    def counted_build(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        module,
+        "build_metric_neighbourhood_geometry",
+        counted_build,
+    )
+
+    first = gaussian_filter(
+        values,
+        cell_ids,
+        refinement_level,
+        sigma_m=sigma_m,
+    )
+    second = gaussian_filter(
+        values + 1.0,
+        cell_ids.copy(),
+        refinement_level,
+        sigma_m=sigma_m,
+    )
+
+    assert calls == 1
+    np.testing.assert_allclose(second, first + 1.0)
+    module._clear_filter_caches()
+
+
+def test_oversize_cache_warning_is_actionable_and_emitted_once():
+    module = importlib.import_module("healpix_analyse.radial_filter")
+    original = module.radial_filter_cache_info()
+    refinement_level = 5
+    cell_ids = _domain_around_center(1000, refinement_level)
+    values = np.ones(cell_ids.size, dtype=np.float64)
+
+    try:
+        module.configure_radial_filter_cache(
+            geometry_max_mib=0,
+            weight_max_mib=0,
+        )
+        with pytest.warns(RuntimeWarning) as captured:
+            gaussian_filter(
+                values,
+                cell_ids,
+                refinement_level,
+                sigma_m=100_000.0,
+            )
+        messages = [str(item.message) for item in captured]
+        assert len(messages) == 2
+        assert all("configure_radial_filter_cache" in item for item in messages)
+        assert all("halo of at least radius_m=" in item for item in messages)
+
+        with warnings.catch_warnings(record=True) as repeated:
+            warnings.simplefilter("always")
+            gaussian_filter(
+                values,
+                cell_ids,
+                refinement_level,
+                sigma_m=100_000.0,
+            )
+        assert repeated == []
+    finally:
+        module.configure_radial_filter_cache(
+            geometry_max_mib=original["geometry_max_mib"],
+            weight_max_mib=original["weight_max_mib"],
+        )
+        module._clear_filter_caches()
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value", "error"),
+    [
+        ("geometry_max_mib", -1.0, ValueError),
+        ("weight_max_mib", np.inf, ValueError),
+        ("geometry_max_mib", True, TypeError),
+    ],
+)
+def test_configure_cache_rejects_invalid_limits(keyword, value, error):
+    module = importlib.import_module("healpix_analyse.radial_filter")
+    with pytest.raises(error):
+        module.configure_radial_filter_cache(**{keyword: value})
+
+
 def test_gaussian_constant_field_preserved_at_partial_domain_boundary():
     refinement_level = 5
     center = 1000
@@ -937,75 +1039,33 @@ def test_same_metric_geometry_gives_same_gaussian_response_across_levels(
         dtype=np.float64,
     )
 
-    fake_neighbourhoods = [
-        np.array([10, 11], dtype=np.uint64),
-        np.array([10, 11], dtype=np.uint64),
-    ]
-
-    fake_geometry = RelativeNeighbourhoodGeometry(
+    fake_geometry = CompactMetricNeighbourhoodGeometry(
         center_ids=cell_ids.copy(),
-        neighbour_ids=np.array(
-            [
-                [10, 11],
-                [10, 11],
-            ],
-            dtype=np.int64,
+        neighbour_indices=np.array(
+            [0, 1, 0, 1],
+            dtype=np.uint32,
         ),
-        valid_mask=np.ones(
-            (2, 2),
-            dtype=bool,
-        ),
+        row_offsets=np.array([0, 2, 4], dtype=np.int64),
         distance_m=np.array(
-            [
-                [0.0, 250.0],
-                [250.0, 0.0],
-            ],
-            dtype=np.float64,
-        ),
-        azimuth_rad=np.zeros(
-            (2, 2),
-            dtype=np.float64,
-        ),
-        east_offset_m=np.zeros(
-            (2, 2),
-            dtype=np.float64,
-        ),
-        north_offset_m=np.zeros(
-            (2, 2),
+            [0.0, 250.0, 250.0, 0.0],
             dtype=np.float64,
         ),
     )
 
-    def fake_build_neighbourhoods(
+    def fake_metric_geometry(
         cells,
         radius,
         refinement_level,
         *,
-        neighbourhood,
         ellipsoid,
     ):
-        del cells, radius, refinement_level, neighbourhood, ellipsoid
-        return fake_neighbourhoods
-
-    def fake_relative_geometry(
-        center_ids,
-        neighbourhoods,
-        refinement_level,
-        *,
-        ellipsoid,
-    ):
-        del center_ids, neighbourhoods, refinement_level, ellipsoid
+        del cells, radius, refinement_level, ellipsoid
         return fake_geometry
 
     monkeypatch.setattr(
         module,
-        "build_neighbourhoods",
-        fake_build_neighbourhoods,
-    )
-    monkeypatch.setattr(
-        module,
-        "relative_geometry_from_neighbourhoods",
-        fake_relative_geometry,
+        "build_metric_neighbourhood_geometry",
+        fake_metric_geometry,
     )
 
     outputs = []

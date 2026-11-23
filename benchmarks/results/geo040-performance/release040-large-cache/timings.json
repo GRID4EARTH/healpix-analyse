@@ -1,0 +1,129 @@
+{
+  "platform": "macOS-26.4-arm64-arm-64bit-Mach-O",
+  "python": "3.13.15",
+  "cpu_count": 18,
+  "repeats": 3,
+  "packages": {
+    "healpix-geo": "0.4.0",
+    "numpy": "2.5.2",
+    "pyproj": "3.7.2",
+    "healpy": "1.20.0"
+  },
+  "geo_direct_url": null,
+  "cases": [
+    {
+      "level": 19,
+      "size_m": 3600,
+      "sigma_m": 20,
+      "truncate": 4,
+      "cells": 133002,
+      "samples": [
+        {
+          "mode": "scalar",
+          "repetition": 0,
+          "cold_s": 2.7609475000062957,
+          "coverage_s": 1.4179023749893531,
+          "repeat_s": 0.10984795895637944,
+          "repeat_coverage_calls": 0,
+          "cache": {
+            "geometry_max_mib": 1024.0,
+            "weight_max_mib": 1024.0,
+            "geometry_used_mib": 199.2342071533203,
+            "weight_used_mib": 131.46983337402344,
+            "geometry_entries": 1,
+            "weight_entries": 1
+          }
+        },
+        {
+          "mode": "scalar",
+          "repetition": 1,
+          "cold_s": 2.772496375022456,
+          "coverage_s": 1.419156291987747,
+          "repeat_s": 0.11003179202089086,
+          "repeat_coverage_calls": 0,
+          "cache": {
+            "geometry_max_mib": 1024.0,
+            "weight_max_mib": 1024.0,
+            "geometry_used_mib": 199.2342071533203,
+            "weight_used_mib": 131.46983337402344,
+            "geometry_entries": 1,
+            "weight_entries": 1
+          }
+        },
+        {
+          "mode": "scalar",
+          "repetition": 2,
+          "cold_s": 2.7724551249993965,
+          "coverage_s": 1.4174087909632362,
+          "repeat_s": 0.11222845799056813,
+          "repeat_coverage_calls": 0,
+          "cache": {
+            "geometry_max_mib": 1024.0,
+            "weight_max_mib": 1024.0,
+            "geometry_used_mib": 199.2342071533203,
+            "weight_used_mib": 131.46983337402344,
+            "geometry_entries": 1,
+            "weight_entries": 1
+          }
+        }
+      ]
+    },
+    {
+      "level": 20,
+      "size_m": 1200,
+      "sigma_m": 20,
+      "truncate": 5,
+      "cells": 59426,
+      "samples": [
+        {
+          "mode": "scalar",
+          "repetition": 0,
+          "cold_s": 4.661139250034466,
+          "coverage_s": 1.5163200829993002,
+          "repeat_s": 0.24649116699583828,
+          "repeat_coverage_calls": 0,
+          "cache": {
+            "geometry_max_mib": 1024.0,
+            "weight_max_mib": 1024.0,
+            "geometry_used_mib": 521.3370132446289,
+            "weight_used_mib": 346.9534912109375,
+            "geometry_entries": 1,
+            "weight_entries": 1
+          }
+        },
+        {
+          "mode": "scalar",
+          "repetition": 1,
+          "cold_s": 4.596060333016794,
+          "coverage_s": 1.5452578749973327,
+          "repeat_s": 0.2543090410181321,
+          "repeat_coverage_calls": 0,
+          "cache": {
+            "geometry_max_mib": 1024.0,
+            "weight_max_mib": 1024.0,
+            "geometry_used_mib": 521.3370132446289,
+            "weight_used_mib": 346.9534912109375,
+            "geometry_entries": 1,
+            "weight_entries": 1
+          }
+        },
+        {
+          "mode": "scalar",
+          "repetition": 2,
+          "cold_s": 4.573690917051863,
+          "coverage_s": 1.514301041024737,
+          "repeat_s": 0.26701750000938773,
+          "repeat_coverage_calls": 0,
+          "cache": {
+            "geometry_max_mib": 1024.0,
+            "weight_max_mib": 1024.0,
+            "geometry_used_mib": 521.3370132446289,
+            "weight_used_mib": 346.9534912109375,
+            "geometry_entries": 1,
+            "weight_entries": 1
+          }
+        }
+      ]
+    }
+  ]
+}

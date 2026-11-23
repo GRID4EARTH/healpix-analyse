@@ -49,6 +49,24 @@ The geometry construction uses `healpix-geo` and NumPy on the CPU. Projection,
 FFT, IFFT and back-projection then run on the device holding the transform's
 buffers.
 
+## Projection convention and blur floor
+
+`LocalFFT(..., projection="average")` (default) divides each grid point by its
+accumulated interpolation weight, so a constant stays constant but sums over
+the cells are not kept by a filter. `projection="conservative"` scatters
+without that division and divides the grid by that weight just before the
+back-projection gather. The two steps are not transposes of one another; the
+round trip is a symmetric matrix with column sums of one, so `ifft(fft(x))`
+still returns a constant for a constant, and a filter between the two steps
+keeps the sum over the cells. The round trip is the same in both conventions
+and has a blur floor of about 0.58 grid pixel (`blur_floor_px()` per cell,
+`PROJECTION_BLUR_FLOOR_PX` for the nominal value, not isotropic); see
+{doc}`fft_conv` for the measured consequences. `fft()` and `ps()` act on the
+projected grid, so with `"conservative"` they return the spectrum of the
+plain scatter, not of the averaged grid: near the patch edge and where cells
+are sparse they differ by order one, and spectra are not comparable between
+the two conventions.
+
 ## Functional interface
 
 The module also exposes two convenience functions:

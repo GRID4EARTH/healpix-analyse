@@ -24,8 +24,9 @@ classifiers = [
 dependencies = [
   "numpy",
   "torch",
-  # HEALPix geometry comes from the GRID4EARTH suite, not from healpy
-  "healpix-geo",
+  # HEALPix geometry comes from the GRID4EARTH suite, not from healpy.
+  # lower bound: the first release with batched nested.cone_coverage (GRID4EARTH/healpix-geo#292)
+  "healpix-geo>=0.5",
   "pyproj>=3.6",
   "termcolor",
   "umap-learn",
@@ -35,6 +36,14 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest>=8",
+]
+
+scipy = [
+  "scipy>=1.11",
+]
+
+benchmark = [
+  "scipy>=1.11",
 ]
 
 # DINOv3 embeddings -- healpix_analyse.dino
@@ -89,8 +98,9 @@ docs = [
 ]
 
 [project.urls]
-Documentation = "https://eopf-dggs.github.io/healpix-analyse/"
-Repository = "https://github.com/EOPF-DGGS/healpix-analyse"
+Documentation = "https://grid4earth.eu/healpix-analyse/"
+Repository = "https://github.com/GRID4EARTH/healpix-analyse"
+Issues = "https://github.com/GRID4EARTH/healpix-analyse/issues"
 
 [tool.setuptools.packages.find]
 include = [
@@ -99,4 +109,3 @@ include = [
 ]
 
 [tool.setuptools_scm]
-
