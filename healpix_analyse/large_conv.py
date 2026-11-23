@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import operator
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple, Optional, Union
@@ -255,6 +256,8 @@ class LargeConv(nn.Module):
         self.ellipsoid = str(ellipsoid)
         self.weight_norm = str(weight_norm)
         self.up_norm = str(up_norm)
+        self.radius_deg = radius_deg
+        self.sigma_deg = sigma_deg
         self.use_norm = bool(use_norm)
         self.dtype = dtype
         if device is None:
@@ -405,7 +408,9 @@ class LargeConv(nn.Module):
         axis), or a :class:`GaussianPlan`, in which case the layer must have
         the plan's ``n_levels`` and a compact kernel at least ``plan.kernel_sz``
         wide (build it with ``LargeConv.from_gaussian``, or pass
-        ``n_levels=plan.n_levels`` and ``plan.fine_kernel_sz``).  The Gaussian
+        ``n_levels=plan.n_levels`` and ``plan.fine_kernel_sz``), and the
+        level, ellipsoid, ``radius_deg``, ``sigma_deg``, ``weight_norm`` and
+        ``up_norm`` the plan was measured with.  The Gaussian
         is sampled on the whole compact kernel grid and must fit in it
         (radius of at least four sigmas).  Each channel is smoothed on its
         own, so ``in_channels`` must equal ``out_channels``.
@@ -417,6 +422,19 @@ class LargeConv(nn.Module):
                     f"the plan needs n_levels={plan.n_levels}, this layer has "
                     f"{self.n_levels}: build it with n_levels=plan.n_levels and "
                     "kernel_sz=plan.fine_kernel_sz, or use LargeConv.from_gaussian"
+                )
+            mine = _layer_options(self)
+            if mine != plan.options:
+                names = ("level", "ellipsoid", "radius_deg", "sigma_deg",
+                         "weight_norm", "up_norm")
+                diff = ", ".join(
+                    f"{k}={a!r} (plan: {b!r})"
+                    for k, a, b in zip(names, mine, plan.options) if a != b
+                )
+                raise ValueError(
+                    f"the plan was measured with other options than this layer: {diff}; "
+                    "the width would differ, use LargeConv.from_gaussian or the "
+                    "same options in gaussian_plan"
                 )
             compact_sigma = plan.compact_sigma
         if self.in_channels != self.out_channels:
@@ -478,6 +496,9 @@ class LargeConv(nn.Module):
         go to :class:`LargeConv`.  See :func:`gaussian_plan` for the accuracy
         and the limits.
         """
+        if reference_cell is None and cell_ids is not None:
+            # here, so that a wide-domain warning points at the caller
+            reference_cell = _centre_cell(level, cell_ids, str(ellipsoid))
         plan = gaussian_plan(
             level, sigma, sigma_m=sigma_m, max_levels=max_levels, ellipsoid=ellipsoid,
             radius_deg=radius_deg, sigma_deg=sigma_deg, weight_norm=weight_norm,
@@ -537,6 +558,16 @@ _PATCH_MARGIN = 3  # n_levels <= patch_depth - 3: blur ~ 2**n cells << 2**depth
 _COMPACT_SIGMA_START = 0.5  # coarse cells: smallest compact sigma used by gaussian_plan
 _COMPACT_SIGMA_MAX = 2.25  # coarse cells: largest compact sigma calibrated
 _COMPACT_SIGMA_STEP = 0.05
+# The calibration measures the width on one patch, with zero padding at its
+# border: the tail beyond the border is lost and biases the measured width,
+# so the plan would set a compact Gaussian that is too wide on a larger
+# domain.  Measured at level 10 (calibration patch 256 x 256, response
+# re-measured on the 512 x 512 block around it, same centre cell): border at
+# 4 sigmas or more -> at most 3e-4 relative; 3.2 -> 4.4e-3; 2.1 -> 0.11.
+_EDGE_SIGMAS = 4.0
+# Above this angular reach of cell_ids from the chosen calibration cell, warn:
+# calibrated at the equator, 55 degrees latitude is up to 22 % too wide.
+_WIDE_DOMAIN_DEG = 30.0
 
 
 def _check_options(level, n_levels, patch_depth):
@@ -580,6 +611,26 @@ def _patch(level, depth, ellipsoid, parent=None):
     return ids, centre, dist
 
 
+@lru_cache(maxsize=16)
+def _edge_distance(level, depth, ellipsoid, parent=None):
+    """Angular distance from the centre cell of a patch to its border cells."""
+    ids, centre, dist = _patch(level, depth, ellipsoid, parent)
+    local = np.arange(4**depth, dtype=np.int64)
+    x = np.zeros_like(local)
+    y = np.zeros_like(local)
+    for b in range(depth):
+        x |= ((local >> (2 * b)) & 1) << b
+        y |= ((local >> (2 * b + 1)) & 1) << b
+    side = 2**depth - 1
+    border = (x == 0) | (x == side) | (y == 0) | (y == side)
+    return float(dist[border].min())
+
+
+def _layer_options(layer):
+    return (layer.level, layer.ellipsoid, getattr(layer, "radius_deg", None),
+            getattr(layer, "sigma_deg", None), layer.weight_norm, layer.up_norm)
+
+
 def _impulse_width(layer, centre, dist, n_cells):
     impulse = np.zeros(n_cells)
     impulse[centre] = 1.0
@@ -599,8 +650,12 @@ def _measure_layer(level, n_levels, depth, kernel_sz, options):
     return layer, centre, dist, ids.size
 
 
-def _centre_cell(level, cell_ids, ellipsoid):
-    """NESTED id of the cell of ``cell_ids`` closest to their mean direction."""
+def _centre_cell(level, cell_ids, ellipsoid, stacklevel=2):
+    """NESTED id of the cell of ``cell_ids`` closest to their mean direction.
+
+    A wide domain gives a warning attributed ``stacklevel`` frames above
+    this function (2: the caller of the public function that called it).
+    """
     import healpix_geo.nested as hgn
 
     ids = np.asarray(cell_ids, dtype=np.int64).ravel()
@@ -613,7 +668,17 @@ def _centre_cell(level, cell_ids, ellipsoid):
     xyz = np.stack(
         [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1
     )
-    return int(ids[int(np.argmax(xyz @ xyz.mean(axis=0)))])
+    k = int(np.argmax(xyz @ xyz.mean(axis=0)))
+    spread = float(np.degrees(np.arccos(np.clip(np.min(xyz @ xyz[k]), -1.0, 1.0))))
+    if spread > _WIDE_DOMAIN_DEG:
+        warnings.warn(
+            f"cell_ids reach {spread:.0f} degrees from the cell chosen for the "
+            f"calibration ({int(ids[k])}); the width is calibrated there only and "
+            "can be off by about 20 % at other latitudes (see docs/large_conv.md); "
+            "pass reference_cell, or smooth each region with its own layer",
+            stacklevel=stacklevel + 1,
+        )
+    return int(ids[k])
 
 
 def _options(
@@ -687,6 +752,9 @@ class GaussianPlan(NamedTuple):
     """``kernel_sz`` argument of ``LargeConv`` that gives that compact size."""
     sigma: float
     """The requested width (radians)."""
+    options: tuple
+    """``(level, ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm)`` of
+    the calibration; ``set_gaussian_kernel`` refuses a layer with others."""
 
 
 @lru_cache(maxsize=32)
@@ -803,8 +871,13 @@ def gaussian_plan(
     Gaussian of 0.5 coarse cell (about 2.2 cells at level 10).  Below it a
     ``ValueError`` is raised; use ``gaussian_filter`` for narrower
     widths.  The largest is set by ``max_levels`` or the patch
-    (``min(level, patch_depth) - 3`` levels) and the largest calibrated
-    compact width.
+    (``min(level, patch_depth) - 3`` levels), the largest calibrated
+    compact width, and the patch border: the width must be at most a quarter
+    of the distance from the calibration cell to the border of the patch
+    (31.7 cells at level 10 with the default ``patch_depth=8``), otherwise its
+    tail is cut there during the calibration and the plan would be too wide
+    on a larger domain; ``patch_depth + 1`` doubles that limit.  Above any of
+    these a ``ValueError`` is raised.
 
     The widths are measured on one patch: the aligned block of
     ``4**patch_depth`` cells that contains ``reference_cell`` (a NESTED id at
@@ -825,6 +898,19 @@ def gaussian_plan(
         ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm, level, depth, reference_cell
     )
     top = _plan_state(level, depth, max_levels)
+    edge = _edge_distance(level, depth, opts[0], opts[5])
+    if sigma > edge / _EDGE_SIGMAS:
+        hint = (
+            f"use patch_depth={depth + 1} (4 times more cells, slower calibration)"
+            if depth < level else "use a larger level"
+        )
+        raise ValueError(
+            f"sigma={_fmt_width(level, sigma)} is too wide for the calibration patch "
+            f"(patch_depth={depth}): its border is {_fmt_width(level, edge)} from the "
+            f"calibration cell; wider than 1/{_EDGE_SIGMAS:g} of that "
+            f"({_fmt_width(level, edge / _EDGE_SIGMAS)}) the tail is cut at the "
+            f"border and the width would come out too wide on a larger domain; {hint}"
+        )
 
     start = int(round(_COMPACT_SIGMA_START / _COMPACT_SIGMA_STEP))
     sigmas, widths = _calibration(level, 1, depth, opts)
@@ -857,6 +943,7 @@ def gaussian_plan(
         kernel_sz=2 * radius + 1,
         fine_kernel_sz=2 * radius * 2**n + 1,
         sigma=sigma,
+        options=(level,) + tuple(opts[:5]),
     )
 
 

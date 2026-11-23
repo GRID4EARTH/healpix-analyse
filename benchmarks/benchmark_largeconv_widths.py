@@ -32,7 +32,7 @@ import numpy as np
 import torch
 
 from healpix_analyse import LargeConv, down_up_blur, gaussian_plan
-from healpix_analyse.large_conv import _kernel_plan, _nominal_cell
+from healpix_analyse.large_conv import _edge_distance, _kernel_plan, _nominal_cell
 
 
 def make_patch(level: int, depth: int, face_centre: int):
@@ -160,7 +160,10 @@ def main() -> None:
     ap.add_argument("--level", type=int, default=10)
     ap.add_argument("--depth", type=int, default=8, help="patch of 4**depth cells")
     ap.add_argument("--sigma-min", type=float, default=2.25)
-    ap.add_argument("--sigma-max", type=float, default=40.0)
+    # default: the widest width of the calibration patch (31.7 cells at level
+    # 10, depth 8); results/largeconv-widths.json was made with 40 before
+    # gaussian_plan enforced that limit
+    ap.add_argument("--sigma-max", type=float, default=None)
     ap.add_argument("--step", type=float, default=0.05)
     ap.add_argument("--json", default=None)
     ap.add_argument("--position-only", action="store_true",
@@ -177,6 +180,9 @@ def main() -> None:
 
     level = args.level
     cell = _nominal_cell(level)
+    if args.sigma_max is None:
+        edge = _edge_distance(level, min(args.depth, level), "WGS84")
+        args.sigma_max = math.floor(edge / 4.0 / cell / args.step) * args.step
     sigmas = np.arange(args.sigma_min, args.sigma_max + 1e-9, args.step)
     floors = {n: down_up_blur(level, n, patch_depth=args.depth) / cell for n in range(0, 6)}
 

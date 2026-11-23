@@ -33,7 +33,14 @@
   sits on 2.0, 4.2, 8.3 and 16.5 cells: 592 flat steps out of 595 over 2.25
   to 32 cells). Measured over 756 widths from 2.25 to 40 cells across four
   level switches, the response to the calibration cell is strictly
-  increasing and within 3.8e-4 of the requested width. Other cells of the
+  increasing and within 3.8e-4 of the requested width on the calibration
+  patch (an inversion check). Widths above a quarter of the distance to the
+  patch border (31.7 cells at level 10 with the default `patch_depth=8`)
+  are refused: their tail is cut at the border during the calibration, and
+  on a larger domain they came out up to 10.6 % too wide at 60 cells
+  (within 3e-4 below the limit). `set_gaussian_kernel` refuses a plan
+  measured with other options than the layer, and a domain that reaches
+  more than 30 degrees from the calibration cell gives a warning. Other cells of the
   domain spread by 8 % at 3 cells, 3 % at 6 and at most 1.5 % from 9 cells (up
   to 240 cells from the calibration cell, clear of the patch edge), as much
   as the automatic rule around its own mean; the total of one cell is not

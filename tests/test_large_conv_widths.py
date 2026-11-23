@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 import pytest
 import torch
+import healpix_geo.nested as hgn
 
 from healpix_analyse import LargeConv, down_up_blur, gaussian_plan
+from healpix_analyse import large_conv
 from healpix_analyse.large_conv import (
     _blur_cached,
+    _edge_distance,
     _calibration,
     _impulse_width,
     _kernel_plan,
@@ -121,7 +125,7 @@ def test_gaussian_plan_rejects_widths_below_the_class_and_names_the_alternative(
 
 def test_gaussian_plan_rejects_widths_above_the_levels_available():
     with pytest.raises(ValueError, match="above the widest"):
-        gaussian_plan(LEVEL, 400 * CELL, max_levels=2)
+        gaussian_plan(LEVEL, 25 * CELL, max_levels=2)
 
 
 def test_gaussian_plan_rejects_a_level_that_is_too_small():
@@ -150,7 +154,8 @@ def test_down_up_blur_values_and_units():
 def dense():
     """Width of real LargeConv responses over a dense sweep through 4 switches."""
     ids, centre, dist = _patch(LEVEL, DEPTH, "WGS84")
-    sweep = list(np.arange(2.3, 41.0, 0.15))
+    # up to the widest width of the default calibration patch (31.7 cells)
+    sweep = list(np.arange(2.3, 31.6, 0.15))
     # points just below / above each switch of the number of levels
     switches = []
     prev = gaussian_plan(LEVEL, sweep[0] * CELL).n_levels
@@ -185,12 +190,12 @@ def dense():
     return np.array(sigmas), np.array(eff), switches, plans
 
 
-def test_gaussian_plan_crosses_four_level_switches(dense):
+def test_gaussian_plan_crosses_three_level_switches(dense):
     sigmas, eff, switches, plans = dense
-    assert len(sigmas) >= 200
-    assert len(switches) == 4  # about 4.7, 9.35, 18.65 and 37.3 cells
+    assert len(sigmas) >= 190
+    assert len(switches) == 3  # about 4.7, 9.35 and 18.65 cells
     assert [p.n_levels for p in plans[:1]] == [1]
-    assert {p.n_levels for p in plans} == {1, 2, 3, 4, 5}
+    assert {p.n_levels for p in plans} == {1, 2, 3, 4}
 
 
 def test_effective_width_is_strictly_increasing_in_sigma(dense):
@@ -419,3 +424,74 @@ def test_exactly_one_of_sigma_and_sigma_m():
         gaussian_plan(LEVEL, 3 * CELL, sigma_m=1000.0)
     with pytest.raises(ValueError, match="sigma_m must be"):
         gaussian_plan(LEVEL, sigma_m=-1.0)
+
+
+def test_wide_plan_is_accurate_on_a_larger_domain_and_too_wide_is_refused(monkeypatch):
+    # level 8, patch_depth 6: calibration patch 64 x 64, border 31 cells from
+    # its centre, so the widest width is 7.7 cells.  The response is measured
+    # again at the same cell on the 128 x 128 block that contains the patch,
+    # where nothing is cut: the width must still be the requested one.
+    level, depth = 8, 6
+    cell = _nominal_cell(level)
+    small, centre, _ = _patch(level, depth, "WGS84")
+    big, _, _ = _patch(level, depth + 1, "WGS84")
+    assert np.isin(small, big).all()
+    k = int(np.flatnonzero(big == small[centre])[0])
+    lon, lat = hgn.healpix_to_lonlat(big, level, ellipsoid="WGS84")
+    lon, lat = np.deg2rad(lon), np.deg2rad(lat)
+    xyz = np.stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], -1)
+    dist = np.arccos(np.clip(xyz @ xyz[k], -1.0, 1.0))
+    widest = _edge_distance(level, depth, "WGS84") / 4.0
+    assert 7.0 * cell < widest < 8.0 * cell
+    sigma = 0.98 * widest
+    plan = gaussian_plan(level, sigma, patch_depth=depth)
+    layer = LargeConv(level, 1, 1, plan.fine_kernel_sz, n_levels=plan.n_levels,
+                      cell_ids=big, dtype=torch.float64, device="cpu", cache_dir=None)
+    layer.set_gaussian_kernel(plan)
+    assert _impulse_width(layer, k, dist, big.size) == pytest.approx(sigma, rel=2e-3)
+    # wider: the tail would be cut at the patch border, so it is refused
+    with pytest.raises(ValueError, match="patch_depth=7"):
+        gaussian_plan(level, 1.05 * widest, patch_depth=depth)
+    # and the cap is needed: without it, a plan at 1.6 times the limit comes
+    # out too wide on the larger domain (measured 1.017)
+    monkeypatch.setattr(large_conv, "_EDGE_SIGMAS", 1.0)
+    sigma = 1.6 * widest
+    plan = gaussian_plan(level, sigma, patch_depth=depth)
+    layer = LargeConv(level, 1, 1, plan.fine_kernel_sz, n_levels=plan.n_levels,
+                      cell_ids=big, dtype=torch.float64, device="cpu", cache_dir=None)
+    layer.set_gaussian_kernel(plan)
+    assert _impulse_width(layer, k, dist, big.size) / sigma > 1.01
+
+
+def test_plan_measured_with_other_options_is_refused():
+    level = 8
+    plan = gaussian_plan(level, 4.0 * _nominal_cell(level), patch_depth=7)
+    ids = _small_domain()
+    for kw, name in (({"up_norm": "adjoint"}, "up_norm"),
+                     ({"weight_norm": "l2"}, "weight_norm")):
+        layer = LargeConv(level, 1, 1, plan.fine_kernel_sz, n_levels=plan.n_levels,
+                          cell_ids=ids, device="cpu", cache_dir=None, **kw)
+        with pytest.raises(ValueError, match=name):
+            layer.set_gaussian_kernel(plan)
+    other = LargeConv(level + 1, 1, 1, plan.fine_kernel_sz, n_levels=plan.n_levels,
+                      device="cpu", cache_dir=None)
+    with pytest.raises(ValueError, match="level=9"):
+        other.set_gaussian_kernel(plan)
+    # the bare compact width is not checked
+    other.set_gaussian_kernel(plan.compact_sigma)
+
+
+def test_wide_domain_warns_about_the_calibration_location():
+    level = 6
+    sigma = 4.0 * _nominal_cell(level)
+    everything = np.arange(12 * 4**level)
+    with pytest.warns(UserWarning, match="reference_cell") as rec:
+        gaussian_plan(level, sigma, cell_ids=everything)
+    assert rec[0].filename == __file__
+    with pytest.warns(UserWarning, match="reference_cell") as rec:
+        LargeConv.from_gaussian(level, sigma, everything, device="cpu", cache_dir=None)
+    assert rec[0].filename == __file__
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        gaussian_plan(8, 4.0 * _nominal_cell(8), patch_depth=7, cell_ids=_small_domain())
+    assert not [w for w in caught if "reference_cell" in str(w.message)]

@@ -143,7 +143,9 @@ y = layer(x)
 One call: it computes `gaussian_plan`, builds the layer with the same
 options and sets the kernel. The calibration location is the block that
 contains `reference_cell`; by default it is a cell at the centre of
-`cell_ids` (the equatorial block when `cell_ids` is `None`). The plan is
+`cell_ids` (the equatorial block when `cell_ids` is `None`); a warning is
+given when `cell_ids` reach more than 30 degrees from that cell, since the
+width is calibrated at one latitude only (see "Other places" below). The plan is
 kept in `layer.gaussian_plan`. `gaussian_plan(level, sigma, cell_ids=...)`
 is public for inspection (levels, compact sigma, kernel sizes); the manual
 construction is
@@ -156,8 +158,10 @@ layer.set_gaussian_kernel(plan)
 ```
 
 `set_gaussian_kernel` refuses a layer that has other levels than the plan
-(forgotten `n_levels`) or a compact kernel too small for the Gaussian
-(`plan.kernel_sz` passed instead of `plan.fine_kernel_sz`).
+(forgotten `n_levels`), a compact kernel too small for the Gaussian
+(`plan.kernel_sz` passed instead of `plan.fine_kernel_sz`), or another
+level, ellipsoid, `radius_deg`, `sigma_deg`, `weight_norm` or `up_norm` than
+the plan was measured with (`plan.options`).
 
 For each number of levels `n`, `gaussian_plan` measures the real
 `LargeConv` response to the centre cell of the calibration block for compact
@@ -171,15 +175,27 @@ switch, so the width is continuous, and strictly increasing, in sigma.
 
 Measured at level 10 on the calibration patch (256 x 256 cells near the
 equator), 756 widths from 2.25 to 40 cells including the four switches
-(4.7, 9.35, 18.65 and 36.9 cells):
+(4.7, 9.35, 18.65 and 36.9 cells; the benchmark was run before the limit at
+31.7 cells of the next paragraph, which `gaussian_plan` now enforces with
+the default `patch_depth=8`):
 
 - the effective width of the response to the calibration cell is strictly
   increasing (smallest step 0.048 cell for a sigma step of 0.05 cell; no
   shelf, no step down);
 - it equals the requested width within 3.8e-4 relative (median 2.3e-5).
 
-**This accuracy is for the calibration cell.** Other cells and other places
-differ, as follows.
+**This accuracy is for the calibration cell, and it is measured on the
+patch used for the calibration**, so it checks the inversion of the table.
+The patch has zero padding at its border, so a wide response loses its tail
+there during the calibration, and the plan then sets a compact Gaussian that
+is too wide on a larger domain. Re-measured at the same cell on the
+512 x 512 block that contains the patch, the width / sigma is 1.0000 to
+1.0003 up to 32 cells (border at 4 sigmas or more), 1.0011 at 36, 1.0044 at
+40, 1.0126 at 48, 1.047 at 56 and 1.106 at 60 cells. `gaussian_plan`
+therefore refuses widths above a quarter of the distance from the
+calibration cell to the patch border (31.7 cells at level 10 with
+`patch_depth=8`; `patch_depth=9` doubles it, for a calibration on four
+times more cells). Other cells and other places differ, as follows.
 
 - **Other cells of the domain.** Measured on a 512 x 512 cell patch
   (level 10, near the equator, calibrated on its centre cell), response to 96
@@ -253,10 +269,12 @@ Limits:
   `gaussian_filter` ({doc}`radial_filter`), which with `width_rule="matched"`
   reaches the requested width down to about half a cell (its default `"sampled"` is narrower than requested
   below about one cell).
-- **Widest width.** Set by `max_levels` and the calibration patch
-  (`min(level, patch_depth) - 3` levels, 5 at level 10) and the largest
-  calibrated compact width (2.25 coarse cells); `gaussian_plan` raises
-  `ValueError` above it.
+- **Widest width.** Set by `max_levels`, the calibration patch
+  (`min(level, patch_depth) - 3` levels, 5 at level 10), the largest
+  calibrated compact width (2.25 coarse cells), and the patch border (a
+  quarter of its distance from the calibration cell: 31.7 cells at level 10
+  with `patch_depth=8`, so 4 levels by default); `gaussian_plan` raises
+  `ValueError` above it and names the `patch_depth` that would do.
 - **Cost and cache.** The first call for a block builds 65 536-cell
   `LargeConv` layers and evaluates 46 kernels per level count: 16 to 19 s
   for the first call (it calibrates one and two levels), 1 to 2 s for each
