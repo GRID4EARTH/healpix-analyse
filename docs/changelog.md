@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2026.11.1 (2026-11-23)
 
 ### Added
 - `HealPixDown(mode="smooth_conservative")`: the Gaussian smoothing of
