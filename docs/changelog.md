@@ -58,6 +58,30 @@
   HEALPIX-GEO 0.4.0 direct-sum benchmark
   (`benchmarks/results/geo040-performance/`), so that the first-call and
   cache timings of `gaussian_filter` can be cited and re-run.
+- `LargeConv.from_gaussian`, `gaussian_plan`, `LargeConv.set_gaussian_kernel`,
+  `down_up_blur` and `LargeConv(n_levels=...)`: a Gaussian smoothing of a
+  given width whose effective width is continuous and strictly increasing in
+  sigma. The automatic level rule gives a staircase (at level 10 the width
+  sits on 2.0, 4.2, 8.3 and 16.5 cells: 592 flat steps out of 595 over 2.25
+  to 32 cells). Measured over 756 widths from 2.25 to 40 cells across four
+  level switches, the response to the calibration cell is strictly
+  increasing and within 3.8e-4 of the requested width on the calibration
+  patch (an inversion check). Widths above a quarter of the distance to the
+  patch border (31.7 cells at level 10 with the default `patch_depth=8`)
+  are refused: their tail is cut at the border during the calibration, and
+  on a larger domain they came out up to 10.6 % too wide at 60 cells
+  (within 3e-4 below the limit). `set_gaussian_kernel` refuses a plan
+  measured with other options than the layer, and a domain that reaches
+  more than 30 degrees from the calibration cell gives a warning. Other cells of the
+  domain spread by 8 % at 3 cells, 3 % at 6 and at most 1.5 % from 9 cells (up
+  to 240 cells from the calibration cell, clear of the patch edge), as much
+  as the automatic rule around its own mean; the total of one cell is not
+  conserved (0.92 to 1.05); near the edge of a partial domain the width is up to 12.7 % too
+  narrow (zero padding); calibrated at the equator, 55 degrees latitude is
+  up to 22 % too wide, so the calibration block comes from the domain by
+  default. Widths are one-axis RMS (sigma, not FWHM) in radians; the
+  narrowest width is about 2.2 to 2.8 cells, narrower ones are for
+  `gaussian_filter`. The default behaviour of `LargeConv` is unchanged.
 - `HealPixGeoFFT` / `geo_fft_convolve`: FFT convolution of a block inside one
   base face with a wide kernel sampled on geodesic distances and azimuths from
   the block centre (predefined families in metres, kilometres, degrees or
