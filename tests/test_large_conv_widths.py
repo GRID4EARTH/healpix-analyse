@@ -473,8 +473,9 @@ def test_plan_measured_with_other_options_is_refused():
                           cell_ids=ids, device="cpu", cache_dir=None, **kw)
         with pytest.raises(ValueError, match=name):
             layer.set_gaussian_kernel(plan)
+    # a small level-9 domain (children of the level-8 one), not the whole sky
     other = LargeConv(level + 1, 1, 1, plan.fine_kernel_sz, n_levels=plan.n_levels,
-                      device="cpu", cache_dir=None)
+                      cell_ids=4 * ids, device="cpu", cache_dir=None)
     with pytest.raises(ValueError, match="level=9"):
         other.set_gaussian_kernel(plan)
     # the bare compact width is not checked
