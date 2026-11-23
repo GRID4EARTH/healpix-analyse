@@ -28,6 +28,21 @@
   around it stays inside the candidate disc of 1.5 radii around the source; a
   longer detour drops the pair, so a long hole then acts as a barrier. Without blocked cells
   the operator is the same as before.
+- `multiorder_filter_operator`: a Gaussian filter operator on a mixed-level
+  set of HEALPix leaves (a river at a fine level opening into a sea at a
+  coarse one). Land is a place without a leaf, or a blocked leaf (with
+  `correction="lattice"` only blocked leaves are land); the kernel acts on the
+  shortest path through water over edge and corner contacts across levels (2:1
+  balanced input, checked), with leaf areas (and an optional wet fraction) in
+  the weights. `normalization="source"` conserves the total exactly; with one
+  level and `correction="lattice"` the result equals the one-level operator with
+  `blocked_cells` without holes, and with holes whose detours stay within both
+  limits (the one-level operator limits the search by the disc of 1.5 radii,
+  this one by a path length of three radii; a source with a hole or the edge of
+  the set within reach is searched again up to three radii). For a long hole
+  the two can differ, and a detour longer than the limit acts as a barrier. No new
+  dependency: `shortest_path="scipy"` can use SciPy
+  (optional extra `scipy`, imported only then).
 - `normalization="source"` for the two operators: every source cell hands out
   weights that sum to one over the cells it reaches, so that the columns sum to
   one and the total of the signal is conserved (a reflecting coast and domain
