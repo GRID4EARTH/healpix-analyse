@@ -9,6 +9,13 @@
   `numpy.bincount` instead of building the sparse `N x N` response matrix.
   Same values to round-off, O(N), and about twice as fast.
   `tests/test_fft_conservative.py` no longer imports SciPy either.
+- `import healpix_analyse` no longer needs SciPy: `validation.py` (imported by
+  `kernel_pyramid`) imported `scipy.spatial.cKDTree` at module level; it is now
+  imported inside `direct_spherical_convolution`, the only function that uses
+  it, which raises a clear `ImportError` without SciPy. With SciPy
+  installed, this also takes its import (about 0.7 s of the 5 to 7 s of
+  `import healpix_analyse` on a laptop) off the package import; the first
+  call of `direct_spherical_convolution` pays it instead.
 
 ## 2026.11.1 (2026-11-23)
 

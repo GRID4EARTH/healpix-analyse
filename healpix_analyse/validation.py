@@ -37,7 +37,6 @@ from typing import Callable, Optional
 
 import numpy as np
 import healpix_geo
-from scipy.spatial import cKDTree
 
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
@@ -111,7 +110,18 @@ def direct_spherical_convolution(
     with no supported neighbours (summed weight below ``eps``) are NaN if
     ``restore_mask`` else 0; ``normalize=False`` never produces NaN/fill
     values on its own (missing values are simply excluded via ``m``).
+
+    Needs SciPy (``scipy.spatial.cKDTree``), imported here rather than at
+    module level so that ``import healpix_analyse`` does not require it.
     """
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError as exc:
+        raise ImportError(
+            "direct_spherical_convolution needs SciPy (scipy.spatial.cKDTree); "
+            "install it with `pip install scipy`."
+        ) from exc
+
     cell_ids = np.asarray(cell_ids, dtype=np.int64).ravel()
     x = np.asarray(x, dtype=np.float64).ravel()
     if x.shape[0] != cell_ids.shape[0]:
