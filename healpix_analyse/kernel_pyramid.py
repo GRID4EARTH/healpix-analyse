@@ -577,6 +577,10 @@ class HealPixKernelPyramid:
         ``decomp.Jmax``; a target wider than the coarsest band's own reach
         cannot be represented regardless of how the taps are fit).
 
+        Needs SciPy, through the direct reference (``scipy.spatial.cKDTree``):
+        ``pip install 'healpix-analyse[scipy]'``. The rest of the module does
+        not.
+
         Parameters
         ----------
         decomp : HealPixDecomp
