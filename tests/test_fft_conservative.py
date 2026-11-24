@@ -57,12 +57,16 @@ def _distance_to_outside(tr):
     gy = np.rint(tr.projected_y.numpy() / px + centre).astype(np.int64)
     cells = np.stack((gy, gx), axis=1)
     outside = np.argwhere(~tr.coverage_mask.numpy().astype(bool)).astype(np.int64)
-    d2 = (
-        (cells**2).sum(axis=1)[:, None]
-        + (outside**2).sum(axis=1)[None, :]
-        - 2 * cells @ outside.T
-    )
-    return np.sqrt(d2.min(axis=1))
+    if outside.size == 0:
+        return np.full(len(cells), np.inf)
+    out_sq = (outside**2).sum(axis=1)
+    d2 = np.empty(len(cells), dtype=np.int64)
+    for start in range(0, len(cells), 1024):  # bounded memory: 1024 x M at a time
+        block = cells[start:start + 1024]
+        d2[start:start + 1024] = (
+            (block**2).sum(axis=1)[:, None] + out_sq[None, :] - 2 * block @ outside.T
+        ).min(axis=1)
+    return np.sqrt(d2)
 
 
 def _interior(layer, sigma):
