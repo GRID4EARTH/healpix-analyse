@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- `LocalFFT.blur_floor_px` (called by `HealPixFFTConv.set_gaussian` and
+  `LocalFFT.check_width` since 2026.11.1) no longer uses SciPy: the moments of
+  the round-trip response are accumulated per grid pixel with
+  `numpy.bincount` instead of building the sparse `N x N` response matrix.
+  Same values to round-off, O(N), and about twice as fast.
+  `tests/test_fft_conservative.py` no longer imports SciPy either.
+
 ## 2026.11.1 (2026-11-23)
 
 ### Added
