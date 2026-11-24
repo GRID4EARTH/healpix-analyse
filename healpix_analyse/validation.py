@@ -119,7 +119,7 @@ def direct_spherical_convolution(
     except ImportError as exc:
         raise ImportError(
             "direct_spherical_convolution needs SciPy (scipy.spatial.cKDTree); "
-            "install it with `pip install scipy`."
+            "install it (pip install 'healpix-analyse[scipy]')."
         ) from exc
 
     cell_ids = np.asarray(cell_ids, dtype=np.int64).ravel()
