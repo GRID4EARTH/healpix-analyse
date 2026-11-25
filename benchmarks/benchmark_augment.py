@@ -11,12 +11,17 @@ then a Markdown table::
 
 Timed stages (median of ``--reps`` runs after one warm-up)
 ----------------------------------------------------------
-plan       ``aug.sample(B, generator)``: the per-sample draw and, for the
-           geometric transforms, the indices and bilinear weights of the fused
-           gather, computed on the device.
-apply      ``plan.apply(x)`` without gradient.
-fwd_bwd    ``plan.apply(x)`` and the backward pass with respect to the data.
-total      plan + apply: one augmented batch, the number behind samples/s.
+plan       ``aug.sample(B, generator)``: the per-sample draw (the geometry is
+           computed lazily, at the first apply).
+total      ``aug.sample(B, generator).apply(x)`` without gradient: one
+           augmented batch, geometry included, the number behind samples/s.
+apply      total - plan.
+fwd_bwd    a fresh draw, apply and the backward pass with respect to the data.
+geometry   (Triton) the fused kernel without the gather: the cost of
+           computing the bilinear weights alone.
+fwd GB/s   (Triton) minimal traffic of the fused forward (read the input
+           once, write the output and the per-cell scale) / apply time, and
+           its fraction of the GPU's peak DRAM bandwidth.
 
 The ``naive`` pipeline is the per-sample way of earlier libraries, for
 comparison: a rotation about the domain centre whose source positions are
@@ -47,6 +52,17 @@ from healpix_analyse.augment import (
     RandomZoom,
 )
 from healpix_analyse.healpix_interp import get_interp_weights
+from healpix_analyse._augment_backend import fused_augment_triton
+
+
+def _peak_bw(dev):
+    """Peak DRAM bandwidth (GB/s) of known GPUs, None otherwise."""
+    name = torch.cuda.get_device_name(dev)
+    for key, bw in (("A100-SXM4-80GB", 2039), ("A100 80GB PCIe", 1935), ("A100", 1555),
+                    ("H100", 3350), ("H200", 4800)):
+        if key in name:
+            return bw
+    return None
 
 GEOM = [RandomShift(0.05), RandomRotation(), RandomZoom((0.8, 1.25)), RandomFlip()]
 
@@ -141,19 +157,37 @@ def run(args):
                 gy = torch.randn_like(x)
                 plan = aug.sample(B, gen)
                 t_plan = _time(lambda: aug.sample(B, gen), dev, args.reps)
+                # A fresh draw every time: the maps are built lazily and cached
+                # on a plan, so re-applying one plan would skip the geometry.
                 with torch.no_grad():
-                    t_apply = _time(lambda: plan.apply(x), dev, args.reps)
+                    t_total = _time(lambda: aug.sample(B, gen).apply(x), dev, args.reps)
+                t_apply = t_total - t_plan
                 xg = x.clone().requires_grad_(True)
 
                 def fb():
-                    y = plan.apply(xg).x
+                    y = aug.sample(B, gen).apply(xg).x
                     torch.autograd.grad((y.nan_to_num() * gy).sum(), xg)
 
                 t_fb = _time(fb, dev, args.reps) if not args.no_backward else None
-                n_taps = max([m.idx.shape[1] for m in plan.gather_maps] or [0])
-                rows.append(dict(pipeline=name, backend=be, C=Ce, taps=n_taps,
-                                 plan_s=t_plan, apply_s=t_apply, fwd_bwd_s=t_fb,
-                                 total_s=t_plan + t_apply))
+                n_taps = max([g.n_taps for g in plan.groups] or [0])
+                row = dict(pipeline=name, backend=be, C=Ce, taps=n_taps,
+                           plan_s=t_plan, apply_s=t_apply, fwd_bwd_s=t_fb,
+                           total_s=t_total)
+                if plan.groups and be == "triton" and len(plan.groups) == 1 and len(tr) == len(
+                        [t for t in tr if t.kind_for(aug.grid) in ("R", "A")]):
+                    # Geometry alone (weights, no gather) and the bandwidth of
+                    # the fused forward against the minimal traffic: read the
+                    # input once, write the output and the per-cell scale.
+                    grp = plan.groups[0]
+                    grp.geo()
+                    row["geom_s"] = _time(lambda: fused_augment_triton(grp.geo(), None), dev, args.reps)
+                    es = x.element_size()
+                    nbytes = B * Ce * args.cells * es * 2 + B * args.cells * 8
+                    row["fwd_GBps"] = nbytes / t_apply / 1e9
+                    row["peak_GBps"] = _peak_bw(dev)
+                    if t_fb is not None:
+                        row["bwd_s"] = t_fb - t_total
+                rows.append(row)
                 _emit(rows[-1], args, B)
     return rows
 
@@ -178,12 +212,17 @@ def table(paths):
     def ms(v):
         return "—" if v is None else f"{1e3 * v:.1f}"
 
-    print("| device | pipeline | backend | C | taps | plan ms | apply ms | fwd+bwd ms | samples/s |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    print("| device | dtype | pipeline | backend | C | taps | plan ms | apply ms | geometry ms "
+          "| fwd+bwd ms | samples/s | fwd GB/s (% peak) |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
-        print(f"| {r['device']} | {r['pipeline']} | {r['backend']} | {r['C']} | {r.get('taps', '—')} | "
-              f"{ms(r.get('plan_s'))} | {ms(r.get('apply_s'))} | {ms(r.get('fwd_bwd_s'))} | "
-              f"{r['samples_per_s']:.0f} |")
+        bw = "—"
+        if r.get("fwd_GBps"):
+            pk = r.get("peak_GBps")
+            bw = f"{r['fwd_GBps']:.0f}" + (f" ({100 * r['fwd_GBps'] / pk:.0f} %)" if pk else "")
+        print(f"| {r['device']} | {r.get('dtype', '')} | {r['pipeline']} | {r['backend']} | {r['C']} | "
+              f"{r.get('taps', '—')} | {ms(r.get('plan_s'))} | {ms(r.get('apply_s'))} | "
+              f"{ms(r.get('geom_s'))} | {ms(r.get('fwd_bwd_s'))} | {r['samples_per_s']:.0f} | {bw} |")
 
 
 def main(argv=None):

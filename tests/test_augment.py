@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import healpix_geo
 import numpy as np
@@ -228,9 +229,9 @@ def test_so3_then_inverse_full_sphere():
 
 def test_fusion_into_one_gather():
     aug = HealPixAugment([RandomShift(0.02), RandomRotation(), RandomZoom(), RandomFlip()], LEVEL, BLOCK)
-    assert len(aug.sample(2, torch.Generator().manual_seed(0)).gather_maps) == 1
+    assert len(aug.sample(2, torch.Generator().manual_seed(0)).groups) == 1
     aug2 = HealPixAugment([RandomZoom(), RandomShift(0.02)], LEVEL, BLOCK)
-    assert len(aug2.sample(2, torch.Generator().manual_seed(0)).gather_maps) == 2
+    assert len(aug2.sample(2, torch.Generator().manual_seed(0)).groups) == 2
 
 
 def test_fused_matches_sequential():
@@ -468,3 +469,30 @@ def test_cuda_plan_matches_cpu_plan():
     aug.to("cuda")
     y_gpu = aug.sample(3, torch.Generator().manual_seed(9)).apply(x.cuda()).x
     torch.testing.assert_close(y_gpu.cpu(), y_cpu, rtol=0, atol=1e-9)
+
+
+@pytest.mark.skipif(
+    not (ab._HAS_TRITON and os.environ.get("TRITON_INTERPRET", "0") == "1"),
+    reason="runs the Triton kernels on the CPU under TRITON_INTERPRET=1",
+)
+@pytest.mark.parametrize("antialias,zoom", [("supersample", (0.5, 1.3)), ("pyramid", (0.3, 1.3)),
+                                            ("supersample", (1.0, 1.0))])
+def test_fused_kernels_interpreter(antialias, zoom):
+    """Fused forward / backward / labels against the torch reference."""
+    ids = np.random.default_rng(0).permutation(np.arange(4**4) + 9 * 4**4)
+    aug = HealPixAugment([RandomShift(0.03), RandomRotation(), RandomZoom(zoom), RandomFlip()],
+                         6, ids, antialias=antialias, fill=0.0)
+    plan = aug.sample(3, torch.Generator().manual_seed(1))
+    x = torch.randn(3, 3, ids.size, requires_grad=True)
+    lab = torch.randint(0, 4, (3, ids.size))
+    gy = torch.randn(3, 3, ids.size)
+    res = {}
+    for be in ("auto", "torch"):
+        aug.backend = be
+        o = plan.apply(x, labels=lab)
+        (g,) = torch.autograd.grad(o.x, x, gy)
+        res[be] = (o.x.detach(), o.valid, o.labels, g)
+    a, r = res["auto"], res["torch"]
+    torch.testing.assert_close(a[0], r[0], rtol=1e-5, atol=1e-5)
+    assert torch.equal(a[1], r[1]) and torch.equal(a[2], r[2])
+    torch.testing.assert_close(a[3], r[3], rtol=1e-5, atol=1e-5)

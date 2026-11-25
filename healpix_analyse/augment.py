@@ -78,8 +78,13 @@ import torch
 from torch import nn
 
 from healpix_analyse._augment_backend import (
+    _TRITON_DTYPES,
     GatherMap,
     apply_gather,
+    fused_augment_triton,
+    gather_backward,
+    ring_theta_table,
+    triton_on,
     bilinear_ring,
     ring_to_nest,
 )
@@ -532,6 +537,12 @@ class _Grid(nn.Module):
         self._pyr = {}
         self._blocks = {}
 
+    def theta_table(self, nside, dtype, device):
+        key = ("theta", int(nside), str(dtype), str(device))
+        if key not in self._pyr:
+            self._pyr[key] = ring_theta_table(int(nside), dtype, device)
+        return self._pyr[key]
+
     # -- RING lookup tables --------------------------------------------------
     def ring_index(self, k, device):
         """Lookup of RING ids of level ``L - k`` into positions of the source.
@@ -663,6 +674,12 @@ class AugmentPlan:
 
     @property
     def gather_maps(self) -> List[GatherMap]:
+        """The gather maps of the fused geometric groups (built on demand)."""
+        return [s[1].gather_map() for s in self.steps if s[0] == "gather"]
+
+    @property
+    def groups(self) -> List["GeometricGroup"]:
+        """The fused geometric groups of the plan, in order."""
         return [s[1] for s in self.steps if s[0] == "gather"]
 
     def apply(self, x: torch.Tensor, labels=None) -> AugmentResult:
@@ -677,18 +694,24 @@ class AugmentPlan:
             raise ValueError(f"expected {aug.grid.N} cells on the last axis, got {x3.shape[-1]}")
         lab = labels
         valid = torch.ones(B, x3.shape[-1], dtype=torch.bool, device=x.device)
+        valid_all = True
         mask = ids_keep = ids_restore = cell_ids = None
         for step in self.steps:
             kind = step[0]
             if kind == "gather":
-                gmap = step[1]
-                src = aug._source(x3, gmap)
-                x3 = apply_gather(src, gmap, aug.fill, aug.backend, aug.deterministic)
-                nn_c = gmap.nn.clamp_min(0)
-                valid = gmap.valid & torch.gather(valid, 1, nn_c)
-                if mask is not None:
-                    mask = torch.gather(mask, 1, nn_c) & gmap.valid
-                lab = _map_labels(lab, lambda t: _nearest(t, gmap.nn, aug.label_fill))
+                grp = step[1]
+                src = aug._source(x3, grp.kmax)
+                need_nn = lab is not None or not valid_all or mask is not None
+                x3, valid_g, gmap = grp.run(src, need_nn)
+                if need_nn:
+                    nn_c = gmap.nn.clamp_min(0)
+                    valid = valid_g & torch.gather(valid, 1, nn_c)
+                    if mask is not None:
+                        mask = torch.gather(mask, 1, nn_c) & valid_g
+                    lab = _map_labels(lab, lambda t, nn=gmap.nn: _nearest(t, nn, aug.label_fill))
+                else:
+                    valid = valid_g
+                valid_all = False
             elif kind == "gauge":
                 x3 = _permute_gauges(x3, step[1], step[2])
             elif kind == "noise":
@@ -948,10 +971,10 @@ class HealPixAugment(nn.Module):
             w[a:b] = wa
         return (pos + offset).view(*shape, 4), w.view(*shape, 4), present.view(*shape, 4)
 
-    def _build_map(self, R, A, has_r, has_a) -> GatherMap:
+    def _build_map(self, R, A, has_r, has_a) -> "GeometricGroup":
         g = self.grid
         dev, gd = self.device, self.geom_dtype
-        B, N = R.shape[0], g.N
+        B = R.shape[0]
         # Footprint growth of the tangent map (largest singular value of A).
         a2 = (A ** 2).sum((1, 2))
         det = torch.linalg.det(A)
@@ -966,16 +989,27 @@ class HealPixAugment(nn.Module):
         T = n_ss * n_ss
         kmax = int(levels.max())
         pyr = g.pyramid(kmax, dev) if kmax > 0 else []
-        n_src = N + sum(lv[0].numel() for lv in pyr)
-
-        Rd, Ad = R.to(dev, gd), A.to(dev, gd)
+        n_src = g.N + sum(lv[0].numel() for lv in pyr)
         if n_ss > 1:
             o = (torch.arange(n_ss, dtype=gd, device=dev) + 0.5) / n_ss - 0.5
             off = torch.stack(torch.meshgrid(o, o, indexing="ij"), -1).reshape(T, 2) * g.h
         else:
             off = torch.zeros(1, 2, dtype=gd, device=dev)
+        return GeometricGroup(
+            self, R.to(dev, gd).contiguous(), A.to(dev, gd).contiguous(), has_r, has_a,
+            n_ss, levels, kmax, n_src, off.contiguous())
+
+    def _torch_map(self, grp) -> GatherMap:
+        """Gather map of a group, computed with torch ops (reference, CPU)."""
+        g = self.grid
+        dev, gd = self.device, self.geom_dtype
+        B, N = grp.B, g.N
+        Rd, Ad, off, has_a, has_r = grp.R, grp.A, grp.off, grp.has_a, grp.has_r
+        n_ss, T, kmax = grp.n_ss, grp.T, grp.kmax
+        pyr = g.pyramid(kmax, dev) if kmax > 0 else []
+        n_src = grp.n_src
         c, e1, e2 = g.frame[0], g.frame[1], g.frame[2]
-        lev_d = levels.to(dev)
+        lev_d = grp.levels.to(dev)
 
         idx = torch.empty(B, 4 * T, N, dtype=torch.int32, device=dev)
         wts = torch.empty(B, 4 * T, N, dtype=gd, device=dev)
@@ -1033,13 +1067,10 @@ class HealPixAugment(nn.Module):
             nn_b = torch.gather(p0, -1, best).squeeze(-1)
             found = torch.gather(w0, -1, best).squeeze(-1) >= 0
             nn_idx[b0:b1] = torch.where(found & ok, nn_b, torch.full((), -1, dtype=nn_b.dtype, device=dev))
-        gm = GatherMap(idx, wts, valid, nn_idx, n_src)
-        gm.pyr_levels = kmax
-        return gm
+        return GatherMap(idx, wts, valid, nn_idx, n_src)
 
-    def _source(self, x3, gmap):
+    def _source(self, x3, kmax):
         """The input, followed by its mean pyramid when the map reads it."""
-        kmax = getattr(gmap, "pyr_levels", 0)
         if kmax == 0:
             return x3
         parts = [x3]
@@ -1052,3 +1083,136 @@ class HealPixAugment(nn.Module):
             parts.append(cur)
             prev = cur
         return torch.cat(parts, dim=2)
+
+
+# ===========================================================================
+# One fused geometric group
+# ===========================================================================
+
+class _FusedAugment(torch.autograd.Function):
+    """One Triton kernel for the forward (bilinear weights from the
+    per-sample parameters + gather of all channels) and one for the backward
+    (the same weights recomputed + deterministic fixed-point scatter).  No
+    map is kept between the two: only the per-cell scale [B, N]."""
+
+    @staticmethod
+    def forward(ctx, src, grp, need_nn):
+        aug = grp.aug
+        out, scale, nn, _ = fused_augment_triton(
+            grp.geo(), src.contiguous(), store_nn=need_nn, fill=aug.fill)
+        grp._last = (scale, grp._nn_from(nn, scale) if need_nn else None)
+        ctx.grp = grp
+        ctx.scale = scale
+        ctx.src_dtype = src.dtype
+        ctx.n_src = src.shape[2]
+        return out
+
+    @staticmethod
+    def backward(ctx, gout):
+        grp = ctx.grp
+        if torch.is_grad_enabled():  # create_graph=True: differentiable scatter
+            gm = grp.gather_map("triton")
+            return gather_backward(gout, gm, True, ctx.src_dtype), None, None
+        g = fused_augment_triton(grp.geo(), gout=gout, scale=ctx.scale,
+                                 deterministic=grp.aug.deterministic, n_src=ctx.n_src)
+        return g.to(ctx.src_dtype), None, None
+
+
+class GeometricGroup:
+    """Consecutive geometric transforms fused into one source map
+    ``S(p) = R lift(A proj(p))`` per sample, and one gather.
+
+    On CUDA (and ``backend != "torch"``), :meth:`run` launches one Triton
+    kernel that computes the bilinear weights of each output cell from the
+    per-sample ``R`` and ``A`` and gathers the channels in the same pass; the
+    map (indices and weights) is written only when the backward pass, the
+    labels or a composition with an earlier step need it.  Elsewhere the map
+    is built with torch ops.
+    """
+
+    def __init__(self, aug, R, A, has_r, has_a, n_ss, levels, kmax, n_src, off):
+        self.aug = aug
+        self.R, self.A = R, A
+        self.has_r, self.has_a = bool(has_r), bool(has_a)
+        self.n_ss, self.T = int(n_ss), int(n_ss) ** 2
+        self.levels, self.kmax, self.n_src = levels, int(kmax), int(n_src)
+        self.off = off
+        self.B = R.shape[0]
+        self._geo = None
+        self._maps = {}
+        self._last = None
+
+    @property
+    def n_taps(self) -> int:
+        """Entries per output cell of the gather (4 per sampling tap)."""
+        return 4 * self.T
+
+    def triton_ok(self) -> bool:
+        return self.aug.backend != "torch" and triton_on(self.aug.device)
+
+    def geo(self) -> dict:
+        if self._geo is None:
+            aug, g = self.aug, self.aug.grid
+            dev, gd = aug.device, aug.geom_dtype
+            frame_h = torch.cat([g.frame.reshape(-1),
+                                 torch.tensor([g.h], dtype=gd, device=dev)]).contiguous()
+            pyr = g.pyramid(self.kmax, dev) if self.kmax > 0 else []
+            launches = []
+            for k in range(self.kmax + 1):
+                bsel = torch.nonzero(self.levels == k).reshape(-1).to(torch.int32).to(dev)
+                nside = 1 << (g.level - k)
+                launches.append((bsel, nside, g.theta_table(nside, gd, dev), g.ring_index(k, dev),
+                                 0 if k == 0 else pyr[k - 1][2]))
+            self._geo = dict(
+                uv=g.uv.contiguous(), xyz=g.xyz.contiguous(), A=self.A, R=self.R, off=self.off,
+                frame_h=frame_h, launches=launches, T=self.T,
+                t_nn=(self.T // 2) if self.n_ss % 2 == 1 else self.T,
+                has_a=self.has_a, has_r=self.has_r, min_support=aug.min_support,
+                snap=aug._snap, B=self.B, N=g.N)
+        return self._geo
+
+    def _nn_from(self, nn, scale):
+        """Nearest cell for labels (level 0, cell centre)."""
+        if self.kmax == 0:
+            return nn
+        g, dev = self.aug.grid, self.aug.device
+        nside = 1 << g.level
+        geo0 = dict(self.geo())
+        geo0.update(T=1, t_nn=0, off=torch.zeros(1, 2, dtype=self.off.dtype, device=dev),
+                    launches=[(torch.arange(self.B, dtype=torch.int32, device=dev), nside,
+                               g.theta_table(nside, self.aug.geom_dtype, dev),
+                               g.ring_index(0, dev), 0)])
+        _, _, nn0, _ = fused_augment_triton(geo0, None, store_nn=True)
+        return torch.where(scale > 0, nn0, torch.full((), -1, dtype=torch.long, device=dev))
+
+    def gather_map(self, kind: Optional[str] = None) -> GatherMap:
+        """The map of the group: ``"triton"`` (fused kernel) or ``"torch"``."""
+        kind = kind or ("triton" if self.triton_ok() else "torch")
+        if kind not in self._maps:
+            if kind == "triton":
+                _, scale, nn, (idx, w) = fused_augment_triton(
+                    self.geo(), None, store_map=True, store_nn=True)
+                self._maps["triton"] = GatherMap(
+                    idx, w * scale.unsqueeze(1), scale > 0, self._nn_from(nn, scale), self.n_src)
+            else:
+                self._maps["torch"] = self.aug._torch_map(self)
+        return self._maps[kind]
+
+    def run(self, src, need_nn):
+        """Gather ``src`` [B, C, n_src]; returns (out, valid, map or None)."""
+        aug = self.aug
+        if self.triton_ok() and src.dtype in _TRITON_DTYPES and triton_on(src.device):
+            out = _FusedAugment.apply(src, self, need_nn)
+            scale, nn = self._last
+            gm = _NNOnly(nn) if need_nn else None
+            return out, scale > 0, gm
+        gm = self.gather_map("triton" if self.triton_ok() else "torch")
+        out = apply_gather(src, gm, aug.fill, aug.backend, aug.deterministic)
+        return out, gm.valid, gm
+
+
+class _NNOnly:
+    """The nearest-cell part of a map (labels), from the fused kernel."""
+
+    def __init__(self, nn):
+        self.nn = nn

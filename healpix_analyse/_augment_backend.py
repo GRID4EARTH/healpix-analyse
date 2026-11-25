@@ -59,7 +59,7 @@ __all__ = [
     "bilinear_nested",
     "triton_on",
     "ring_theta_table",
-    "plan_triton",
+    "fused_augment_triton",
     "GatherMap",
     "apply_gather",
     "gather_torch",
@@ -286,7 +286,7 @@ if _HAS_TRITON:
     # Cephes atan on [0, 1] (rational approximation, ~1 ulp in float64).
     # Written out instead of libdevice so that the Triton interpreter runs it.
     @triton.jit
-    def _atan01(t):
+    def _tl_atan01(t):
         big = t > 0.66
         x = tl.where(big, (t - 1.0) / (t + 1.0), t)
         z = x * x
@@ -300,19 +300,19 @@ if _HAS_TRITON:
         return tl.where(big, 0.7853981633974483 + (r + 3.061616997868383e-17), r)
 
     @triton.jit
-    def _atan2(y, x):
+    def _tl_atan2(y, x):
         ax = tl.abs(x)
         ay = tl.abs(y)
         mx = tl.maximum(ax, ay)
         mn = tl.minimum(ax, ay)
         t = tl.where(mx > 0, mn / tl.where(mx > 0, mx, 1.0), 0.0 * mx)
-        a = _atan01(t)
+        a = _tl_atan01(t)
         a = tl.where(ay > ax, (1.5707963267948966 - a) + 6.123233995736766e-17, a)
         a = tl.where(x < 0, (3.141592653589793 - a) + 1.2246467991473532e-16, a)
         return tl.where(y < 0, -a, a)
 
     @triton.jit
-    def _ring_int(ring, nside):
+    def _tl_ring_int(ring, nside):
         """startpix, ringpix, shifted of RING rings (int64)."""
         ncap = 2 * nside * (nside - 1)
         npix = 12 * nside * nside
@@ -327,7 +327,7 @@ if _HAS_TRITON:
         return startpix, ringpix, shifted
 
     @triton.jit
-    def _ring_row(phi, sp, nr, shifted):
+    def _tl_ring_row(phi, sp, nr, shifted):
         dphi = 6.283185307179586 / nr.to(phi.dtype)
         hs = tl.where(shifted, 0.5, 0.0).to(phi.dtype)
         tmp = phi / dphi - hs
@@ -340,7 +340,7 @@ if _HAS_TRITON:
         return sp + i1, sp + i2, 1.0 - w1, w1
 
     @triton.jit
-    def _find(key, rs_ptr, rp_ptr, n_rs, MODE: tl.constexpr, LOG2: tl.constexpr):
+    def _tl_find(key, rs_ptr, rp_ptr, n_rs, MODE: tl.constexpr, LOG2: tl.constexpr):
         if MODE == 1:
             pos = tl.load(rs_ptr + key)
             present = key >= 0
@@ -359,15 +359,54 @@ if _HAS_TRITON:
         return pos, present
 
     @triton.jit
-    def _plan_kernel(
-        uv_ptr, xyz_ptr, a_ptr, r_ptr, off_ptr, fr_ptr, thr_ptr, rs_ptr, rp_ptr,
-        idx_ptr, w_ptr, valid_ptr, nn_ptr,
-        N, n_rs, nside_in, min_support, snap,
+    def _tl_scatter(ptrs, val, mask, FIXED: tl.constexpr):
+        if FIXED:
+            tl.atomic_add(ptrs, tl.floor(val + 0.5).to(tl.int64), mask=mask)
+        else:
+            tl.atomic_add(ptrs, val.to(tl.float32), mask=mask)
+
+    def _aug_configs():
+        if os.environ.get("TRITON_INTERPRET", "0") == "1":
+            return [triton.Config({"BLOCK": 64}, num_warps=4)]
+        return [
+            triton.Config({"BLOCK": bl}, num_warps=nw)
+            for bl in (64, 128, 256) for nw in (2, 4, 8)
+            if not (bl == 64 and nw == 8)
+        ]
+
+    @triton.autotune(configs=_aug_configs(),
+                     key=["N", "C", "T", "GATHER", "SCATTER", "STORE_MAP", "HAS_A", "HAS_R"],
+                     reset_to_zero=["gsrc_ptr"])
+    @triton.jit
+    def _aug_kernel(
+        uv_ptr, xyz_ptr, a_ptr, r_ptr, off_ptr, fr_ptr, thr_ptr, rs_ptr, rp_ptr, bsel_ptr,
+        src_ptr, out_ptr, idx_ptr, w_ptr, scale_ptr, nn_ptr, gout_ptr, gsrc_ptr, fsc_ptr,
+        N, NS, C, n_rs, nside_in, pos_off, min_support, snap, fill,
         T: tl.constexpr, T_NN: tl.constexpr, HAS_A: tl.constexpr, HAS_R: tl.constexpr,
-        MODE: tl.constexpr, LOG2: tl.constexpr, BLOCK: tl.constexpr,
+        MODE: tl.constexpr, LOG2: tl.constexpr, GATHER: tl.constexpr, SCATTER: tl.constexpr,
+        STORE_MAP: tl.constexpr, STORE_NN: tl.constexpr, FIXED: tl.constexpr,
+        BLOCK_C: tl.constexpr, BLOCK: tl.constexpr,
     ):
+        """One augmented batch in one pass.
+
+        For every output cell of sample ``b`` and every sampling tap: the
+        source point (``R lift(A (uv + offset))`` or ``R xyz``), the HEALPix
+        bilinear lookup (``get_interpol``, RING), the binary search of the 4
+        RING cells among the cells of the domain, and, with ``GATHER``, the
+        weighted gather of ``BLOCK_C`` channels accumulated in fp32.  The
+        weights are renormalised once at the end (one scale per cell, written
+        to ``scale``), so nothing is stored between the taps.
+
+        ``SCATTER`` is the backward pass: the same geometry is recomputed and
+        ``scale * w * grad_out`` is scattered into ``gsrc``; with ``FIXED``
+        (deterministic) into an int64 fixed-point accumulator (``fsc`` =
+        2^k), whose integer atomics give the same sum in any order.
+        ``STORE_NN`` writes the nearest cell (labels); ``STORE_MAP`` the raw
+        map (idx, weight) for inspection and the torch fallback.
+        """
         pid = tl.program_id(0)
-        b = tl.program_id(1).to(tl.int64)
+        pid_c = tl.program_id(1)
+        b = tl.load(bsel_ptr + tl.program_id(2)).to(tl.int64)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         m = offs < N
         o64 = offs.to(tl.int64)
@@ -408,14 +447,27 @@ if _HAS_TRITON:
         s_in = zero
         tot = zero
         nn_pos = tl.zeros((BLOCK,), dtype=tl.int64) - 1
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        mc = offs_c < C
+        src_b = src_ptr + b * C * NS + offs_c.to(tl.int64)[:, None] * NS
+        acc = tl.zeros((BLOCK_C, BLOCK), dtype=tl.float32)
+        if SCATTER:
+            g_in = tl.load(gout_ptr + b * C * N + offs_c.to(tl.int64)[:, None] * N + o64[None, :],
+                           mask=mc[:, None] & m[None, :], other=0.0)
+            sc_in = tl.load(scale_ptr + b * N + o64, mask=m, other=0.0)
+            coef = sc_in[None, :] * g_in.to(sc_in.dtype)
+            if FIXED:
+                coef = coef * tl.load(fsc_ptr)
+            gs_b = gsrc_ptr + b * C * NS + offs_c.to(tl.int64)[:, None] * NS
         J: tl.constexpr = 4 * T
         out_b = b * J * N
+        do_store = pid_c == 0
         NT: tl.constexpr = T + 1 if T_NN == T else T
         for t in tl.static_range(NT):
             if HAS_A:
                 if t < T:
-                    u = u0 + tl.load(off_ptr + 2 * t) * h
-                    v = v0 + tl.load(off_ptr + 2 * t + 1) * h
+                    u = u0 + tl.load(off_ptr + 2 * t)
+                    v = v0 + tl.load(off_ptr + 2 * t + 1)
                 else:
                     u = u0
                     v = v0
@@ -439,8 +491,8 @@ if _HAS_TRITON:
             rho = tl.sqrt(qx * qx + qy * qy)
             rr = tl.sqrt(rho * rho + qz * qz)
             z = tl.minimum(tl.maximum(qz / rr, -1.0), 1.0)
-            theta = _atan2(rho, qz)
-            phi = _atan2(qy, qx)
+            theta = _tl_atan2(rho, qz)
+            phi = _tl_atan2(qy, qx)
             phi = tl.where(phi < 0, phi + 6.283185307179586, phi)
             phi = tl.where(phi >= 6.283185307179586, phi - 6.283185307179586, phi)
             az = tl.abs(z)
@@ -452,12 +504,12 @@ if _HAS_TRITON:
             ir2 = ir1 + 1
             ra = tl.minimum(tl.maximum(ir1, 1), 4 * nside - 1)
             rb = tl.minimum(tl.maximum(ir2, 1), 4 * nside - 1)
-            sp1, nr1, sh1 = _ring_int(ra, nside)
-            sp2, nr2, sh2 = _ring_int(rb, nside)
+            sp1, nr1, sh1 = _tl_ring_int(ra, nside)
+            sp2, nr2, sh2 = _tl_ring_int(rb, nside)
             th1 = tl.load(thr_ptr + ra)
             th2 = tl.load(thr_ptr + rb)
-            p0, p1, w0, w1 = _ring_row(phi, sp1, nr1, sh1)
-            p2, p3, w2, w3 = _ring_row(phi, sp2, nr2, sh2)
+            p0, p1, w0, w1 = _tl_ring_row(phi, sp1, nr1, sh1)
+            p2, p3, w2, w3 = _tl_ring_row(phi, sp2, nr2, sh2)
             north = ir1 == 0
             south = (ir2 == 4 * nside) & (ir1 != 0)
             wt_mid = (theta - th1) / (th2 - th1)
@@ -478,48 +530,75 @@ if _HAS_TRITON:
             g2 = tl.where(g2 < snap, 0.0, g2)
             g3 = tl.where(g3 < snap, 0.0, g3)
             # --- domain lookup ---------------------------------------------
-            q0, f0 = _find(k0, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-            q1, f1 = _find(k1, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-            q2, f2 = _find(k2, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-            q3, f3 = _find(k3, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+            q0, f0 = _tl_find(k0, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+            q1, f1 = _tl_find(k1, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+            q2, f2 = _tl_find(k2, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+            q3, f3 = _tl_find(k3, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+            q0 = q0 + pos_off
+            q1 = q1 + pos_off
+            q2 = q2 + pos_off
+            q3 = q3 + pos_off
             if t < T:
                 h0 = tl.where(f0, g0, 0.0)
                 h1 = tl.where(f1, g1, 0.0)
                 h2 = tl.where(f2, g2, 0.0)
                 h3 = tl.where(f3, g3, 0.0)
-                base = out_b + (4 * t) * N + o64
-                tl.store(idx_ptr + base, q0.to(tl.int32), mask=m)
-                tl.store(idx_ptr + base + N, q1.to(tl.int32), mask=m)
-                tl.store(idx_ptr + base + 2 * N, q2.to(tl.int32), mask=m)
-                tl.store(idx_ptr + base + 3 * N, q3.to(tl.int32), mask=m)
-                tl.store(w_ptr + base, h0, mask=m)
-                tl.store(w_ptr + base + N, h1, mask=m)
-                tl.store(w_ptr + base + 2 * N, h2, mask=m)
-                tl.store(w_ptr + base + 3 * N, h3, mask=m)
                 s_in += h0 + h1 + h2 + h3
                 tot += g0 + g1 + g2 + g3
-            if t == T_NN:
-                ww0 = tl.where(f0, g0, -1.0)
-                ww1 = tl.where(f1, g1, -1.0)
-                ww2 = tl.where(f2, g2, -1.0)
-                ww3 = tl.where(f3, g3, -1.0)
-                best = ww0
-                nn_pos = tl.where(ww0 >= 0, q0, -1)
-                nn_pos = tl.where(ww1 > best, q1, nn_pos)
-                best = tl.maximum(best, ww1)
-                nn_pos = tl.where(ww2 > best, q2, nn_pos)
-                best = tl.maximum(best, ww2)
-                nn_pos = tl.where(ww3 > best, q3, nn_pos)
+                if GATHER:
+                    # raw (unnormalised) weights; one scale per cell at the end
+                    v = tl.load(src_b + q0[None, :], mask=mc[:, None] & (m & (h0 > 0))[None, :], other=0.0)
+                    acc += h0.to(tl.float32)[None, :] * v.to(tl.float32)
+                    v = tl.load(src_b + q1[None, :], mask=mc[:, None] & (m & (h1 > 0))[None, :], other=0.0)
+                    acc += h1.to(tl.float32)[None, :] * v.to(tl.float32)
+                    v = tl.load(src_b + q2[None, :], mask=mc[:, None] & (m & (h2 > 0))[None, :], other=0.0)
+                    acc += h2.to(tl.float32)[None, :] * v.to(tl.float32)
+                    v = tl.load(src_b + q3[None, :], mask=mc[:, None] & (m & (h3 > 0))[None, :], other=0.0)
+                    acc += h3.to(tl.float32)[None, :] * v.to(tl.float32)
+                if SCATTER:
+                    ma = mc[:, None] & (m & (h0 > 0))[None, :]
+                    _tl_scatter(gs_b + q0[None, :], h0[None, :] * coef, ma, FIXED)
+                    ma = mc[:, None] & (m & (h1 > 0))[None, :]
+                    _tl_scatter(gs_b + q1[None, :], h1[None, :] * coef, ma, FIXED)
+                    ma = mc[:, None] & (m & (h2 > 0))[None, :]
+                    _tl_scatter(gs_b + q2[None, :], h2[None, :] * coef, ma, FIXED)
+                    ma = mc[:, None] & (m & (h3 > 0))[None, :]
+                    _tl_scatter(gs_b + q3[None, :], h3[None, :] * coef, ma, FIXED)
+                if STORE_MAP:
+                    sm = m & do_store
+                    base = out_b + (4 * t) * N + o64
+                    tl.store(idx_ptr + base, tl.where(h0 > 0, q0, -1).to(tl.int32), mask=sm)
+                    tl.store(idx_ptr + base + N, tl.where(h1 > 0, q1, -1).to(tl.int32), mask=sm)
+                    tl.store(idx_ptr + base + 2 * N, tl.where(h2 > 0, q2, -1).to(tl.int32), mask=sm)
+                    tl.store(idx_ptr + base + 3 * N, tl.where(h3 > 0, q3, -1).to(tl.int32), mask=sm)
+                    tl.store(w_ptr + base, h0, mask=sm)
+                    tl.store(w_ptr + base + N, h1, mask=sm)
+                    tl.store(w_ptr + base + 2 * N, h2, mask=sm)
+                    tl.store(w_ptr + base + 3 * N, h3, mask=sm)
+            if STORE_NN:
+                if t == T_NN:
+                    ww0 = tl.where(f0, g0, -1.0)
+                    ww1 = tl.where(f1, g1, -1.0)
+                    ww2 = tl.where(f2, g2, -1.0)
+                    ww3 = tl.where(f3, g3, -1.0)
+                    best = ww0
+                    nn_pos = tl.where(ww0 >= 0, q0 - pos_off, -1)
+                    nn_pos = tl.where(ww1 > best, q1 - pos_off, nn_pos)
+                    best = tl.maximum(best, ww1)
+                    nn_pos = tl.where(ww2 > best, q2 - pos_off, nn_pos)
+                    best = tl.maximum(best, ww2)
+                    nn_pos = tl.where(ww3 > best, q3 - pos_off, nn_pos)
         ok = (s_in >= min_support * tot - 1e-12) & (s_in > 0)
         scale = tl.where(ok, 1.0 / tl.where(ok, s_in, 1.0), 0.0)
-        for jj in tl.static_range(J):
-            base = out_b + jj * N + o64
-            wv = tl.load(w_ptr + base, mask=m, other=0.0) * scale
-            iv = tl.load(idx_ptr + base, mask=m, other=-1)
-            tl.store(w_ptr + base, wv, mask=m)
-            tl.store(idx_ptr + base, tl.where(wv > 0, iv, -1), mask=m)
-        tl.store(valid_ptr + b * N + o64, ok.to(tl.int8), mask=m)
-        tl.store(nn_ptr + b * N + o64, tl.where(ok, nn_pos, -1), mask=m)
+        if GATHER:
+            res = tl.where(ok[None, :], acc * scale.to(tl.float32)[None, :], fill)
+            out = out_ptr + b * C * N + offs_c.to(tl.int64)[:, None] * N + o64[None, :]
+            tl.store(out, res.to(out_ptr.dtype.element_ty), mask=mc[:, None] & m[None, :])
+        sm = m & do_store
+        if not SCATTER:
+            tl.store(scale_ptr + b * N + o64, scale, mask=sm)
+        if STORE_NN:
+            tl.store(nn_ptr + b * N + o64, tl.where(ok, nn_pos, -1), mask=sm)
 
 
 def ring_theta_table(nside: int, dtype, device) -> torch.Tensor:
@@ -528,39 +607,104 @@ def ring_theta_table(nside: int, dtype, device) -> torch.Tensor:
     return _ring_info(ring, nside, dtype)[2].contiguous()
 
 
-def plan_triton(uv, xyz, A, R, off, frame_h, thr, lookup, nside, *,
-                T, t_nn, has_a, has_r, min_support, snap, B, N):
-    """Run the fused plan kernel; returns idx, w, valid, nn (see GatherMap).
+# Fixed-point backward: gradients are accumulated as int64 multiples of
+# 2^-k * max|grad_out|, k = _FIXED_BITS.  Exact and order-independent as long
+# as the weights received by one source cell sum to less than
+# 2^(62 - _FIXED_BITS) (= 4096: a zoom-in by a factor of ~30); the rounding of
+# each contribution is below 2^-_FIXED_BITS * max|grad_out| (~1e-15).
+_FIXED_BITS = 50
 
-    ``frame_h`` = [c, e1, e2, h] (10 values, geometry dtype); ``lookup`` is
-    ``("table", r2n)`` or ``("sorted", ring_sorted, positions)``.
+
+def fused_augment_triton(geo, src=None, *, gout=None, scale=None, store_map=False,
+                         store_nn=False, fill=float("nan"), deterministic=True, n_src=None):
+    """Run the fused augmentation kernel for one geometric group.
+
+    ``geo`` is a dict with the per-launch geometry: ``uv``, ``xyz``, ``A``
+    [B, 2, 2], ``R`` [B, 3, 3], ``off`` [T, 2], ``frame_h`` (c, e1, e2, h),
+    ``launches`` = list of (bsel, nside, thr, lookup, pos_off), ``T``,
+    ``t_nn``, ``has_a``, ``has_r``, ``min_support``, ``snap``, ``B``, ``N``.
+
+    Forward (``gout is None``): with ``src`` [B, C, NS] (float32 / float16 /
+    bfloat16) gathers into ``out`` [B, C, N]; always writes ``scale`` [B, N]
+    (the renormalisation of each cell, 0 outside the domain).  Returns
+    ``(out, scale, nn, maps)``: ``nn`` [B, N] with ``store_nn``, ``maps`` =
+    (idx [B, 4T, N] int32, raw w [B, 4T, N]) with ``store_map`` (entry weight
+    = w * scale).
+
+    Backward (``gout`` [B, C, N] and the forward ``scale``): returns the
+    gradient [B, C, n_src] in float32, deterministic with
+    ``deterministic=True`` (int64 fixed point), fp32 atomics otherwise.
     """
-    dev = thr.device
-    gd = thr.dtype
+    B, N, T = geo["B"], geo["N"], geo["T"]
+    gd = geo["frame_h"].dtype
+    dev = geo["frame_h"].device
     J = 4 * T
-    idx = torch.empty(B, J, N, dtype=torch.int32, device=dev)
-    w = torch.empty(B, J, N, dtype=gd, device=dev)
-    valid = torch.empty(B, N, dtype=torch.int8, device=dev)
-    nn = torch.empty(B, N, dtype=torch.long, device=dev)
-    if lookup[0] == "table":
-        mode, rs, rp, n_rs, log2 = 1, lookup[1], lookup[1], lookup[1].numel(), 1
+    dummy = geo["frame_h"]
+    scatter = gout is not None
+    gather = src is not None and not scatter
+    maps = nn = out = gsrc = None
+    fsc = dummy
+    fixed = False
+    if scatter:
+        gout = gout.contiguous()
+        _, C, _ = gout.shape
+        NS = int(n_src)
+        gmax = float(gout.abs().max()) if gout.numel() else 0.0
+        fixed = bool(deterministic) and math.isfinite(gmax)
+        if fixed:
+            k = _FIXED_BITS - (math.frexp(gmax)[1] if gmax > 0 else 0)
+            fsc = torch.tensor([2.0 ** k], dtype=torch.float64, device=dev)
+            gsrc = torch.zeros(B, C, NS, dtype=torch.int64, device=dev)
+        else:
+            gsrc = torch.zeros(B, C, NS, dtype=torch.float32, device=dev)
+    elif gather:
+        _, C, NS = src.shape
+        out = torch.empty(B, C, N, dtype=src.dtype, device=dev)
     else:
-        rs, rp = lookup[1], lookup[2]
-        mode, n_rs = 0, rs.numel()
-        log2 = max(1, int(math.ceil(math.log2(n_rs + 1))))
-    dummy = thr
-    BLOCK = 128
-    grid = (triton.cdiv(N, BLOCK), B)
-    _plan_kernel[grid](
-        uv if has_a else dummy, xyz if not has_a else dummy,
-        A if has_a else dummy, R if has_r else dummy,
-        off if has_a else dummy, frame_h, thr, rs, rp,
-        idx, w, valid, nn,
-        N, n_rs, nside, float(min_support), float(snap),
-        T=T, T_NN=t_nn, HAS_A=bool(has_a), HAS_R=bool(has_r), MODE=mode, LOG2=log2,
-        BLOCK=BLOCK, num_warps=4,
-    )
-    return idx, w, valid.bool(), nn
+        C, NS = 1, 1
+    if scatter or gather:
+        BLOCK_C = max(1, min(16, triton.next_power_of_2(C)))
+        n_cb = triton.cdiv(C, BLOCK_C)
+    else:
+        BLOCK_C, n_cb = 1, 1
+    if not scatter:
+        scale = torch.empty(B, N, dtype=gd, device=dev)
+    if store_map:
+        maps = (torch.empty(B, J, N, dtype=torch.int32, device=dev),
+                torch.empty(B, J, N, dtype=gd, device=dev))
+    if store_nn:
+        nn = torch.empty(B, N, dtype=torch.long, device=dev)
+    idx, w = maps if store_map else (dummy, dummy)
+    has_a, has_r = geo["has_a"], geo["has_r"]
+    for bsel, nside, thr, lookup, pos_off in geo["launches"]:
+        nb = bsel.numel()
+        if nb == 0:
+            continue
+        if lookup[0] == "table":
+            mode, rs, rp, n_rs, log2 = 1, lookup[1], lookup[1], lookup[1].numel(), 1
+        else:
+            rs, rp = lookup[1], lookup[2]
+            mode, n_rs = 0, rs.numel()
+            log2 = max(1, int(math.ceil(math.log2(n_rs + 1))))
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK"]), n_cb, nb)  # noqa: E731
+        _aug_kernel[grid](
+            geo["uv"] if has_a else dummy, geo["xyz"] if not has_a else dummy,
+            geo["A"] if has_a else dummy, geo["R"] if has_r else dummy,
+            geo["off"] if has_a else dummy, geo["frame_h"], thr, rs, rp, bsel,
+            src if gather else dummy, out if gather else dummy, idx, w, scale,
+            nn if store_nn else dummy, gout if scatter else dummy,
+            gsrc if scatter else torch.zeros(1, device=dev), fsc,
+            N, NS, C, n_rs, int(nside), int(pos_off),
+            float(geo["min_support"]), float(geo["snap"]), float(fill),
+            T=T, T_NN=geo["t_nn"], HAS_A=bool(has_a), HAS_R=bool(has_r), MODE=mode, LOG2=log2,
+            GATHER=gather, SCATTER=scatter, STORE_MAP=bool(store_map), STORE_NN=bool(store_nn),
+            FIXED=fixed, BLOCK_C=BLOCK_C,
+        )
+    if scatter:
+        if fixed:
+            return (gsrc.to(torch.float64) / fsc).to(torch.float32)
+        return gsrc
+    return out, scale, nn, maps
 
 
 # ===========================================================================
@@ -654,6 +798,12 @@ def gather_torch(src: torch.Tensor, gmap: GatherMap, fill: float) -> torch.Tenso
 
 if _HAS_TRITON:
 
+    def _cfg(name, sizes=(128, 256, 512), warps=(2, 4, 8)):
+        if os.environ.get("TRITON_INTERPRET", "0") == "1":
+            return [triton.Config({name: 64}, num_warps=4)]
+        return [triton.Config({name: s}, num_warps=w) for s in sizes for w in warps]
+
+    @triton.autotune(configs=_cfg("BLOCK_N"), key=["C", "N", "J"])
     @triton.jit
     def _gather_fwd_kernel(
         src_ptr, idx_ptr, w_ptr, out_ptr,
@@ -682,6 +832,7 @@ if _HAS_TRITON:
         out_b = out_ptr + b * C * N + offs_c.to(tl.int64)[:, None] * N + offs_n[None, :]
         tl.store(out_b, res.to(out_ptr.dtype.element_ty), mask=mc[:, None] & mn[None, :])
 
+    @triton.autotune(configs=_cfg("BLOCK_N"), key=["C", "N", "J"], reset_to_zero=["gsrc_ptr"])
     @triton.jit
     def _gather_bwd_atomic_kernel(
         gout_ptr, idx_ptr, w_ptr, gsrc_ptr,
@@ -708,6 +859,7 @@ if _HAS_TRITON:
             tl.atomic_add(gs_b + ij.to(tl.int64)[None, :], wj[None, :] * g,
                           mask=mc[:, None] & ok[None, :])
 
+    @triton.autotune(configs=_cfg("BLOCK_R", sizes=(64, 128, 256)), key=["C", "NS"])
     @triton.jit
     def _gather_bwd_csr_kernel(
         gout_ptr, rowptr_ptr, ent_ptr, w_ptr, gsrc_ptr,
@@ -747,12 +899,10 @@ def _gather_triton(src, gmap, fill):
     B, C, NS = src.shape
     _, J, N = gmap.idx.shape
     out = torch.empty(B, C, N, dtype=src.dtype, device=src.device)
-    BLOCK_N = 256
     BLOCK_C = _block_c(C)
-    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(C, BLOCK_C), B)
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), triton.cdiv(C, BLOCK_C), B)  # noqa: E731
     _gather_fwd_kernel[grid](
-        src, gmap.idx, gmap.w32, out, C, NS, N, float(fill),
-        J=J, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C, num_warps=4,
+        src, gmap.idx, gmap.w32, out, C, NS, N, float(fill), J=J, BLOCK_C=BLOCK_C,
     )
     return out
 
@@ -782,32 +932,34 @@ class _TritonGather(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, gout):
-        gmap = ctx.gmap
-        if torch.is_grad_enabled():  # create_graph=True: differentiable path
-            return _scatter_torch(gout, gmap).to(ctx.src_dtype), None, None, None
-        gout = gout.contiguous()
-        B, C, N = gout.shape
-        ns = gmap.n_src
-        J = gmap.idx.shape[1]
-        BLOCK_C = _block_c(C)
-        if ctx.deterministic:
-            rowptr, entries, _ = gmap.csr()
-            gsrc = torch.empty(B, C, ns, dtype=ctx.src_dtype, device=gout.device)
-            BLOCK_R = 128
-            grid = (triton.cdiv(ns, BLOCK_R), triton.cdiv(C, BLOCK_C), B)
-            _gather_bwd_csr_kernel[grid](
-                gout, rowptr, entries, gmap.w32, gsrc, C, ns, N,
-                BLOCK_R=BLOCK_R, BLOCK_C=BLOCK_C, num_warps=4,
-            )
-            return gsrc, None, None, None
-        gsrc = torch.zeros(B, C, ns, dtype=torch.float32, device=gout.device)
-        BLOCK_N = 256
-        grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(C, BLOCK_C), B)
-        _gather_bwd_atomic_kernel[grid](
-            gout, gmap.idx, gmap.w32, gsrc, C, ns, N,
-            J=J, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C, num_warps=4,
+        return gather_backward(gout, ctx.gmap, ctx.deterministic, ctx.src_dtype), None, None, None
+
+
+def gather_backward(gout, gmap, deterministic, src_dtype):
+    """Gradient of a gather with respect to its source [B, C, n_src]."""
+    if torch.is_grad_enabled():  # create_graph=True: differentiable path
+        return _scatter_torch(gout, gmap).to(src_dtype)
+    if not triton_on(gout.device):
+        return _scatter_torch(gout, gmap).to(src_dtype)
+    gout = gout.contiguous()
+    B, C, N = gout.shape
+    ns = gmap.n_src
+    J = gmap.idx.shape[1]
+    BLOCK_C = _block_c(C)
+    if deterministic:
+        rowptr, entries, _ = gmap.csr()
+        gsrc = torch.empty(B, C, ns, dtype=src_dtype, device=gout.device)
+        grid = lambda meta: (triton.cdiv(ns, meta["BLOCK_R"]), triton.cdiv(C, BLOCK_C), B)  # noqa: E731
+        _gather_bwd_csr_kernel[grid](
+            gout, rowptr, entries, gmap.w32, gsrc, C, ns, N, BLOCK_C=BLOCK_C,
         )
-        return gsrc.to(ctx.src_dtype), None, None, None
+        return gsrc
+    gsrc = torch.zeros(B, C, ns, dtype=torch.float32, device=gout.device)
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), triton.cdiv(C, BLOCK_C), B)  # noqa: E731
+    _gather_bwd_atomic_kernel[grid](
+        gout, gmap.idx, gmap.w32, gsrc, C, ns, N, J=J, BLOCK_C=BLOCK_C,
+    )
+    return gsrc.to(src_dtype)
 
 
 _WARNED_TORCH_CUDA = False
