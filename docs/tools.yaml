@@ -303,7 +303,7 @@ tools:
   title: Gauge-equivariant convolution (HealPixConv)
   family: A
   page: conv/convol
-  not_exported: [healpix_analyse.convol.HealPixConv]
+  symbols: [HealPixConv]
   also: [set_kernel, missing, completed_stencil]
   summary: >-
     A torch nn.Module that applies a small learned stencil (kernel_sz x
@@ -334,7 +334,7 @@ tools:
     - "Reach is `kernel_sz // 2` cells: a wide receptive field needs many layers or another tool."
     - Outputs G*C_out channels; memory grows as B*C_in*G*K*P.
     - "By default, at the edge of a regional domain, missing stencil points take the value of the centre (silent padding); `missing='local_mean'` uses the local mean instead and also completes NaN."
-    - Not exported from `healpix_analyse`; the disk cache stores float32 buffers, so a float64 layer gets float32 geometry.
+    - The disk cache stores float32 buffers, so a float64 layer gets float32 geometry.
   use_instead:
     - when: the receptive field must be wide under a memory budget
       use: LargeConv
@@ -585,7 +585,7 @@ tools:
   title: Spherical harmonics of a whole-sphere HEALPix map (HEALPixSHT)
   family: C
   page: sht/healpix_sht
-  not_exported: [healpix_analyse.healpix_sht.HEALPixSHT]
+  symbols: [HEALPixSHT]
   also: [map2alm, alm2map, map2alm_spin, alm2map_spin, anafast, uv_to_curl_div]
   summary: >-
     Ring-based spherical harmonic transform of a whole-sphere HEALPix map:
@@ -616,9 +616,8 @@ tools:
   cons:
     - Whole sphere only; RING by default.
     - Memory of the tables grows as nside^3 (4.8 GB at level 8 in float32).
-    - "Spin != 0 (and `uv_to_curl_div`) needs `quaternionic` and `spherical`, which are in no extra."
+    - "Spin != 0 (and `uv_to_curl_div`) needs `quaternionic` and `spherical`, (extra `sht`)."
     - "`uv_to_curl_div` applies no ell-dependent factor: its outputs are not div and curl in 1/s."
-    - Not exported from `healpix_analyse`.
   use_instead:
     - when: the grid is ERA5, a regular or Gaussian lat/lon grid, or HEALPix too large for the memory of the tables
       use: anafast_latlon / map2alm_latlon
@@ -769,45 +768,49 @@ tools:
   optional_deps: none
 
 - id: flat_spectra
-  title: Experimental flat spectra (ps, powerspectra, powerspectra_lonlat)
+  title: Deprecated flat spectrum (powerspectra)
   family: C
   page: sht/powerspectra
-  status: experimental
-  not_exported: [healpix_analyse.ps.ps, healpix_analyse.powerspectra.powerspectra, healpix_analyse.powerspectra_lonlat.powerspectra_lonlat]
+  status: legacy
+  not_exported: [healpix_analyse.powerspectra.powerspectra]
   summary: >-
-    Radial power spectra from a plain 2-D FFT: of a regular 2-D array (ps),
-    or of HEALPix cells through the experimental AlmTransform (powerspectra,
-    powerspectra_lonlat).
+    Deprecated (DeprecationWarning, to be removed). Radial power spectrum
+    from a plain 2-D FFT of a rectangular block of RING cells, through the
+    experimental AlmTransform.
   tasks:
-    - do: get the radial spectrum of a regular 2-D array I have already gridded
-      use: [ps]
-  keywords: [2-D FFT, radial spectrum, regular array, experimental]
-  domain: a regular 2-D array (ps); a 2-D array of RING cell ids (powerspectra)
+    - do: reproduce an old radial spectrum of a 2-D block of RING cells (deprecated)
+      use: [powerspectra]
+  keywords: [2-D FFT, radial spectrum, deprecated]
+  domain: a 2-D array of RING cell ids, one row per iso-latitude ring
   differentiable: no (NumPy binning)
   cost: plain FFT
   pros:
-    - "`ps` is simple and self-contained."
+    - Simple.
   cons:
-    - Not exported; not differentiable.
-    - "`powerspectra_lonlat` cannot run as written; `powerspectra` prints diagnostics and its `method=\"alm\"` runs the FFT path."
+    - Deprecated, to be removed; not exported; not differentiable.
+    - The second stage is an FFT across rings, not a Legendre sum; periodic boundaries only.
   use_instead:
-    - when: a HEALPix patch
-      use: local_ps
-      page: sht/fft_local
-    - when: the whole sphere
-      use: HEALPixSHT.anafast or anafast_latlon
-      page: sht/compare_power_spectra
+    - when: the full sphere
+      use: HEALPixSHT.anafast
+      page: sht/healpix_sht
+    - when: a regional domain or a map with missing data
+      use: HealPixWaveletSpectrum
+      page: sht/wavelet_spectrum
+    - when: a lon/lat or Gaussian grid
+      use: build_rings_from_latlon + anafast_latlon
+      page: sht/alm_latlon
   optional_deps: matplotlib only for the plotting options
 
 - id: alm_coeffs
   title: Coefficient container (AlmCoeffs)
   family: C
   page: sht/alm_coeffs
-  symbols: [AlmCoeffs]
+  not_exported: [healpix_analyse.alm.AlmCoeffs]
   status: unused
   summary: >-
     A dataclass holding coefficients (alm), their degrees and orders (l, m)
-    and metadata, with device helpers. No function of the package returns it.
+    and metadata, with device helpers. No function of the package returns it,
+    and it is not exported.
   tasks:
     - store spherical harmonic coefficients with their (l, m) indices and metadata
   keywords: [container, dataclass, alm]
@@ -817,7 +820,7 @@ tools:
   pros:
     - Validates shapes; .to(), .cpu(), .cuda(), .clone().
   cons:
-    - Not used by any function of the package (open question whether to keep it).
+    - Not used by any function of the package; not exported (import it from healpix_analyse.alm).
   use_instead:
     - when: you need the coefficients of a map
       use: HEALPixSHT.map2alm or map2alm_latlon (plain tensors, healpy layout)
@@ -946,7 +949,7 @@ tools:
   title: Binary dilation and erosion by a radius (morphology)
   family: B
   page: stats/morphology
-  not_exported: [healpix_analyse.morphology.binary_dilation, healpix_analyse.morphology.binary_erosion]
+  symbols: [binary_dilation, binary_erosion]
   summary: >-
     Grow or shrink a mask, given as a list of active cell ids, by a radius in
     metres, optionally restricted to a domain.
@@ -962,7 +965,7 @@ tools:
   pros:
     - Metric radius with cell-centre or cone-coverage structuring neighbourhoods; domain-aware.
   cons:
-    - Not exported; NumPy only; without `domain` a dilation is unbounded.
+    - NumPy only; without `domain` a dilation is unbounded.
   use_instead:
     - when: the mask is a boolean value per cell
       use: max_filter / min_filter
@@ -1148,8 +1151,7 @@ tools:
   title: Between any levels and domains (resample_healpix)
   family: D
   page: other/resample
-  symbols: [HealPixResampler, resample_healpix]
-  not_exported: [healpix_analyse.resample.resample_to_latlon_grid]
+  symbols: [HealPixResampler, resample_healpix, resample_to_latlon_grid]
   summary: >-
     Move data from one HEALPix level and domain to another by chaining
     HealPixDown or HealPixUp steps, normalised by the coverage so gaps are
@@ -1174,7 +1176,7 @@ tools:
     - Any level to any level, partial domains in and out, gaps handled.
   cons:
     - Chained steps on partial or gappy data give a mean of means.
-    - "`resample_to_latlon_grid` is not exported, needs SciPy and is not tied to HEALPix ids."
+    - "`resample_to_latlon_grid` needs SciPy and is not tied to HEALPix ids."
   use_instead:
     - when: one level, inside a network
       use: HealPixDown / HealPixUp
@@ -1188,7 +1190,7 @@ tools:
   title: Values at arbitrary points (get_interp_val)
   family: D
   page: other/interpolation
-  not_exported: [healpix_analyse.healpix_interp.get_interp_val, healpix_analyse.healpix_interp.get_interp_weights]
+  symbols: [get_interp_val, get_interp_weights]
   summary: >-
     Bilinear interpolation of a whole-sphere NESTED map at any lon/lat, or
     the four cells and weights; identical in algorithm to healpy on the

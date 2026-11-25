@@ -7,7 +7,7 @@ harmonic coefficients with their indices and metadata.
 ```
 
 ```python
-from healpix_analyse import AlmCoeffs
+from healpix_analyse.alm import AlmCoeffs
 
 c = AlmCoeffs(alm=alm, l=l, m=m, meta={"grid": "ERA5"})
 c.n_modes, c.is_batched
@@ -19,9 +19,9 @@ and `m` (1-D tensors of degrees and orders, `m >= 0`), `meta` (a
 dictionary). The constructor validates types and shapes.
 
 No function of the package returns an `AlmCoeffs`: `HEALPixSHT.map2alm` and
-`map2alm_latlon` return plain tensors in the `healpy` layout. Whether to use
-this container in those functions or to drop it is an open question of the
-documentation overhaul.
+`map2alm_latlon` return plain tensors in the `healpy` layout, and
+`AlmCoeffs` is not exported from `healpix_analyse`: import it from
+`healpix_analyse.alm`.
 
 The same module defines `AlmTransform`, the experimental flat transform used
-by `powerspectra` ({doc}`powerspectra`); it is not exported.
+by the deprecated `powerspectra` ({doc}`powerspectra`); it is not exported.

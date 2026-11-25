@@ -63,6 +63,7 @@ Flat alm layout (same as healpy / alm_latlon.py):
 
 from __future__ import annotations
 
+import importlib.util
 import math
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -71,12 +72,27 @@ import torch
 
 import healpix_geo
 
-try:
-    import quaternionic
-    import spherical as _spherical_pkg
-    _HAS_SPHERICAL = True
-except ImportError:
-    _HAS_SPHERICAL = False
+# Found without importing them (spherical pulls in numba).
+_HAS_SPHERICAL = all(
+    importlib.util.find_spec(name) is not None for name in ("quaternionic", "spherical")
+)
+
+
+def _import_spherical():
+    """Import ``quaternionic`` and ``spherical`` (extra ``sht``) on first use.
+
+    They are imported lazily so that ``import healpix_analyse`` does not pay
+    for them (``spherical`` pulls in numba) and works without them.
+    """
+    try:
+        import quaternionic
+        import spherical
+    except ImportError as exc:
+        raise ImportError(
+            "Spin ≠ 0 transforms require 'quaternionic' and 'spherical'.\n"
+            "Install the 'sht' extra:  pip install 'healpix-analyse[sht]'"
+        ) from exc
+    return quaternionic, spherical
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -360,11 +376,7 @@ class HEALPixSHT:
         """
         if spin in self._spin_Yp:
             return
-        if not _HAS_SPHERICAL:
-            raise ImportError(
-                "Spin ≠ 0 transforms require 'quaternionic' and 'spherical'.\n"
-                "Install with:  pip install quaternionic spherical"
-            )
+        quaternionic, _spherical_pkg = _import_spherical()
 
         lmax = self.lmax
         lth  = self._ring_theta                        # (R,) float64

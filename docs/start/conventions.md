@@ -146,7 +146,7 @@ through `torch.autograd` (geometry, weights and kernel shapes are constants).
 - **Not differentiable:** `HealPixWideConv` (it detaches its input), the
   operator builders (NumPy), `neighbour_reduce` with `count`, `mode`, `any`,
   `all`, morphology, components, `get_interp_*`, DINO (inference mode),
-  `powerspectra`, `ps`.
+  `powerspectra` (deprecated).
 - **Not differentiable with respect to the width:** no tool gives a gradient
   with respect to `sigma_m`, `radius_m` or the parameters of a kernel callable.
 
@@ -182,5 +182,5 @@ $$C_\ell = \frac{1}{2\ell+1} \left[ |a_{\ell 0}|^2 + 2 \sum_{m=1}^{\ell} |a_{\el
 
 Cell centres, vertices and neighbours come from
 [healpix-geo](https://healpix-geo.readthedocs.io/); ellipsoidal distances come
-from `pyproj`. `healpy` is not a dependency; one exported function,
+from `pyproj`. `healpy` is not a core dependency; one exported function,
 `build_healpix_adjacency`, needs it (see {doc}`installation`).

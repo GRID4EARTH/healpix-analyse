@@ -15,8 +15,8 @@ from healpix_analyse.morphology import (
 )
 ```
 
-Both functions are **not exported** from `healpix_analyse`: import them from
-`healpix_analyse.morphology`. They take a list of active cell ids and return a
+Both functions are exported from `healpix_analyse` (and live in
+`healpix_analyse.morphology`). They take a list of active cell ids and return a
 sorted array of cell ids (NumPy only, so not differentiable). The structuring
 element is a **metric radius** in metres (`radius`), with the cell-centre or
 cone-coverage neighbourhoods described below — the same neighbourhoods as

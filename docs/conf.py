@@ -96,15 +96,6 @@ autoapi_options = [
     "show-module-summary",
 ]
 autoapi_keep_files = True
-# Legacy modules that cannot be imported with the declared dependencies
-# (they import ``foscat`` or ``cdshealpix``) or that are scripts, not API.
-# They stay in the source tree for now; see the open questions of issue #89.
-autoapi_ignore = [
-    "*/LocalizedFlatSkyAlm.py",
-    "*/LocalizedAlm_optimized_v13_fixed.py",
-    "*/demo_ps.py",
-    "*/make_rectangle.py",
-]
 autoapi_python_use_implicit_namespaces = True
 
 # ---------------------------------------------------------------------------
