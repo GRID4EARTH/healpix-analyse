@@ -4,7 +4,7 @@ Run directly: ``python examples/pyramid_conv_quickstart.py``
 
 Builds a synthetic masked map, filters it with a NaN-aware pyramidal
 Gaussian-shaped smoother, and reports basic sanity numbers (no plotting
-dependency required). See docs/pyramid_convolution.md for the full
+dependency required). See docs/conv/pyramid_conv.md for the full
 guide/math/API/validation write-up.
 """
 
@@ -52,7 +52,7 @@ def main():
 
     # Sanity check independent of any test file: a constant field behind the
     # same mask should reconstruct back to that same constant everywhere it
-    # has support (see docs/pyramid_convolution.md section A.2).
+    # has support (see docs/conv/pyramid_conv_maths.md section A.2).
     c = 3.0
     xc = np.full(npix, c, dtype=np.float32)
     xc[~mask] = np.nan

@@ -1,0 +1,1223 @@
+# Tool catalogue of healpix-analyse
+#
+# The single source of truth for "which tool for which task". The docs build
+# (docs/_ext/tool_catalogue.py) checks it against healpix_analyse.__all__ and
+# generates from it the decision tables of the family landing pages, the API
+# reference grouped by family, and llms.txt / llms-full.txt.
+#
+# Every statement here must come from the code or from the docs pages; write
+# "to be measured" rather than guess a number.
+#
+# Fields of a tool:
+#   id, title, family (A/B/C/D), page (docname, optional #anchor)
+#   symbols:       names exported in healpix_analyse.__all__ (each exactly once)
+#   not_exported:  qualified names of documented entry points that are not
+#                  exported from healpix_analyse
+#   also:          other names covered (methods, options) that an answer may use
+#   use:           the names shown in the "Use" column (default: first name)
+#   status:        stable | experimental | unused | legacy (checked by the build)
+#   summary, tasks ("I want to ..."), keywords
+#   domain, ordering, ellipsoid, io, differentiable, gpu, nan, cost
+#   pros, cons, use_instead [{when, use, page}], optional_deps
+
+intro: >-
+  PyTorch tools to analyse values stored on HEALPix grids, built for Earth
+  observation: convolution and filtering in metres, neighbourhood statistics,
+  spherical harmonics and local FFT spectra, resolution changes, interpolation
+  and foundation-model embeddings, on the whole sphere or on a regional set of
+  NESTED cells.
+
+key_pages:
+  - [start/overview, "Which tool for which task? (decision guide)"]
+  - [start/conventions, "Conventions: cell ids, levels, ellipsoids, units, shapes"]
+  - [start/installation, "Installation and optional dependencies"]
+  - [api/index, "API reference by family"]
+
+# Pages moved by the docs overhaul (#89): old docname -> new docname.
+# The build writes a redirect stub at the old URL.
+redirects:
+  installation: start/installation
+  overview: start/overview
+  convol_doc: conv/convol
+  convol_api: conv/convol
+  convol_internals: dev/convol_internals
+  large_conv: conv/large_conv
+  fft_conv: conv/fft_conv
+  geo_fft: conv/geo_fft
+  wide_convolution: conv/wide_conv
+  pyramid_convolution: conv/pyramid_conv
+  radial_filter: conv/radial_filter
+  directional_filter: conv/directional_filter
+  directional_filter_migration: dev/directional_filter_migration
+  neighbour_reduce: stats/neighbour_reduce
+  gradient: stats/gradient
+  divcurl: stats/divcurl
+  morphology: stats/morphology
+  components: stats/components
+  minkowski: stats/minkowski
+  healpix_sht: sht/healpix_sht
+  healpix_sht_api: sht/healpix_sht
+  healpix_sht_maths: sht/healpix_sht_maths
+  alm_latlon_1_quickstart: sht/alm_latlon
+  alm_latlon_2_mathematics: sht/alm_latlon_maths
+  alm_latlon_3_api: sht/alm_latlon
+  fft_local: sht/fft_local
+  powerspectra: sht/powerspectra
+  down: other/down
+  up: other/up
+  decomp: other/decomp
+  resample_healpix: other/resample
+  healpix_interp: other/interpolation
+  dino: other/dino
+  changelog: about/changelog
+  license: about/license
+
+# Pages whose full text is copied into llms-full.txt
+full_text_pages:
+  - start/overview
+  - start/conventions
+
+families:
+  A:
+    title: Convolution & filtering
+    page: conv/index
+    summary: >-
+      Every way to convolve or filter a field: learned convolutions for neural
+      networks, wide fixed kernels, FFT convolutions, and metric filters whose
+      scale is given in metres (Gaussian, radial, directional, land barrier).
+  B:
+    title: Statistics & local analysis
+    page: stats/index
+    summary: >-
+      Local statistics and local analysis without harmonics or FFT:
+      neighbourhood reductions in metres, gradients, divergence and curl,
+      binary morphology, connected components, Minkowski functionals.
+  C:
+    title: Spherical harmonics & FFT
+    page: sht/index
+    summary: >-
+      Transforms and spectra: spherical harmonics on the whole sphere
+      (HEALPix or lat/lon grids), local FFT and local power spectra on a
+      regional patch.
+  D:
+    title: Other tools
+    page: other/index
+    summary: >-
+      Changing resolution, multiscale decompositions, resampling between
+      levels and domains, point interpolation, lat/lon grids, tiles and
+      foundation-model embeddings.
+
+tools:
+# ===========================================================================
+# A. Convolution & filtering — metric filters (no learning)
+# ===========================================================================
+- id: radial_filter
+  title: Gaussian and radial filters in metres
+  family: A
+  page: conv/radial_filter
+  symbols: [gaussian_filter, radial_filter]
+  summary: >-
+    Filter values with a Gaussian (sigma_m) or any isotropic kernel of the
+    WGS84 geodesic distance in metres, on the whole sphere or a regional set
+    of NESTED cells.
+  tasks:
+    - smooth a field with a Gaussian whose width is given in metres
+    - do: filter a field with my own kernel of the distance in metres
+      use: [radial_filter]
+  keywords: [smoothing, blur, low-pass, Gaussian, sigma in metres, isotropic kernel, top-hat]
+  domain: whole sphere or regional set of cell ids; `domain` selects the output cells
+  ordering: NESTED cell ids (stated, not checked)
+  ellipsoid: '"WGS84" (the only accepted value)'
+  io: "values [..., N] matching cell_ids; output [..., len(domain)]; NumPy in -> NumPy float64 out, Torch keeps device and dtype"
+  differentiable: in the values (Torch); not in sigma_m or kernel parameters
+  gpu: the gather/scatter runs on the tensor's device; geometry and weights are built on CPU
+  nan: NaN samples are left out; with normalisation the weights are renormalised over the present cells
+  cost: geometry and (default Gaussian) weights are cached in memory; see the filter-cache page
+  pros:
+    - The width keeps the same physical meaning at every level.
+    - Any kernel of the distance (`kernel(distance_m)`), negative weights allowed.
+    - Differentiable in the values; NumPy or Torch, any leading batch dimensions.
+    - "`width_rule=\"matched\"` reaches the requested width down to about half a cell."
+  cons:
+    - "With the default `width_rule=\"sampled\"` the sampled Gaussian is narrower than requested below about one cell."
+    - "Two normalisation parameters: `normalize` (bool) and `normalization` (\"present\" or \"full_disc\"); \"source\" and `blocked_cells` are only on the operators."
+    - Only the WGS84 ellipsoid; the weights are rebuilt (or read from the cache) on every call.
+  use_instead:
+    - when: the same filter is applied many times, the total must be conserved, or land must block the kernel
+      use: gaussian_filter_operator / radial_filter_operator
+      page: conv/filter_operators
+    - when: the weight depends on the bearing too
+      use: directional_filter
+      page: conv/directional_filter
+    - when: an unweighted mean, median, min or max over a radius is enough
+      use: neighbour_reduce
+      page: stats/neighbour_reduce
+    - when: the kernel is very wide (many cells) and the cost of the neighbourhood is too high
+      use: LargeConv.from_gaussian or HealPixWideConv
+      page: conv/compare_wide
+  optional_deps: none
+
+- id: filter_operators
+  title: Filter operators and the land barrier
+  family: A
+  page: conv/filter_operators
+  symbols: [gaussian_filter_operator, radial_filter_operator, apply_filter_operator, FilterOperator]
+  use: [gaussian_filter_operator, apply_filter_operator]
+  also: [blocked_cells]
+  summary: >-
+    Build the sparse weights of a Gaussian or radial filter once (CSR
+    FilterOperator) and apply them many times; conserve the total with
+    normalization="source"; stop the kernel at a coast with blocked_cells.
+  tasks:
+    - apply the same metric filter to many time steps or chunks
+    - do: smooth a field while conserving its total (mass, counts, probability)
+      use: [gaussian_filter_operator]
+    - do: smooth an ocean field without leaking across land (land barrier)
+      use: [gaussian_filter_operator]
+  keywords: [sparse operator, reuse weights, conservative smoothing, land mask, coast, barrier, diffusion, likelihood]
+  domain: whole sphere or regional set of cell ids; rows follow `domain`, columns index `cell_ids`
+  ordering: NESTED cell ids
+  ellipsoid: '"WGS84" (the only accepted value)'
+  io: "the operator is a NumPy CSR NamedTuple (row_offsets, column_indices, weights, n_columns); apply_filter_operator takes values [..., N], NumPy or Torch"
+  differentiable: apply_filter_operator is differentiable in the values; building the operator is NumPy only
+  gpu: application on the tensor's device; the build is CPU only, and GPU timing was never measured
+  nan: "apply_filter_operator: renormalize_missing=False counts NaN as zero (the \"full_disc\" rule), True renormalises over the present cells"
+  cost: >-
+    Built once; the geometry is cached. Near long coasts the land barrier
+    searches every row within 1.5 x truncate x sigma of land: measured on an
+    8125-cell level-10 domain, sigma 4 cells, 25.7 s with the barrier against
+    5.2 s without.
+  pros:
+    - Built once, applied many times.
+    - "`normalization=\"source\"`: the columns sum to 1, so the total is conserved."
+    - "`blocked_cells`: weight travels only through water, along the shortest path of non-blocked cells."
+    - The CSR arrays can be wrapped as a SciPy sparse matrix if wanted (SciPy is not required).
+  cons:
+    - "\"source\" does not preserve a constant field near the edge or near land."
+    - Building near long coasts costs several times more than without barrier.
+    - Real coasts were tried on one demo domain only; GPU and dask were not tried.
+  use_instead:
+    - when: the cells have different levels (multi-order set)
+      use: multiorder_filter_operator
+      page: conv/multiorder_filter
+    - when: one call on one field is enough
+      use: gaussian_filter / radial_filter
+      page: conv/radial_filter
+  optional_deps: none
+
+- id: multiorder_filter
+  title: Multi-order (mixed-level) filtering
+  family: A
+  page: conv/multiorder_filter
+  symbols: [multiorder_filter_operator]
+  summary: >-
+    Build a Gaussian filter operator on leaves of different levels (a 2:1
+    balanced multi-order set), with distance through water and total
+    conservation by default.
+  tasks:
+    - smooth a field held on cells of different levels (multi-order, adaptive refinement)
+  keywords: [multi-order, MOC, mixed resolution, adaptive mesh, river, estuary, total conservation]
+  domain: a set of leaves given as (levels, cell_ids), 2:1 balanced (checked)
+  ordering: NESTED ids at each leaf's level
+  ellipsoid: '"WGS84" (not validated; edge lengths always use WGS84)'
+  io: returns a NumPy FilterOperator over the leaves in input order; apply it with apply_filter_operator
+  differentiable: the build is NumPy only; the application is differentiable in the values
+  gpu: application only
+  nan: through apply_filter_operator
+  cost: to be measured in general; the docs give one example (22 765 leaves, builtin and SciPy shortest paths)
+  pros:
+    - "Mixed levels in one operator; `normalization=\"source\"` (default) conserves the total exactly."
+    - Optional land mask (`blocked`), wet fraction and water contacts.
+    - "The default shortest path (`\"builtin\"`) needs no SciPy."
+  cons:
+    - The leaves must be 2:1 balanced (touching leaves differ by at most one level); a ValueError is raised otherwise.
+    - "No `width_rule` and no `domain` option; `\"full_disc\"` is not available."
+  use_instead:
+    - when: all cells have the same level
+      use: gaussian_filter_operator
+      page: conv/filter_operators
+  optional_deps: "SciPy only for shortest_path=\"scipy\""
+
+- id: filter_cache
+  title: Filter caches
+  family: A
+  page: conv/filter_cache
+  symbols: [configure_radial_filter_cache, radial_filter_cache_info]
+  summary: >-
+    Inspect and bound the in-memory LRU caches of geometry (default 192 MiB)
+    and Gaussian weights (default 96 MiB) used by the metric filters.
+  tasks:
+    - limit or inspect the memory used by the metric filter caches
+  keywords: [cache, memory, LRU, MiB]
+  domain: not applicable
+  differentiable: not applicable
+  cost: none
+  pros:
+    - "Limits in MiB; `0` disables a cache; lowering a limit evicts at once."
+  cons:
+    - In-memory only (no disk cache); a RuntimeWarning is emitted once when one entry is larger than the limit.
+  use_instead:
+    - when: the same weights are reused many times
+      use: a FilterOperator, which you keep yourself
+      page: conv/filter_operators
+  optional_deps: none
+
+- id: directional_filter
+  title: Directional filter (distance and bearing)
+  family: A
+  page: conv/directional_filter
+  symbols: [directional_filter]
+  summary: >-
+    Weight neighbours by a kernel of the geodesic distance in metres and of
+    the bearing relative to an azimuth measured clockwise from North, so the
+    result does not depend on the orientation of the grid.
+  tasks:
+    - filter along a direction (sun azimuth, shadow, wind, swell)
+  keywords: [azimuth, bearing, anisotropic, shadow, wind direction, oriented kernel]
+  domain: whole sphere or regional set of cell ids
+  ordering: NESTED cell ids
+  ellipsoid: '"WGS84" (the only accepted value)'
+  io: values [..., N]; output [..., len(domain)]; NumPy or Torch
+  differentiable: in the values (Torch)
+  gpu: the reduction runs on the tensor's device; geometry on CPU
+  nan: NaN samples are left out
+  cost: not cached; to be measured
+  pros:
+    - Kernel of the real geographic bearing (0 = North, clockwise), not of a pixel direction.
+  cons:
+    - "`normalize` defaults to False, unlike `radial_filter`."
+    - No cache, no `blocked_cells`, no `normalization` option.
+  use_instead:
+    - when: the weight depends on the distance only
+      use: radial_filter
+      page: conv/radial_filter
+    - when: the weights are learned
+      use: HealPixConv
+      page: conv/convol
+  optional_deps: none
+
+# ===========================================================================
+# A. Convolution & filtering — learned, wide and FFT convolutions
+# ===========================================================================
+- id: healpix_conv
+  title: Gauge-equivariant convolution (HealPixConv)
+  family: A
+  page: conv/convol
+  not_exported: [healpix_analyse.convol.HealPixConv]
+  also: [set_kernel]
+  summary: >-
+    A torch nn.Module that applies a small learned stencil (kernel_sz x
+    kernel_sz) at every cell, transported into a local frame, so the result
+    does not depend on how the pixel grid is oriented (gauge equivariance).
+  tasks:
+    - learn a small convolution (3x3, 5x5) in a neural network on the sphere or on a regional domain
+    - build a spherical U-Net or CNN layer that does not depend on the grid orientation
+  keywords: [CNN, deep learning, neural network, learned kernel, equivariant, gauge, U-Net, stencil]
+  domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction
+  ordering: NESTED (the `nest` flag has no effect on the geometry)
+  ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
+  io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out"
+  differentiable: yes, in the input and in the kernel weights
+  gpu: yes (CUDA by default when available)
+  nan: not handled; NaN propagates
+  cost: >-
+    Geometry built once (about 0.8 s at nside 64, G = 4, per the code
+    comments) and cached on disk (HEALPIXCONV_CACHE or ~/.cache/healpixconv).
+    The two geometry buffers [4, G, K*P] take 944 MB at nside 128, G = 4,
+    kernel 5; the forward pass gathers B*C_in*G*K*P values. GPU timing: to be
+    measured.
+  pros:
+    - Gauge-equivariant, with four gauge types (`phi`, `cosmo`, `projected_ref`, `two_ref`) and singularities placed where you want them.
+    - Whole sphere or regional patch; learned weights; NumPy or Torch.
+    - Geometry cached on disk, so a second construction is fast.
+  cons:
+    - "Reach is `kernel_sz // 2` cells: a wide receptive field needs many layers or another tool."
+    - Outputs G*C_out channels; memory grows as B*C_in*G*K*P.
+    - At the edge of a regional domain, missing stencil points take the value of the centre (silent padding).
+    - Not exported from `healpix_analyse`; the disk cache stores float32 buffers, so a float64 layer gets float32 geometry.
+  use_instead:
+    - when: the receptive field must be wide under a memory budget
+      use: LargeConv
+      page: conv/large_conv
+    - when: one large learned kernel on one regional patch
+      use: HealPixFFTConv
+      page: conv/fft_conv
+    - when: no weights are learned and the scale is in metres
+      use: gaussian_filter / radial_filter
+      page: conv/radial_filter
+  optional_deps: none
+
+- id: large_conv
+  title: Wide receptive field (LargeConv) and its Gaussian recipe
+  family: A
+  page: conv/large_conv
+  symbols: [LargeConv, gaussian_plan, GaussianPlan, down_up_blur]
+  also: [from_gaussian, set_gaussian_kernel]
+  summary: >-
+    Reach a wide receptive field cheaply: coarsen with HealPixDown, apply a
+    small HealPixConv, refine with HealPixUp. LargeConv.from_gaussian builds a
+    Gaussian smoothing of a requested width (radians or metres) on that chain.
+  tasks:
+    - learn a convolution with a wide receptive field under a memory budget
+    - do: apply a wide Gaussian smoothing (several cells to tens of cells) on the whole sphere or a large domain
+      use: [LargeConv.from_gaussian]
+  keywords: [receptive field, multiscale, U-Net, coarse-to-fine, wide Gaussian, memory budget]
+  domain: whole sphere or a regional set of cell ids at construction (include a halo)
+  ordering: NESTED only (nest=False raises)
+  ellipsoid: '"WGS84"'
+  io: as HealPixConv; output G*C_out channels
+  differentiable: yes, in the input and the compact kernel (the from_gaussian kernel is frozen)
+  gpu: yes; GPU timing to be measured
+  nan: not handled; NaN propagates
+  cost: >-
+    About 2800 times fewer gathers than a direct 33x33 stencil (nominal count
+    for a 5x5 kernel over 3 levels). gaussian_plan calibrates on first use:
+    16 to 19 s per block, then cached in memory.
+  pros:
+    - Wide receptive field for the cost of a compact kernel.
+    - "`from_gaussian` reaches the requested width within 3.8e-4 relative at the calibration cell, and the width is continuous and increasing in sigma."
+    - Width in radians or `sigma_m` in metres.
+  cons:
+    - "NESTED only; a regional domain needs a halo (Down and Up pad with zeros, so the tail at the edge is lost)."
+    - "Without `from_gaussian`, the automatic level rule gives a staircase width (up to 106 % off near the equator)."
+    - "Narrowest Gaussian about 2.2 cells near the equator, 2.75 cells at 55 degrees; widest about 32 cells at level 10 by default."
+    - "Not conservative: the total of one cell after smoothing is 0.92 to 1.05."
+    - "The width spreads by up to 8 % across the domain at 3 cells (at most 1.5 % from 9 cells)."
+  use_instead:
+    - when: the Gaussian is narrower than about 2 cells, or the total must be conserved
+      use: gaussian_filter / gaussian_filter_operator
+      page: conv/compare_gaussian
+    - when: the kernel is not a Gaussian (formula in metres, raster)
+      use: HealPixWideConv
+      page: conv/wide_conv
+  optional_deps: none
+
+- id: wide_conv
+  title: Wide kernel given as an image, a formula in metres or a raster (HealPixWideConv)
+  family: A
+  page: conv/wide_conv
+  symbols: [HealPixWideConv]
+  also: [from_function, from_radial, from_grid]
+  summary: >-
+    Convolve with one wide fixed kernel that you write down: an image on the
+    HEALPix lattice, a function of east/north offsets or of the distance in
+    metres, or a metric raster. It fits one compact kernel per band of a
+    multiscale pyramid, so the cost is linear in the number of cells.
+  tasks:
+    - convolve with a wide kernel written as a formula in metres, a radial profile or a raster
+  keywords: [wide kernel, point spread function, PSF, raster kernel, formula in metres, exponential kernel]
+  domain: a regional set of cell ids given at call time (sorted); the fit is redone for every new domain
+  ordering: NESTED, sorted cell ids
+  ellipsoid: '"sphere"'
+  io: "x [N] or [..., N] -> same shape; NumPy or Torch (same device and dtype); single channel"
+  differentiable: no (the input is detached)
+  gpu: the result is returned on the input device; to be measured
+  nan: not handled; NaN propagates
+  cost: >-
+    A few seconds for the first fit and about 0.1 s per call at level 17 on
+    65 536 cells (docs); the fit is cached per domain.
+  pros:
+    - The kernel is written in physical units (metres) or as a raster; the four constructors gave the same accuracy in the documented test.
+    - Linear cost on any domain.
+  cons:
+    - Single channel, not differentiable, not a torch Module.
+    - "Approximate: the peak of an exponential kernel reaches only about 0.82 and the far tail floors near 1e-4 (documented measurements)."
+    - Taps that fall outside the domain or off the base face are dropped (with a warning); the fit is per domain.
+    - Assumes sorted cell ids (not checked).
+  use_instead:
+    - when: the weights must be learned
+      use: LargeConv
+      page: conv/large_conv
+    - when: the data have gaps (NaN) or several channels
+      use: HealPixKernelPyramid + HealPixPyramidConv
+      page: conv/pyramid_conv
+    - when: the block is inside one face and an exact geodesic kernel is wanted
+      use: HealPixGeoFFT
+      page: conv/geo_fft
+  optional_deps: none
+
+- id: kernel_pyramid
+  title: Per-band kernels of a pyramid (HealPixKernelPyramid, kernel_*)
+  family: A
+  page: conv/pyramid_conv
+  symbols: [HealPixKernelPyramid, kernel_gaussian, kernel_exponential, kernel_lorentzian, kernel_beta, kernel_anisotropic_gaussian]
+  also: [calibrate, calibrate_joint, from_kernel]
+  summary: >-
+    One small fixed HealPixConv kernel per band of a HealPixDecomp, from an
+    analytic profile kernel_*(rho_pix, phi) or calibrated against a reference
+    operator; used by HealPixPyramidConv.
+  tasks:
+    - define a multiscale filter as one compact kernel per pyramid band
+  keywords: [pyramid, per-band kernel, analytic profile, calibration, Lorentzian, exponential]
+  domain: the domain of the HealPixDecomp it is built on
+  ordering: NESTED
+  ellipsoid: '"sphere" (the HealPixDecomp default is "WGS84": pass the same value to both)'
+  io: a dataclass of per-band kernels; `apply(bands)` applies them without synthesis
+  differentiable: the taps are fixed (no gradient); gradients flow to the data through HealPixPyramidConv
+  cost: "`calibrate`: NumPy least squares; `calibrate_joint`: a direct reference convolution (slow)"
+  pros:
+    - Five analytic profiles in cell units, so the footprint grows with the band.
+    - "`calibrate` fits taps by least squares with NumPy only."
+  cons:
+    - "`calibrate_joint` needs SciPy and a whole-sphere decomposition."
+    - The ellipsoid of the decomposition is not checked against the kernel pyramid.
+  use_instead:
+    - when: you have one wide kernel and want the per-band kernels derived for you
+      use: HealPixWideConv
+      page: conv/wide_conv
+  optional_deps: SciPy for calibrate_joint only
+
+- id: pyramid_conv
+  title: NaN-aware multiscale convolution (HealPixPyramidConv)
+  family: A
+  page: conv/pyramid_conv
+  symbols: [HealPixPyramidConv]
+  summary: >-
+    Apply a HealPixKernelPyramid band by band to the data and to a confidence
+    weight, and combine them with one division after synthesis (normalised
+    convolution), so gaps and weights are handled.
+  tasks:
+    - filter gappy data (NaN, cloud mask, confidence weights) at every scale
+    - filter several channels (e.g. RGB) with a multiscale kernel
+  keywords: [normalized convolution, NaN, gaps, cloud mask, weights, multiscale, multi-channel]
+  domain: whole sphere or a regional set of cell ids (from the HealPixDecomp)
+  ordering: NESTED
+  ellipsoid: from the HealPixDecomp ("WGS84" by default) and the kernel pyramid ("sphere" by default), not checked
+  io: "x [..., N] (+ optional weights) -> same shape; `return_support=True` also gives the support"
+  differentiable: yes, in the input (no trainable parameters)
+  gpu: yes
+  nan: '"normalized" mode is NaN- and weight-aware; "signed" mode is not'
+  cost: "O(N); about 2.5 microseconds per cell on CPU in the documented benchmark"
+  pros:
+    - Gaps and confidence weights handled by normalised convolution.
+    - Linear cost; several channels.
+  cons:
+    - "A block-diagonal (per-band) approximation of the target operator: 22 % RMS error on white noise for a Gaussian of sigma 1.2 cells; on smooth fields the test bound is 15 % and a Lorentzian reached 18.4 % (documented)."
+    - "The \"signed\" mode does not take weights."
+  use_instead:
+    - when: no gaps and a single wide kernel written in metres
+      use: HealPixWideConv
+      page: conv/wide_conv
+    - when: inside one base face, with an exact geodesic kernel
+      use: HealPixGeoFFT
+      page: conv/geo_fft
+  optional_deps: none
+
+- id: fft_conv
+  title: Large learned kernel on one patch, by FFT (HealPixFFTConv)
+  family: A
+  page: conv/fft_conv
+  symbols: [HealPixFFTConv]
+  also: [set_gaussian]
+  summary: >-
+    Project one regional patch onto a local tangent grid (LocalFFT), convolve
+    with a large learned multi-channel kernel by FFT (linear, not circular),
+    and project back.
+  tasks:
+    - learn a large convolution kernel (e.g. 33x33) on one regional patch
+    - do: smooth one patch with a Gaussian by FFT while conserving the total (projection="conservative")
+      use: [HealPixFFTConv.set_gaussian]
+  keywords: [FFT convolution, large kernel, patch, tangent plane, gnomonic, learned, multi-channel]
+  domain: one regional patch of radius at most 10 degrees by default (max_patch_radius_deg), with a halo
+  ordering: NESTED
+  ellipsoid: '"sphere"'
+  io: "[B, N] or [B, C_in, N] -> [B, C_out, N]; [N] -> [C_out, N], or [N] when C_out = 1; NumPy or Torch"
+  differentiable: yes, in the input and the kernel
+  gpu: yes; timing to be measured
+  nan: one NaN makes the whole output NaN
+  cost: FFT cost, independent of the kernel size; worth it for large kernels only
+  pros:
+    - Large learned kernels at FFT cost; dense channel mixing.
+    - "`projection=\"conservative\"` keeps totals; `\"average\"` (default) keeps constants."
+  cons:
+    - "Not gauge-equivariant; one patch only (radius 10 degrees by default)."
+    - The projection round trip is approximate, so an identity kernel is not the identity; blur floor about 0.58 tangent-grid pixel.
+    - Needs a halo; NaN contaminates the whole output.
+  use_instead:
+    - when: the kernel is fixed and the data have gaps, inside one base face
+      use: HealPixGeoFFT
+      page: conv/geo_fft
+    - when: the domain is the whole sphere or larger than one patch
+      use: LargeConv
+      page: conv/large_conv
+  optional_deps: none
+
+- id: geo_fft
+  title: Geodesic kernel by FFT inside one base face (HealPixGeoFFT)
+  family: A
+  page: conv/geo_fft
+  symbols: [HealPixGeoFFT, geo_fft_convolve]
+  summary: >-
+    Convolve a block of cells inside one HEALPix base face with a fixed kernel
+    of the geodesic distance (and azimuth), by FFT on the face lattice itself
+    (no reprojection), with gaps handled as a ratio of two FFTs.
+  tasks:
+    - convolve a regional block with a fixed wide kernel in metres, exactly, with gaps
+    - apply a Matern, Moffat, Voigt or screened-Poisson kernel
+  keywords: [FFT, geodesic kernel, face lattice, gaps, NaN, Matern, Moffat, Voigt, DoG, top hat]
+  domain: a block of cell ids inside one base face (several faces raise ValueError)
+  ordering: NESTED
+  ellipsoid: '"sphere"'
+  io: "x [..., N] -> same shape; NumPy or Torch; nine named kernels or any callable k(rho, phi)"
+  differentiable: yes, in the input
+  gpu: runs on the chosen device (CPU by default)
+  nan: normalized mode (default) is NaN-aware; the result is NaN where the support is too small
+  cost: to be measured (no benchmark yet)
+  pros:
+    - No reprojection; kernel sampled at the true geodesic distance.
+    - Nine named kernels or any callable; units m, km, deg or pix.
+  cons:
+    - One base face only; accuracy drifts near the block edges; a warning is given above 10 degrees of extent.
+    - Fixed kernel (no learning).
+  use_instead:
+    - when: the block crosses base faces
+      use: HealPixPyramidConv or HealPixWideConv
+      page: conv/compare_wide
+    - when: the kernel must be learned
+      use: HealPixFFTConv
+      page: conv/fft_conv
+  optional_deps: "SciPy for the matern, voigt and screened_poisson kernels"
+
+# ===========================================================================
+# C. Spherical harmonics & FFT — transforms and spectra
+# ===========================================================================
+- id: healpix_sht
+  title: Spherical harmonics of a whole-sphere HEALPix map (HEALPixSHT)
+  family: C
+  page: sht/healpix_sht
+  not_exported: [healpix_analyse.healpix_sht.HEALPixSHT]
+  also: [map2alm, alm2map, map2alm_spin, alm2map_spin, anafast, uv_to_curl_div]
+  summary: >-
+    Ring-based spherical harmonic transform of a whole-sphere HEALPix map:
+    analysis, synthesis, spin-1 and spin-2 fields, angular power spectra,
+    batched and differentiable, with the Legendre tables precomputed once.
+  tasks:
+    - do: compute the alm or the angular power spectrum C_ell of a whole-sphere HEALPix map
+      use: [HEALPixSHT.anafast]
+    - do: filter a whole-sphere field in harmonic space (low-pass in ell)
+      use: [HEALPixSHT.map2alm, HEALPixSHT.alm2map]
+    - do: transform a vector or spin-2 field on the whole sphere (E/B modes)
+      use: [HEALPixSHT.map2alm_spin]
+  keywords: [spherical harmonics, SHT, alm, C_ell, anafast, angular power spectrum, spin-2, E/B, global, healpy]
+  domain: whole sphere only (the last dimension must be 12*nside^2)
+  ordering: RING by default; nest=True for NESTED
+  ellipsoid: '"sphere"'
+  io: "(..., N) NumPy or Torch -> Torch on the transform's device; alm (..., K) complex, healpy layout"
+  differentiable: yes
+  gpu: yes (CUDA by default when available)
+  nan: not handled
+  cost: >-
+    The Legendre tables hold about 36*nside^3 complex values: 76 MB at
+    level 6, 0.60 GB at level 7, 4.8 GB at level 8 in complex64; each spin
+    adds twice that. Speed against alm_latlon: to be measured.
+  pros:
+    - Matches healpy conventions (orthonormal, m-major alm layout); validated against healpy in the guide.
+    - Batched, differentiable, GPU; spin 0, 1 and 2.
+  cons:
+    - Whole sphere only; RING by default.
+    - Memory of the tables grows as nside^3 (4.8 GB at level 8 in float32).
+    - "Spin != 0 (and `uv_to_curl_div`) needs `quaternionic` and `spherical`, which are in no extra."
+    - "`uv_to_curl_div` applies no ell-dependent factor: its outputs are not div and curl in 1/s."
+    - Not exported from `healpix_analyse`.
+  use_instead:
+    - when: the grid is ERA5, a regular or Gaussian lat/lon grid, or HEALPix too large for the memory of the tables
+      use: anafast_latlon / map2alm_latlon
+      page: sht/alm_latlon
+    - when: the data cover a regional patch only
+      use: local_ps
+      page: sht/fft_local
+    - when: divergence and curl in physical units on a regional domain
+      use: HealPixDivCurl
+      page: stats/divcurl
+  optional_deps: "quaternionic and spherical for spin != 0 (not in any extra)"
+
+- id: alm_latlon
+  title: Spherical harmonics on lat/lon and other ring grids (alm_latlon)
+  family: C
+  page: sht/alm_latlon
+  symbols: [build_rings_from_latlon, map2alm_latlon, alm2map_latlon, anafast_latlon, compute_weights, grid_summary]
+  summary: >-
+    Spherical harmonic analysis of any grid made of iso-latitude rings (ERA5,
+    regular and Gaussian lat/lon grids, HEALPix): group the samples into
+    rings, choose a quadrature, get alm or C_ell in float64.
+  tasks:
+    - do: compute the angular power spectrum of an ERA5 or other lat/lon field
+      use: [anafast_latlon]
+    - do: compare spectra of a model on a lat/lon grid and observations on HEALPix without regridding
+      use: [anafast_latlon]
+  keywords: [ERA5, ECMWF, Gaussian grid, lat/lon, regular grid, quadrature, Gauss-Legendre, C_ell, alm]
+  domain: whole sphere (any iso-latitude rings; no mask correction)
+  ordering: samples sorted by rings with the sort_idx of build_rings_from_latlon
+  ellipsoid: not applicable (colatitudes and longitudes in radians)
+  io: "(..., n_pix) NumPy or Torch -> Torch float64 / complex128"
+  differentiable: yes for Torch input
+  gpu: the uniform-ring path follows the input device; the irregular-ring path builds a kernel on the CPU
+  nan: not handled
+  cost: the Legendre tables are recomputed in float64 at every call (no cache); grid_summary gives an estimate of the longitude stage
+  pros:
+    - Any iso-latitude grid; three quadratures (trapeze, Gauss-Legendre, equal area) or your own weights.
+    - Only NumPy and Torch; float64 throughout.
+  cons:
+    - Spin 0 only.
+    - "Known issue: `alm2map_latlon` returns the m > 0 terms at half amplitude (measured)."
+    - "Different `lmax` defaults: 64 for `map2alm_latlon` and `anafast_latlon`, 24 for `alm2map_latlon` and `grid_summary`."
+    - Synthesis uses a direct DFT per ring; tables are not cached.
+  use_instead:
+    - when: whole-sphere HEALPix map and enough memory for the tables, or spin-1 / spin-2 fields
+      use: HEALPixSHT
+      page: sht/healpix_sht
+    - when: the data cover a regional patch only
+      use: local_ps
+      page: sht/fft_local
+  optional_deps: none
+
+- id: local_fft
+  title: Local FFT and spectrum of a regional patch (LocalFFT)
+  family: C
+  page: sht/fft_local
+  symbols: [LocalFFT, local_fft, local_ifft, local_ps]
+  not_exported: [healpix_analyse.fft_local.check_kernel_width]
+  summary: >-
+    Project a regional patch of NESTED cells onto a local gnomonic tangent
+    grid, take its 2-D FFT, invert it, and reduce it to a 1-D radial power
+    spectrum (local_ps), on CPU or GPU and differentiably.
+  tasks:
+    - do: compute the power spectrum of a regional patch (one scene, one basin)
+      use: [local_ps]
+    - do: take the 2-D FFT of a regional patch, filter it and go back
+      use: [LocalFFT]
+  keywords: [local FFT, flat sky, tangent plane, gnomonic, power spectrum, Sentinel-2 scene, patch, wavenumber]
+  domain: one regional patch of radius at most max_patch_radius_deg (10 degrees by default, up to 90)
+  ordering: NESTED
+  ellipsoid: '"sphere"'
+  io: "[..., N] NumPy or Torch -> [..., grid, grid] spectrum; NumPy in -> NumPy out"
+  differentiable: yes, in the data
+  gpu: yes (CUDA by default when available)
+  nan: not handled; NaN propagates
+  cost: geometry built once at construction; FFT of the next power of two covering the patch
+  pros:
+    - "`local_ps` is the production-ready local spectrum (linear bins up to Nyquist)."
+    - Batched, differentiable, GPU.
+  cons:
+    - The inverse is a fast interpolating inverse, not a least-squares reconstruction.
+    - "Frequencies are in cycles per tangent unit (about cycles per radian): the spectrum is not a C_ell without calibration."
+    - One patch only (radius 10 degrees by default); no mask correction or apodisation.
+  use_instead:
+    - when: the field covers the whole sphere
+      use: HEALPixSHT.anafast or anafast_latlon
+      page: sht/compare_power_spectra
+    - when: you want to convolve, not to analyse
+      use: HealPixFFTConv or HealPixGeoFFT
+      page: conv/compare_fft
+  optional_deps: none
+
+- id: flat_spectra
+  title: Experimental flat spectra (ps, powerspectra, powerspectra_lonlat)
+  family: C
+  page: sht/powerspectra
+  status: experimental
+  not_exported: [healpix_analyse.ps.ps, healpix_analyse.powerspectra.powerspectra, healpix_analyse.powerspectra_lonlat.powerspectra_lonlat]
+  summary: >-
+    Radial power spectra from a plain 2-D FFT: of a regular 2-D array (ps),
+    or of HEALPix cells through the experimental AlmTransform (powerspectra,
+    powerspectra_lonlat).
+  tasks:
+    - do: get the radial spectrum of a regular 2-D array I have already gridded
+      use: [ps]
+  keywords: [2-D FFT, radial spectrum, regular array, experimental]
+  domain: a regular 2-D array (ps); a 2-D array of RING cell ids (powerspectra)
+  differentiable: no (NumPy binning)
+  cost: plain FFT
+  pros:
+    - "`ps` is simple and self-contained."
+  cons:
+    - Not exported; not differentiable.
+    - "`powerspectra_lonlat` cannot run as written; `powerspectra` prints diagnostics and its `method=\"alm\"` runs the FFT path."
+  use_instead:
+    - when: a HEALPix patch
+      use: local_ps
+      page: sht/fft_local
+    - when: the whole sphere
+      use: HEALPixSHT.anafast or anafast_latlon
+      page: sht/compare_power_spectra
+  optional_deps: matplotlib only for the plotting options
+
+- id: alm_coeffs
+  title: Coefficient container (AlmCoeffs)
+  family: C
+  page: sht/alm_coeffs
+  symbols: [AlmCoeffs]
+  status: unused
+  summary: >-
+    A dataclass holding coefficients (alm), their degrees and orders (l, m)
+    and metadata, with device helpers. No function of the package returns it.
+  tasks:
+    - store spherical harmonic coefficients with their (l, m) indices and metadata
+  keywords: [container, dataclass, alm]
+  domain: not applicable
+  differentiable: holds tensors; no computation
+  cost: none
+  pros:
+    - Validates shapes; .to(), .cpu(), .cuda(), .clone().
+  cons:
+    - Not used by any function of the package (open question whether to keep it).
+  use_instead:
+    - when: you need the coefficients of a map
+      use: HEALPixSHT.map2alm or map2alm_latlon (plain tensors, healpy layout)
+      page: sht/healpix_sht
+  optional_deps: none
+
+# ===========================================================================
+# B. Statistics & local analysis
+# ===========================================================================
+- id: neighbour_reduce
+  title: Neighbourhood statistics within a radius (neighbour_reduce)
+  family: B
+  page: stats/neighbour_reduce
+  symbols: [neighbour_reduce, median_filter, mean_filter, min_filter, max_filter, HealPixNeighbourReducer]
+  summary: >-
+    Unweighted statistic (mean, median, min, max, std, count, mode, any, all,
+    sum) over the cells within a physical radius in metres of each cell.
+  tasks:
+    - do: take the median, minimum or maximum of a field within a radius in metres
+      use: [neighbour_reduce, median_filter, max_filter]
+    - do: count valid cells or take the most frequent class (mode) around each cell
+      use: [neighbour_reduce]
+    - do: apply several reductions on the same cells without rebuilding the neighbourhoods
+      use: [HealPixNeighbourReducer]
+  keywords: [median filter, max filter, min filter, mode filter, local statistics, despeckle, classification smoothing, radius in metres]
+  domain: whole sphere or regional set of cell ids; `domain` selects the output cells
+  ordering: NESTED
+  ellipsoid: '"WGS84" (the only accepted value with the cell-centre neighbourhood)'
+  io: "values [..., N] -> [..., len(domain)]; NumPy in -> NumPy out; dtype depends on the reduction"
+  differentiable: for mean, sum, min, max, median, std (Torch); not for count, mode, any, all
+  gpu: the reduction runs on the input device; neighbourhoods built on CPU
+  nan: propagates (mean, std, min, max, median)
+  cost: >-
+    A Python loop over the output cells; in one CPU test (20 000 cells,
+    level 12, 3 km) mean_filter took about 0.5 s per call, slower than
+    radial_filter with a top-hat kernel. HealPixNeighbourReducer keeps the
+    neighbourhoods between calls.
+  pros:
+    - Ten reductions, including categorical ones (mode, any, all, count).
+    - Radius in metres, the same meaning at every level.
+  cons:
+    - NaN propagates; no weights.
+    - Not the cheapest operator (per-cell Python loop).
+  use_instead:
+    - when: a weighted or NaN-aware mean
+      use: radial_filter / gaussian_filter
+      page: stats/compare_neighbourhood
+    - when: growing or shrinking a mask given as a list of cells
+      use: binary_dilation / binary_erosion
+      page: stats/morphology
+  optional_deps: none
+
+- id: gradient
+  title: East/North gradient of a scalar field (gradient)
+  family: B
+  page: stats/gradient
+  symbols: [gradient, gradient_magnitude, directional_derivative]
+  summary: >-
+    Least-squares East and North derivatives of a scalar field from the
+    immediate neighbours of each cell, in units per metre on WGS84; its
+    magnitude; and the derivative along any azimuth.
+  tasks:
+    - compute the slope, gradient or gradient magnitude of a field (e.g. a DEM, SST fronts)
+    - do: compute the derivative of a field along a direction (azimuth from North)
+      use: [directional_derivative]
+  keywords: [gradient, slope, aspect, DEM, fronts, derivative, east, north, azimuth]
+  domain: whole sphere or regional set of cell ids; `domain` selects the output cells
+  ordering: NESTED
+  ellipsoid: hard-coded "WGS84" (no argument)
+  io: "1-D values only -> (grad_east, grad_north) in units per metre; NumPy in -> NumPy out"
+  differentiable: yes (Torch)
+  gpu: the fit runs on the input device; geometry on CPU at every call
+  nan: NaN neighbours are dropped; a cell gets NaN when its value is not finite or fewer than 2 valid neighbours remain or the fit is degenerate
+  cost: the geometry is rebuilt at every call (no cache); to be measured
+  pros:
+    - True East/North directions and metric distances, no Cartesian assumption.
+    - Works on regional domains and across base-cell boundaries.
+  cons:
+    - One 1-D field per call; no radius, no weights (immediate neighbours only).
+    - WGS84 hard-coded.
+  use_instead:
+    - when: a smoother gradient over a larger scale
+      use: gaussian_filter first, then gradient
+      page: conv/radial_filter
+    - when: divergence and curl of a vector field
+      use: HealPixDivCurl
+      page: stats/divcurl
+  optional_deps: none
+
+- id: divcurl
+  title: Divergence and curl of a flow, at one or every scale (HealPixDivCurl)
+  family: B
+  page: stats/divcurl
+  symbols: [HealPixDivCurl, HealPixMultiScaleDivCurl, HealPixDivCurlPyramid]
+  summary: >-
+    Divergence and curl of a horizontal flow (u east, v north) with fixed
+    derivative-of-Gaussian kernels on the cells, at one scale
+    (HealPixDivCurl) or on every band of a HealPixDecomp pyramid
+    (HealPixMultiScaleDivCurl, which returns a HealPixDivCurlPyramid).
+  tasks:
+    - compute the divergence and vorticity (curl) of wind or currents on a regional domain
+    - do: get divergence and curl at every scale of a multiscale decomposition
+      use: [HealPixMultiScaleDivCurl]
+  keywords: [divergence, curl, vorticity, wind, currents, convergence, eddies, multiscale]
+  domain: whole sphere or regional set of cell ids (cell_ids at construction)
+  ordering: NESTED
+  ellipsoid: '"sphere" (HealPixDivCurl); inherited from the HealPixDecomp ("WGS84" by default) for HealPixMultiScaleDivCurl'
+  io: "[..., 2, N] (u, v) -> [..., 2, N] (div, curl) in 1/s for m/s input; NumPy in -> NumPy out"
+  differentiable: yes, in the input
+  gpu: yes (CUDA by default when available)
+  nan: not handled; NaN propagates
+  cost: one HealPixConv per scale; geometry cached on disk by HealPixConv
+  pros:
+    - Local, works on coastlines and regional domains; one band per physical scale.
+  cons:
+    - Near a mask edge the missing taps take the centre value, so the derivatives are one-sided.
+    - The coarsest band (level 0) holds at most twelve cells.
+    - Different default ellipsoids for the two classes.
+  use_instead:
+    - when: the field covers the whole sphere and spectral accuracy matters
+      use: "HEALPixSHT.map2alm_spin(-v, u, spin=1), multiply the alm by sqrt(l(l+1))/R, then alm2map"
+      page: stats/compare_divcurl
+  optional_deps: none
+
+- id: morphology
+  title: Binary dilation and erosion by a radius (morphology)
+  family: B
+  page: stats/morphology
+  not_exported: [healpix_analyse.morphology.binary_dilation, healpix_analyse.morphology.binary_erosion]
+  summary: >-
+    Grow or shrink a mask, given as a list of active cell ids, by a radius in
+    metres, optionally restricted to a domain.
+  tasks:
+    - grow (dilate) or shrink (erode) a cloud, water or land mask by a distance in metres
+  keywords: [morphology, dilation, erosion, buffer, mask, cloud mask, opening, closing]
+  domain: whole sphere, or restricted to `domain`
+  ordering: NESTED
+  ellipsoid: '"WGS84"'
+  io: a list of active cell ids -> sorted unique cell ids (NumPy)
+  differentiable: no
+  cost: the same neighbourhood search as neighbour_reduce
+  pros:
+    - Metric radius with cell-centre or cone-coverage structuring neighbourhoods; domain-aware.
+  cons:
+    - Not exported; NumPy only; without `domain` a dilation is unbounded.
+  use_instead:
+    - when: the mask is a boolean value per cell
+      use: max_filter / min_filter
+      page: stats/compare_neighbourhood
+  optional_deps: none
+
+- id: components
+  title: Connected components and their areas (components)
+  family: B
+  page: stats/components
+  symbols: [connected_components, component_size, component_area, remove_small_components, healpix_cell_area]
+  summary: >-
+    Label the connected regions of a boolean mask with edge or
+    edge-and-vertex connectivity of the NESTED scheme, count their cells,
+    measure their areas in square metres and remove small ones.
+  tasks:
+    - label connected regions of a mask (clouds, burned areas, water bodies) and measure their areas
+    - remove regions smaller than a number of cells or an area in square metres
+    - do: get the area of a HEALPix cell in square metres on an ellipsoid
+      use: [healpix_cell_area]
+  keywords: [connected components, labelling, objects, blobs, area, segmentation, cell area]
+  domain: whole sphere or regional set of cell ids; `domain` restricts the labelling
+  ordering: NESTED only
+  ellipsoid: '"WGS84" for areas'
+  io: "1-D boolean mask -> (labels int64, n_components); label 0 is the background"
+  differentiable: no (discrete)
+  gpu: Torch input is processed on the CPU and returned on its device
+  cost: union-find; the topology comes from healpix-geo
+  pros:
+    - Edge (4-like) or edge-or-vertex (8-like) connectivity; deterministic labels.
+    - Exact ellipsoidal cell area.
+  cons:
+    - NESTED only; not differentiable.
+  use_instead:
+    - when: a smooth, differentiable measure of the shape of a field
+      use: minkowski_functionals_healpix
+      page: stats/minkowski
+  optional_deps: none
+
+- id: minkowski
+  title: Minkowski functionals, planar and HEALPix (minkowski)
+  family: B
+  page: stats/minkowski
+  symbols: [minkowski_functionals, minkowski_curves, build_healpix_adjacency, minkowski_functionals_healpix, minkowski_curves_healpix]
+  summary: >-
+    Soft, differentiable area, perimeter and Euler characteristic (W0, W1,
+    W2) of a field above a threshold, for batches of planar images or for
+    HEALPix maps after a one-time adjacency setup.
+  tasks:
+    - do: measure area, perimeter and Euler characteristic of a field above thresholds, differentiably (as a loss or a feature)
+      use: [minkowski_functionals_healpix, minkowski_curves_healpix]
+  keywords: [Minkowski functionals, morphology statistics, topology, Euler characteristic, perimeter, loss term]
+  domain: planar [B, N, N] images, or a HEALPix map (whole sphere or cell_ids) for the _healpix variants
+  ordering: NESTED or RING (`nest` of build_healpix_adjacency)
+  ellipsoid: not applicable
+  io: "Torch tensors only; planar: [B, N, N] -> [B]; HEALPix: [..., Npix] -> [...] (curves add a threshold axis)"
+  differentiable: yes after setup (sigmoid thresholds; gradients also flow to a tensor threshold)
+  gpu: yes (Torch)
+  nan: not handled
+  cost: build_healpix_adjacency runs a Python loop over the cells (once)
+  pros:
+    - Differentiable, usable as a loss term; several thresholds at once.
+  cons:
+    - "`build_healpix_adjacency` needs `healpy`, which is not a dependency, and is slow on large maps."
+    - "`minkowski_functionals` and `minkowski_curves` work on planar images, not on HEALPix."
+  use_instead:
+    - when: discrete objects and their areas
+      use: connected_components / component_area
+      page: stats/components
+  optional_deps: healpy for build_healpix_adjacency
+
+# ===========================================================================
+# D. Other tools
+# ===========================================================================
+- id: down
+  title: One level coarser (HealPixDown)
+  family: D
+  page: other/down
+  symbols: [HealPixDown]
+  summary: >-
+    Go one HEALPix level coarser with a Gaussian-weighted average ("smooth"),
+    a smooth average that keeps the global mean ("smooth_conservative"), the
+    mean of the four children ("mean") or their maximum ("maxpool").
+  tasks:
+    - do: coarsen a map by one level while keeping its mean
+      use: [HealPixDown]
+    - build the pooling layer of a spherical U-Net encoder
+  keywords: [downsample, coarsen, pooling, max pooling, average pooling, U-Net, mean conservation]
+  domain: whole sphere or regional set of cell ids at construction
+  ordering: NESTED
+  ellipsoid: '"WGS84"'
+  io: "[N] or [B, N] only -> tuple (y, cell_ids_out); cast to dtype (float32 by default)"
+  differentiable: yes (maxpool almost everywhere, the gradient goes to the largest child)
+  gpu: yes (CUDA by default when available)
+  nan: '"smooth" spreads NaN; "mean" keeps it to the parent, or ignores it with skipna=True'
+  cost: a sparse matrix built once at construction (about 1.5 s at level 8 for smooth in the documented benchmark), then one sparse product
+  pros:
+    - Four modes, with a table of what each conserves.
+    - Whole sphere or regional domain; NumPy or Torch.
+  cons:
+    - "`\"smooth\"` does not conserve the global mean."
+    - "Known issue: `\"maxpool\"` on a regional domain gives a parent with missing children the value of the first input cell."
+    - Only [N] or [B, N] inputs; returns a tuple.
+  use_instead:
+    - when: several levels at once, or another output domain
+      use: resample_healpix
+      page: other/resample
+    - when: a smoothing at the same level
+      use: gaussian_filter
+      page: conv/compare_gaussian
+  optional_deps: none
+
+- id: up
+  title: One level finer (HealPixUp)
+  family: D
+  page: other/up
+  symbols: [HealPixUp]
+  summary: >-
+    Go one HEALPix level finer with the transpose of the smooth Down matrix
+    and a normalisation (col_l1 by default), optionally paired with an
+    existing HealPixDown.
+  tasks:
+    - build the upsampling layer of a spherical U-Net decoder
+  keywords: [upsample, refine, unpooling, decoder, adjoint, transpose]
+  domain: whole sphere or regional set of coarse cell ids
+  ordering: NESTED
+  ellipsoid: '"WGS84" (or that of paired_down)'
+  io: "[N] or [B, N] only -> tuple (y, cell_ids_out)"
+  differentiable: yes
+  gpu: yes
+  nan: not handled
+  cost: sparse matrix built once, then one sparse product
+  pros:
+    - "`col_l1` with `weight_norm=\"l1\"` preserves constants; `paired_down` reuses the exact Down matrix."
+  cons:
+    - "A Down then Up round trip is far from exact on white noise (RMS 0.97 with col_l1, 3.33 with diag_l2 at nside 64, measured)."
+  use_instead:
+    - when: values at arbitrary points rather than at the next level
+      use: get_interp_val
+      page: other/interpolation
+    - when: several levels at once
+      use: resample_healpix
+      page: other/resample
+  optional_deps: none
+
+- id: decomp
+  title: Exactly invertible multiscale pyramid (HealPixDecomp)
+  family: D
+  page: other/decomp
+  symbols: [HealPixDecomp, HealPixPyramid, HealPixWeightedPyramid]
+  summary: >-
+    Split a map into detail bands and a coarse band (a Laplacian pyramid built
+    on HealPixDown and HealPixUp) whose sum gives the map back exactly, with a
+    NaN- and weight-aware variant.
+  tasks:
+    - split a field into scales (multiscale bands) and put it back together exactly
+    - do: decompose a gappy field into scales, ignoring the gaps
+      use: [HealPixDecomp.compute_weighted]
+  keywords: [multiscale, Laplacian pyramid, wavelet-like, bands, scale separation, masked data]
+  domain: whole sphere or regional set of cell ids
+  ordering: NESTED
+  ellipsoid: '"WGS84"'
+  io: "[..., N] -> HealPixPyramid (bands in sorted cell-id order); invert restores the input order"
+  differentiable: yes
+  gpu: yes
+  nan: plain compute propagates NaN; compute_weighted is NaN- and weight-aware
+  cost: one Down and one Up per level, built at construction
+  pros:
+    - Exact synthesis; works on masked regional domains.
+    - "`down_mode` chooses what the coarse band conserves."
+  cons:
+    - The bands are not orthogonal and are correlated.
+  use_instead:
+    - when: a convolution at every scale
+      use: HealPixPyramidConv
+      page: conv/pyramid_conv
+    - when: divergence and curl at every scale
+      use: HealPixMultiScaleDivCurl
+      page: stats/divcurl
+  optional_deps: none
+
+- id: resample
+  title: Between any levels and domains (resample_healpix)
+  family: D
+  page: other/resample
+  symbols: [HealPixResampler, resample_healpix]
+  not_exported: [healpix_analyse.resample.resample_to_latlon_grid]
+  summary: >-
+    Move data from one HEALPix level and domain to another by chaining
+    HealPixDown or HealPixUp steps, normalised by the coverage so gaps are
+    handled; plus a SciPy helper to a regular lat/lon raster.
+  tasks:
+    - do: move a regional field from one HEALPix level to another (coarser or finer)
+      use: [resample_healpix]
+    - do: put two datasets on the same HEALPix level and domain before comparing them
+      use: [HealPixResampler]
+    - do: produce a regular lat/lon raster from scattered samples
+      use: [resample_to_latlon_grid]
+  keywords: [resample, regrid, change level, change resolution, domain, coverage, lat/lon raster]
+  domain: input and output domains chosen independently (in_cell_ids, out_cell_ids)
+  ordering: NESTED
+  ellipsoid: '"WGS84"'
+  io: "[..., N_in] -> tuple (out_data, out_cell_ids); NumPy in -> NumPy out"
+  differentiable: yes (Torch); resample_to_latlon_grid is NumPy only
+  gpu: yes
+  nan: normalised by the coverage; NaN where there is no support
+  cost: build one HealPixResampler and reuse it for repeated calls
+  pros:
+    - Any level to any level, partial domains in and out, gaps handled.
+  cons:
+    - Chained steps on partial or gappy data give a mean of means.
+    - "`resample_to_latlon_grid` is not exported, needs SciPy and is not tied to HEALPix ids."
+  use_instead:
+    - when: one level, inside a network
+      use: HealPixDown / HealPixUp
+      page: other/compare_resolution
+    - when: values at arbitrary points
+      use: get_interp_val
+      page: other/interpolation
+  optional_deps: SciPy for resample_to_latlon_grid only
+
+- id: interpolation
+  title: Values at arbitrary points (get_interp_val)
+  family: D
+  page: other/interpolation
+  not_exported: [healpix_analyse.healpix_interp.get_interp_val, healpix_analyse.healpix_interp.get_interp_weights]
+  summary: >-
+    Bilinear interpolation of a whole-sphere NESTED map at any lon/lat, or
+    the four cells and weights; identical in algorithm to healpy on the
+    sphere, through healpix-geo on other ellipsoids.
+  tasks:
+    - sample a map at stations, ship tracks or profile positions (lon/lat)
+  keywords: [interpolation, bilinear, points, stations, tracks, colocation, healpy get_interp_val]
+  domain: a whole-sphere NESTED map (no cell_ids)
+  ordering: NESTED
+  ellipsoid: '"sphere" (exact string)'
+  io: "lon/lat in degrees, any shape -> values (NumPy)"
+  differentiable: no (NumPy)
+  nan: NaN if one of the four cells is NaN
+  cost: NumPy, no cache
+  pros:
+    - Same algorithm as healpy for "sphere" (validated outside the test suite on about 130 000 points).
+  cons:
+    - Whole-sphere map only; not exported; the level is called `depth`; the ellipsoid name is compared exactly.
+    - The equivalence with healpy is not covered by a test of the repository.
+  use_instead:
+    - when: a regional field to another level or domain
+      use: resample_healpix
+      page: other/resample
+  optional_deps: none
+
+- id: dino
+  title: DINOv3 embeddings of Sentinel-2 data (GetDINOV3SAT)
+  family: D
+  page: other/dino
+  status: experimental
+  symbols: [GetDINOV3SAT, DINOEmbedding, load_dinov3_sat, nested_to_tiles, tiles_to_nested]
+  summary: >-
+    Run an unmodified DINOv3 SAT-493M backbone on HEALPix data (tangent,
+    per-cell or NESTED images) and map every embedding back to a HEALPix
+    cell; plus the NESTED block <-> square image reshape.
+  tasks:
+    - do: compute foundation-model embeddings of Sentinel-2 data on HEALPix cells (for clustering or classification)
+      use: [GetDINOV3SAT]
+    - do: turn NESTED blocks into square images for a CNN, and back
+      use: [nested_to_tiles, tiles_to_nested]
+  keywords: [DINOv3, foundation model, embeddings, Sentinel-2, self-supervised, UMAP, clustering, tiles]
+  domain: the cells present in the data
+  ordering: NESTED
+  ellipsoid: module setting set_ellipsoid(), "sphere" by default
+  io: "data [N, C] reflectances in [0, 1] -> DINOEmbedding (NumPy)"
+  differentiable: no (inference mode)
+  gpu: yes, bf16 autocast on CUDA
+  nan: missing pixels filled (per-tile mean or zero); min_coverage drops tiles
+  cost: one backbone pass per tile (per cell in "percell" mode); cost grows as over_sample**2 and (context_px / cell)**2
+  pros:
+    - No change to the network; embeddings on a fixed grid, comparable across dates.
+    - "`\"tangent\"` (default) corrects the shape distortion of HEALPix cells."
+  cons:
+    - Experimental; the weights are gated by Meta and never downloaded by the package.
+    - Not differentiable; three bands (R, G, B) per run.
+  use_instead:
+    - when: a learned convolution trained on your own data
+      use: HealPixConv / LargeConv
+      page: conv/compare_wide
+  optional_deps: "termcolor (dino extra, torch-hub route) or transformers (dino-hf extra)"
+
+- id: validation
+  title: Reference convolution for tests (validation)
+  family: D
+  page: other/validation
+  not_exported: [healpix_analyse.validation.direct_spherical_convolution]
+  also: [direct_reference_operator_factory, smooth_test_field]
+  summary: >-
+    A direct, non-pyramidal spherical convolution at the exact great-circle
+    distance, independent of HealPixConv, used to test and calibrate the
+    pyramidal convolutions.
+  tasks:
+    - check a fast convolution against a brute-force reference
+  keywords: [reference, oracle, validation, brute force, test]
+  domain: whole sphere or regional set of cell ids
+  ordering: NESTED
+  ellipsoid: '"sphere"'
+  io: "x [N] -> [N] (NumPy)"
+  differentiable: no
+  cost: Python loop over the cells; slow, for test-size maps
+  pros:
+    - Independent of the code it checks; exact distances.
+  cons:
+    - Isotropic kernels only; slow; needs SciPy.
+  use_instead:
+    - when: production filtering
+      use: the tools of family A
+      page: conv/index
+  optional_deps: SciPy

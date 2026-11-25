@@ -1,0 +1,121 @@
+# Tool-choice evaluation set
+#
+# Realistic requests, written as a user would describe their problem, with
+# the tool(s) an assistant should propose. "expected" lists the acceptable
+# answers (any one is right). Names are public symbols, methods written as
+# Class.method, or documented entry points that are not exported.
+#
+# The docs build checks that every expected name is in docs/tools.yaml.
+# scripts/eval_tool_choice.py asks a model to choose a tool for each case,
+# given only llms-full.txt, and reports the hit rate.
+
+cases:
+  # --- A. Convolution & filtering -----------------------------------------
+  - id: smooth-sst-20km
+    question: I have sea surface temperature on HEALPix cells at level 12 over the Bay of Biscay and want to smooth it with a Gaussian of 20 km.
+    expected: [gaussian_filter, gaussian_filter_operator]
+  - id: smooth-subcell
+    question: I need a Gaussian smoothing whose standard deviation is about half a cell, and it must really have that width.
+    expected: [gaussian_filter]
+  - id: smooth-many-timesteps
+    question: I smooth 8760 hourly chlorophyll maps on the same cells with the same 5 km Gaussian. How do I avoid rebuilding the weights every time?
+    expected: [gaussian_filter_operator, apply_filter_operator]
+  - id: conserve-mass
+    question: I spread fish-presence probabilities with a Gaussian kernel and the total probability must stay exactly 1.
+    expected: [gaussian_filter_operator]
+  - id: land-barrier
+    question: When I smooth an ocean tracer near the coast, the kernel leaks weight across a thin peninsula into the next bay. How do I stop that?
+    expected: [gaussian_filter_operator, radial_filter_operator]
+  - id: multiorder
+    question: My grid is adaptive, a river refined to level 15 that opens into a sea held at level 11, and I want to diffuse a concentration on it.
+    expected: [multiorder_filter_operator]
+  - id: custom-radial-kernel
+    question: I want to weight neighbours with an exponential of the geodesic distance in metres, my own formula, up to 3 km.
+    expected: [radial_filter]
+  - id: shadow-direction
+    question: I want to filter cloud-shadow candidates along the direction opposite to the sun azimuth.
+    expected: [directional_filter]
+  - id: learned-small-kernel
+    question: I am building a U-Net on the sphere and need a 3x3 learned convolution layer that does not depend on the grid orientation.
+    expected: [HealPixConv]
+  - id: wide-receptive-field
+    question: My network needs a receptive field of about 30 cells but a 61x61 stencil does not fit in GPU memory.
+    expected: [LargeConv]
+  - id: large-kernel-patch
+    question: I want to learn a 33x33 convolution kernel on one Sentinel-2 tile of a few degrees.
+    expected: [HealPixFFTConv]
+  - id: geodesic-matern-gaps
+    question: Convolve a block of cells inside one base face with a Matern kernel of 50 km, the field has cloud gaps.
+    expected: [HealPixGeoFFT, geo_fft_convolve]
+  - id: psf-raster
+    question: I have a point spread function given as a raster in metres and want to convolve my HEALPix field with it.
+    expected: [HealPixWideConv]
+  - id: gappy-multiscale
+    question: I need a multiscale filter that ignores NaN pixels and works on three channels at once.
+    expected: [HealPixPyramidConv, HealPixKernelPyramid]
+  - id: very-wide-gaussian
+    question: I want a Gaussian smoothing of 25 cells on the whole sphere at level 10, cheaply.
+    expected: [LargeConv.from_gaussian, LargeConv, gaussian_plan]
+
+  # --- B. Statistics & local analysis -------------------------------------
+  - id: median-despeckle
+    question: I want to remove speckle with a median over 60 m around each cell of a SAR backscatter map.
+    expected: [median_filter, neighbour_reduce, HealPixNeighbourReducer]
+  - id: majority-class
+    question: Smooth a land-cover classification by taking the most frequent class within 100 m.
+    expected: [neighbour_reduce, HealPixNeighbourReducer]
+  - id: dem-slope
+    question: Compute the slope magnitude of a DEM stored on HEALPix cells.
+    expected: [gradient_magnitude, gradient]
+  - id: wind-vorticity-coast
+    question: Compute the divergence and vorticity of 10 m wind over a coastal domain with a land mask.
+    expected: [HealPixDivCurl, HealPixMultiScaleDivCurl]
+  - id: dilate-cloud-mask
+    question: Grow my cloud mask by 300 m before using the clear pixels.
+    expected: [binary_dilation, max_filter]
+  - id: label-burned-areas
+    question: Find the separate burned areas in a fire mask and drop those smaller than 1 km2.
+    expected: [remove_small_components, connected_components]
+  - id: minkowski-loss
+    question: I want a differentiable measure of the perimeter and Euler characteristic of a predicted HEALPix field, to use in a loss.
+    expected: [minkowski_functionals_healpix, minkowski_curves_healpix]
+  - id: cell-area
+    question: What is the area in square metres of one cell at level 14 on WGS84?
+    expected: [healpix_cell_area]
+
+  # --- C. Spherical harmonics & FFT ---------------------------------------
+  - id: cl-healpix
+    question: Compute the angular power spectrum of a global HEALPix map of sea level anomaly at level 7.
+    expected: [HEALPixSHT.anafast, HEALPixSHT, anafast_latlon]
+  - id: cl-era5
+    question: Compute the angular power spectrum of an ERA5 2 m temperature field on its regular 0.25 degree grid.
+    expected: [anafast_latlon]
+  - id: spectrum-scene
+    question: I want the power spectrum of one Sentinel-2 scene of 100 km already on HEALPix cells.
+    expected: [local_ps, LocalFFT]
+  - id: lowpass-global
+    question: Low-pass filter a global field by keeping only the spherical harmonics up to ell = 50.
+    expected: [HEALPixSHT.map2alm, HEALPixSHT, map2alm_latlon]
+  - id: fft-filter-patch
+    question: Take the 2-D FFT of a regional patch, remove some wavenumbers and transform back.
+    expected: [LocalFFT, local_fft]
+
+  # --- D. Other tools ------------------------------------------------------
+  - id: coarsen-keep-mean
+    question: Coarsen a level-10 precipitation map by one level while keeping the global mean.
+    expected: [HealPixDown]
+  - id: regrid-domains
+    question: Bring a level-12 product of one domain onto level 9 and onto the cells of another dataset before comparing them.
+    expected: [resample_healpix, HealPixResampler]
+  - id: multiscale-exact
+    question: Split a field into scales and put it back together exactly, with a coastline mask.
+    expected: [HealPixDecomp]
+  - id: buoys
+    question: Sample a global HEALPix SST map at the positions of 500 drifting buoys.
+    expected: [get_interp_val, get_interp_weights]
+  - id: dino-embeddings
+    question: I want foundation-model embeddings of Sentinel-2 RGB on HEALPix cells to cluster land cover.
+    expected: [GetDINOV3SAT]
+  - id: unet-pooling
+    question: What should I use for the pooling and unpooling layers of a HEALPix U-Net?
+    expected: [HealPixDown, HealPixUp]

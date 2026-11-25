@@ -98,7 +98,7 @@ frequency, power = transform.ps(spectrum)
 The transform accepts local NESTED HEALPix patches up to a configurable
 angular radius (10 degrees by default). Its three-dimensional tangent-frame
 construction works at the poles and across 0/360 degrees. See the
-[detailed local FFT documentation](docs/fft_local.md) for geometry,
+[detailed local FFT documentation](docs/sht/fft_local.md) for geometry,
 normalisation, reconstruction accuracy and Sentinel-2 examples.
 
 ### FFT-accelerated large kernels
@@ -118,7 +118,7 @@ y = layer(x)
 ```
 
 The layer performs a zero-padded linear convolution on the same pole-safe
-gnomonic grid used by `LocalFFT`. See the [FFT convolution documentation](docs/fft_conv.md).
+gnomonic grid used by `LocalFFT`. See the [FFT convolution documentation](docs/conv/fft_conv.md).
 
 ### Large receptive-field convolution
 
@@ -137,7 +137,7 @@ y = layer(x)
 
 This example automatically uses three smooth Down operations, a compact
 `5×5` convolution, and the three exactly paired Up operations. See the
-[LargeConv documentation](docs/large_conv.md) for kernel planning, partial
+[LargeConv documentation](docs/conv/large_conv.md) for kernel planning, partial
 patches, gradients and limitations.
 
 ### Exactly reconstructing multiscale decomposition
@@ -152,7 +152,7 @@ u_v_reconstructed = decomp.invert(pyramid)
 
 The pyramid retains the NESTED cell identifiers at every scale and works on
 irregular masked domains such as ocean fields bounded by coastlines. See the
-[multiscale decomposition documentation](docs/decomp.md).
+[multiscale decomposition documentation](docs/other/decomp.md).
 
 ### Convolution with a wide kernel
 
@@ -173,7 +173,7 @@ small (5x5) kernel — fitted automatically from the kernel you supplied — and
 synthesizes. The kernel can be given as an image on the HEALPix lattice, as a
 function of `x, y` or of `r` in metres, or as a metric raster resampled onto the
 cells' true positions. See the
-[wide-kernel convolution documentation](docs/wide_convolution.md).
+[wide-kernel convolution documentation](docs/conv/wide_conv.md).
 
 ### Multiscale divergence and curl
 
@@ -189,7 +189,7 @@ curl = diagnostics.curl
 
 Each scale uses a fixed derivative-of-Gaussian `HealPixConv` kernel normalised
 by that level's physical pixel spacing. See the
-[divergence and curl documentation](docs/divcurl.md).
+[divergence and curl documentation](docs/stats/divcurl.md).
 
 ### HEALPix-to-HEALPix resampling
 
@@ -206,7 +206,7 @@ out_data, out_ids = resample_healpix(
 ```
 
 The output order follows `out_cell_ids`; unavailable cells are filled with
-`NaN`. See the [HEALPix resampling documentation](docs/resample_healpix.md).
+`NaN`. See the [HEALPix resampling documentation](docs/other/resample.md).
 
 ---
 
@@ -227,6 +227,13 @@ pip install -e .
 ## Documentation
 
 Full documentation is available at **[grid4earth.eu/healpix-analyse](https://grid4earth.eu/healpix-analyse/)**.
+It is organised by task (convolution and filtering, statistics, spherical
+harmonics and FFT, other tools), starts with a decision guide, and gives the
+pros, cons and alternatives of every function. The same tool catalogue is
+published for AI assistants as
+[`llms.txt`](https://grid4earth.eu/healpix-analyse/llms.txt) and
+[`llms-full.txt`](https://grid4earth.eu/healpix-analyse/llms-full.txt); its
+source is [`docs/tools.yaml`](docs/tools.yaml).
 
 To build locally:
 
