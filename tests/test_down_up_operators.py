@@ -234,3 +234,74 @@ def test_buffers_follow_to_and_state_dict():
     M = down.sparse_matrix()
     torch.testing.assert_close(down._M_indices, M.indices())
     torch.testing.assert_close(down._M_values, M.values())
+
+
+# ---------------------------------------------------------------------------
+# dtype rule: every mode follows .to(dtype); 16-bit casts keep the matrix
+# ---------------------------------------------------------------------------
+
+DOWN_MODES = ("smooth", "smooth_conservative", "mean", "maxpool")
+
+
+@pytest.mark.parametrize("half", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("regional", [False, True])
+def test_half_precision_cast(half, regional):
+    level = 3
+    ids = _regional_ids(level, 0.5, 5) if regional else None
+    rng = np.random.default_rng(1)
+    for mode in DOWN_MODES:
+        ref = HealPixDown(level, mode=mode, cell_ids=ids, device="cpu")
+        op = HealPixDown(level, mode=mode, cell_ids=ids, device="cpu").to(half)
+        assert op.dtype == half
+        x = torch.as_tensor(rng.standard_normal((2, op.N_in)), dtype=torch.float32)
+        y, _ = op(x.to(half))
+        assert y.dtype == half
+        y_ref, _ = ref(x.to(half).float())
+        torch.testing.assert_close(y.float(), y_ref, rtol=1e-2, atol=1e-2)
+        # numpy input: bfloat16 is returned as float32 (numpy has no bfloat16)
+        y_np, _ = op(x[0].numpy())
+        assert y_np.dtype == (np.float32 if half == torch.bfloat16 else np.float16)
+        if mode in ("smooth", "smooth_conservative"):
+            assert op._M_val.dtype == torch.float32
+        # gradient flows back to the 16-bit input
+        if mode != "maxpool":
+            xh = x.to(half).requires_grad_(True)
+            op(xh)[0].sum().backward()
+            assert xh.grad.dtype == half and torch.isfinite(xh.grad.float()).all()
+
+    up_ids = None if ids is None else np.unique(ids // 4)
+    for kw in (dict(cell_ids=up_ids), dict(paired_down=HealPixDown(
+            level, mode="mean", cell_ids=ids, device="cpu"))):
+        ref = HealPixUp(level - 1, device="cpu", **kw)
+        up = HealPixUp(level - 1, device="cpu", **kw).to(half)
+        z = torch.as_tensor(rng.standard_normal((2, up.N_in)), dtype=torch.float32)
+        yu, _ = up(z.to(half))
+        assert yu.dtype == half and up._col_sum.dtype == torch.float32
+        torch.testing.assert_close(yu.float(), ref(z.to(half).float())[0],
+                                   rtol=1e-2, atol=1e-2)
+    # back to float32: the kept-precision buffers are unchanged
+    up.float()
+    torch.testing.assert_close(up(z)[0], ref(z)[0])
+
+
+@pytest.mark.parametrize("half", [torch.bfloat16, torch.float16])
+def test_half_precision_constructor(half):
+    down = HealPixDown(2, device="cpu", dtype=half)
+    up = HealPixUp(1, device="cpu", dtype=half)
+    assert down._M_val.dtype == torch.float32 and up._M_val.dtype == torch.float32
+    x = torch.randn(down.N_in).to(half)
+    y, _ = down(x)
+    assert y.dtype == half and up(y)[0].dtype == half
+
+
+def test_every_mode_follows_double():
+    level = 2
+    ids = _regional_ids(level, 0.6, 2)
+    x = np.random.default_rng(0).standard_normal(len(ids)).astype(np.float32)
+    for mode in DOWN_MODES:
+        op = HealPixDown(level, mode=mode, cell_ids=ids, device="cpu").double()
+        assert op.dtype == torch.float64
+        assert op(x)[0].dtype == np.float64
+        assert op(torch.as_tensor(x))[0].dtype == torch.float64
+    up = HealPixUp(level - 1, cell_ids=np.unique(ids // 4), device="cpu").double()
+    assert up(np.zeros(up.N_in, np.float32))[0].dtype == np.float64

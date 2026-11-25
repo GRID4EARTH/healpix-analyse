@@ -94,6 +94,8 @@ def _restore_output(
     if was_1d:
         t = t.squeeze(0)   # [N]
     if is_numpy:
+        if t.dtype == torch.bfloat16:      # numpy has no bfloat16
+            t = t.float()
         return t.detach().cpu().numpy()
     return t
 
@@ -101,6 +103,18 @@ def _restore_output(
 # ---------------------------------------------------------------------------
 # Sparse operator kept as CSR buffers (built once, follows .to())
 # ---------------------------------------------------------------------------
+
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+
+# Buffers that keep at least float32 when the module is cast to a 16-bit
+# dtype: the sparse matrix (CPU sparse kernels have no 16-bit version) and the
+# normalisation / coverage vectors.
+_KEEP_PRECISION = ("_M_val", "_MT_val", "_coverage", "_col_sum", "_col_l2")
+
+
+def _storage_dtype(dtype: torch.dtype) -> torch.dtype:
+    """dtype of the stored matrix for a module of dtype ``dtype``."""
+    return torch.float32 if dtype in _HALF_DTYPES else dtype
 
 class _CsrMatmul(torch.autograd.Function):
     """
@@ -133,10 +147,34 @@ class _SparseOperatorMixin:
     arguments, so it is not written to the ``state_dict``.  The
     ``_M_indices`` / ``_M_values`` keys written by older versions are
     accepted and ignored.
+
+    dtype rule, shared by every mode of ``HealPixDown`` and ``HealPixUp``:
+    the output has the module dtype ``self.dtype``, which starts as the
+    constructor ``dtype`` and follows ``.to(dtype)``, ``.double()``,
+    ``.half()``...  (``self.device`` follows ``.to(device)`` likewise).  With
+    a 16-bit dtype the matrix and the normalisation vectors stay in float32
+    (or in their previous precision): the linear part is computed there and
+    the output is cast to the 16-bit dtype.
     """
 
+    def _apply(self, fn, *args, **kwargs):
+        keep = {n: b for n, b in self._buffers.items()
+                if n in _KEEP_PRECISION and b is not None}
+        probe = fn(torch.zeros((), dtype=self.dtype, device=self.device))
+        out = super()._apply(fn, *args, **kwargs)
+        self.dtype, self.device = probe.dtype, probe.device
+        for n, old in keep.items():
+            new = self._buffers[n]
+            if new.dtype in _HALF_DTYPES and old.dtype not in _HALF_DTYPES:
+                self._buffers[n] = old.to(device=new.device)
+        return out
+
+    def _compute_dtype(self) -> torch.dtype:
+        """dtype in which the sparse product is computed."""
+        return self._M_val.dtype if self.dtype in _HALF_DTYPES else self.dtype
+
     def _register_sparse(self, M: torch.Tensor) -> None:
-        M = M.coalesce()
+        M = M.coalesce().to(_storage_dtype(M.dtype))
         with warnings.catch_warnings():
             # torch warns once per process that CSR support is "beta"
             warnings.filterwarnings("ignore", message=".*Sparse CSR tensor support")
@@ -200,7 +238,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
     over the 4 direct NESTED children (``mode="maxpool"``), or their
     unweighted mean (``mode="mean"``).
 
-    Can operate on the full sphere or on a partial-sky subset.
+    Can operate on the full sphere or on a regional domain.
 
     Parameters
     ----------
@@ -220,11 +258,11 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         to use for a hierarchy of maps.  *smooth* does not have this
         property: its weights are normalised per output cell only, which
         preserves constant fields but not the global mean.
-        On a partial sky, a coarse cell is the mean of the children
+        On a regional domain, a coarse cell is the mean of the children
         present in ``cell_ids``; :attr:`coverage` gives the fraction of
         children present, and the mean of the output weighted by
         :attr:`coverage` equals the mean of the input.  This holds for one
-        step: chaining partial-sky operators with incomplete parents gives
+        step: chaining regional-domain operators with incomplete parents gives
         a mean of means.  To stay conservative over several steps, run the
         data and a map of ones through the chain, multiply each step's
         output by that step's :attr:`coverage`, and divide the two at the
@@ -238,7 +276,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         added.  A constant field is preserved (``delta`` is then zero up to
         round-off).  The shift is the same for every cell, so a negative
         ``delta`` can make a non-negative field (a probability, say)
-        slightly negative: positivity is not kept.  On a partial sky the
+        slightly negative: positivity is not kept.  On a regional domain the
         means are weighted by :attr:`coverage` (the fraction of the 4
         children present), as for *mean*.  NaN: ``delta`` is built from
         finite values only, so a NaN stays local and the finite output
@@ -348,7 +386,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
                 "mode='smooth_conservative' requires weight_norm='l1'."
             )
 
-        # ---- partial sky ----
+        # ---- regional domain ----
         self.partial = cell_ids is not None
         if self.partial:
             cell_ids_in = np.asarray(cell_ids, dtype=np.int64).ravel()
@@ -429,7 +467,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         olevel = int(np.log2(self.nside_out))
 
         # ------------------------------------------------------------------
-        # Partial-sky column lookup  (vectorisable via searchsorted)
+        # Regional-domain column lookup  (vectorisable via searchsorted)
         # ------------------------------------------------------------------
         if self.partial:
             # Columns index the *input array*, i.e. the order of cell_ids_in,
@@ -519,7 +557,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
             valid_mask  [i_out, :s] = True
 
         # ------------------------------------------------------------------
-        # 4a. Partial-sky availability mask — vectorised over ALL rows at once
+        # 4a. Regional-domain availability mask — vectorised over ALL rows at once
         # ------------------------------------------------------------------
         if self.partial:
             safe_cands_flat = np.where(valid_mask.ravel(), cands_padded.ravel(), 0)
@@ -602,14 +640,15 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         # ------------------------------------------------------------------
         rows_t = torch.as_tensor(rows_arr, dtype=torch.long,  device=self.device)
         cols_t = torch.as_tensor(cols_arr, dtype=torch.long,  device=self.device)
-        vals_t = torch.as_tensor(vals_arr, dtype=self.dtype,  device=self.device)
+        vdtype = _storage_dtype(self.dtype)
+        vals_t = torch.as_tensor(vals_arr, dtype=vdtype,  device=self.device)
 
         M = torch.sparse_coo_tensor(
             torch.stack([rows_t, cols_t]),
             vals_t,
             size=(self.N_out, self.N_in),
             device=self.device,
-            dtype=self.dtype,
+            dtype=vdtype,
         ).coalesce()
         return M
 
@@ -656,7 +695,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         Registers ``_children_idx`` of shape [N_out, 4] (positions in the
         input array, in the order of ``cell_ids``) and ``_children_valid``
         of shape [N_out, 4] (False where a child is absent from a
-        partial-sky ``cell_ids``).
+        regional ``cell_ids``).
         """
         children = 4 * self._cell_ids_out[:, None] + np.arange(4, dtype=np.int64)
 
@@ -753,9 +792,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         """
         if self.mode != "mean":
             raise ValueError("valid_fraction is only defined for mode='mean'.")
-        t, is_numpy, was_1d = _prepare_input(
-            x, self._children_idx.device, self.dtype
-        )
+        t, is_numpy, was_1d = _prepare_input(x, self.device, self.dtype)
         if t.shape[1] != self.N_in:
             raise ValueError(
                 f"Expected input with {self.N_in} pixels, got {t.shape[1]}."
@@ -785,12 +822,13 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         idx = self._children_idx
         valid = self._children_valid
         rows = torch.arange(self.N_out, device=idx.device)[:, None].expand_as(idx)
-        n = valid.sum(dim=-1, keepdim=True).to(self.dtype).expand(idx.shape)
+        vdtype = _storage_dtype(self.dtype)
+        n = valid.sum(dim=-1, keepdim=True).to(vdtype).expand(idx.shape)
         return torch.sparse_coo_tensor(
             torch.stack([rows[valid], idx[valid]]),
             1.0 / n[valid],
             size=(self.N_out, self.N_in),
-            device=idx.device, dtype=self.dtype,
+            device=idx.device, dtype=vdtype,
         ).coalesce()
 
     @property
@@ -800,7 +838,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         present in ``cell_ids`` (``mode="mean"`` and
         ``"smooth_conservative"``).
 
-        All ones on the full sphere.  On a partial sky, the mean of the
+        All ones on the full sphere.  On a regional domain, the mean of the
         output weighted by this array equals the mean of the input.  It
         does not depend on the data; for the NaN-skipping mean use
         :meth:`valid_fraction`.
@@ -839,12 +877,11 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         cell_ids_out : np.ndarray
             NESTED pixel indices of the output pixels at ``nside_out``.
         """
-        if self.mode in ("smooth", "smooth_conservative"):
-            # device and dtype of the stored matrix (they follow .to())
-            device, dtype = self._M_val.device, self._M_val.dtype
-        else:
-            device, dtype = self._children_idx.device, self.dtype
-        t, is_numpy, was_1d = _prepare_input(x, device, dtype)
+        # self.device / self.dtype follow .to(); the sparse product of a
+        # 16-bit module is computed in the stored precision (float32)
+        linear = self.mode in ("smooth", "smooth_conservative")
+        dtype = self._compute_dtype() if linear else self.dtype
+        t, is_numpy, was_1d = _prepare_input(x, self.device, dtype)
         B, N = t.shape
 
         if N != self.N_in:
@@ -857,6 +894,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
             y = self._apply_sparse(t)       # [B, N_out]
             if self.mode == "smooth_conservative":
                 y = self._conserve_mean(t, y)
+            y = y.to(self.dtype)
 
         elif self.mode == "mean":
             gathered, valid = self._gather_children(t)          # [B, N_out, 4]

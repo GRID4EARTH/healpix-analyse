@@ -37,6 +37,7 @@ import torch.nn as nn
 from healpix_analyse.down import (
     HealPixDown,
     _SparseOperatorMixin,
+    _storage_dtype,
     _prepare_input,
     _restore_output,
 )
@@ -86,7 +87,7 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
     eps : float, default 1e-12
         Small value added to the denominator to avoid division by zero.
     cell_ids : array-like of int or None
-        Coarse pixel indices (NESTED) for partial-sky operation.
+        Coarse pixel indices (NESTED) for a regional domain.
         If ``None``, the operator covers the full sphere.
     device : torch.device or str or None
         Device for computation.  Defaults to CUDA if available, else CPU.
@@ -174,7 +175,7 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
             raise ValueError("up_norm must be 'adjoint', 'col_l1', or 'diag_l2'.")
         self.eps = float(eps)
 
-        # ---- partial sky / exact pairing ----
+        # ---- regional domain / exact pairing ----
         if paired_down is not None:
             if cell_ids is not None:
                 raise ValueError(
@@ -250,7 +251,8 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
             down = paired_down
 
         # Reconstruct Down matrix M_down: [N_in_coarse, N_out_fine]
-        M_down = down.sparse_matrix().to(device=self.device, dtype=self.dtype).coalesce()
+        vdtype = _storage_dtype(self.dtype)
+        M_down = down.sparse_matrix().to(device=self.device, dtype=vdtype).coalesce()
 
         # Transpose → M_up: [N_out_fine, N_in_coarse]
         self._register_sparse(self._transpose_sparse(M_down))
@@ -261,8 +263,8 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
             vals = M_down.values()
             cols = idx[1]   # fine-grid column indices
 
-            col_sum = torch.zeros(self.N_out, device=self.device, dtype=self.dtype)
-            col_l2  = torch.zeros(self.N_out, device=self.device, dtype=self.dtype)
+            col_sum = torch.zeros(self.N_out, device=self.device, dtype=vdtype)
+            col_l2  = torch.zeros(self.N_out, device=self.device, dtype=vdtype)
             col_sum.scatter_add_(0, cols, vals)
             col_l2.scatter_add_(0, cols, vals * vals)
 
@@ -317,9 +319,10 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
         cell_ids_out : np.ndarray
             NESTED pixel indices of the output pixels at ``nside_out``.
         """
-        # device and dtype of the stored matrix (they follow .to())
+        # self.device / self.dtype follow .to(); a 16-bit module computes in
+        # the stored precision (float32) and casts the output
         t, is_numpy, was_1d = _prepare_input(
-            x, self._M_val.device, self._M_val.dtype
+            x, self.device, self._compute_dtype()
         )
         B, N = t.shape
 
@@ -342,4 +345,5 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
 
         # up_norm == "adjoint" → no correction
 
+        y = y.to(self.dtype)
         return _restore_output(y, is_numpy, was_1d), self._cell_ids_out

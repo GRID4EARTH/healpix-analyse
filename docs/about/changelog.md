@@ -72,9 +72,23 @@
   differentiable). Level 8 → 7, one CPU thread, one map: `HealPixDown`
   forward 167 → 12 ms, forward + backward 370 → 15 ms with a per-call peak
   of 151 → 6 MiB; `HealPixUp` forward 153 → 10 ms, forward + backward
-  575 → 36 ms (157 → 9 MiB) (#59). The matrix is no longer in the
-  `state_dict`; older `state_dict`s with `_M_indices` / `_M_values` still
-  load.
+  575 → 36 ms (157 → 9 MiB) (#59).
+- `HealPixDown` and `HealPixUp`: one dtype rule for every mode. The output
+  has the module dtype, which follows `.to(dtype)`, `.double()`, `.half()`
+  (before, `"mean"` and `"maxpool"` kept the constructor dtype). After a cast
+  to `bfloat16` or `float16`, the matrix and the normalisation vectors stay
+  in float32 (the CPU sparse kernels have no 16-bit version), the linear
+  part is computed there, and the output is cast to the 16-bit dtype. A
+  `bfloat16` result for a numpy input is returned as float32.
+
+### Compatibility
+- The matrix of `HealPixDown` / `HealPixUp` is no longer in the
+  `state_dict`. Loading a `state_dict` saved by an older version still works
+  (its `_M_indices` / `_M_values` are ignored), but a `state_dict` saved by
+  this version has no `_M_*` keys, so older versions fail to load it with
+  `strict=True`. Whole modules pickled (`torch.save(module)`) by an older
+  version do not unpickle with this version: rebuild them from their
+  constructor arguments.
 
 ### Removed
 - `down.py`: the old `_build_smooth_matrix` kept in a string, the unused
