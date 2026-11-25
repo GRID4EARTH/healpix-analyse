@@ -189,9 +189,11 @@ def test_gauge_equivariance(backend):
     device = "cuda" if backend == "triton" else "cpu"
     dtype = torch.float32 if backend == "triton" else torch.float64
     tol = 1e-5 if backend == "triton" else 1e-9
+    # geometry built in float64 in both cases: a float32 build rounds the two
+    # rotated stencils differently (~1e-5), which is not what is tested here
     conv = HealPixConv(4, 2, 3, kernel_sz=k, n_gauges=G, gauge_type="projected_ref",
-                       singularity_lonlat=(20.0, 5.0), device=device, dtype=dtype,
-                       cache_dir=None, backend=backend)
+                       singularity_lonlat=(20.0, 5.0), device=device, dtype=torch.float64,
+                       cache_dir=None, backend=backend).to(dtype)
     rng = np.random.default_rng(5)
     W = rng.standard_normal((2, 3, k * k))
     x = torch.as_tensor(rng.standard_normal((2, 2, conv.K)), dtype=dtype, device=device)
