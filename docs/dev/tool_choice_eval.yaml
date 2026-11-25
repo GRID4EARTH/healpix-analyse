@@ -93,6 +93,12 @@ cases:
   - id: spectrum-scene
     question: I want the power spectrum of one Sentinel-2 scene of 100 km already on HEALPix cells.
     expected: [local_ps, LocalFFT]
+  - id: spectrum-with-land
+    question: I want the spectrum of global SST at level 8, where land is NaN, scale by scale, and I need gradients because it is a loss term.
+    expected: [HealPixWaveletSpectrum, HealPixIsotropicWaveletSpectrum, wavelet_power_spectrum]
+  - id: coherence-two-fields
+    question: How coherent are SST and 2 m air temperature at each scale over the North Atlantic? Both are on the same HEALPix cells and land is missing.
+    expected: [HealPixWaveletSpectrum.cross, HealPixWaveletSpectrum]
   - id: lowpass-global
     question: Low-pass filter a global field by keeping only the spherical harmonics up to ell = 50.
     expected: [HEALPixSHT.map2alm, HEALPixSHT, map2alm_latlon]

@@ -14,6 +14,9 @@ FFT-based *convolutions* are in family A ({doc}`/conv/compare_fft`).
    when the memory of `HEALPixSHT` is too large).
 3. **Scalar or vector field?** Spin 1 and 2 are only in `HEALPixSHT`, and
    need the optional `quaternionic` and `spherical` packages.
+4. **Missing data?** With NaN (land, clouds, swaths) or on a regional domain
+   of any size, the wavelet power spectrum gives band powers per level,
+   differentiably ({doc}`wavelet_spectrum`).
 
 Comparison: {doc}`compare_power_spectra`. Divergence and curl, global or
 local: {doc}`/stats/compare_divcurl`.
@@ -41,6 +44,14 @@ healpix_sht_maths
 alm_latlon
 alm_latlon_maths
 alm_coeffs
+```
+
+```{toctree}
+---
+maxdepth: 1
+caption: Spectra with missing data
+---
+wavelet_spectrum
 ```
 
 ```{toctree}

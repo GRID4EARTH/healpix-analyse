@@ -108,6 +108,19 @@ from healpix_analyse.fft_local import (
 
 
 # ---------------------------------------------------------------------------
+# Wavelet power spectrum (NaN- and mask-aware, differentiable)
+# ---------------------------------------------------------------------------
+
+from healpix_analyse.wavelet_spectrum import (
+    HealPixWaveletSpectrum,
+    HealPixIsotropicWaveletSpectrum,
+    wavelet_power_spectrum,
+    wavelet_morlet,
+    wavelet_morlet_isotropic,
+)
+
+
+# ---------------------------------------------------------------------------
 # Minkowski functionals
 # ---------------------------------------------------------------------------
 
@@ -250,6 +263,14 @@ __all__ = [
     "local_fft",
     "local_ifft",
     "local_ps",
+    # ------------------------------------------------------------------
+    # Wavelet power spectrum
+    # ------------------------------------------------------------------
+    "HealPixWaveletSpectrum",
+    "HealPixIsotropicWaveletSpectrum",
+    "wavelet_power_spectrum",
+    "wavelet_morlet",
+    "wavelet_morlet_isotropic",
 
     # ------------------------------------------------------------------
     # Minkowski functionals — 2D planar

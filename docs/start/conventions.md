@@ -164,8 +164,8 @@ input tensor. No GPU timing is published for any tool yet.
 
 | Behaviour | Tools |
 |---|---|
-| NaN-aware: left out and the weights renormalised | `radial_filter`, `gaussian_filter` (`"present"`), `apply_filter_operator(renormalize_missing=True)`, `directional_filter` (with `normalize=True`), `HealPixGeoFFT` (normalized mode), `HealPixPyramidConv` (`"normalized"`), `HealPixDecomp.compute_weighted`, `HealPixResampler`, `HealPixDown(mode="mean", skipna=True)`, `gradient` (NaN neighbours dropped) |
-| NaN propagates | `HealPixConv`, `LargeConv`, `HealPixFFTConv` (one NaN makes the whole output NaN), `HealPixWideConv`, `HealPixDivCurl`, `HealPixDown` (`smooth`, `maxpool`), `HealPixUp`, `HEALPixSHT`, `alm_latlon`, `LocalFFT`, `neighbour_reduce` (`mean`, `median`, `std`, `min`, `max`), `get_interp_val` |
+| NaN-aware: left out and the weights renormalised | `radial_filter`, `gaussian_filter` (`"present"`), `apply_filter_operator(renormalize_missing=True)`, `directional_filter` (with `normalize=True`), `HealPixGeoFFT` (normalized mode), `HealPixPyramidConv` (`"normalized"`), `HealPixDecomp.compute_weighted`, `HealPixResampler`, `HealPixDown(mode="mean", skipna=True)`, `gradient` (NaN neighbours dropped), `HealPixConv(missing="local_mean")` (completed with the valid neighbours or the local mean), `HealPixWaveletSpectrum` and `HealPixIsotropicWaveletSpectrum` |
+| NaN propagates | `HealPixConv` (default `missing="centre"`), `LargeConv`, `HealPixFFTConv` (one NaN makes the whole output NaN), `HealPixWideConv`, `HealPixDivCurl`, `HealPixDown` (`smooth`, `maxpool`), `HealPixUp`, `HEALPixSHT`, `alm_latlon`, `LocalFFT`, `neighbour_reduce` (`mean`, `median`, `std`, `min`, `max`), `get_interp_val` |
 
 ## Spherical-harmonic convention
 

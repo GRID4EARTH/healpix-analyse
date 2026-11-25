@@ -304,7 +304,7 @@ tools:
   family: A
   page: conv/convol
   not_exported: [healpix_analyse.convol.HealPixConv]
-  also: [set_kernel]
+  also: [set_kernel, missing, completed_stencil]
   summary: >-
     A torch nn.Module that applies a small learned stencil (kernel_sz x
     kernel_sz) at every cell, transported into a local frame, so the result
@@ -319,7 +319,7 @@ tools:
   io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out"
   differentiable: yes, in the input and in the kernel weights
   gpu: yes (CUDA by default when available)
-  nan: not handled; NaN propagates
+  nan: not handled by default (NaN propagates); missing="local_mean" completes NaN like pixels outside the domain
   cost: >-
     Geometry built once (about 0.8 s at nside 64, G = 4, per the code
     comments) and cached on disk (HEALPIXCONV_CACHE or ~/.cache/healpixconv).
@@ -333,7 +333,7 @@ tools:
   cons:
     - "Reach is `kernel_sz // 2` cells: a wide receptive field needs many layers or another tool."
     - Outputs G*C_out channels; memory grows as B*C_in*G*K*P.
-    - At the edge of a regional domain, missing stencil points take the value of the centre (silent padding).
+    - "By default, at the edge of a regional domain, missing stencil points take the value of the centre (silent padding); `missing='local_mean'` uses the local mean instead and also completes NaN."
     - Not exported from `healpix_analyse`; the disk cache stores float32 buffers, so a float64 layer gets float32 geometry.
   use_instead:
     - when: the receptive field must be wide under a memory budget
@@ -709,6 +709,63 @@ tools:
     - when: you want to convolve, not to analyse
       use: HealPixFFTConv or HealPixGeoFFT
       page: conv/compare_fft
+  optional_deps: none
+
+- id: wavelet_spectrum
+  title: Wavelet power spectrum with NaN and masks (HealPixWaveletSpectrum)
+  family: C
+  page: sht/wavelet_spectrum
+  symbols: [HealPixWaveletSpectrum, HealPixIsotropicWaveletSpectrum, wavelet_power_spectrum, wavelet_morlet, wavelet_morlet_isotropic]
+  also: [cross, windows, littlewood_paley, scales_per_octave, coverage_weight, down_mode]
+  summary: >-
+    Band power spectrum, one band per HEALPix level (or two per octave), on
+    the full sphere or a regional domain with NaN (land, clouds, swaths): a
+    Morlet wavelet applied with HealPixConv at each level of a HealPixDown
+    descent, with missing stencil points completed by the local mean.
+    Oriented or isotropic, cross-spectra and coherence, differentiable.
+  tasks:
+    - do: compute the power spectrum of a field with NaN or a land mask (SST, clouds, swaths)
+      use: [HealPixWaveletSpectrum, wavelet_power_spectrum]
+    - do: compute a power spectrum on a regional domain of any size, without projection
+      use: [HealPixWaveletSpectrum]
+    - do: use a power spectrum as a differentiable loss in training (match the spectrum of a generated field)
+      use: [HealPixWaveletSpectrum]
+    - do: compute the coherence or cross-spectrum of two fields per scale (model and observation, SST and air temperature)
+      use: [HealPixWaveletSpectrum.cross]
+    - do: get an isotropic band spectrum at a lower cost
+      use: [HealPixIsotropicWaveletSpectrum]
+  keywords: [wavelet, band power, power spectrum, NaN, mask, land mask, SST, coastline, regional, cross-spectrum, coherence, Morlet, scattering S1, loss]
+  domain: whole sphere (cell_ids=None) or a regional set of NESTED cell ids
+  ordering: NESTED
+  ellipsoid: '"WGS84" by default (HealPixConv and HealPixDown); "sphere" for comparisons with anafast'
+  io: "[..., N] NumPy or Torch (NaN = missing, optional weights in [0, 1]) -> dataclass of Torch tensors: power [..., S, G], power_total [..., S], monopole, lowpass_var, n_eff"
+  differentiable: yes, in the data and the weights
+  gpu: yes (CUDA by default when available)
+  nan: handled (missing pixels completed with the local mean inside HealPixConv)
+  cost: >-
+    That of HealPixConv at the finest level, twice (values and mask): about
+    0.3 GB per gathered tensor at level 8 on the full sphere for one map
+    (oriented default), 0.15 GB isotropic; each coarser level 4 times less.
+    GPU timing: to be measured.
+  pros:
+    - Any mask and NaN, full sphere or regional domain; a result at every valid pixel.
+    - Differentiable, batched, GPU; usable as a loss.
+    - "Orientation resolved (G = 4), or isotropic and cheaper; cross-spectra and coherence."
+    - "The frequency 0 is the mean of the level-0 pixels, equal to the mean of the valid pixels (area-weighted mean descent, the default)."
+    - "Per map on the full sphere, the finest band agrees with band-averaged `anafast` within about 4 %."
+  cons:
+    - One band per octave (or two), not a C_ell per ell.
+    - "The default mean descent aliases: below the input level, a band also picks up multipoles beyond its grid (about half of the power for white noise, 5-13 % for C_ell ~ ell^-3), and agrees with band-averaged `anafast` within 9 % one level down and 19 % two levels down; `down_mode=\"smooth\"` aliases about 1 % (within 5 %) but does not conserve the mean."
+    - "Band powers are unnormalised by default; the Littlewood-Paley constants are fitted on demand at small levels."
+    - Bands at levels 0 and 1 are global filters, not local ones.
+    - Validation on real coastlines (ERA5 SST at level 8) and GPU timing still to do.
+  use_instead:
+    - when: the field covers the whole sphere without gaps and you need C_ell per ell
+      use: HEALPixSHT.anafast or anafast_latlon
+      page: sht/compare_power_spectra
+    - when: one gap-free regional patch and a spectrum in cycles per unit length
+      use: local_ps
+      page: sht/fft_local
   optional_deps: none
 
 - id: flat_spectra
