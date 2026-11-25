@@ -46,6 +46,7 @@ from healpix_analyse._stencil_backend import (
     BACKENDS,
     GradientStencil,
     lsq_gradient,
+    triton_available,
 )
 
 
@@ -823,7 +824,10 @@ class HealPixGradient:
     ``(grad_east, grad_north)`` of shape ``[..., N_domain]``.
 
     Torch tensors of float32 / float64 run a fused kernel: Triton on CUDA
-    when it is installed, a loop over the neighbours otherwise.  Neither
+    when it is installed, a loop over the neighbours otherwise.  On CUDA with
+    Triton, float16 / bfloat16 data run the same kernels with fp32
+    accumulation (the reference would compute the normal equations in the
+    16-bit dtype, where squared offsets in metres overflow).  Neither
     materialises the ``[..., N, K]`` gathered tensor, and the backward pass
     is written by hand (on CUDA, a gather on the transposed neighbourhoods:
     no atomics, deterministic).  Other dtypes and NumPy arrays use the
@@ -930,10 +934,19 @@ class HealPixGradient:
                     "'values' must contain numerical scalar values, not bool."
                 )
 
-            if values.dtype not in (
+            fused = values.dtype in (
                 torch.float32,
                 torch.float64,
-            ) or self.domain.size == 0:
+            ) or (
+                # 16-bit data: fp32 accumulation in the Triton kernels; the
+                # reference computes in the 16-bit dtype itself.
+                values.dtype in (torch.float16, torch.bfloat16)
+                and values.is_cuda
+                and backend != "torch"
+                and triton_available()
+            )
+
+            if not fused or self.domain.size == 0:
                 return _torch_gradient_from_geometry(
                     values,
                     self._geometry,

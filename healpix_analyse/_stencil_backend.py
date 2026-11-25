@@ -39,6 +39,8 @@ Triton is optional: without it (or without CUDA) everything runs on the
 from __future__ import annotations
 
 import contextlib
+import math
+import os
 import warnings
 from dataclasses import dataclass, field
 
@@ -54,11 +56,13 @@ __all__ = [
     "stencil_reduce",
     "GradientStencil",
     "lsq_gradient",
+    "divcurl_embed",
+    "divcurl_contract",
 ]
 
 BACKENDS = ("auto", "triton", "torch")
 _TRITON_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-_GRAD_TRITON_DTYPES = (torch.float32, torch.float64)
+_GRAD_TRITON_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 FAST_REDUCTIONS = ("sum", "mean", "min", "max", "median")
 _OPS = {"sum": 0, "mean": 1, "max": 2, "min": 3, "median": 4}
 
@@ -347,160 +351,218 @@ def _torch_reduce_backward(gy, sd, op, sel, n_in, dtype):
 # ===========================================================================
 # Triton kernels
 # ===========================================================================
+#
+# Every kernel handles a block of cells for BB batch rows: the neighbour
+# indices (and, for the gradient, the geometry) are loaded once per program
+# and reused for the BB rows, so the stencil is read ~B/BB times instead of B
+# times.  Tiles (BLOCK_N / BLOCK, BB, warps) are autotuned per problem shape.
+
+
+def _size_class(n):
+    """Coarse size bucket, part of the autotune keys."""
+    return int(math.log2(max(int(n), 1))) // 2
+
 
 if _HAS_TRITON:
 
+    def _cfgs(spec):
+        configs = [triton.Config(kw, num_warps=w) for kw, w in spec]
+        if os.environ.get("TRITON_INTERPRET") == "1":
+            # one config in the interpreter, with several batch rows per program
+            configs = [c for c in configs if c.kwargs["BB"] == 4][:1] or configs[:1]
+        return configs
+
+    _RED_FWD_CFGS = _cfgs([({"BLOCK_N": bn, "BB": bb}, w)
+                           for bn in (16, 32, 64, 128, 256)
+                           for bb in (1, 2, 4, 8) for w in (4, 8)])
+    _BWD_CFGS = _cfgs([({"BLOCK": bl, "BB": bb}, w)
+                       for bl in (64, 128, 256) for bb in (2, 4, 8) for w in (4, 8)])
+    _LSQ_CFGS = _cfgs([({"BLOCK_N": bn, "BB": bb}, w)
+                       for bn in (32, 64, 128, 256) for bb in (1, 2, 4, 8) for w in (4, 8)])
+
+    def _meta(named_args, kwargs):
+        meta = dict(named_args)
+        meta.update(kwargs)
+        return meta
+
+    def _prune_bb(configs, B):
+        bb_max = max(2, _next_pow2(B))
+        kept = [c for c in configs if c.kwargs["BB"] <= bb_max]
+        return kept or configs[:1]
+
+    def _prune_red_fwd(configs, named_args, **kwargs):
+        meta = _meta(named_args, kwargs)
+        bk = meta["BLOCK_K"]
+        if meta["OP"] == 4:   # [BLOCK_N, BK, BK] comparison tile
+            kept = [c for c in configs if c.kwargs["BLOCK_N"] * bk * bk <= 16384
+                    and c.kwargs["BLOCK_N"] <= 64]
+        else:
+            kept = [c for c in configs if c.kwargs["BLOCK_N"] * bk <= 8192]
+        if not kept:
+            kept = [min(configs, key=lambda c: c.kwargs["BLOCK_N"])]
+        return _prune_bb(kept, meta["B"])
+
+    def _prune_bwd(configs, named_args, **kwargs):
+        return _prune_bb(configs, _meta(named_args, kwargs)["B"])
+
+    def _prune_lsq(configs, named_args, **kwargs):
+        meta = _meta(named_args, kwargs)
+        bk = meta["BLOCK_K"]
+        kept = [c for c in configs if c.kwargs["BLOCK_N"] * bk <= 4096] or configs[:1]
+        return _prune_bb(kept, meta["B"])
+
+    @triton.autotune(configs=_RED_FWD_CFGS, key=["KP", "SIZE", "OP", "NEED_SEL", "ACC64"],
+                     prune_configs_by={"early_config_prune": _prune_red_fwd})
     @triton.jit
     def _reduce_fwd_kernel(x_ptr, idx_ptr, cnt_ptr, y_ptr, sel_ptr,
-                           N_IN, N_OUT, KP, B, NBLK,
+                           N_IN, N_OUT, KP, B, SIZE,
                            OP: tl.constexpr, NEED_SEL: tl.constexpr, ACC64: tl.constexpr,
-                           BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
-        """y[b, n] = reduce_k x[b, idx[n, k]] over k < cnt[n]."""
-        pid = tl.program_id(0)
-        b = (pid // NBLK).to(tl.int64)
-        n = (pid % NBLK) * BLOCK_N + tl.arange(0, BLOCK_N)
+                           BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr, BB: tl.constexpr):
+        """y[b, n] = reduce_k x[b, idx[n, k]] over k < cnt[n], for BB rows b."""
+        n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        b0 = tl.program_id(1) * BB
         n_ok = n < N_OUT
         cnt = tl.load(cnt_ptr + n, mask=n_ok, other=0)
         k = tl.arange(0, BLOCK_K)
-        m = n_ok[:, None] & (k[None, :] < cnt[:, None])
-        src = tl.load(idx_ptr + n.to(tl.int64)[:, None] * KP + k[None, :], mask=m, other=0)
-        v = tl.load(x_ptr + b * N_IN + src.to(tl.int64), mask=m, other=0.0)
-        y_off = b * N_OUT + n
-        if OP <= 1:
-            if ACC64:
-                vf = v.to(tl.float64)
-            else:
-                vf = v.to(tl.float32)
-            s = tl.sum(tl.where(m, vf, 0.0), axis=1)
-            if OP == 1:
-                s = s / cnt.to(s.dtype)
-            tl.store(y_ptr + y_off, s.to(y_ptr.dtype.element_ty), mask=n_ok)
-        else:
-            isn = m & (v != v)
-            has_nan = tl.max(isn.to(tl.int32), axis=1) > 0
-            nan_v = tl.sum(tl.where(isn, v, 0.0), axis=1)          # NaN iff has_nan
-            kk = k[None, :]
-            if OP == 4:
-                # rank of each value among the valid ones of its row, ties
-                # broken by tap: a strict total order, so ranks are 0..cnt-1
-                vi = v[:, :, None]
-                vj = v[:, None, :]
-                ki = kk[:, :, None]
-                kj = kk[:, None, :]
-                less = (vj < vi) | ((vj == vi) & (kj < ki))
-                less = less & m[:, None, :]
-                rank = tl.sum(less.to(tl.int32), axis=2)
-                r_lo = (cnt - 1) // 2
-                r_hi = cnt // 2
-                hit_lo = m & (rank == r_lo[:, None])
-                hit_hi = m & (rank == r_hi[:, None])
-                lo = tl.max(tl.where(hit_lo, v, float("-inf")), axis=1)
-                hi = tl.max(tl.where(hit_hi, v, float("-inf")), axis=1)
-                odd = (cnt % 2) == 1
-                val = tl.where(odd, hi, (lo + hi) / 2)
-                out = tl.where(has_nan, nan_v, val)
-                tl.store(y_ptr + y_off, out.to(y_ptr.dtype.element_ty), mask=n_ok)
-                if NEED_SEL:
-                    s_lo = tl.min(tl.where(hit_lo, kk, BLOCK_K), axis=1)
-                    s_hi = tl.min(tl.where(hit_hi, kk, BLOCK_K), axis=1)
-                    s_lo = tl.where(odd | has_nan, -1, s_lo)
-                    s_hi = tl.where(has_nan, -1, s_hi)
-                    tl.store(sel_ptr + y_off, s_lo.to(tl.int16), mask=n_ok)
-                    tl.store(sel_ptr + B * N_OUT + y_off, s_hi.to(tl.int16), mask=n_ok)
-            else:
-                ok = m & (v == v)
-                if OP == 2:
-                    vv = tl.where(ok, v, float("-inf"))
-                    best = tl.max(vv, axis=1)
+        kk = k[None, :]
+        m0 = n_ok[:, None] & (kk < cnt[:, None])
+        src = tl.load(idx_ptr + n.to(tl.int64)[:, None] * KP + kk, mask=m0, other=0).to(tl.int64)
+        for i in tl.static_range(BB):
+            b = (b0 + i).to(tl.int64)
+            row_ok = b < B
+            m = m0 & row_ok
+            out_ok = n_ok & row_ok
+            v = tl.load(x_ptr + b * N_IN + src, mask=m, other=0.0)
+            y_off = b * N_OUT + n
+            if OP <= 1:
+                if ACC64:
+                    vf = v.to(tl.float64)
                 else:
-                    vv = tl.where(ok, v, float("inf"))
-                    best = tl.min(vv, axis=1)
-                cand = tl.where(has_nan[:, None], isn, m & (vv == best[:, None]))
-                sel = tl.min(tl.where(cand, kk, BLOCK_K), axis=1)
-                # the value at the selected tap, exactly (sign of zero included)
-                picked = tl.max(tl.where(kk == sel[:, None], v, float("-inf")), axis=1)
-                out = tl.where(has_nan, nan_v, picked)
-                tl.store(y_ptr + y_off, out.to(y_ptr.dtype.element_ty), mask=n_ok)
-                if NEED_SEL:
-                    tl.store(sel_ptr + y_off, sel.to(tl.int16), mask=n_ok)
+                    vf = v.to(tl.float32)
+                s = tl.sum(tl.where(m, vf, 0.0), axis=1)
+                if OP == 1:
+                    s = s / cnt.to(s.dtype)
+                tl.store(y_ptr + y_off, s.to(y_ptr.dtype.element_ty), mask=out_ok)
+            else:
+                isn = m & (v != v)
+                has_nan = tl.max(isn.to(tl.int32), axis=1) > 0
+                nan_v = tl.sum(tl.where(isn, v, 0.0), axis=1)      # NaN iff has_nan
+                if OP == 4:
+                    # rank of each value among the valid ones of its row, ties
+                    # broken by tap: a strict total order, ranks are 0..cnt-1
+                    vi = v[:, :, None]
+                    vj = v[:, None, :]
+                    less = (vj < vi) | ((vj == vi) & (kk[:, None, :] < kk[:, :, None]))
+                    less = less & m[:, None, :]
+                    rank = tl.sum(less.to(tl.int32), axis=2)
+                    hit_lo = m & (rank == ((cnt - 1) // 2)[:, None])
+                    hit_hi = m & (rank == (cnt // 2)[:, None])
+                    lo = tl.max(tl.where(hit_lo, v, float("-inf")), axis=1)
+                    hi = tl.max(tl.where(hit_hi, v, float("-inf")), axis=1)
+                    odd = (cnt % 2) == 1
+                    val = tl.where(odd, hi, (lo + hi) / 2)
+                    out = tl.where(has_nan, nan_v, val)
+                    tl.store(y_ptr + y_off, out.to(y_ptr.dtype.element_ty), mask=out_ok)
+                    if NEED_SEL:
+                        s_lo = tl.min(tl.where(hit_lo, kk, BLOCK_K), axis=1)
+                        s_hi = tl.min(tl.where(hit_hi, kk, BLOCK_K), axis=1)
+                        s_lo = tl.where(odd | has_nan, -1, s_lo)
+                        s_hi = tl.where(has_nan, -1, s_hi)
+                        tl.store(sel_ptr + y_off, s_lo.to(tl.int16), mask=out_ok)
+                        tl.store(sel_ptr + B * N_OUT + y_off, s_hi.to(tl.int16), mask=out_ok)
+                else:
+                    ok = m & (v == v)
+                    if OP == 2:
+                        vv = tl.where(ok, v, float("-inf"))
+                        best = tl.max(vv, axis=1)
+                    else:
+                        vv = tl.where(ok, v, float("inf"))
+                        best = tl.min(vv, axis=1)
+                    cand = tl.where(has_nan[:, None], isn, m & (vv == best[:, None]))
+                    sel = tl.min(tl.where(cand, kk, BLOCK_K), axis=1)
+                    # the value at the selected tap, exactly (sign of zero included)
+                    picked = tl.max(tl.where(kk == sel[:, None], v, float("-inf")), axis=1)
+                    out = tl.where(has_nan, nan_v, picked)
+                    tl.store(y_ptr + y_off, out.to(y_ptr.dtype.element_ty), mask=out_ok)
+                    if NEED_SEL:
+                        tl.store(sel_ptr + y_off, sel.to(tl.int16), mask=out_ok)
 
+    @triton.autotune(configs=_BWD_CFGS, key=["SIZE", "OP", "ACC64"],
+                     prune_configs_by={"early_config_prune": _prune_bwd})
     @triton.jit
     def _reduce_bwd_kernel(gy_ptr, ptr_ptr, tn_ptr, tk_ptr, cnt_ptr, sel_ptr, gx_ptr,
-                           N_IN, N_OUT, B, NBLK,
-                           OP: tl.constexpr, ACC64: tl.constexpr, BLOCK: tl.constexpr):
-        """gx[b, j] = sum over the entries (n, k) that read j of gy[b, n] * w(n, k)."""
-        pid = tl.program_id(0)
-        b = (pid // NBLK).to(tl.int64)
-        j = (pid % NBLK) * BLOCK + tl.arange(0, BLOCK)
+                           N_IN, N_OUT, B, SIZE,
+                           OP: tl.constexpr, ACC64: tl.constexpr,
+                           BLOCK: tl.constexpr, BB: tl.constexpr):
+        """gx[b, j] = sum over the entries (n, k) that read j of gy[b, n] * w(n, k).
+
+        A gather on the transposed stencil: no atomics, deterministic.  The
+        entries of a block of input cells are read once for BB batch rows.
+        """
+        j = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        bv = tl.program_id(1) * BB + tl.arange(0, BB)
         j_ok = j < N_IN
+        b_ok = bv < B
+        brow = bv.to(tl.int64)[None, :] * N_OUT
         start = tl.load(ptr_ptr + j, mask=j_ok, other=0)
         n_e = tl.load(ptr_ptr + j + 1, mask=j_ok, other=0) - start
         n_max = tl.max(n_e, axis=0)
         if ACC64:
-            acc = tl.zeros((BLOCK,), dtype=tl.float64)
+            acc = tl.zeros((BLOCK, BB), dtype=tl.float64)
         else:
-            acc = tl.zeros((BLOCK,), dtype=tl.float32)
+            acc = tl.zeros((BLOCK, BB), dtype=tl.float32)
         for e in range(0, n_max):
             mm = j_ok & (e < n_e)
+            m2 = mm[:, None] & b_ok[None, :]
             ent = start + e
             nn = tl.load(tn_ptr + ent, mask=mm, other=0).to(tl.int64)
-            g = tl.load(gy_ptr + b * N_OUT + nn, mask=mm, other=0.0).to(acc.dtype)
+            goff = brow + nn[:, None]
+            g = tl.load(gy_ptr + goff, mask=m2, other=0.0).to(acc.dtype)
             if OP == 0:
                 acc += g
             elif OP == 1:
                 c = tl.load(cnt_ptr + nn, mask=mm, other=1).to(acc.dtype)
-                acc += g / c
+                acc += g / c[:, None]
             elif OP == 4:
-                kk = tl.load(tk_ptr + ent, mask=mm, other=-2).to(tl.int32)
-                s_lo = tl.load(sel_ptr + b * N_OUT + nn, mask=mm, other=-1).to(tl.int32)
-                s_hi = tl.load(sel_ptr + B * N_OUT + b * N_OUT + nn, mask=mm, other=-1).to(tl.int32)
+                kk = tl.load(tk_ptr + ent, mask=mm, other=-2).to(tl.int32)[:, None]
+                s_lo = tl.load(sel_ptr + goff, mask=m2, other=-1).to(tl.int32)
+                s_hi = tl.load(sel_ptr + B * N_OUT + goff, mask=m2, other=-1).to(tl.int32)
                 half = g / 2
-                w = tl.where(s_lo >= 0,
-                             tl.where(s_lo == kk, half, 0.0) + tl.where(s_hi == kk, half, 0.0),
-                             tl.where(s_hi == kk, g, 0.0))
-                acc += w
+                acc += tl.where(s_lo >= 0,
+                                tl.where(s_lo == kk, half, 0.0) + tl.where(s_hi == kk, half, 0.0),
+                                tl.where(s_hi == kk, g, 0.0))
             else:
-                kk = tl.load(tk_ptr + ent, mask=mm, other=-2).to(tl.int32)
-                s = tl.load(sel_ptr + b * N_OUT + nn, mask=mm, other=-1).to(tl.int32)
+                kk = tl.load(tk_ptr + ent, mask=mm, other=-2).to(tl.int32)[:, None]
+                s = tl.load(sel_ptr + goff, mask=m2, other=-1).to(tl.int32)
                 acc += tl.where(s == kk, g, 0.0)
-        tl.store(gx_ptr + b * N_IN + j, acc.to(gx_ptr.dtype.element_ty), mask=j_ok)
-
-
-def _fwd_blocks(op, kp):
-    bk = max(2, _next_pow2(kp))
-    if op == "median":
-        bn = max(2, min(128, 8192 // (bk * bk)))
-    else:
-        bn = max(16, min(256, 4096 // bk))
-    return bn, bk
+        tl.store(gx_ptr + bv.to(tl.int64)[None, :] * N_IN + j[:, None],
+                 acc.to(gx_ptr.dtype.element_ty), mask=j_ok[:, None] & b_ok[None, :])
 
 
 def _triton_reduce(x, sd, op, need_sel):
     B, n_in = x.shape
     N, KP = sd.idx.shape
     y = torch.empty(B, N, dtype=x.dtype, device=x.device)
-    if N == 0 or B == 0:
-        sel = None
-        if need_sel and op in ("min", "max", "median"):
-            shape = (2, B, N) if op == "median" else (B, N)
-            sel = torch.empty(shape, dtype=torch.int16, device=x.device)
-        return y, sel
     sel = None
-    if op in ("min", "max"):
-        sel = torch.empty(B, N, dtype=torch.int16, device=x.device) if need_sel else y
-    elif op == "median":
-        sel = torch.empty(2, B, N, dtype=torch.int16, device=x.device) if need_sel else y
-    bn, bk = _fwd_blocks(op, KP)
-    nblk = triton.cdiv(N, bn)
+    if need_sel and op in ("min", "max"):
+        sel = torch.empty(B, N, dtype=torch.int16, device=x.device)
+    elif need_sel and op == "median":
+        sel = torch.empty(2, B, N, dtype=torch.int16, device=x.device)
+    if N == 0 or B == 0:
+        return y, sel
+    bk = max(2, _next_pow2(KP))
+
+    def grid(meta):
+        return (triton.cdiv(N, meta["BLOCK_N"]), triton.cdiv(B, meta["BB"]))
+
     with _device_ctx(x.device):
-        _reduce_fwd_kernel[(B * nblk,)](
+        _reduce_fwd_kernel[grid](
             x, sd.idx, sd.cnt, y, sel if sel is not None else y,
-            n_in, N, KP, B, nblk,
-            OP=_OPS[op], NEED_SEL=bool(need_sel and sel is not None),
-            ACC64=x.dtype == torch.float64, BLOCK_N=bn, BLOCK_K=bk,
-            num_warps=4,
+            n_in, N, KP, B, _size_class(B * N),
+            OP=_OPS[op], NEED_SEL=sel is not None,
+            ACC64=x.dtype == torch.float64, BLOCK_K=bk,
         )
-    return y, (sel if need_sel and op in ("min", "max", "median") else None)
+    return y, sel
 
 
 def _triton_reduce_backward(gy, stencil, sd, op, sel, n_in, dtype):
@@ -510,13 +572,15 @@ def _triton_reduce_backward(gy, stencil, sd, op, sel, n_in, dtype):
     gx = torch.empty(B, n_in, dtype=dtype, device=gy.device)
     if B == 0 or n_in == 0:
         return gx
-    block = 128
-    nblk = triton.cdiv(n_in, block)
+
+    def grid(meta):
+        return (triton.cdiv(n_in, meta["BLOCK"]), triton.cdiv(B, meta["BB"]))
+
     with _device_ctx(gy.device):
-        _reduce_bwd_kernel[(B * nblk,)](
+        _reduce_bwd_kernel[grid](
             gy, ptr, tn, tk, sd.cnt, sel if sel is not None else gy, gx,
-            n_in, N, B, nblk,
-            OP=_OPS[op], ACC64=dtype == torch.float64, BLOCK=block, num_warps=4,
+            n_in, N, B, _size_class(B * n_in),
+            OP=_OPS[op], ACC64=dtype == torch.float64,
         )
     return gx
 
@@ -746,27 +810,38 @@ def _torch_lsq_backward(x, gd, dtype, gu, gw, n_in):
 if _HAS_TRITON:
 
     @triton.jit
-    def _lsq_sums_tile(x_ptr, idx_ptr, e_ptr, no_ptr, ctr_ptr, b, n, n_ok, N_IN, K,
-                       BLOCK_K: tl.constexpr, ACC64: tl.constexpr):
+    def _lsq_geometry(idx_ptr, e_ptr, no_ptr, ctr_ptr, n, n_ok, N_IN, K,
+                      BLOCK_K: tl.constexpr, ACC64: tl.constexpr):
+        """Stencil of a block of cells, loaded once for all the batch rows."""
         k = tl.arange(0, BLOCK_K)
         m = n_ok[:, None] & (k[None, :] < K)
         off = n.to(tl.int64)[:, None] * K + k[None, :]
         src = tl.load(idx_ptr + off, mask=m, other=0)
         geo = m & (src < N_IN)
-        xb = x_ptr + b * N_IN
-        v = tl.load(xb + src.to(tl.int64), mask=geo, other=0.0)
         c = tl.load(ctr_ptr + n, mask=n_ok, other=0).to(tl.int64)
-        xc = tl.load(xb + c, mask=n_ok, other=0.0)
+        if ACC64:
+            E = tl.load(e_ptr + off, mask=m, other=0.0).to(tl.float64)
+            Nn = tl.load(no_ptr + off, mask=m, other=0.0).to(tl.float64)
+        else:
+            E = tl.load(e_ptr + off, mask=m, other=0.0).to(tl.float32)
+            Nn = tl.load(no_ptr + off, mask=m, other=0.0).to(tl.float32)
+        return src.to(tl.int64), geo, c, E, Nn
+
+    @triton.jit
+    def _lsq_row(x_ptr, b, row_ok, src, geo, c, n_ok, E, Nn, N_IN, EPS100,
+                 ACC64: tl.constexpr):
+        """Normal-equation sums of one batch row (registers only)."""
+        xb = x_ptr + b * N_IN
+        v = tl.load(xb + src, mask=geo & row_ok, other=0.0)
+        xc = tl.load(xb + c, mask=n_ok & row_ok, other=0.0)
         if ACC64:
             v = v.to(tl.float64)
             xc = xc.to(tl.float64)
         else:
             v = v.to(tl.float32)
             xc = xc.to(tl.float32)
-        fc = n_ok & (tl.abs(xc) < float("inf"))
+        fc = n_ok & row_ok & (tl.abs(xc) < float("inf"))
         valid = geo & (tl.abs(v) < float("inf")) & fc[:, None]
-        E = tl.load(e_ptr + off, mask=m, other=0.0).to(v.dtype)
-        Nn = tl.load(no_ptr + off, mask=m, other=0.0).to(v.dtype)
         e = tl.where(valid, E, 0.0)
         nn = tl.where(valid, Nn, 0.0)
         d = tl.where(valid, v - tl.where(fc, xc, 0.0)[:, None], 0.0)
@@ -778,109 +853,126 @@ if _HAS_TRITON:
         sum_e = tl.sum(e, axis=1)
         sum_n = tl.sum(nn, axis=1)
         n_valid = tl.sum(valid.to(tl.int32), axis=1)
-        return s_ee, s_en, s_nn, r_e, r_n, sum_e, sum_n, n_valid, fc, c
-
-    @triton.jit
-    def _lsq_fwd_kernel(x_ptr, idx_ptr, e_ptr, no_ptr, ctr_ptr, ge_ptr, gn_ptr,
-                        N_IN, N_OUT, K, NBLK, EPS100,
-                        ACC64: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
-        pid = tl.program_id(0)
-        b = (pid // NBLK).to(tl.int64)
-        n = (pid % NBLK) * BLOCK_N + tl.arange(0, BLOCK_N)
-        n_ok = n < N_OUT
-        s_ee, s_en, s_nn, r_e, r_n, sum_e, sum_n, n_valid, fc, c = _lsq_sums_tile(
-            x_ptr, idx_ptr, e_ptr, no_ptr, ctr_ptr, b, n, n_ok, N_IN, K, BLOCK_K, ACC64)
         det = s_ee * s_nn - s_en * s_en
         scale = tl.maximum(s_ee * s_nn, 1.0)
         solv = fc & (n_valid >= 2) & (det > EPS100 * scale)
         sd = tl.where(solv, det, 1.0)
-        ge = (r_e * s_nn - r_n * s_en) / sd
-        gn = (r_n * s_ee - r_e * s_en) / sd
-        nan = float("nan")
-        ge = tl.where(solv, ge, nan)
-        gn = tl.where(solv, gn, nan)
-        tl.store(ge_ptr + b * N_OUT + n, ge.to(ge_ptr.dtype.element_ty), mask=n_ok)
-        tl.store(gn_ptr + b * N_OUT + n, gn.to(gn_ptr.dtype.element_ty), mask=n_ok)
+        return s_ee, s_en, s_nn, r_e, r_n, sum_e, sum_n, solv, sd
 
+    @triton.autotune(configs=_LSQ_CFGS, key=["K", "SIZE", "ACC64"],
+                     prune_configs_by={"early_config_prune": _prune_lsq})
+    @triton.jit
+    def _lsq_fwd_kernel(x_ptr, idx_ptr, e_ptr, no_ptr, ctr_ptr, ge_ptr, gn_ptr,
+                        N_IN, N_OUT, K, B, SIZE, EPS100,
+                        ACC64: tl.constexpr, BLOCK_K: tl.constexpr,
+                        BLOCK_N: tl.constexpr, BB: tl.constexpr):
+        n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        b0 = tl.program_id(1) * BB
+        n_ok = n < N_OUT
+        src, geo, c, E, Nn = _lsq_geometry(idx_ptr, e_ptr, no_ptr, ctr_ptr, n, n_ok,
+                                           N_IN, K, BLOCK_K, ACC64)
+        for i in tl.static_range(BB):
+            b = (b0 + i).to(tl.int64)
+            row_ok = b < B
+            s_ee, s_en, s_nn, r_e, r_n, sum_e, sum_n, solv, sd = _lsq_row(
+                x_ptr, b, row_ok, src, geo, c, n_ok, E, Nn, N_IN, EPS100, ACC64)
+            ge = tl.where(solv, (r_e * s_nn - r_n * s_en) / sd, float("nan"))
+            gn = tl.where(solv, (r_n * s_ee - r_e * s_en) / sd, float("nan"))
+            out_ok = n_ok & row_ok
+            tl.store(ge_ptr + b * N_OUT + n, ge.to(ge_ptr.dtype.element_ty), mask=out_ok)
+            tl.store(gn_ptr + b * N_OUT + n, gn.to(gn_ptr.dtype.element_ty), mask=out_ok)
+
+    @triton.autotune(configs=_LSQ_CFGS, key=["K", "SIZE", "ACC64"],
+                     prune_configs_by={"early_config_prune": _prune_lsq})
     @triton.jit
     def _lsq_bwd1_kernel(x_ptr, idx_ptr, e_ptr, no_ptr, ctr_ptr, gu_ptr, gw_ptr,
                          p_ptr, q_ptr, gx_ptr,
-                         N_IN, N_OUT, K, NBLK, EPS100,
-                         ACC64: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                         N_IN, N_OUT, K, B, SIZE, EPS100,
+                         ACC64: tl.constexpr, BLOCK_K: tl.constexpr,
+                         BLOCK_N: tl.constexpr, BB: tl.constexpr):
         """P, Q per output cell, and the centre term written at gx[b, c(n)]."""
-        pid = tl.program_id(0)
-        b = (pid // NBLK).to(tl.int64)
-        n = (pid % NBLK) * BLOCK_N + tl.arange(0, BLOCK_N)
+        n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        b0 = tl.program_id(1) * BB
         n_ok = n < N_OUT
-        s_ee, s_en, s_nn, r_e, r_n, sum_e, sum_n, n_valid, fc, c = _lsq_sums_tile(
-            x_ptr, idx_ptr, e_ptr, no_ptr, ctr_ptr, b, n, n_ok, N_IN, K, BLOCK_K, ACC64)
-        det = s_ee * s_nn - s_en * s_en
-        scale = tl.maximum(s_ee * s_nn, 1.0)
-        solv = fc & (n_valid >= 2) & (det > EPS100 * scale)
-        sd = tl.where(solv, det, 1.0)
-        gu = tl.load(gu_ptr + b * N_OUT + n, mask=n_ok, other=0.0).to(s_ee.dtype)
-        gw = tl.load(gw_ptr + b * N_OUT + n, mask=n_ok, other=0.0).to(s_ee.dtype)
-        gu = tl.where(solv, gu, 0.0)
-        gw = tl.where(solv, gw, 0.0)
-        P = tl.where(solv, (gu * s_nn - gw * s_en) / sd, 0.0)
-        Q = tl.where(solv, (gw * s_ee - gu * s_en) / sd, 0.0)
-        tl.store(p_ptr + b * N_OUT + n, P, mask=n_ok)
-        tl.store(q_ptr + b * N_OUT + n, Q, mask=n_ok)
-        ctr_term = -(sum_e * P + sum_n * Q)
-        tl.store(gx_ptr + b * N_IN + c, ctr_term.to(gx_ptr.dtype.element_ty), mask=n_ok)
+        src, geo, c, E, Nn = _lsq_geometry(idx_ptr, e_ptr, no_ptr, ctr_ptr, n, n_ok,
+                                           N_IN, K, BLOCK_K, ACC64)
+        for i in tl.static_range(BB):
+            b = (b0 + i).to(tl.int64)
+            row_ok = b < B
+            out_ok = n_ok & row_ok
+            s_ee, s_en, s_nn, r_e, r_n, sum_e, sum_n, solv, sd = _lsq_row(
+                x_ptr, b, row_ok, src, geo, c, n_ok, E, Nn, N_IN, EPS100, ACC64)
+            gu = tl.load(gu_ptr + b * N_OUT + n, mask=out_ok, other=0.0).to(s_ee.dtype)
+            gw = tl.load(gw_ptr + b * N_OUT + n, mask=out_ok, other=0.0).to(s_ee.dtype)
+            gu = tl.where(solv, gu, 0.0)
+            gw = tl.where(solv, gw, 0.0)
+            P = tl.where(solv, (gu * s_nn - gw * s_en) / sd, 0.0)
+            Q = tl.where(solv, (gw * s_ee - gu * s_en) / sd, 0.0)
+            tl.store(p_ptr + b * N_OUT + n, P, mask=out_ok)
+            tl.store(q_ptr + b * N_OUT + n, Q, mask=out_ok)
+            ctr_term = -(sum_e * P + sum_n * Q)
+            tl.store(gx_ptr + b * N_IN + c, ctr_term.to(gx_ptr.dtype.element_ty), mask=out_ok)
 
+    @triton.autotune(configs=_BWD_CFGS, key=["SIZE", "ACC64"],
+                     prune_configs_by={"early_config_prune": _prune_bwd},
+                     restore_value=["gx_ptr"])
     @triton.jit
     def _lsq_bwd2_kernel(x_ptr, p_ptr, q_ptr, ptr_ptr, tn_ptr, te_ptr, tno_ptr, gx_ptr,
-                         N_IN, N_OUT, NBLK,
-                         ACC64: tl.constexpr, BLOCK: tl.constexpr):
+                         N_IN, N_OUT, B, SIZE,
+                         ACC64: tl.constexpr, BLOCK: tl.constexpr, BB: tl.constexpr):
         """gx[b, j] += finite(x_j) * sum over entries (n, k) reading j of e P + n Q."""
-        pid = tl.program_id(0)
-        b = (pid // NBLK).to(tl.int64)
-        j = (pid % NBLK) * BLOCK + tl.arange(0, BLOCK)
+        j = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        bv = tl.program_id(1) * BB + tl.arange(0, BB)
         j_ok = j < N_IN
-        xj = tl.load(x_ptr + b * N_IN + j, mask=j_ok, other=0.0)
-        acc = tl.load(gx_ptr + b * N_IN + j, mask=j_ok, other=0.0)
-        if ACC64:
-            acc = acc.to(tl.float64)
-        else:
-            acc = acc.to(tl.float32)
+        b_ok = bv < B
+        mo = j_ok[:, None] & b_ok[None, :]
+        xoff = bv.to(tl.int64)[None, :] * N_IN + j[:, None]
+        prow = bv.to(tl.int64)[None, :] * N_OUT
         start = tl.load(ptr_ptr + j, mask=j_ok, other=0)
         n_e = tl.load(ptr_ptr + j + 1, mask=j_ok, other=0) - start
         n_max = tl.max(n_e, axis=0)
-        part = tl.zeros((BLOCK,), dtype=acc.dtype)
+        if ACC64:
+            part = tl.zeros((BLOCK, BB), dtype=tl.float64)
+        else:
+            part = tl.zeros((BLOCK, BB), dtype=tl.float32)
         for e in range(0, n_max):
             mm = j_ok & (e < n_e)
+            m2 = mm[:, None] & b_ok[None, :]
             ent = start + e
             nn = tl.load(tn_ptr + ent, mask=mm, other=0).to(tl.int64)
-            te = tl.load(te_ptr + ent, mask=mm, other=0.0).to(acc.dtype)
-            tno = tl.load(tno_ptr + ent, mask=mm, other=0.0).to(acc.dtype)
-            P = tl.load(p_ptr + b * N_OUT + nn, mask=mm, other=0.0)
-            Q = tl.load(q_ptr + b * N_OUT + nn, mask=mm, other=0.0)
-            part += te * P + tno * Q
-        fin = tl.abs(xj.to(acc.dtype)) < float("inf")
-        acc += tl.where(fin, part, 0.0)
-        tl.store(gx_ptr + b * N_IN + j, acc.to(gx_ptr.dtype.element_ty), mask=j_ok)
+            te = tl.load(te_ptr + ent, mask=mm, other=0.0).to(part.dtype)
+            tno = tl.load(tno_ptr + ent, mask=mm, other=0.0).to(part.dtype)
+            P = tl.load(p_ptr + prow + nn[:, None], mask=m2, other=0.0)
+            Q = tl.load(q_ptr + prow + nn[:, None], mask=m2, other=0.0)
+            part += te[:, None] * P + tno[:, None] * Q
+        xj = tl.load(x_ptr + xoff, mask=mo, other=0.0).to(part.dtype)
+        acc = tl.load(gx_ptr + xoff, mask=mo, other=0.0).to(part.dtype)
+        acc += tl.where(tl.abs(xj) < float("inf"), part, 0.0)
+        tl.store(gx_ptr + xoff, acc.to(gx_ptr.dtype.element_ty), mask=mo)
 
 
-def _grad_blocks(k):
-    bk = max(2, _next_pow2(k))
-    return max(16, min(256, 2048 // bk)), bk
+def _geo_dtype(dtype):
+    """dtype of the geometry and of the accumulators (fp32 for 16-bit data)."""
+    return _acc_dtype(dtype)
 
 
 def _triton_lsq_forward(x, gd, dtype):
     B, n_in = x.shape
     N, K = gd.idx.shape
+    gdt = _geo_dtype(dtype)
     ge = torch.empty(B, N, dtype=dtype, device=x.device)
     gn = torch.empty(B, N, dtype=dtype, device=x.device)
     if B * N == 0:
         return ge, gn
-    bn, bk = _grad_blocks(K)
-    nblk = triton.cdiv(N, bn)
+
+    def grid(meta):
+        return (triton.cdiv(N, meta["BLOCK_N"]), triton.cdiv(B, meta["BB"]))
+
     with _device_ctx(x.device):
-        _lsq_fwd_kernel[(B * nblk,)](
-            x, gd.idx, gd.east[dtype], gd.north[dtype], gd.ctr, ge, gn,
-            n_in, N, K, nblk, 100.0 * torch.finfo(dtype).eps,
-            ACC64=dtype == torch.float64, BLOCK_N=bn, BLOCK_K=bk, num_warps=4,
+        _lsq_fwd_kernel[grid](
+            x, gd.idx, gd.east[gdt], gd.north[gdt], gd.ctr, ge, gn,
+            n_in, N, K, B, _size_class(B * N), 100.0 * torch.finfo(gdt).eps,
+            ACC64=gdt == torch.float64, BLOCK_K=max(2, _next_pow2(K)),
         )
     return ge, gn
 
@@ -888,30 +980,33 @@ def _triton_lsq_forward(x, gd, dtype):
 def _triton_lsq_backward(x, gstencil, gd, dtype, gu, gw):
     B, n_in = x.shape
     N, K = gd.idx.shape
-    gx = torch.zeros(B, n_in, dtype=dtype, device=x.device)
+    gdt = _geo_dtype(dtype)
+    gx = torch.zeros(B, n_in, dtype=gdt, device=x.device)
     if B * N == 0:
-        return gx
-    P = torch.empty(B, N, dtype=dtype, device=x.device)
-    Q = torch.empty(B, N, dtype=dtype, device=x.device)
-    bn, bk = _grad_blocks(K)
-    nblk = triton.cdiv(N, bn)
-    eps100 = 100.0 * torch.finfo(dtype).eps
-    acc64 = dtype == torch.float64
-    ptr, tn, te, tno = gstencil.transposed(x.device, dtype)
+        return gx.to(dtype)
+    P = torch.empty(B, N, dtype=gdt, device=x.device)
+    Q = torch.empty(B, N, dtype=gdt, device=x.device)
+    acc64 = gdt == torch.float64
+    ptr, tn, te, tno = gstencil.transposed(x.device, gdt)
+
+    def grid1(meta):
+        return (triton.cdiv(N, meta["BLOCK_N"]), triton.cdiv(B, meta["BB"]))
+
+    def grid2(meta):
+        return (triton.cdiv(n_in, meta["BLOCK"]), triton.cdiv(B, meta["BB"]))
+
     with _device_ctx(x.device):
-        _lsq_bwd1_kernel[(B * nblk,)](
-            x, gd.idx, gd.east[dtype], gd.north[dtype], gd.ctr,
-            gu.to(dtype).contiguous(), gw.to(dtype).contiguous(), P, Q, gx,
-            n_in, N, K, nblk, eps100,
-            ACC64=acc64, BLOCK_N=bn, BLOCK_K=bk, num_warps=4,
+        _lsq_bwd1_kernel[grid1](
+            x, gd.idx, gd.east[gdt], gd.north[gdt], gd.ctr,
+            gu.contiguous(), gw.contiguous(), P, Q, gx,
+            n_in, N, K, B, _size_class(B * N), 100.0 * torch.finfo(gdt).eps,
+            ACC64=acc64, BLOCK_K=max(2, _next_pow2(K)),
         )
-        block = 128
-        nb2 = triton.cdiv(n_in, block)
-        _lsq_bwd2_kernel[(B * nb2,)](
-            x, P, Q, ptr, tn, te, tno, gx, n_in, N, nb2,
-            ACC64=acc64, BLOCK=block, num_warps=4,
+        _lsq_bwd2_kernel[grid2](
+            x, P, Q, ptr, tn, te, tno, gx, n_in, N, B, _size_class(B * n_in),
+            ACC64=acc64,
         )
-    return gx
+    return gx.to(dtype)
 
 
 @dataclass(frozen=True)
@@ -921,16 +1016,22 @@ class _GradOpts:
 
 
 class LsqGradientFunction(torch.autograd.Function):
-    """``x [B, n_in] -> (g_east [B, N], g_north [B, N])``."""
+    """``x [B, n_in] -> (g_east [B, N], g_north [B, N])``.
+
+    16-bit data compute in fp32 (geometry, sums and gradients) and return
+    the input dtype.
+    """
 
     @staticmethod
     def forward(ctx, x, opts):
         dtype = x.dtype
-        gd = opts.stencil.on(x.device, dtype)
+        gdt = _geo_dtype(dtype)
+        gd = opts.stencil.on(x.device, gdt)
         if opts.use_triton:
             ge, gn = _triton_lsq_forward(x, gd, dtype)
         else:
-            ge, gn = _torch_lsq_forward(x, gd, dtype)
+            ge, gn = _torch_lsq_forward(x.to(gdt), gd, gdt)
+            ge, gn = ge.to(dtype), gn.to(dtype)
         ctx.opts = opts
         ctx.save_for_backward(x)
         return ge, gn
@@ -940,7 +1041,8 @@ class LsqGradientFunction(torch.autograd.Function):
         (x,) = ctx.saved_tensors
         opts = ctx.opts
         dtype = x.dtype
-        gd = opts.stencil.on(x.device, dtype)
+        gdt = _geo_dtype(dtype)
+        gd = opts.stencil.on(x.device, gdt)
         if gu is None:
             gu = torch.zeros(x.shape[0], gd.idx.shape[0], dtype=dtype, device=x.device)
         if gw is None:
@@ -948,14 +1050,253 @@ class LsqGradientFunction(torch.autograd.Function):
         if opts.use_triton and not torch.is_grad_enabled():
             gx = _triton_lsq_backward(x, opts.stencil, gd, dtype, gu, gw)
         else:
-            gx = _torch_lsq_backward(x.detach(), gd, dtype, gu.to(dtype), gw.to(dtype),
-                                     x.shape[1])
+            gx = _torch_lsq_backward(x.detach().to(gdt), gd, gdt, gu.to(gdt), gw.to(gdt),
+                                     x.shape[1]).to(dtype)
         return gx, None
 
 
 def lsq_gradient(x, stencil, *, backend="auto"):
-    """Least-squares tangent gradient of ``x [B, n_in]`` (float32 / float64)."""
+    """Least-squares tangent gradient of ``x [B, n_in]``.
+
+    float32 / float64 everywhere; float16 / bfloat16 on the Triton backend
+    (fp32 accumulation).
+    """
     use_triton = _use_triton(x, backend, _GRAD_TRITON_DTYPES, kp_ok=stencil.k <= 64)
     if use_triton:
         x = x.contiguous()
     return LsqGradientFunction.apply(x, _GradOpts(use_triton, stencil))
+
+
+# ===========================================================================
+# Divergence / curl: the embedding and the contraction around HealPixConv
+# ===========================================================================
+#
+# HealPixDivCurl = embed -> HealPixConv (3 -> 6 channels per gauge) -> contract.
+#
+#   embed:    V[b, c, n] = u[b, n] east[c, n] + v[b, n] north[c, n]      c < 3
+#   contract: div[b, n]  = s sum_g sum_c a[g,c,n] Da[b,g,c,n] + bx[g,c,n] Db[b,g,c,n]
+#             curl[b, n] = s sum_g sum_c bx[g,c,n] Da[b,g,c,n] - a[g,c,n] Db[b,g,c,n]
+#
+# (s = 1/G with the gauge mean, else one output per gauge).  Each is one
+# elementwise pass, forward and backward, instead of ~10 PyTorch kernels and
+# their intermediate tensors; no atomics.
+
+if _HAS_TRITON:
+
+    _EW_CFGS = _cfgs([({"BLOCK": bl, "BB": bb}, w)
+                      for bl in (256, 512, 1024) for bb in (1, 2, 4) for w in (4, 8)])
+
+    def _prune_ew(configs, named_args, **kwargs):
+        return _prune_bb([c for c in configs if c.kwargs["BB"] >= 1], _meta(named_args, kwargs)["B"])
+
+    @triton.autotune(configs=_EW_CFGS, key=["SIZE", "BWD"],
+                     prune_configs_by={"early_config_prune": _prune_ew})
+    @triton.jit
+    def _embed_kernel(a_ptr, e_ptr, no_ptr, out_ptr, N, B, SIZE,
+                      BWD: tl.constexpr, BLOCK: tl.constexpr, BB: tl.constexpr):
+        """Forward: a = uv [B, 2, N] -> out = V [B, 3, N].
+        Backward: a = gV [B, 3, N] -> out = g_uv [B, 2, N]."""
+        n = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        b0 = tl.program_id(1) * BB
+        ok = n < N
+        e0 = tl.load(e_ptr + n, mask=ok, other=0.0).to(tl.float64 if a_ptr.dtype.element_ty == tl.float64 else tl.float32)
+        e1 = tl.load(e_ptr + N + n, mask=ok, other=0.0).to(e0.dtype)
+        e2 = tl.load(e_ptr + 2 * N + n, mask=ok, other=0.0).to(e0.dtype)
+        n0 = tl.load(no_ptr + n, mask=ok, other=0.0).to(e0.dtype)
+        n1 = tl.load(no_ptr + N + n, mask=ok, other=0.0).to(e0.dtype)
+        n2 = tl.load(no_ptr + 2 * N + n, mask=ok, other=0.0).to(e0.dtype)
+        for i in tl.static_range(BB):
+            b = (b0 + i).to(tl.int64)
+            m = ok & (b < B)
+            if BWD:
+                base = a_ptr + b * 3 * N
+                g0 = tl.load(base + n, mask=m, other=0.0).to(e0.dtype)
+                g1 = tl.load(base + N + n, mask=m, other=0.0).to(e0.dtype)
+                g2 = tl.load(base + 2 * N + n, mask=m, other=0.0).to(e0.dtype)
+                ob = out_ptr + b * 2 * N
+                tl.store(ob + n, (g0 * e0 + g1 * e1 + g2 * e2).to(out_ptr.dtype.element_ty), mask=m)
+                tl.store(ob + N + n, (g0 * n0 + g1 * n1 + g2 * n2).to(out_ptr.dtype.element_ty), mask=m)
+            else:
+                base = a_ptr + b * 2 * N
+                u = tl.load(base + n, mask=m, other=0.0).to(e0.dtype)
+                v = tl.load(base + N + n, mask=m, other=0.0).to(e0.dtype)
+                ob = out_ptr + b * 3 * N
+                tl.store(ob + n, (u * e0 + v * n0).to(out_ptr.dtype.element_ty), mask=m)
+                tl.store(ob + N + n, (u * e1 + v * n1).to(out_ptr.dtype.element_ty), mask=m)
+                tl.store(ob + 2 * N + n, (u * e2 + v * n2).to(out_ptr.dtype.element_ty), mask=m)
+
+    @triton.autotune(configs=_EW_CFGS, key=["SIZE", "G", "MEAN"],
+                     prune_configs_by={"early_config_prune": _prune_ew})
+    @triton.jit
+    def _contract_fwd_kernel(d_ptr, ax_ptr, bx_ptr, out_ptr, N, G, B, SIZE, SCALE,
+                             MEAN: tl.constexpr, BLOCK: tl.constexpr, BB: tl.constexpr):
+        """d [B, G, 6, N] -> out [B, 2, N] (MEAN) or [B, G, 2, N]."""
+        n = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        b0 = tl.program_id(1) * BB
+        ok = n < N
+        for i in tl.static_range(BB):
+            b = (b0 + i).to(tl.int64)
+            m = ok & (b < B)
+            if d_ptr.dtype.element_ty == tl.float64:
+                div_acc = tl.zeros((BLOCK,), dtype=tl.float64)
+            else:
+                div_acc = tl.zeros((BLOCK,), dtype=tl.float32)
+            curl_acc = tl.zeros_like(div_acc)
+            for g in range(0, G):
+                dbase = d_ptr + ((b * G + g) * 6) * N
+                div = tl.zeros_like(div_acc)
+                curl = tl.zeros_like(div_acc)
+                for c in tl.static_range(3):
+                    a = tl.load(ax_ptr + (g * 3 + c) * N + n, mask=ok, other=0.0).to(div.dtype)
+                    bb = tl.load(bx_ptr + (g * 3 + c) * N + n, mask=ok, other=0.0).to(div.dtype)
+                    da = tl.load(dbase + c * N + n, mask=m, other=0.0).to(div.dtype)
+                    db = tl.load(dbase + (3 + c) * N + n, mask=m, other=0.0).to(div.dtype)
+                    div += a * da + bb * db
+                    curl += bb * da - a * db
+                if MEAN:
+                    div_acc += div
+                    curl_acc += curl
+                else:
+                    obase = out_ptr + ((b * G + g) * 2) * N
+                    tl.store(obase + n, div.to(out_ptr.dtype.element_ty), mask=m)
+                    tl.store(obase + N + n, curl.to(out_ptr.dtype.element_ty), mask=m)
+            if MEAN:
+                obase = out_ptr + b * 2 * N
+                tl.store(obase + n, (div_acc * SCALE).to(out_ptr.dtype.element_ty), mask=m)
+                tl.store(obase + N + n, (curl_acc * SCALE).to(out_ptr.dtype.element_ty), mask=m)
+
+    @triton.autotune(configs=_EW_CFGS, key=["SIZE", "G", "MEAN"],
+                     prune_configs_by={"early_config_prune": _prune_ew})
+    @triton.jit
+    def _contract_bwd_kernel(go_ptr, ax_ptr, bx_ptr, gd_ptr, N, G, B, SIZE, SCALE,
+                             MEAN: tl.constexpr, BLOCK: tl.constexpr, BB: tl.constexpr):
+        """g_out [B, 2, N] or [B, G, 2, N] -> g_d [B, G, 6, N]."""
+        n = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        b0 = tl.program_id(1) * BB
+        ok = n < N
+        for i in tl.static_range(BB):
+            b = (b0 + i).to(tl.int64)
+            m = ok & (b < B)
+            if MEAN:
+                gdiv = tl.load(go_ptr + b * 2 * N + n, mask=m, other=0.0)
+                gcurl = tl.load(go_ptr + b * 2 * N + N + n, mask=m, other=0.0)
+                if gd_ptr.dtype.element_ty == tl.float64:
+                    gdiv = gdiv.to(tl.float64) * SCALE
+                    gcurl = gcurl.to(tl.float64) * SCALE
+                else:
+                    gdiv = gdiv.to(tl.float32) * SCALE
+                    gcurl = gcurl.to(tl.float32) * SCALE
+            for g in range(0, G):
+                if not MEAN:
+                    obase = go_ptr + ((b * G + g) * 2) * N
+                    gdiv = tl.load(obase + n, mask=m, other=0.0)
+                    gcurl = tl.load(obase + N + n, mask=m, other=0.0)
+                    if gd_ptr.dtype.element_ty == tl.float64:
+                        gdiv = gdiv.to(tl.float64)
+                        gcurl = gcurl.to(tl.float64)
+                    else:
+                        gdiv = gdiv.to(tl.float32)
+                        gcurl = gcurl.to(tl.float32)
+                dbase = gd_ptr + ((b * G + g) * 6) * N
+                for c in tl.static_range(3):
+                    a = tl.load(ax_ptr + (g * 3 + c) * N + n, mask=ok, other=0.0).to(gdiv.dtype)
+                    bb = tl.load(bx_ptr + (g * 3 + c) * N + n, mask=ok, other=0.0).to(gdiv.dtype)
+                    tl.store(dbase + c * N + n,
+                             (gdiv * a + gcurl * bb).to(gd_ptr.dtype.element_ty), mask=m)
+                    tl.store(dbase + (3 + c) * N + n,
+                             (gdiv * bb - gcurl * a).to(gd_ptr.dtype.element_ty), mask=m)
+
+
+def _torch_embed(uv, east, north):
+    u = uv[:, 0, :]
+    v = uv[:, 1, :]
+    return u[:, None, :] * east[None, :, :] + v[:, None, :] * north[None, :, :]
+
+
+def _torch_contract(d, axis_a, axis_b, mean):
+    """Reference contraction (the formulas of ``HealPixDivCurl.forward``)."""
+    da = d[:, :, :3, :]
+    db = d[:, :, 3:, :]
+    a = axis_a[None]
+    b = axis_b[None]
+    div = (a * da).sum(dim=2) + (b * db).sum(dim=2)
+    curl = (b * da).sum(dim=2) - (a * db).sum(dim=2)
+    out = torch.stack((div, curl), dim=2)
+    return out.mean(dim=1) if mean else out
+
+
+def _ew_grid(n, B):
+    def grid(meta):
+        return (triton.cdiv(n, meta["BLOCK"]), triton.cdiv(B, meta["BB"]))
+    return grid
+
+
+class _EmbedFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, uv, east, north):
+        B, _, N = uv.shape
+        out = torch.empty(B, 3, N, dtype=uv.dtype, device=uv.device)
+        with _device_ctx(uv.device):
+            _embed_kernel[_ew_grid(N, B)](uv, east, north, out, N, B, _size_class(B * N), BWD=False)
+        ctx.save_for_backward(east, north)
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        east, north = ctx.saved_tensors
+        if torch.is_grad_enabled():      # double backward: recorded torch ops
+            return torch.stack(((g * east).sum(1), (g * north).sum(1)), 1), None, None
+        g = g.contiguous()
+        B, _, N = g.shape
+        out = torch.empty(B, 2, N, dtype=g.dtype, device=g.device)
+        with _device_ctx(g.device):
+            _embed_kernel[_ew_grid(N, B)](g, east, north, out, N, B, _size_class(B * N), BWD=True)
+        return out, None, None
+
+
+class _ContractFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, d, axis_a, axis_b, mean):
+        B, G, _, N = d.shape
+        shape = (B, 2, N) if mean else (B, G, 2, N)
+        out = torch.empty(shape, dtype=d.dtype, device=d.device)
+        with _device_ctx(d.device):
+            _contract_fwd_kernel[_ew_grid(N, B)](d, axis_a, axis_b, out, N, G, B,
+                                                 _size_class(B * N * G), 1.0 / G, MEAN=mean)
+        ctx.save_for_backward(axis_a, axis_b)
+        ctx.mean = mean
+        ctx.G = G
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        axis_a, axis_b = ctx.saved_tensors
+        mean, G = ctx.mean, ctx.G
+        if torch.is_grad_enabled():      # double backward: recorded torch ops
+            gg = (g[:, None] / G).expand(-1, G, -1, -1) if mean else g
+            gdiv, gcurl = gg[:, :, 0:1, :], gg[:, :, 1:2, :]
+            a, b = axis_a[None], axis_b[None]
+            return torch.cat((gdiv * a + gcurl * b, gdiv * b - gcurl * a), 2), None, None, None
+        g = g.contiguous()
+        B, N = g.shape[0], g.shape[-1]
+        gd = torch.empty(B, G, 6, N, dtype=g.dtype, device=g.device)
+        with _device_ctx(g.device):
+            _contract_bwd_kernel[_ew_grid(N, B)](g, axis_a, axis_b, gd, N, G, B,
+                                                 _size_class(B * N * G), 1.0 / G, MEAN=mean)
+        return gd, None, None, None
+
+
+def divcurl_embed(uv, east, north, *, backend="auto"):
+    """``uv [B, 2, N]`` (eastward, northward) -> Cartesian tangent vector ``[B, 3, N]``."""
+    if _use_triton(uv, backend, (torch.float32, torch.float64)):
+        return _EmbedFunction.apply(uv.contiguous(), east.contiguous(), north.contiguous())
+    return _torch_embed(uv, east, north)
+
+
+def divcurl_contract(d, axis_a, axis_b, *, mean, backend="auto"):
+    """``d [B, G, 6, N]`` directional derivatives -> div / curl, ``[B, 2, N]``
+    with the gauge mean, else ``[B, G, 2, N]``."""
+    if _use_triton(d, backend, (torch.float32, torch.float64)):
+        return _ContractFunction.apply(d.contiguous(), axis_a.contiguous(),
+                                       axis_b.contiguous(), bool(mean))
+    return _torch_contract(d, axis_a, axis_b, mean)

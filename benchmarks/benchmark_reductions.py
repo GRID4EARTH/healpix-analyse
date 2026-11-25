@@ -199,6 +199,43 @@ def _build(op, level, ids, device, dtype):
     raise ValueError(op)
 
 
+def _min_bytes(op, level, n, batch, es):
+    """Compulsory DRAM traffic (bytes) of one forward and one backward pass.
+
+    Inputs, outputs and the stencil read once: the lower bound a fused kernel
+    can reach (``None`` for the DivCurl operators, dominated by HealPixConv).
+    Reductions: K = 9 neighbours (int32), the transposed stencil
+    (int32 cell + int16 tap per entry, int64 row offsets) and the int16
+    selected taps of min / max / median.  Gradient: 8 neighbours with int32
+    positions and fp32 / fp64 East / North offsets.
+    """
+    if op in REDUCTIONS:
+        k = 9
+        stencil = n * k * 4 + n * 4
+        fwd = batch * n * es * 2 + stencil
+        sel = {"max": 2, "min": 2, "median": 4}.get(op, 0) * batch * n
+        bwd = batch * n * es * 2 + n * k * 6 + n * 8 + sel
+        return fwd + sel, bwd
+    if op == "gradient":
+        k, ges = 8, (8 if es == 8 else 4)
+        geometry = n * k * (4 + 2 * ges) + n * 4
+        fwd = batch * n * es * 3 + geometry
+        # pass 1: x, gu, gw in; P, Q, centre term out; pass 2: P, Q, x, gx
+        # in, gx out, transposed map (int32 cell + 2 offsets per entry)
+        bwd = (batch * n * (3 * es + 3 * ges) + geometry
+               + batch * n * (2 * ges + 2 * es + ges) + n * k * (4 + 2 * ges) + n * 8)
+        return fwd, bwd
+    return None, None
+
+
+def _peak_gbps(device):
+    """HBM peak of the GPU (A100: 1555 GB/s for 40 GB, 2039 GB/s for 80 GB)."""
+    props = torch.cuda.get_device_properties(device)
+    if "A100" in props.name:
+        return 2039.0 if props.total_memory > 50 * 2 ** 30 else 1555.0
+    return None
+
+
 def cmd_run(args):
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
@@ -210,6 +247,7 @@ def cmd_run(args):
                           gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
                           threads=torch.get_num_threads())), flush=True)
     too_slow = set()
+    peak = _peak_gbps(device) if device.type == "cuda" else None
     for level in args.levels:
         for domain in args.domains:
             ids = (np.arange(12 * 4 ** level, dtype=np.int64) if domain == "full"
@@ -236,6 +274,13 @@ def cmd_run(args):
 
                     t, reps = timeit(fwd, device, args.reps, args.budget)
                     rec["fwd_ms"], rec["fwd_reps"] = 1e3 * t, reps
+                    es = torch.finfo(dtype).bits // 8
+                    b_fwd, b_bwd = _min_bytes(op, level, len(ids), args.batch, es)
+                    if b_fwd:
+                        rec["fwd_min_bytes"], rec["bwd_min_bytes"] = b_fwd, b_bwd
+                        rec["fwd_GBps"] = b_fwd / t / 1e9
+                        if peak:
+                            rec["fwd_pct_peak"] = 100 * rec["fwd_GBps"] / peak
                     if t > args.budget:
                         too_slow.add((op, domain))
                     if op != "count" and t <= args.budget:
@@ -248,6 +293,10 @@ def cmd_run(args):
 
                         t2, reps2 = timeit(fwdbwd, device, args.reps, args.budget)
                         rec["fwdbwd_ms"], rec["fwdbwd_reps"] = 1e3 * t2, reps2
+                        if b_fwd:
+                            rec["fwdbwd_GBps"] = (b_fwd + b_bwd) / t2 / 1e9
+                            if peak:
+                                rec["fwdbwd_pct_peak"] = 100 * rec["fwdbwd_GBps"] / peak
                         rec["peak_GiB"] = peak_mem(fwdbwd, device)
                         if t2 > args.budget:
                             too_slow.add((op, domain))
@@ -303,17 +352,27 @@ def _cell(r, key):
     return s
 
 
+def _bw(r, key):
+    v = r.get(f"{key}_GBps")
+    if v is None:
+        return "–"
+    pct = r.get(f"{key}_pct_peak")
+    return f"{v:,.0f}" + (f" ({pct:.0f}%)" if pct is not None else "")
+
+
 def cmd_table(args):
     before, after = _load(args.before), _load(args.after)
     print("| Configuration | before fwd / fwd+bwd (ms) | after fwd / fwd+bwd (ms) "
-          "| speed-up fwd / fwd+bwd | before / after peak (GiB) | build before / after (s) |")
-    print("|---|---|---|---|---|---|")
+          "| speed-up fwd / fwd+bwd | after GB/s fwd / fwd+bwd (% of HBM peak) "
+          "| before / after peak (GiB) | build before / after (s) |")
+    print("|---|---|---|---|---|---|---|")
     for name, rb in after.items():
         ra = before.get(name)
         sp_f = _ratio((ra or {}).get("fwd_ms"), rb.get("fwd_ms"))
         sp_b = _ratio((ra or {}).get("fwdbwd_ms"), rb.get("fwdbwd_ms"))
         print(f"| {name} | {_cell(ra, 'fwd_ms')} / {_cell(ra, 'fwdbwd_ms')} "
               f"| {_cell(rb, 'fwd_ms')} / {_cell(rb, 'fwdbwd_ms')} | {sp_f} / {sp_b} "
+              f"| {_bw(rb, 'fwd')} / {_bw(rb, 'fwdbwd')} "
               f"| {_gib((ra or {}).get('peak_GiB'))} / {_gib(rb.get('peak_GiB'))} "
               f"| {(ra or {}).get('build_s', '–')} / {rb.get('build_s', '–')} |")
 

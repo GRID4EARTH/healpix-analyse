@@ -396,3 +396,75 @@ def test_torch_backend_on_cuda(reducers):
     for reduction in ("mean", "median", "max", "std", "count"):
         a = r(x.cuda(), reduction=reduction, backend="torch").cpu()
         _assert_same(a, r._reference_reduce(x, reduction), reduction, torch.float64)
+
+
+# ---------------------------------------------------------------------------
+# HealPixDivCurl: fused embedding / contraction
+# ---------------------------------------------------------------------------
+
+
+def _divcurl_main(m, velocity):
+    """Verbatim forward of ``HealPixDivCurl`` on main (PyTorch ops)."""
+    tensor, leading_shape, _ = m._prepare_velocity(velocity)
+    u = tensor[:, 0, :]
+    v = tensor[:, 1, :]
+    cartesian = u[:, None, :] * m._east[None] + v[:, None, :] * m._north[None]
+    d = m.conv(cartesian).reshape(tensor.shape[0], m.n_gauges, 6, m.n_pixels)
+    da, db = d[:, :, :3, :], d[:, :, 3:, :]
+    a, b = m._axis_a[None], m._axis_b[None]
+    div = (a * da).sum(dim=2) + (b * db).sum(dim=2)
+    curl = (b * da).sum(dim=2) - (a * db).sum(dim=2)
+    out = torch.stack((div, curl), dim=2)
+    if m.gauge_reduce == "mean":
+        return out.mean(dim=1).reshape(*leading_shape, 2, m.n_pixels)
+    return out.reshape(*leading_shape, m.n_gauges, 2, m.n_pixels)
+
+
+@pytest.mark.parametrize("gauge_reduce", ["mean", "none"])
+def test_divcurl_matches_main_cpu(gauge_reduce):
+    from healpix_analyse import HealPixDivCurl
+    m = HealPixDivCurl(3, n_gauges=2, gauge_reduce=gauge_reduce, dtype=torch.float64,
+                       device="cpu", cache_dir=None)
+    vel = torch.randn(2, 2, 12 * 4**3, dtype=torch.float64)
+    torch.testing.assert_close(m(vel), _divcurl_main(m, vel), rtol=1e-12, atol=1e-15)
+
+
+@pytest.mark.skipif(not TRITON, reason="needs CUDA and Triton")
+@pytest.mark.parametrize("gauge_reduce", ["mean", "none"])
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_triton_divcurl_matches_main(gauge_reduce, dtype):
+    from healpix_analyse import HealPixDivCurl
+    ids = _regional_ids(4, np.random.default_rng(31), 0.2)
+    m = HealPixDivCurl(4, ids, n_gauges=2, gauge_reduce=gauge_reduce, dtype=dtype,
+                       device="cuda", cache_dir=None)
+    vel = torch.randn(3, 2, ids.size, dtype=dtype, device="cuda")
+
+    def run(fn):
+        x = vel.clone().requires_grad_(True)
+        y = fn(x)
+        g = torch.cos(torch.arange(y.numel(), device="cuda", dtype=dtype)).reshape(y.shape)
+        (y * g).sum().backward()
+        return y.detach(), x.grad
+
+    y_ref, g_ref = run(lambda x: _divcurl_main(m, x))
+    y_new, g_new = run(m)
+    tol = dict(rtol=1e-12, atol=1e-14) if dtype == torch.float64 else dict(rtol=1e-5, atol=1e-6)
+    s = y_ref.abs().max()
+    torch.testing.assert_close(y_new / s, y_ref / s, **tol)
+    s = g_ref.abs().max()
+    torch.testing.assert_close(g_new / s, g_ref / s, **tol)
+
+
+@pytest.mark.skipif(not TRITON, reason="needs CUDA and Triton")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_triton_lsq_gradient_16bit(gradient_ops, dtype):
+    op = gradient_ops["full"]
+    x64 = torch.as_tensor(np.random.default_rng(23).normal(size=(2, op.cell_ids.size)))
+    ref = _reference_gradient(op, x64)
+    x = x64.to(dtype).cuda().requires_grad_(True)
+    e, n = op(x)
+    assert e.dtype == dtype
+    (e.float().sum() + n.float().sum()).backward()
+    assert torch.isfinite(x.grad.float()).all()
+    for a, r in zip((e, n), ref):
+        torch.testing.assert_close(a.double().cpu(), r, rtol=3e-2, atol=3e-2 * r.abs().max().item())
