@@ -484,3 +484,35 @@ def test_layers_on_cuda_auto_use_triton_and_match():
         torch.testing.assert_close(a(x, m), r(x, m), atol=1e-4, rtol=1e-4)
         if cls is HealPixBatchNorm:
             torch.testing.assert_close(a.running_var, r.running_var, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("kind", ["group", "batch", "layer"])
+@pytest.mark.parametrize("mask_kind", ["none", "N_bool", "BN_float", "BCN_float"])
+@pytest.mark.parametrize("fill", ["zero", "nan", "passthrough"])
+@pytest.mark.parametrize("affine", [True, False])
+def test_torch_backend_matches_reference(kind, mask_kind, fill, affine):
+    """The few-pass PyTorch backend (hand-written backward) equals the
+    plain reference to 1e-12 in float64, outputs and gradients."""
+    torch.manual_seed(0)
+    B, C, N, G = 3, 6, 50, 3
+    x = _rand(B, C, N)
+    x[1, 2, 7] = float("nan")
+    mask = {"none": None,
+            "N_bool": torch.rand(N) > 0.3,
+            "BN_float": torch.rand(B, N, dtype=torch.float64) * (torch.rand(B, N) > 0.2),
+            "BCN_float": torch.rand(B, C, N, dtype=torch.float64)}[mask_kind]
+    w = torch.randn(C, dtype=torch.float64, requires_grad=True) if affine else None
+    b = torch.randn(C, dtype=torch.float64, requires_grad=True) if affine else None
+    Gk = G if kind == "group" else 1
+    xr = x.clone().requires_grad_()
+    xt = x.clone().requires_grad_()
+    y0, mu0, var0, _ = mn.masked_norm_reference(xr, mask, kind, Gk, w, b, 1e-5, fill)
+    y1, mu1, var1, _ = mn._TorchNormFunction.apply(xt, mn._mask_3d(mask, xt), w, b, kind,
+                                                   Gk, 1e-5, fill)
+    torch.testing.assert_close(y1, y0, atol=1e-12, rtol=1e-12, equal_nan=True)
+    torch.testing.assert_close(var1.reshape(-1), var0.reshape(-1), atol=1e-12, rtol=1e-12)
+    g = torch.randn_like(y0)
+    ins0 = (xr,) + ((w, b) if affine else ())
+    ins1 = (xt,) + ((w, b) if affine else ())
+    for a, c in zip(torch.autograd.grad(y1, ins1, g), torch.autograd.grad(y0, ins0, g)):
+        torch.testing.assert_close(a, c, atol=1e-11, rtol=1e-11, equal_nan=True)

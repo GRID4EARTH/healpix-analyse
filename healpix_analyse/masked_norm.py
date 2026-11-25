@@ -28,8 +28,12 @@ changes its share in the statistics.
 
 Backends
 --------
-``"torch"``  (CPU, float64, and the reference everywhere)
-    Plain PyTorch operations; autograd computes the gradients.
+``"torch"``  (CPU, float64, CUDA without Triton)
+    A few PyTorch passes (validity, row sums, one fused sum of squares, the
+    output) and a hand-written backward that saves nothing of size
+    ``[B, C, N]`` beyond the input.  :func:`masked_norm_reference`, plain
+    differentiable PyTorch, is the ground truth of the tests and serves the
+    second derivatives.
 ``"triton"`` (CUDA, float32 / float16 / bfloat16, fp32 accumulation)
     Fused kernels for ``HealPixGroupNorm``, ``HealPixBatchNorm`` (training)
     and ``HealPixLayerNorm``: the mask is read through broadcast strides
@@ -144,6 +148,21 @@ def _weights(x: torch.Tensor, m: Optional[torch.Tensor]) -> torch.Tensor:
     return mw * finite.to(cdt)
 
 
+def _validity(x: torch.Tensor, m: Optional[torch.Tensor]):
+    """``(valid, cov)``: ``valid`` the bool ``[B, C, N]`` of the cells of
+    weight > 0; ``cov`` None for a binary mask (None or bool: the weight is
+    ``valid``), else the clamped coverage ``[B|1, C|1, N]`` in the compute
+    dtype (the weight is ``where(valid, cov, 0)``)."""
+    valid = torch.isfinite(x)
+    if m is None:
+        return valid, None
+    if m.dtype == torch.bool:
+        return valid & m, None
+    cov = m.to(_compute_dtype(x.dtype))
+    cov = torch.where(torch.isfinite(cov), cov, torch.zeros_like(cov)).clamp(0.0, 1.0)
+    return valid & (cov > 0), cov
+
+
 def _apply_fill(y, x, valid, fill):
     if fill == "zero":
         return torch.where(valid, y, torch.zeros_like(y))
@@ -210,6 +229,187 @@ def masked_norm_reference(x, mask, kind, num_groups=1, weight=None, bias=None,
         y = y + bias.to(cdt).view(1, C, 1)
     y = _apply_fill(y, x, valid, fill).to(x.dtype)
     return y, mu, va, s0
+
+
+# ===========================================================================
+# PyTorch backend: few passes, hand-written backward
+# ===========================================================================
+
+def _row_sum(t, kind, G):
+    """Sums over the cells of each statistics row: ``[B, G]`` (group),
+    ``[C]`` (batch) or ``[B, N]`` (layer)."""
+    B, C, N = t.shape
+    if kind == "group":
+        return t.reshape(B, G, -1).sum(-1)
+    if kind == "batch":
+        return t.sum((0, 2))
+    return t.sum(1)
+
+
+def _row_sq(d, kind, G):
+    """Sum of squares over each statistics row (one fused reduction)."""
+    B, C, N = d.shape
+    if kind == "group":
+        return torch.linalg.vector_norm(d.reshape(B, G, -1), dim=-1).square()
+    if kind == "batch":
+        return torch.linalg.vector_norm(d, dim=(0, 2)).square()
+    return torch.linalg.vector_norm(d, dim=1).square()
+
+
+def _bc(s, kind, C, G):
+    """Row statistics broadcastable to ``[B, C, N]``."""
+    if kind == "group":
+        return s.repeat_interleave(C // G, dim=1).unsqueeze(-1)
+    if kind == "batch":
+        return s.view(1, C, 1)
+    return s.unsqueeze(1)
+
+
+def _masked_dev(x, m, kind, G, mu=None):
+    """valid, cov, xz (x at the valid cells, 0 elsewhere), and with ``mu``
+    the masked deviation ``where(valid, x - mu, 0)``."""
+    cdt = _compute_dtype(x.dtype)
+    valid, cov = _validity(x, m)
+    xc = x.to(cdt)
+    zero = torch.zeros((), dtype=cdt, device=x.device)
+    xz = torch.where(valid, xc, zero)
+    if mu is None:
+        return valid, cov, xz, None
+    C = x.shape[1]
+    d = (xz - _bc(mu, kind, C, G)).mul_(valid)
+    return valid, cov, xz, d
+
+
+class _TorchNormFunction(torch.autograd.Function):
+    """Masked group / batch / layer normalisation in a few PyTorch passes.
+
+    Forward: the validity, ``xz``, the row sums, the masked deviation and
+    one fused sum of squares, then ``y = d * scale + shift``.  Backward,
+    by hand from ``x`` and the saved row mean and 1/std (nothing of size
+    ``[B, C, N]`` is saved beyond ``x``)::
+
+        dx = rstd * (gamma * g - w * (A + xhat * Bv))
+        A  = sum(gamma g) / S0,   Bv = sum(gamma g xhat) / S0   (per row)
+
+    with ``g`` the output gradient at the valid cells.  A second derivative
+    goes through :func:`masked_norm_reference`.
+    """
+
+    @staticmethod
+    def forward(ctx, x, m, weight, bias, kind, G, eps, fill):
+        B, C, N = x.shape
+        cdt = _compute_dtype(x.dtype)
+        valid, cov, xz, _ = _masked_dev(x, m, kind, G)
+        if cov is None:
+            s0 = _row_sum(valid, kind, G).to(cdt)
+            s1 = _row_sum(xz, kind, G)
+        else:
+            w = torch.where(valid, cov, torch.zeros((), dtype=cdt, device=x.device))
+            s0 = _row_sum(w.expand(B, C, N), kind, G)
+            s1 = _row_sum(xz * w, kind, G)
+        s0c = s0.clamp_min(torch.finfo(cdt).tiny)
+        mu = s1 / s0c
+        d = (xz - _bc(mu, kind, C, G)).mul_(valid)
+        if cov is None:
+            m2 = _row_sq(d, kind, G)
+        else:
+            m2 = _row_sum(d.square() * w, kind, G)
+        var = m2 / s0c
+        rstd = torch.rsqrt(var + eps)
+        affine = weight is not None
+        if kind == "layer":
+            y = d.mul_(_bc(rstd, kind, C, G))
+            if affine:
+                y = torch.addcmul(bias.to(cdt).view(1, C, 1), y, weight.to(cdt).view(1, C, 1))
+        else:
+            scale = _bc(rstd, kind, C, G)
+            if affine:
+                scale = scale * weight.to(cdt).view(1, C, 1)
+                y = torch.addcmul(bias.to(cdt).view(1, C, 1), d, scale)
+            else:
+                y = d.mul_(scale)
+        if fill == "zero":
+            if affine:
+                y = y.mul_(valid)
+        elif fill == "nan":
+            y = torch.where(valid, y, torch.full((), float("nan"), dtype=cdt, device=x.device))
+        else:
+            y = torch.where(valid, y, x.to(cdt))
+        ctx.save_for_backward(x, m if m is not None else torch.empty(0),
+                              weight if affine else torch.empty(0), mu, rstd, s0)
+        ctx.meta = (kind, G, eps, fill, m is not None, affine)
+        ctx.mark_non_differentiable(mu, var, s0)
+        return y.to(x.dtype), mu, var, s0
+
+    @staticmethod
+    def backward(ctx, dy, _dmu, _dvar, _ds0):
+        x, m, weight, mu, rstd, s0 = ctx.saved_tensors
+        kind, G, eps, fill, has_m, affine = ctx.meta
+        m = m if has_m else None
+        if torch.is_grad_enabled():
+            return _reference_backward(ctx, x, m, weight if affine else None, dy,
+                                       kind, G, eps, fill)
+        B, C, N = x.shape
+        cdt = _compute_dtype(x.dtype)
+        zero = torch.zeros((), dtype=cdt, device=x.device)
+        valid, cov, _, d = _masked_dev(x, m, kind, G, mu)
+        rb = _bc(rstd, kind, C, G)
+        xh = d.mul_(rb)
+        dyc = dy.to(cdt)
+        g = torch.where(valid, dyc, zero)
+        gam = weight.to(cdt) if affine else torch.ones(C, dtype=cdt, device=x.device)
+        s0c = s0.clamp_min(torch.finfo(cdt).tiny)
+        if kind == "layer":
+            gx = g * xh
+            dw = gx.sum((0, 2)) if affine else None
+            db = g.sum((0, 2)) if affine else None
+            sg = torch.einsum("bcn,c->bn", g, gam)
+            sgx = torch.einsum("bcn,c->bn", gx, gam)
+            del gx
+        else:
+            P1 = g.sum(-1)                                   # [B, C]
+            P2 = torch.linalg.vecdot(g, xh)                  # [B, C]
+            dw = P2.sum(0) if affine else None
+            db = P1.sum(0) if affine else None
+            g1, g2 = P1 * gam, P2 * gam
+            if kind == "group":
+                sg, sgx = g1.view(B, G, -1).sum(-1), g2.view(B, G, -1).sum(-1)
+            else:
+                sg, sgx = g1.sum(0), g2.sum(0)
+        A = _bc(sg / s0c, kind, C, G)
+        Bv = _bc(sgx / s0c, kind, C, G)
+        t = torch.addcmul(A, xh, Bv)
+        if cov is None:
+            t = t.mul_(valid)
+        else:
+            t = t.mul_(torch.where(valid, cov, zero))
+        gam3 = gam.view(1, C, 1)
+        if kind == "layer":
+            dx = (g * gam3).sub_(t).mul_(rb)
+        else:
+            dx = (g * (rb * gam3)).sub_(t.mul_(rb))
+        if fill == "passthrough":
+            dx = torch.where(valid, dx, dyc)
+        dx = dx.to(x.dtype)
+        if dw is not None:
+            dw = dw.to(weight.dtype) if ctx.needs_input_grad[2] else None
+            db = db.to(weight.dtype) if ctx.needs_input_grad[3] else None
+        return (dx if ctx.needs_input_grad[0] else None), None, dw, db, None, None, None, None
+
+
+def _batch_norm_eval(x, m, rm, rv, weight, bias, eps, fill):
+    """Element-wise masked batch normalisation with given statistics."""
+    C = x.shape[1]
+    cdt = _compute_dtype(x.dtype)
+    valid, _ = _validity(x, m)
+    scale = torch.rsqrt(rv.to(cdt) + eps)
+    if weight is not None:
+        scale = scale * weight.to(cdt)
+    shift = -rm.to(cdt) * scale
+    if bias is not None:
+        shift = shift + bias.to(cdt)
+    y = torch.addcmul(shift.view(1, C, 1), x.to(cdt), scale.view(1, C, 1))
+    return _apply_fill(y, x, valid, fill).to(x.dtype)
 
 
 # ===========================================================================
@@ -715,9 +915,9 @@ class HealPixGroupNorm(_MaskedNormMixin, nn.GroupNorm):
         ``"auto"``: fused Triton kernels on CUDA for float32 / float16 /
         bfloat16 when Triton is installed, the PyTorch reference otherwise.
 
-    Forward
-    -------
-    ``forward(x, mask=None)`` with ``x`` of shape ``[B, C, N]`` and ``mask``
+    Notes
+    -----
+    ``forward(x, mask=None)`` takes ``x`` of shape ``[B, C, N]`` and ``mask``
     of shape ``[N]``, ``[B, N]`` or ``[B, C, N]`` (B and C may be 1), bool or
     float in [0, 1].  ``mask=None`` means ``isfinite(x)``; with a mask,
     non-finite values of ``x`` are invalid too.  The mask is not
@@ -739,8 +939,8 @@ class HealPixGroupNorm(_MaskedNormMixin, nn.GroupNorm):
                 x, m, self.weight, self.bias, "group", self.num_groups,
                 self.eps, self.fill)
             return y
-        y, *_ = masked_norm_reference(
-            x, m, "group", self.num_groups, self.weight, self.bias, self.eps, self.fill)
+        y, *_ = _TorchNormFunction.apply(
+            x, m, self.weight, self.bias, "group", self.num_groups, self.eps, self.fill)
         return y
 
 
@@ -793,8 +993,8 @@ class HealPixLayerNorm(_MaskedNormMixin, nn.Module):
         m = _mask_3d(mask, x)
         if _use_triton(x, self.backend):
             return _LayerNormFunction.apply(x, m, self.weight, self.bias, self.eps, self.fill)
-        y, *_ = masked_norm_reference(
-            x, m, "layer", 1, self.weight, self.bias, self.eps, self.fill)
+        y, *_ = _TorchNormFunction.apply(
+            x, m, self.weight, self.bias, "layer", 1, self.eps, self.fill)
         return y
 
 
@@ -847,17 +1047,15 @@ class HealPixBatchNorm(_MaskedNormMixin, nn.BatchNorm1d):
         use_batch = self.training or (self.running_mean is None and self.running_var is None)
 
         if not use_batch:
-            y, *_ = masked_norm_reference(
-                x, m, "batch", 1, self.weight, self.bias, self.eps, self.fill,
-                mean=self.running_mean, var=self.running_var)
-            return y
+            return _batch_norm_eval(x, m, self.running_mean, self.running_var,
+                                    self.weight, self.bias, self.eps, self.fill)
 
         if _use_triton(x, self.backend):
             y, mu, var, s0 = _RowsNormFunction.apply(
                 x, m, self.weight, self.bias, "batch", 1, self.eps, self.fill)
         else:
-            y, mu, var, s0 = masked_norm_reference(
-                x, m, "batch", 1, self.weight, self.bias, self.eps, self.fill)
+            y, mu, var, s0 = _TorchNormFunction.apply(
+                x, m, self.weight, self.bias, "batch", 1, self.eps, self.fill)
 
         if self.training and self.running_mean is not None:
             with torch.no_grad():
@@ -920,21 +1118,35 @@ def global_pool(x, mask=None, mode: str = "mean", fill: str = "zero",
     if mode not in POOL_MODES:
         raise ValueError(f"mode must be one of {POOL_MODES}; got {mode!r}.")
     empty = _empty_value(fill)
-    B, C, N = x.shape
+    src, wt = _pool_sources(x, _mask_3d(mask, x), mode)
+    cdt = src.dtype
+    s0 = wt.sum(-1, dtype=cdt).expand(x.shape[0], x.shape[1])
+    y = src.amax(-1) if mode == "max" else src.sum(-1)
+    return _pool_finish(y, s0, mode, empty, x.dtype, return_weight)
+
+
+def _pool_sources(x, m, mode):
+    """The values to reduce (``[B, C, N]``, compute dtype: x at the valid
+    cells, times the coverage for mean / sum, -inf / 0 elsewhere) and the
+    cell weights (bool ``valid`` or the coverage)."""
     cdt = _compute_dtype(x.dtype)
-    w = _weights(x, _mask_3d(mask, x)).expand(B, C, N)
-    valid = w > 0
+    valid, cov = _validity(x, m)
     xc = x.to(cdt)
-    s0 = w.sum(-1)
-    has = s0 > 0
     if mode == "max":
-        y = torch.where(valid, xc, torch.full_like(xc, -float("inf"))).amax(-1)
+        src = torch.where(valid, xc, torch.full((), -float("inf"), dtype=cdt, device=x.device))
     else:
-        xz = torch.where(valid, xc, torch.zeros_like(xc))
-        y = (xz * w).sum(-1)
-        if mode == "mean":
-            y = y / s0.clamp_min(torch.finfo(cdt).tiny)
-    y = torch.where(has, y, torch.full_like(y, empty)).to(x.dtype)
+        src = torch.where(valid, xc if cov is None else xc * cov,
+                          torch.zeros((), dtype=cdt, device=x.device))
+    wt = valid if cov is None else torch.where(valid, cov, torch.zeros((), dtype=cdt,
+                                                                      device=x.device))
+    return src, wt
+
+
+def _pool_finish(y, s0, mode, empty, dtype, return_weight):
+    has = s0 > 0
+    if mode == "mean":
+        y = y / s0.clamp_min(torch.finfo(s0.dtype).tiny)
+    y = torch.where(has, y, torch.full((), empty, dtype=y.dtype, device=y.device)).to(dtype)
     return (y, s0) if return_weight else y
 
 
@@ -980,34 +1192,39 @@ def _region_layout(regions, n_regions=None):
     pad = torch.zeros(R, L, dtype=torch.bool)
     idx[lab, rank] = pos
     pad[lab, rank] = True
-    return idx, pad, counts, r.numel()
+    n = r.numel()
+    full = bool(pad.all())
+    ident = full and idx.numel() == n and bool(torch.equal(idx.reshape(-1), torch.arange(n)))
+    return idx, pad, counts, n, ident, full
 
 
-def _region_pool_layout(x, idx, pad, mask, mode, fill, return_weight):
+def _region_reduce(t, idx, pad, ident, full, op, dtype):
+    """Reduce ``t [B', C', N]`` over the cells of each region -> ``[B', C', R]``."""
+    R, L = idx.shape
+    lead = t.shape[:-1]
+    if ident:                       # sorted, equal regions: a view
+        g = t.reshape(*lead, R, L)
+    else:
+        g = t.index_select(-1, idx.reshape(-1)).view(*lead, R, L)
+    if not full:
+        neutral = -float("inf") if op == "max" else 0
+        g = torch.where(pad, g, torch.full((), neutral, dtype=g.dtype, device=g.device))
+    if op == "max":
+        return g.amax(-1)
+    return g.sum(-1, dtype=dtype)
+
+
+def _region_pool_layout(x, idx, pad, ident, full, mask, mode, fill, return_weight):
     _check_x(x)
     if mode not in POOL_MODES:
         raise ValueError(f"mode must be one of {POOL_MODES}; got {mode!r}.")
     empty = _empty_value(fill)
     B, C, N = x.shape
-    R, L = idx.shape
-    cdt = _compute_dtype(x.dtype)
-    w = _weights(x, _mask_3d(mask, x))
-    xc = x.to(cdt)
-    flat = idx.reshape(-1)
-    wg = w.index_select(-1, flat).view(w.shape[0], w.shape[1], R, L) * pad.to(cdt)
-    xg = xc.index_select(-1, flat).view(B, C, R, L)
-    valid = wg > 0
-    s0 = wg.sum(-1).expand(B, C, R)
-    has = s0 > 0
-    if mode == "max":
-        y = torch.where(valid, xg, torch.full_like(xg, -float("inf"))).amax(-1)
-    else:
-        xz = torch.where(valid, xg, torch.zeros_like(xg))
-        y = (xz * wg).sum(-1)
-        if mode == "mean":
-            y = y / s0.clamp_min(torch.finfo(cdt).tiny)
-    y = torch.where(has, y, torch.full_like(y, empty)).to(x.dtype)
-    return (y, s0) if return_weight else y
+    src, wt = _pool_sources(x, _mask_3d(mask, x), mode)
+    cdt = src.dtype
+    y = _region_reduce(src, idx, pad, ident, full, "max" if mode == "max" else "sum", cdt)
+    s0 = _region_reduce(wt, idx, pad, ident, full, "sum", cdt).expand(B, C, idx.shape[0])
+    return _pool_finish(y, s0, mode, empty, x.dtype, return_weight)
 
 
 def region_pool(x, regions, mask=None, mode: str = "mean", fill: str = "zero",
@@ -1035,14 +1252,16 @@ def region_pool(x, regions, mask=None, mode: str = "mean", fill: str = "zero",
     -----
     The cells of each region are gathered into a padded ``[B, C, R, L]``
     tensor, L being the size of the largest region, then reduced: no
-    atomics, deterministic forward and backward.  For many calls with the
+    atomics, deterministic forward and backward.  When the regions are
+    contiguous, sorted and of equal size (``from_cell_ids`` on the full
+    sphere or on a complete sorted domain) the gather is a free view.  For many calls with the
     same regions, build a :class:`HealPixRegionPool` once.
     """
-    idx, pad, _, n = _region_layout(regions, n_regions)
+    idx, pad, _, n, ident, full = _region_layout(regions, n_regions)
     if n != x.shape[-1]:
         raise ValueError(f"regions has {n} labels for {x.shape[-1]} cells.")
-    return _region_pool_layout(x, idx.to(x.device), pad.to(x.device), mask, mode,
-                               fill, return_weight)
+    return _region_pool_layout(x, idx.to(x.device), pad.to(x.device), ident, full, mask,
+                               mode, fill, return_weight)
 
 
 class HealPixRegionPool(nn.Module):
@@ -1074,7 +1293,7 @@ class HealPixRegionPool(nn.Module):
         if mode not in POOL_MODES:
             raise ValueError(f"mode must be one of {POOL_MODES}; got {mode!r}.")
         _empty_value(fill)
-        idx, pad, counts, n = _region_layout(regions, n_regions)
+        idx, pad, counts, n, self._ident, self._full = _region_layout(regions, n_regions)
         self.mode = mode
         self.fill = fill
         self.n_regions = idx.shape[0]
@@ -1105,5 +1324,5 @@ class HealPixRegionPool(nn.Module):
     def forward(self, x, mask=None, return_weight: bool = False):
         if x.shape[-1] != self.n_cells:
             raise ValueError(f"Expected {self.n_cells} cells, got {x.shape[-1]}.")
-        return _region_pool_layout(x, self._idx, self._pad, mask, self.mode,
-                                   self.fill, return_weight)
+        return _region_pool_layout(x, self._idx, self._pad, self._ident, self._full, mask,
+                                   self.mode, self.fill, return_weight)
