@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 def _benchmark_module():
@@ -47,4 +48,6 @@ def test_result_comparison_is_zero_for_identical_common_grid():
     assert comparison["rmse"] == 0.0
     assert comparison["max_abs"] == 0.0
     assert comparison["nrmse"] == 0.0
-    assert comparison["correlation"] == 1.0
+    # np.corrcoef goes through BLAS: the correlation of identical arrays is 1
+    # only to round-off (0.9999999999999998 with MKL 2026.2.1 on the CI runner).
+    assert comparison["correlation"] == pytest.approx(1.0, rel=0, abs=1e-12)
