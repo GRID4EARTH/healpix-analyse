@@ -1,40 +1,15 @@
 """
-convol.py  (optimised v3)
-=========================
+convol.py
+=========
 Gauge-equivariant spherical convolution on HEALPix maps.
 
-Optimisation summary::
-
-    #  Location              Before                        After
-    ──────────────────────────────────────────────────────────────────────────
-     1  Buffer layout         _pos_safe / _w_norm stored     Stored as [4, G, K*P]
-        (__init__)            as [G, 4, K*P].                → pos[j] is contiguous
-                              pos[:, j, :].reshape(-1)        → reshape(-1) is a
-                              forces a hidden copy each       free view, zero copy.
-                              call in forward().
-
-     2  forward gather        One index_select over          Loop over 4 neighbors:
-        (forward)             [G*4*K*P] → peak alloc          accumulate in-place.
-                              B·C·G·4·K·P (~3.6 GB).         Peak: 2·B·C·G·K·P
-                                                             → 4× memory reduction.
-
-     3  einsum vs bmm         einsum("bcgkp,gcop->bgok")     Explicit torch.bmm
-        (forward)             may not fuse contractions.     → cuBLAS/MKL, 2–4×
-                                                             faster on GPU.
-
-     4  Geometry cache        All of _get_interp_weights +   _geometry_cache_key()
-        (__init__)  ★ NEW ★   _bind_support_batched          hashes all ctor params
-                              recomputed from scratch        → torch.save on first
-                              on every __init__ call         run, torch.load on
-                              (~0.8 s for nside=64, G=4).    subsequent runs
-                                                             (~5 ms reload).
-                                                             Cache dir configurable
-                                                             via HEALPIXCONV_CACHE or
-                                                             cache_dir= kwarg.
-    ──────────────────────────────────────────────────────────────────────────
-     Differentiability: 100 % preserved.
-     API: identical to v2 — drop-in replacement (one new optional kwarg: cache_dir).
-    ──────────────────────────────────────────────────────────────────────────
+The stencil geometry (rotation of the kernel grid, bilinear neighbours and
+their weights) is computed once at construction, cached on disk, and stored as
+the *tap geometry* ``[P, 4, G, K]``: int32 neighbour positions in the order of
+the input, and their weights.  The forward and backward passes run in
+``healpix_analyse._conv_backend``: fused Triton kernels on CUDA (float32,
+float16, bfloat16) when Triton is installed, a PyTorch loop over the taps
+otherwise.  Neither materialises the gathered ``[B, C_in, G, K, P]`` tensor.
 """
 
 from __future__ import annotations
@@ -53,6 +28,12 @@ import torch.nn.functional as F
 import healpix_geo
 from healpix_analyse.healpix_interp import get_interp_weights
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
+from healpix_analyse._conv_backend import (
+    BACKENDS,
+    build_transposed_map,
+    gauge_conv,
+    tap_geometry,
+)
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
@@ -66,6 +47,16 @@ _DEFAULT_CACHE_DIR = Path(
 # Geometry cache helpers
 # ===========================================================================
 
+# Bump when the meaning or layout of any cached buffer changes.
+_CACHE_FORMAT = 3
+
+
+def _geometry_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Precision of the geometry build: float64 layers get float64 geometry,
+    every other dtype float32 (16-bit rotations would be meaningless)."""
+    return torch.float64 if dtype == torch.float64 else torch.float32
+
+
 def _geometry_cache_key(
     nside: int,
     kernel_sz: int,
@@ -75,39 +66,42 @@ def _geometry_cache_key(
     nest: bool,
     cell_ids,             # np.ndarray or None
     ellipsoid: str,
+    geom_dtype: torch.dtype = torch.float32,
 ) -> str:
     """
     Return a hex digest that uniquely identifies a set of geometry parameters.
 
     Only the fields that affect _get_interp_weights / _bind_support_batched
-    are included.  dtype and device are intentionally excluded: the buffers
-    are stored as float32/int64 CPU tensors and cast at load time.
+    are included, plus the precision of the build (float32 or float64), which
+    is also the dtype of the cached weights.  The device is excluded.  The
+    ``cell_ids`` enter as their raw int64 bytes, in the input order: the
+    cached geometry depends on that order, and hashing the bytes costs far
+    less than serialising a list.
     """
+    ids = None if cell_ids is None else np.ascontiguousarray(
+        np.asarray(cell_ids, dtype=np.int64).ravel(), dtype="<i8"
+    )
     state: dict = {
-        # Bump when the meaning/layout of any cached buffer changes.
-        "cache_format": 2,
+        "cache_format": _CACHE_FORMAT,
         "nside":      nside,
         "kernel_sz":  kernel_sz,
         "G":          G,
         "gauge_type": gauge_type,
         "nest":       nest,
         "ellipsoid":  ellipsoid,
+        "geom_dtype": str(geom_dtype).replace("torch.", ""),
         # round to 9 decimal places to avoid float noise from different
         # construction paths that produce the same effective direction
         "ref_direction": (
             None if ref_direction is None
             else np.round(np.asarray(ref_direction, dtype=np.float64), 9).tolist()
         ),
-        "cell_ids": (
-            None if cell_ids is None
-            # The cached sort buffers depend on the user-facing input order,
-            # not only on the set of covered cells.  Keep that order in the
-            # key so two permutations cannot share an incompatible cache.
-            else np.asarray(cell_ids, dtype=np.int64).ravel().tolist()
-        ),
+        "n_cells": None if ids is None else int(ids.size),
     }
-    blob = json.dumps(state, sort_keys=True).encode()
-    return hashlib.sha256(blob).hexdigest()
+    h = hashlib.sha256(json.dumps(state, sort_keys=True).encode())
+    if ids is not None:
+        h.update(memoryview(ids).cast("B"))
+    return h.hexdigest()
 
 
 def _cache_path(cache_dir: Path, key: str) -> Path:
@@ -118,13 +112,13 @@ def _load_geometry_cache(
     cache_dir: Path,
     key: str,
     device: torch.device,
-    dtype: torch.dtype,
 ) -> "dict | None":
     """
     Try to load precomputed geometry buffers from disk.
 
-    Returns a dict with keys pos_safe, w_norm, sort_order, inv_order,
-    or None if the cache does not exist or is corrupt.
+    Returns a dict with keys tap_idx, tap_w, sort_order, inv_order, or None
+    if the cache does not exist or is corrupt.  ``tap_w`` keeps the dtype it
+    was built in (part of the key).
     """
     path = _cache_path(cache_dir, key)
     if not path.exists():
@@ -132,10 +126,10 @@ def _load_geometry_cache(
     try:
         data = torch.load(path, map_location="cpu", weights_only=True)
         return {
-            "pos_safe":   data["pos_safe"].to(device=device),            # [4, G, K*P] long
-            "w_norm":     data["w_norm"].to(device=device, dtype=dtype),  # [4, G, K*P] float
-            "sort_order": data["sort_order"].to(device=device),           # [K] long
-            "inv_order":  data["inv_order"].to(device=device),            # [K] long
+            "tap_idx":    data["tap_idx"].to(device=device, dtype=torch.int32),  # [P, 4, G, K]
+            "tap_w":      data["tap_w"].to(device=device),                       # [P, 4, G, K]
+            "sort_order": data["sort_order"].to(device=device),                  # [K] long
+            "inv_order":  data["inv_order"].to(device=device),                   # [K] long
         }
     except Exception:
         # Corrupt or outdated cache — ignore and recompute
@@ -145,19 +139,19 @@ def _load_geometry_cache(
 def _save_geometry_cache(
     cache_dir: Path,
     key: str,
-    pos_safe:   torch.Tensor,   # [4, G, K*P]
-    w_norm:     torch.Tensor,   # [4, G, K*P]
+    tap_idx:    torch.Tensor,   # [P, 4, G, K] int32
+    tap_w:      torch.Tensor,   # [P, 4, G, K]
     sort_order: torch.Tensor,   # [K]
     inv_order:  torch.Tensor,   # [K]
 ) -> None:
-    """Save geometry buffers to disk as float32/int64 CPU tensors."""
+    """Save geometry buffers to disk as CPU tensors (weights in their own dtype)."""
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         tmp = _cache_path(cache_dir, key).with_suffix(".tmp")
         torch.save(
             {
-                "pos_safe":   pos_safe.cpu().to(dtype=torch.long),
-                "w_norm":     w_norm.cpu().to(dtype=torch.float32),
+                "tap_idx":    tap_idx.cpu().to(dtype=torch.int32),
+                "tap_w":      tap_w.cpu(),
                 "sort_order": sort_order.cpu(),
                 "inv_order":  inv_order.cpu(),
             },
@@ -602,6 +596,21 @@ class HealPixConv(nn.Module):
     ellipsoid : str, default "WGS84"
         Reference ellipsoid for healpix_geo coordinate conversions.
     device, dtype : torch device / dtype.
+        Initial placement; ``module.to(...)`` moves and casts the layer
+        afterwards like any other module.
+    backend : {"auto", "triton", "torch"}, default "auto"
+        Compute backend of the forward and backward passes.  ``"auto"``
+        runs the fused Triton kernels on CUDA for float32, float16 and
+        bfloat16 when the optional ``triton`` package is installed, and the
+        PyTorch tap loop otherwise (CPU, float64).  Can be changed after
+        construction (``conv.backend = "torch"``).
+    deterministic : bool, default False
+        Triton backend only.  ``True`` computes the gradient with respect to
+        the input by a gather on the transposed stencil map: no atomics, the
+        same bits at every run, at the cost of a second geometry buffer
+        built at the first backward pass.  ``False`` scatters it with fp32
+        atomics, whose summation order varies between runs.  Also selected
+        when ``torch.use_deterministic_algorithms(True)`` is set.
 
     Examples
     --------
@@ -639,8 +648,16 @@ class HealPixConv(nn.Module):
         ellipsoid: str = "WGS84",
         dtype: torch.dtype = torch.float32,
         cache_dir: "Path | str | None" = _DEFAULT_CACHE_DIR,
+        backend: str = "auto",
+        deterministic: bool = False,
     ):
         super().__init__()
+
+        if backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
+        self.backend = backend
+        self.deterministic = bool(deterministic)
+        self._tmap = None   # transposed stencil map, built on demand
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -794,6 +811,7 @@ class HealPixConv(nn.Module):
         _cache_dir_resolved = (
             Path(cache_dir) if cache_dir is not None else None
         )
+        geom_dtype = _geometry_dtype(self.dtype)
         _cache_key = _geometry_cache_key(
             nside      = self.nside,
             kernel_sz  = self.kernel_sz,
@@ -803,19 +821,19 @@ class HealPixConv(nn.Module):
             nest       = self.nest,
             cell_ids   = cell_ids,
             ellipsoid  = self.ellipsoid,
+            geom_dtype = geom_dtype,
         )
         _cached = (
-            _load_geometry_cache(_cache_dir_resolved, _cache_key,
-                                 self.device, self.dtype)
+            _load_geometry_cache(_cache_dir_resolved, _cache_key, self.device)
             if _cache_dir_resolved is not None else None
         )
 
         if _cached is not None:
             # ---- Fast path: restore buffers from disk ----
-            self.register_buffer("_sort_order", _cached["sort_order"])
-            self.register_buffer("_inv_order",  _cached["inv_order"])
-            self.register_buffer("_pos_safe",   _cached["pos_safe"])
-            self.register_buffer("_w_norm",     _cached["w_norm"])
+            sort_order_t = _cached["sort_order"]
+            inv_order_t  = _cached["inv_order"]
+            tap_idx      = _cached["tap_idx"]
+            tap_w        = _cached["tap_w"]
 
         else:
             # ---- Slow path: full geometry computation ----
@@ -829,20 +847,20 @@ class HealPixConv(nn.Module):
             ph = np.deg2rad(np.asarray(lon, dtype=np.float64))
 
             R_tot = _build_rotation_matrices(
-                th, ph, self.G, self.gauge_type, self.device, self.dtype,
+                th, ph, self.G, self.gauge_type, self.device, geom_dtype,
                 ref_direction=self.ref_direction,
             )  # [K, G, 3, 3]
 
             vec_t = torch.as_tensor(
                 _local_kernel_grid(self.kernel_sz, self.nside),
-                device=self.device, dtype=self.dtype,
+                device=self.device, dtype=geom_dtype,
             )  # [P, 3]
 
             rotated = torch.einsum("kgij,pj->kgpi", R_tot, vec_t)
             flat    = rotated.reshape(-1, 3)   # [K*G*P, 3]
 
             idx_flat, w_flat = _get_interp_weights(
-                self.nside, flat, self.nest, self.device, self.dtype
+                self.nside, flat, self.nest, self.device, geom_dtype
             )  # [4, K*G*P]
 
             idx_all = (
@@ -876,22 +894,33 @@ class HealPixConv(nn.Module):
                 idx_all.clone(), w_all.clone(),
                 ids_sorted_t, self.kernel_sz, self.K, self.P, self.device,
             )  # [G, 4, K*P] each
+            del idx_all, w_all, idx_flat, w_flat, rotated, flat, R_tot
 
-            # OPT 1 — contiguous layout [4, G, K*P]
-            pos_all    = pos_all.permute(1, 0, 2).contiguous()
-            w_all_norm = w_all_norm.permute(1, 0, 2).contiguous()
-
-            self.register_buffer("_sort_order", sort_order_t)
-            self.register_buffer("_inv_order",  inv_order_t)
-            self.register_buffer("_pos_safe",   pos_all)
-            self.register_buffer("_w_norm",     w_all_norm)
+            # Tap-major layout [P, 4, G, K], positions in the input order:
+            # the sort permutation is folded into the indices once here, so
+            # the forward gathers the input as it comes, with no copy.
+            tap_idx, tap_w = tap_geometry(
+                pos_all.permute(1, 0, 2), w_all_norm.permute(1, 0, 2),
+                sort_order_t, self.G, self.K, self.P,
+            )
+            del pos_all, w_all_norm
 
             # Persist to disk for the next run
             if _cache_dir_resolved is not None:
                 _save_geometry_cache(
                     _cache_dir_resolved, _cache_key,
-                    pos_all, w_all_norm, sort_order_t, inv_order_t,
+                    tap_idx, tap_w, sort_order_t, inv_order_t,
                 )
+
+        # The geometry is a function of the constructor arguments, rebuilt
+        # (or reloaded from the disk cache) at construction: it is not part
+        # of the state_dict.  Only the two [K] permutations are, as before.
+        self.register_buffer("_sort_order", sort_order_t)
+        self.register_buffer("_inv_order",  inv_order_t)
+        self.register_buffer("_tap_idx", tap_idx.contiguous(), persistent=False)
+        self.register_buffer(
+            "_tap_w", tap_w.to(dtype=self.dtype).contiguous(), persistent=False
+        )
 
         # ---- learnable kernel and bias ----
         self.weight = nn.Parameter(
@@ -920,7 +949,7 @@ class HealPixConv(nn.Module):
             g = min(8, C_tot)
             while C_tot % g != 0 and g > 1:
                 g -= 1
-            self.norm = nn.GroupNorm(g, C_tot)
+            self.norm = nn.GroupNorm(g, C_tot, device=self.device, dtype=self.dtype)
         else:
             self.norm = None
 
@@ -928,12 +957,60 @@ class HealPixConv(nn.Module):
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
 
     # ------------------------------------------------------------------
-    # Kernel management  (unchanged)
+    # Device, dtype and state_dict
+    # ------------------------------------------------------------------
+
+    def _apply(self, fn, *args, **kwargs):
+        # module.to(...), .cuda(), .double(), ...: the layer follows its
+        # parameters and buffers; self.device / self.dtype only report them.
+        result = super()._apply(fn, *args, **kwargs)
+        self.device = self.weight.device
+        self.dtype = self.weight.dtype
+        self._tmap = None
+        return result
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # state_dicts written before the tap geometry hold the stencil as
+        # _pos_safe / _w_norm.  The geometry is rebuilt from the constructor
+        # arguments, so those entries are dropped rather than reported as
+        # unexpected keys.
+        for name in ("_pos_safe", "_w_norm"):
+            state_dict.pop(prefix + name, None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    @property
+    def _pos_safe(self) -> torch.Tensor:
+        """Legacy view ``[4, G, K*P]``: neighbour positions in the sorted cell
+        order (built on access from the tap geometry)."""
+        pos = self._inv_order[self._tap_idx.long()]              # [P, 4, G, K]
+        return pos.permute(1, 2, 3, 0).reshape(4, self.G, self.K * self.P)
+
+    @property
+    def _w_norm(self) -> torch.Tensor:
+        """Legacy view ``[4, G, K*P]`` of the renormalised bilinear weights."""
+        return self._tap_w.permute(1, 2, 3, 0).reshape(4, self.G, self.K * self.P)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_tmap"] = None          # derived cache, rebuilt on demand
+        return state
+
+    def _transposed_map(self):
+        """Transposed stencil map of the deterministic Triton backward (cached)."""
+        if self._tmap is None or self._tmap[0].device != self._tap_idx.device:
+            self._tmap = build_transposed_map(self._tap_idx, self._tap_w, self.K)
+        return self._tmap
+
+    # ------------------------------------------------------------------
+    # Kernel management
     # ------------------------------------------------------------------
 
     def set_kernel(self, W, bias=None, requires_grad=False):
         """
         Replace the learnable kernel with a fixed (or re-initialised) array.
+
+        The values are copied in the dtype of the layer: a float64 layer keeps
+        float64 kernels.
 
         Parameters
         ----------
@@ -944,27 +1021,28 @@ class HealPixConv(nn.Module):
             Shape [G * C_out].  None resets bias to zero.
         requires_grad : bool, default False
         """
-        W_np = np.asarray(W, dtype=np.float32)
-        if W_np.ndim == 3:
-            W_np = np.broadcast_to(W_np[None], (self.G,) + W_np.shape).copy()
+        dev, dt = self.weight.device, self.weight.dtype
+        if torch.is_tensor(W):
+            W_t = W.detach().to(device=dev, dtype=dt)
+        else:
+            W_t = torch.as_tensor(np.asarray(W, dtype=np.float64), device=dev).to(dt)
+        if W_t.ndim == 3:
+            W_t = W_t.unsqueeze(0).expand((self.G,) + tuple(W_t.shape))
         expected = (self.G, self.in_channels, self.out_channels, self.P)
-        if W_np.shape != expected:
+        if tuple(W_t.shape) != expected:
             raise ValueError(
                 f"W must have shape {expected} or "
                 f"({self.in_channels}, {self.out_channels}, {self.P}); "
-                f"got {W_np.shape}."
+                f"got {tuple(W_t.shape)}."
             )
         with torch.no_grad():
-            self.weight.copy_(
-                torch.as_tensor(W_np, dtype=self.dtype, device=self.device)
-            )
+            self.weight.copy_(W_t)
             if bias is not None:
-                self.bias.copy_(
-                    torch.as_tensor(
-                        np.asarray(bias, np.float32).ravel(),
-                        dtype=self.dtype, device=self.device,
-                    )
-                )
+                if torch.is_tensor(bias):
+                    b_t = bias.detach().reshape(-1)
+                else:
+                    b_t = torch.as_tensor(np.asarray(bias, dtype=np.float64).ravel())
+                self.bias.copy_(b_t.to(device=dev, dtype=dt))
             else:
                 self.bias.zero_()
         self.weight.requires_grad_(requires_grad)
@@ -972,7 +1050,7 @@ class HealPixConv(nn.Module):
         return self
 
     # ------------------------------------------------------------------
-    # Forward — optimised gather + bmm  (no Python loop over G)
+    # Forward
     # ------------------------------------------------------------------
 
     def forward(self, x):
@@ -989,33 +1067,15 @@ class HealPixConv(nn.Module):
 
         Notes
         -----
-        Optimisation vs v1:
-
-        v1 (single giant gather)::
-
-            pos_flat  = pos.reshape(-1)              # [G*4*K*P]
-            vals_flat = t_sorted.index_select(2, pos_flat)  # [B, C_in, G*4*K*P]
-            vals      = vals_flat.view(B, C_in, G, 4, K, P)
-            gathered  = (vals * w).sum(dim=3)        # [B, C_in, G, K, P]
-            y         = einsum("bcgkp,gcop->bgok", gathered, W)
-
-        v2 (4-neighbor accumulation + bmm)::
-
-            # OPT 2: accumulate over 4 neighbors instead of one giant alloc
-            gathered = zeros(B, C_in, G, K, P)
-            for j in range(4):                       # tiny loop, only 4 iters
-                pj = pos[j].reshape(-1)              # [G*K*P]  — contiguous (OPT 1)
-                vf = t_sorted.index_select(2, pj)    # [B, C_in, G*K*P]
-                gathered += vf.view(...) * wn[j]     # in-place accumulate
-
-            # OPT 3: bmm dispatches to cuBLAS instead of generic einsum
-            g_mat = gathered.permute(2,0,3,1,4).reshape(G, B*K, C_in*P)
-            W_mat = W.permute(0,1,3,2).reshape(G, C_in*P, C_out)
-            y = bmm(g_mat, W_mat).reshape(G,B,K,C_out).permute(1,0,3,2)
-
-        Peak intermediate memory: ``B·C_in·G·K·P`` (v2) vs ``B·C_in·G·4·K·P`` (v1) — a 4x reduction.
+        The input is moved to the device of the layer and cast to its dtype.
+        The computation runs on the backend selected by ``self.backend``
+        (see the class docstring); neither backend materialises the gathered
+        ``[B, C_in, G, K, P]`` tensor.  Row k of the geometry is pixel
+        ``cell_ids[k]``, so the output follows the input order.
         """
-        t, is_numpy, was_1d, _ = _prepare_input_conv(x, self.device, self.dtype)
+        t, is_numpy, was_1d, _ = _prepare_input_conv(
+            x, self._tap_w.device, self.weight.dtype
+        )
         B, C_in, N = t.shape
 
         if C_in != self.in_channels:
@@ -1025,88 +1085,14 @@ class HealPixConv(nn.Module):
         if N != self.K:
             raise ValueError(f"Expected {self.K} pixels, got {N}.")
 
-        so  = self._sort_order.to(device=t.device)        # [K]
-        pos = self._pos_safe.to(device=t.device)          # [4, G, K*P]
-        wn  = self._w_norm.to(device=t.device, dtype=t.dtype)   # [4, G, K*P]
-        W   = self.weight.to(device=t.device, dtype=t.dtype)    # [G, C_in, C_out, P]
-
-        G, P, K = self.G, self.P, self.K
-        C_out   = self.out_channels
-
-        # Sort pixels for searchsorted-aligned indexing
-        t_sorted = t[:, :, so]                            # [B, C_in, K]
-
-        # ------------------------------------------------------------------
-        # OPT 2 — Accumulate over 4 bilinear neighbours one at a time.
-        #
-        # v1 allocated [B, C_in, G, 4, K, P] all at once, then summed dim=3.
-        # Peak memory ∝ B·C·G·4·K·P.
-        #
-        # v2 allocates [B, C_in, G, K, P] once and adds each neighbour
-        # in-place.  Peak memory ∝ 2·B·C·G·K·P  (gathered + one vf temp).
-        # For G=4, nside=64, B=8, C=16 this drops from ~3.6 GB to ~0.9 GB.
-        #
-        # Each pos[j] is already contiguous ([G, K*P]) thanks to OPT 1,
-        # so .reshape(-1) is a free zero-copy view.
-        # ------------------------------------------------------------------
-        gathered = t.new_zeros(B, C_in, G, K, P)          # [B, C_in, G, K, P]
-
-        for j in range(4):
-            pj  = pos[j].reshape(-1)                      # [G*K*P] — zero-copy
-            wj  = wn[j]                                   # [G, K*P] — contiguous
-            vf  = t_sorted.index_select(2, pj)            # [B, C_in, G*K*P]
-            # in-place accumulate to avoid a second large alloc
-            gathered.add_(
-                vf.view(B, C_in, G, K, P) * wj.view(1, 1, G, K, P)
-            )
-
-        # ------------------------------------------------------------------
-        # OPT 3 — Replace einsum("bcgkp,gcop->bgok") with torch.bmm.
-        #
-        # einsum may not fuse the two contractions (over c and p) and can
-        # fall back to a slow generic implementation.  An explicit batched
-        # matmul dispatches directly to cuBLAS (GPU) or MKL/OpenBLAS (CPU).
-        #
-        # Reshape plan:
-        #   gathered [B, C_in, G, K, P]
-        #     .permute(2, 0, 3, 1, 4) → [G, B, K, C_in, P]
-        #     .contiguous().view(G, B*K, C_in*P)
-        #   W        [G, C_in, C_out, P]
-        #     .permute(0, 1, 3, 2)    → [G, C_in, P, C_out]
-        #     .contiguous().view(G, C_in*P, C_out)
-        #   bmm → [G, B*K, C_out]
-        #     .view(G, B, K, C_out).permute(1, 0, 3, 2) → [B, G, C_out, K]
-        #     .reshape(B, G*C_out, K)
-        # ------------------------------------------------------------------
-        g_mat = (
-            gathered
-            .permute(2, 0, 3, 1, 4)     # [G, B, K, C_in, P]
-            .contiguous()
-            .view(G, B * K, C_in * P)   # [G, B*K, C_in*P]
+        y = gauge_conv(
+            t, self.weight, self.bias, self._tap_idx, self._tap_w,
+            backend=self.backend, deterministic=self.deterministic,
+            transposed=self._transposed_map,
         )
-        W_mat = (
-            W
-            .permute(0, 1, 3, 2)        # [G, C_in, P, C_out]
-            .contiguous()
-            .view(G, C_in * P, C_out)   # [G, C_in*P, C_out]
-        )
-        y = torch.bmm(g_mat, W_mat)     # [G, B*K, C_out]
-        y = (
-            y
-            .view(G, B, K, C_out)
-            .permute(1, 0, 3, 2)        # [B, G, C_out, K]
-            .contiguous()
-            .view(B, G * C_out, K)      # [B, G*C_out, K]
-        )
-
-        # Bias.  Row k of the geometry is pixel cell_ids[k], so y is already
-        # in the input (cell_ids) order: no un-sorting is needed, and the
-        # former `y[:, :, io]` scrambled the output of unsorted cell_ids.
-        y = y + self.bias.to(device=t.device, dtype=t.dtype).view(1, -1, 1)
 
         if self.use_norm and self.norm is not None:
-            nm = self.norm.to(device=t.device, dtype=t.dtype)
-            y  = F.relu(nm(y), inplace=True)
+            y = F.relu(self.norm(y), inplace=True)
 
         return _restore_output_conv(y, is_numpy, was_1d)
 
