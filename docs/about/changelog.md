@@ -66,8 +66,6 @@
   frequency in the analysis, which corrupted the aliased modes when
   `lmax >= (N_r + 1) / 2`; irregular rings failed on CUDA input (kernel
   built on the CPU). New tests in `tests/test_alm_latlon.py`.
-
-### Fixed
 - `HealPixDown(mode="maxpool")` on a regional domain: a child absent from
   `cell_ids` was replaced by the first input cell, which can belong to
   another parent (cells `[100, 4, 5, 6]` at level 2 with values
