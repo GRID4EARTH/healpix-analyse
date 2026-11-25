@@ -273,10 +273,10 @@ if _HAS_TRITON:
     def _configs(spec):
         return [triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=ns) for bm, nw, ns in spec]
 
-    _FWD_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
+    _FWD_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
     _BWD_W_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
     _BWD_X_CONFIGS = _configs(((32, 2, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1)))
-    _BWD_X_CSR_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
+    _BWD_X_CSR_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
 
     @triton.jit
     def _gather_taps(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok, K, C, G, P,
