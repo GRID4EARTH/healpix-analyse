@@ -36,7 +36,12 @@ Key design choices:
   constructor or the forward pass.
 - **Differentiable**, with a hand-written backward that never stores the
   interpolated stencil values; fused Triton kernels on CUDA (see *Backends*
-  below). Second-order gradients (`create_graph=True`) are supported.
+  below). Second-order gradients (`create_graph=True`) run on the same
+  kernels, and `torch.func` (`vmap`, `jacrev`, `jacfwd`, `jvp`) works.
+- **Strided and transposed**: `stride=2` evaluates the stencil only at the
+  parent cells (the encoder step of a U-Net), and `HealPixConvTranspose` is
+  its adjoint (the decoder step). See *Strided and transposed convolutions*
+  below.
 
 ---
 
@@ -292,6 +297,61 @@ z, cov = conv.completed_stencil(x_with_nan)   # [B, C, G, N, P] values and valid
 fraction of every stencil point, from which the coverage of any kernel
 follows; the wavelet power spectrum ({doc}`/sht/wavelet_spectrum`) uses it.
 
+### Strided and transposed convolutions
+
+An encoder block of a U-Net applies a convolution then a downsampling.
+`HealPixConv(stride=2)` does both in one step: it evaluates the stencil only
+at the centres of the parent cells (level `level - 1`), so it computes N/4
+outputs instead of N and needs no `HealPixDown`. The output lies on the
+parent cells, in the order of `conv.cell_ids_out` (sorted, as
+`HealPixDown.cell_ids_out`; on a regional domain, every parent with at least
+one child in `cell_ids`).
+
+`HealPixConvTranspose` is its adjoint, for the decoder: with the same
+geometry arguments and the same weights,
+`<conv(x) - conv.bias, y> = <x, convT(y) - convT.bias>` holds exactly. It
+reads gauge-major channels on the parent cells and writes `out_channels` on
+the fine cells, in the order of `cell_ids`.
+
+```python
+from healpix_analyse.convol import HealPixConv, HealPixConvTranspose
+
+level, G = 7, 4
+enc = HealPixConv(level, 16, 32, kernel_sz=3, n_gauges=G, stride=2)       # level 7 -> 6
+dec = HealPixConvTranspose(level, 32, 16, kernel_sz=3, n_gauges=G)        # level 6 -> 7
+
+x = torch.randn(8, 16, 12 * 4**level)
+h = enc(x)                      # [8, G*32, 12 * 4**6], on enc.cell_ids_out
+z = dec(h)                      # [8, 16, 12 * 4**7]
+dec.weight = enc.weight         # optional: tie the decoder to the encoder
+```
+
+**Definition of the strided output.** Output `k` is the stride-1
+convolution evaluated at the centre of parent `k`, with the same stencil and
+kernel: the stencil keeps the fine-level spacing (one level-`level` cell), it
+is centred on the parent centre (the vertex shared by its 4 children) with
+the gauge of that point, and its points are interpolated bilinearly from the
+fine cells. The receptive field and the learned kernel are therefore those of
+the stride-1 layer, and weights move between `stride=1` and `stride=2` layers
+unchanged. Two other definitions were rejected:
+
+- a spacing of two fine cells would skip fine cells between the stencil
+  points (aliasing);
+- a stencil centred on one of the 4 children would shift each output by half
+  a fine cell, in a direction that changes from one base face to the next.
+
+`HealPixDown` has no mode that picks one value per parent, so the strided
+layer is not bit-identical to a convolution followed by a downsampling. On a
+smooth field it differs from the stride-1 layer followed by
+`HealPixDown(mode="mean")` (the mean of the 4 children) at first order in the
+cell size: 3 % of the amplitude at level 4, halved at each finer level
+(`tests/test_healpix_conv_strided.py`).
+
+Both layers reuse the geometry, the disk cache and the kernels of the stride-1
+layer: the forward pass of `HealPixConvTranspose` is the input gradient of the
+strided layer, and its input gradient is the strided forward pass. Both are
+deterministic by default.
+
 ### Fixed (non-learnable) isotropic kernel
 
 ```python
@@ -346,6 +406,7 @@ HealPixConv(
     local_mean_weights = None,
     backend            = "auto",
     deterministic      = True,
+    stride             = 1,
 )
 ```
 
@@ -366,7 +427,8 @@ HealPixConv(
 | `ellipsoid` | `str` | `"WGS84"` | Reference ellipsoid for healpix_geo coordinate conversions. |
 | `dtype` | `torch.dtype` | `torch.float32` | Floating-point precision for all buffers and parameters. `module.to(...)` moves and casts the layer afterwards. |
 | `backend` | `str` | `"auto"` | `"auto"`, `"triton"` or `"torch"`; see *Backends* below. |
-| `deterministic` | `bool` | `True` | Triton only: input gradient by a gather on the transposed stencil map, without atomics, identical at every run. `False`: fp32 atomics, no extra memory. |
+| `deterministic` | `bool` | `True` | On CUDA: input gradient by a gather on the transposed stencil map, without atomics, identical at every run (Triton kernels, and the PyTorch backend). `False`: fp32 atomics (Triton) or `index_add_` (PyTorch), no extra memory. |
+| `stride` | `int` | `1` | `2`: strided convolution, output on the parent cells (`cell_ids_out`); see *Strided and transposed convolutions*. Needs `level ≥ 1` and `missing="centre"`. |
 | `missing` | `str` | `"centre"` | `"centre"`: today's behaviour (points outside the domain take the centre value; NaN propagates). `"local_mean"`: NaN and points outside the domain are completed by the renormalised interpolation of the valid neighbours, or the local mean of the valid stencil values. |
 | `local_mean_weights` | `array (P,)` or `None` | `None` | Non-negative weights of the stencil points in the local mean of `"local_mean"`; `None` = uniform. |
 
@@ -404,16 +466,24 @@ needs no extra memory, but the summation order, and so the last bits, vary
 between runs. `torch.use_deterministic_algorithms(True)` selects the gather in
 either case.
 
-`deterministic` applies to the Triton backend only. The PyTorch backend
-scatters the input gradient with `index_add_`, which is deterministic on CPU.
-On CUDA, where the PyTorch backend runs without Triton, it is
-non-deterministic unless `torch.use_deterministic_algorithms(True)` is set.
+The PyTorch backend scatters the input gradient with `index_add_` on CPU,
+which is deterministic there. On CUDA (without Triton) `index_add_` runs with
+atomics, so with `deterministic=True` the PyTorch backend gathers on the
+transposed map instead: the same bits at every run, with no
+`torch.use_deterministic_algorithms` needed. That map is also built at the
+first backward pass and kept (`nnz` entries of 4 + 4 bytes and two int32 per
+cell and tap, about the size of the stencil buffers); `deterministic=False`
+keeps `index_add_`.
 
-A double backward (`create_graph=True`, for example a gradient penalty) runs
-the backward of the PyTorch tap loop on every device, because the Triton
-kernels write their gradients outside the autograd graph. It is correct, and
-as slow on a GPU as the PyTorch backend, and its determinism follows the same
-`index_add_` rule.
+The forward pass, the input gradient and the weight gradient are three
+operators of the same geometry (the convolution, its adjoint, and a bilinear
+weight gradient), each an autograd Function whose backward calls the others.
+So a double backward (`create_graph=True`, for example a gradient penalty)
+runs on the same kernels as the first one, Triton included, with the same
+determinism. The Functions also define `jvp` and `vmap`: `torch.func.vmap`,
+`jacrev`, `jacfwd`, `jvp` and `functional_call` work on the layer. A
+`vmap` over the input folds the mapped dimension into the batch; any other
+`vmap` (over the weights, say) runs one call per mapped element.
 
 ---
 
@@ -437,7 +507,7 @@ y = conv(x, mask=valid)        # missing="local_mean" only
 
 | Name | Type | Shape | Description |
 |---|---|---|---|
-| `y` | same type as `x` | `[G·C_out, N]` or `[B, G·C_out, N]` | Convolved output. Output type and number of dimensions match the input. |
+| `y` | same type as `x` | `[G·C_out, N_out]` or `[B, G·C_out, N_out]` | Convolved output. Output type and number of dimensions match the input. `N_out = N` for `stride=1`; for `stride=2`, the parent cells of `cell_ids_out`. |
 
 **Raises:**
 
@@ -508,7 +578,7 @@ gauge_type='two_ref':
 
 | Buffer / tensor | Shape | Description |
 |---|---|---|
-| `_tap_idx` | `[P, 4, G, K]` (int32) | Position in the input of each bilinear neighbour of each tap (not in the `state_dict`) |
+| `_tap_idx` | `[P, 4, G, K]` (int32) | Position in the input of each bilinear neighbour of each tap (not in the `state_dict`); for `stride=2`, `K` is the number of parent cells `K_out` |
 | `_tap_w` | `[P, 4, G, K]` (layer dtype) | Renormalised bilinear weights (not in the `state_dict`) |
 | `_sort_order` | `[K]` | Index that sorts pixel ids ascending |
 | `_inv_order` | `[K]` | Inverse permutation to restore original order |

@@ -79,7 +79,7 @@ from healpix_analyse.resample import (
     resample_to_latlon_grid,
 )
 from healpix_analyse.healpix_interp import get_interp_val, get_interp_weights
-from healpix_analyse.convol import HealPixConv
+from healpix_analyse.convol import HealPixConv, HealPixConvTranspose
 from healpix_analyse.morphology import binary_dilation, binary_erosion
 
 
@@ -247,6 +247,7 @@ __all__ = [
     "get_interp_val",
     "get_interp_weights",
     "HealPixConv",
+    "HealPixConvTranspose",
     "binary_dilation",
     "binary_erosion",
 

@@ -505,9 +505,12 @@ def test_triton_deterministic_is_bitwise_reproducible():
 
 @needs_triton
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_triton_double_backward_matches_torch(deterministic):
-    """create_graph=True on the Triton path keeps the second-order terms: a
-    gradient penalty reaches the weights as with the PyTorch backend."""
+def test_triton_double_backward_matches_torch(deterministic, monkeypatch):
+    """create_graph=True runs on the Triton kernels (the PyTorch ones are
+    disabled below) and keeps the second-order terms: a gradient penalty
+    reaches the weights as with the PyTorch backend.  ``deterministic``
+    selects the kernel of S^T (CSR gather or atomics), which the double
+    backward runs three times."""
     cs = CASES["regional"]
     dev = torch.device("cuda")
     conv = make_conv(cs, torch.float32, dev, deterministic=deterministic)
@@ -515,6 +518,13 @@ def test_triton_double_backward_matches_torch(deterministic):
 
     def penalty(backend):
         conv.backend = backend
+        if backend == "triton":
+            def fail(*a, **k):
+                raise AssertionError("the PyTorch backend ran on the Triton path")
+            for name in ("_torch_forward", "_torch_transpose", "_torch_grad_w"):
+                monkeypatch.setattr(cb, name, fail)
+        else:
+            monkeypatch.undo()
         conv.zero_grad(set_to_none=True)
         x = x0.clone().requires_grad_(True)
         y = conv(x)
@@ -539,13 +549,16 @@ def test_triton_double_backward_matches_torch(deterministic):
 
 @needs_cuda
 def test_torch_backend_on_cuda_is_reproducible_under_deterministic_algorithms():
-    """deterministic= is a Triton option; the PyTorch backend on CUDA
-    (index_add_) gives the same bits under use_deterministic_algorithms."""
+    """With deterministic=False, the PyTorch backend on CUDA scatters with
+    index_add_, which gives the same bits under use_deterministic_algorithms
+    (that also selects the gather).  The default is checked in
+    test_healpix_conv_strided.py."""
     import warnings
 
     cs = CASES["regional"]
     dev = torch.device("cuda")
-    conv = make_conv(dict(cs, C=16, Co=16), torch.float32, dev, backend="torch")
+    conv = make_conv(dict(cs, C=16, Co=16), torch.float32, dev, backend="torch",
+                     deterministic=False)
     x0 = torch.randn(cs["B"], 16, conv.K, device=dev)
     prev = torch.are_deterministic_algorithms_enabled()
     prev_warn = torch.is_deterministic_algorithms_warn_only_enabled()

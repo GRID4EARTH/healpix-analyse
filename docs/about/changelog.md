@@ -26,6 +26,29 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `HealPixConv(stride=2)`, the strided gauge convolution of an encoder, and
+  `HealPixConvTranspose`, its adjoint for a decoder (#109, 1c). The strided
+  layer evaluates the stencil only at the centres of the parent cells (fine
+  spacing, centred on the parent centre), so it computes N/4 outputs and
+  replaces a convolution followed by `HealPixDown`; its output lies on
+  `cell_ids_out` (sorted parents, as for `HealPixDown`). With the same
+  arguments and weights, `HealPixConvTranspose` is its exact adjoint, from
+  the parent cells back to the fine ones. Both reuse the geometry, the disk
+  cache and the Triton kernels of `HealPixConv`, deterministic by default.
+- `HealPixConv` on the Triton backend: a double backward
+  (`create_graph=True`, gradient penalties) now runs on the Triton kernels
+  instead of the PyTorch backward (#109, 9). The convolution, its adjoint and
+  its weight gradient are three autograd Functions whose backward calls the
+  others. They also define `jvp` and `vmap`, so `torch.func.vmap`,
+  `jacrev`, `jacfwd` and `jvp` work again on the layer, as before #90.
+- `HealPixConv` with the PyTorch backend on CUDA (no Triton):
+  `deterministic=True` (the default) computes the input gradient by a gather
+  on the transposed stencil map instead of `index_add_`, so it gives the same
+  bits at every run without `torch.use_deterministic_algorithms` (#109, 9).
+- `benchmarks/benchmark_healpix_conv.py encoder`: an encoder block,
+  `HealPixConv` + `HealPixDown` against `HealPixConv(stride=2)`, and the
+  transposed convolution; `conv` variants `torch_det` and `penalty`
+  (gradient-penalty step).
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is
@@ -43,11 +66,8 @@
   backward pass and kept, at about the size of the stencil buffers again
   (0.2–2.6 GiB in the benchmark configurations). `deterministic=False`
   scatters the gradient with fp32 atomics instead, with no extra memory and
-  last bits that vary between runs. `deterministic` applies to the Triton
-  backend only: on CUDA, the PyTorch backend (used without Triton) is
-  deterministic only under `torch.use_deterministic_algorithms(True)`. A
-  double backward (`create_graph=True`) runs the PyTorch backward on every
-  device, so gradient penalties keep their second-order terms.
+  last bits that vary between runs. For the PyTorch backend on CUDA and the
+  double backward (`create_graph=True`), see the #109 entries above.
   `missing="local_mean"` keeps the PyTorch reference path (gathered tensor
   and matrix product) on every device.
 - `benchmarks/benchmark_healpix_conv.py`: forward, forward + backward, peak
