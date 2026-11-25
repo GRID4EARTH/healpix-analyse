@@ -76,11 +76,18 @@ def sync(device):
 
 
 def timeit(fn, device, reps, budget):
-    """Median time; one call only when the first one exceeds ``budget`` s."""
+    """Median time; one call only when a call exceeds ``budget`` s (on CUDA,
+    the second call: the first one may include Triton compilation)."""
     t0 = time.perf_counter()
     fn()                                   # warm-up (and Triton compilation)
     sync(device)
     first = time.perf_counter() - t0
+    if first > budget and device.type == "cuda":
+        # the first CUDA call may include Triton compilation and autotuning
+        t0 = time.perf_counter()
+        fn()
+        sync(device)
+        first = time.perf_counter() - t0
     if first > budget:
         return first, 1
     ts = []

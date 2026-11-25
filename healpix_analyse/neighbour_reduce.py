@@ -722,6 +722,10 @@ class HealPixNeighbourReducer:
             self.cell_ids.size,
         )
         self._counts = np.diff(offsets)
+        empty = np.flatnonzero(self._counts == 0)
+        # first output cell with an empty neighbourhood (checked at every
+        # call for the reductions that need values; kept off the hot path)
+        self._first_empty = int(empty[0]) if empty.size else -1
 
     @property
     def output_cell_ids(
@@ -926,10 +930,8 @@ class HealPixNeighbourReducer:
         if reduction in {"sum", "count", "any", "all"}:
             return
 
-        empty = np.flatnonzero(self._counts == 0)
-
-        if empty.size:
-            target_cell = int(self.domain[empty[0]])
+        if self._first_empty >= 0:
+            target_cell = int(self.domain[self._first_empty])
 
             raise ValueError(
                 f"Cell {target_cell} has an empty neighbourhood "
@@ -953,13 +955,9 @@ class HealPixNeighbourReducer:
         device = flattened.device
 
         if reduction == "count":
-            counts = torch.as_tensor(
-                self._counts,
-                dtype=torch.int64,
-                device=device,
-            )
+            counts = stencil.on(device).cnt
 
-            return counts.expand(
+            return counts.to(torch.int64).expand(
                 flattened.shape[0],
                 -1,
             ).clone()
