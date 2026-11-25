@@ -21,16 +21,15 @@ Neither backend ever materialises the gathered tensor ``[B, C, G, K, P]``
 
 ``"triton"`` (CUDA, float32 / float16 / bfloat16, fp32 accumulation)
     Fused kernels.  Forward: a gather-GEMM, one program per (batch, gauge,
-    block of cells, block of output channels); the tiles ``A_p`` of a block
-    of TP taps are built in registers and contracted with ``W[g, p]`` by one
-    product over (tap, channel), so that the products are not 16 wide.
-    grad W: the same gather, reduced over the rows; each program sums a
-    contiguous chunk of rows for a block of taps and writes its partial sum
-    (no atomics, deterministic).  grad x: either a GEMM-scatter with fp32
-    atomics, or, with ``deterministic=True``, a gather on the transposed map
-    of the stencil (for each source cell, its incoming (target cell, weight)
-    entries, in CSR form per gauge and tap), contracted by blocks of taps
-    like the forward: no atomics, and the same result at every run.
+    block of cells, block of output channels); the tap tile ``A_p`` is built
+    in registers and multiplied by ``W[g, p]``.  grad W: the same gather,
+    reduced over the rows; each program sums a contiguous chunk of rows for a
+    block of taps, contracted by one product over (tap, channel), and writes
+    its partial sum (no atomics, deterministic).  grad x: either a
+    GEMM-scatter with fp32 atomics, or, with ``deterministic=True``, a gather
+    on the transposed map of the stencil (for each source cell, its incoming
+    (target cell, weight) entries, in CSR form per gauge and tap): no atomics,
+    and the same result at every run.
 
 Extension points
 ----------------
@@ -248,12 +247,16 @@ def _size_class(n):
 
 
 def _taps_per_block(P, width):
-    """Taps contracted together by one ``tl.dot`` (TP, a power of two).
+    """Taps contracted together by one ``tl.dot`` in the grad-W kernel (TP, a power of two).
 
-    The reduction dimension of the products is ``TP * width`` (``width`` is the
-    channel tile): one tap alone gives 16-wide products, which leave the GPU
-    idle.  TP is the largest power of two with ``TP * width <= 128`` whose
-    padding of the last block of taps stays within a quarter.
+    grad W reduces over the rows: with one tap its products are
+    ``[C, rows] @ [rows, Co]``, only 16 x 16 outputs for 16 channels, which
+    leave the GPU idle (3.5x the forward time on an A100).  A block of taps
+    makes them ``[TP*C, rows] @ [rows, Co]``.  TP is the largest power of two
+    with ``TP * width <= 128`` whose padding of the last block stays within a
+    quarter.  The forward and the deterministic grad x keep one tap per
+    product (TP = 1): there the products are already ``[rows, C] @ [C, Co]``,
+    and blocks of taps measured 1.1-2x slower (register pressure).
     """
     tp = 1
     while tp * 2 * width <= 128 and tp * 2 <= P:
@@ -442,12 +445,11 @@ if _HAS_TRITON:
     @triton.jit
     def _bwd_x_csr_kernel(gyt_ptr, tptr_ptr, tbase_ptr, tk_ptr, tw_ptr, wt_ptr, gx_ptr,
                           K, C, CO, G, P, B, SIZE,
-                          PRECISION: tl.constexpr, TP: tl.constexpr,
+                          PRECISION: tl.constexpr,
                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr):
         """gx[b, c, s] = sum_{g,p} (sum_e tw_e gy[b, g, tk_e, :]) @ W[g, p]^T, no atomics.
 
-        ``gyt`` is ``[B, G, K, CO]``; gx is written as ``[B, C, K]``.  TP taps
-        are contracted by one ``tl.dot`` (reduction over (tap, output channel)).
+        ``gyt`` is ``[B, G, K, CO]``; gx is written as ``[B, C, K]``.
         """
         pid = tl.program_id(0)
         pid_c = tl.program_id(1)
@@ -463,35 +465,27 @@ if _HAS_TRITON:
         acc = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
         for g in range(0, G):
             gy_base = gyt_ptr + (b.to(tl.int64) * G + g) * K * CO
-            for p0 in range(0, P, TP):
-                p = p0 + tl.arange(0, TP)
-                p_ok = p < P
-                m2 = s_ok[:, None] & p_ok[None, :]                          # [BM, TP]
-                base = tl.load(tbase_ptr + p, mask=p_ok, other=0)           # [TP]
-                row = s64[:, None] + g * K + p.to(tl.int64)[None, :] * GK1
-                start = tl.load(tptr_ptr + row, mask=m2, other=0)
-                n = tl.load(tptr_ptr + row + 1, mask=m2, other=0) - start
-                n_max = tl.max(tl.max(n, axis=1), axis=0)
-                first = base[None, :] + start.to(tl.int64)
+            for p in range(0, P):
+                base = tl.load(tbase_ptr + p)
+                row = s64 + g * K + p * GK1
+                start = tl.load(tptr_ptr + row, mask=s_ok, other=0)
+                n = tl.load(tptr_ptr + row + 1, mask=s_ok, other=0) - start
+                n_max = tl.max(n, axis=0)
                 for n0 in range(0, CO, BLOCK_N):
                     o = n0 + offs_n
                     o_ok = o < CO
-                    at = tl.zeros((BLOCK_M, TP, BLOCK_N), dtype=tl.float32)
+                    at = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
                     for jj in range(0, n_max):
-                        m = m2 & (jj < n)
-                        e = first + jj
+                        m = s_ok & (jj < n)
+                        e = base + start.to(tl.int64) + jj
                         kk = tl.load(tk_ptr + e, mask=m, other=0).to(tl.int64)
                         ww = tl.load(tw_ptr + e, mask=m, other=0.0).to(tl.float32)
-                        v = tl.load(gy_base + kk[:, :, None] * CO + o[None, None, :],
-                                    mask=m[:, :, None] & o_ok[None, None, :], other=0.0)
-                        at += ww[:, :, None] * v.to(tl.float32)
-                    # W2T[(t, o), c] = W[g, p0+t, c, o]
-                    rows = ((g * P + p)[:, None, None] * C + c[None, None, :]).to(tl.int64)
-                    wm = (p_ok[:, None, None] & o_ok[None, :, None]) & c_ok[None, None, :]
-                    w3 = tl.load(wt_ptr + rows * CO + o[None, :, None], mask=wm, other=0.0)
-                    w2 = tl.reshape(w3, (TP * BLOCK_N, BLOCK_C))
-                    at2 = tl.reshape(at, (BLOCK_M, TP * BLOCK_N))
-                    acc = tl.dot(at2.to(w2.dtype), w2, acc, input_precision=PRECISION)
+                        v = tl.load(gy_base + kk[:, None] * CO + o[None, :],
+                                    mask=m[:, None] & o_ok[None, :], other=0.0)
+                        at += ww[:, None] * v.to(tl.float32)
+                    wT = tl.load(wt_ptr + ((g * P + p) * C + c)[None, :] * CO + o[:, None],
+                                 mask=o_ok[:, None] & c_ok[None, :], other=0.0)
+                    acc = tl.dot(at.to(wT.dtype), wT, acc, input_precision=PRECISION)
         tl.store(gx_ptr + (b.to(tl.int64) * C + c)[None, :] * K + s[:, None],
                  acc.to(gx_ptr.dtype.element_ty), mask=s_ok[:, None] & c_ok[None, :])
 
@@ -521,7 +515,7 @@ def _triton_forward(x, weight, bias, idx, w):
             xt, idx, w, wt, bias if bias is not None else wt, y,
             K, C, CO, G, P, B, _size_class(B * K),
             HAS_BIAS=bias is not None, PRECISION=_precision(x.dtype),
-            TP=_taps_per_block(P, BLOCK_C), BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
+            TP=1, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,     # see _taps_per_block
         )
     return y
 
@@ -574,8 +568,7 @@ def _triton_backward(x, weight, idx, w, gy, need_x, need_w, deterministic, trans
 
                 _bwd_x_csr_kernel[grid](
                     gyt, tptr, tbase, tk, tw, wt, gx, K, C, CO, G, P, B, size,
-                    PRECISION=prec, TP=_taps_per_block(P, BLOCK_N),
-                    BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
+                    PRECISION=prec, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
                 )
             else:
                 gxt = torch.zeros(B, K, C, device=x.device, dtype=torch.float32)
