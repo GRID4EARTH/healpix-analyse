@@ -78,6 +78,7 @@ Triton is optional: without it (or without CUDA) everything runs on the
 from __future__ import annotations
 
 import math
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -413,10 +414,17 @@ if _HAS_TRITON:
     def _configs(spec):
         return [triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=ns) for bm, nw, ns in spec]
 
-    _FWD_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
-    _BWD_W_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
-    _BWD_X_CONFIGS = _configs(((32, 2, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1)))
-    _BWD_X_CSR_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
+    # HEALPIXCONV_AUTOTUNE=small keeps the two likeliest tiles of each kernel
+    # (short benchmark jobs, CI); the default searches the full space
+    _SMALL = os.environ.get("HEALPIXCONV_AUTOTUNE", "").lower() == "small"
+    _FWD_CONFIGS = _configs(((64, 4, 1), (128, 4, 1)) if _SMALL else
+                            ((32, 2, 1), (32, 4, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
+    _BWD_W_CONFIGS = _configs(((64, 4, 1), (128, 8, 1)) if _SMALL else
+                              ((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
+    _BWD_X_CONFIGS = _configs(((64, 4, 1), (128, 4, 1)) if _SMALL else
+                              ((32, 2, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1)))
+    _BWD_X_CSR_CONFIGS = _configs(((64, 4, 1), (128, 4, 1)) if _SMALL else
+                                  ((32, 2, 1), (32, 4, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
 
     @triton.jit
     def _gather_taps_io(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok, K, K_IN, C, G, P,

@@ -85,6 +85,10 @@ CONFIGS = {
         dict(name="L10 regional 262144 k5 G4 B8 32->32", level=10, m=9, k=5, G=4, B=8, C=32, Co=32),
         dict(name="L7 full k5 G4 B8 64->64", level=7, m=None, k=5, G=4, B=8, C=64, Co=64),
     ],
+    "reduced": [  # representative subset for short GPU jobs: level 8 full sphere, level 10 regional
+        dict(name="L8 full k3 G4 B4 16->16", level=8, m=None, k=3, G=4, B=4, C=16, Co=16),
+        dict(name="L10 regional 262144 k5 G4 B8 32->32", level=10, m=9, k=5, G=4, B=8, C=32, Co=32),
+    ],
     "tiny": [  # smoke test of the script itself
         dict(name="L3 full k3 G2 B2 4->4", level=3, m=None, k=3, G=2, B=2, C=4, Co=4),
         dict(name="L5 regional 256 k5 G2 B2 4->4", level=5, m=4, k=5, G=2, B=2, C=4, Co=4),
