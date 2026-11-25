@@ -40,6 +40,7 @@ from ._neighbourhood import (
     NeighbourhoodMethod,
     build_neighbourhoods,
 )
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 
@@ -122,6 +123,7 @@ def binary_dilation(
 
 
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     cells, domain = _validate_inputs(
         cells,
         radius,
@@ -217,6 +219,7 @@ def binary_erosion(
 
 
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     cells, domain = _validate_inputs(
         cells,
         radius,

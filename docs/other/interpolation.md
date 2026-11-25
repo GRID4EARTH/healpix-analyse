@@ -24,9 +24,8 @@ pixels, weights = get_interp_weights(45.03, 30.03, depth=depth)
 values; there is no `cell_ids` argument); `lon`/`lat` are in degrees and
 accept scalars, 1D arrays, or arrays of any shape (`get_interp_weights`
 flattens them; `get_interp_val` returns the input shape). The level is called
-`depth`. Both functions are NumPy only (not differentiable) and are **not
-exported** from `healpix_analyse`: import them from
-`healpix_analyse.healpix_interp`. A NaN in any of the four cells gives NaN.
+`depth`. Both functions are NumPy only (not differentiable) and are
+exported from `healpix_analyse`. A NaN in any of the four cells gives NaN.
 
 The `ellipsoid` string is compared exactly: write `"sphere"` (default) or a
 name that healpix-geo accepts as is, such as `"WGS84"` (`"wgs84"` or

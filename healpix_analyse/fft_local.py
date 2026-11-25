@@ -19,6 +19,7 @@ import healpix_geo
 import numpy as np
 import torch
 import torch.nn as nn
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -253,6 +254,7 @@ class LocalFFT(nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         projection: str = "average",
     ) -> None:
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__()
 
         if projection not in ("average", "conservative"):

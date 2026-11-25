@@ -25,6 +25,7 @@ from healpix_analyse.convol import (
     _build_rotation_matrices,
 )
 from healpix_analyse.decomp import HealPixDecomp, HealPixPyramid
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -170,6 +171,7 @@ class HealPixDivCurl(nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         cache_dir=_DEFAULT_CACHE_DIR,
     ) -> None:
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__()
 
         if isinstance(level, bool) or int(level) != level or int(level) < 0:
@@ -425,6 +427,8 @@ class HealPixMultiScaleDivCurl(nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         cache_dir=_DEFAULT_CACHE_DIR,
     ) -> None:
+        if ellipsoid is not None:
+            ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__()
         if not isinstance(decomp, HealPixDecomp):
             raise TypeError("decomp must be a HealPixDecomp instance")

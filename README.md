@@ -43,12 +43,9 @@ healpix_analyse/
 ├── up.py                 # Resolution increase (HealPixUp)
 ├── decomp.py             # Exact local multiscale pyramid (HealPixDecomp)
 ├── divcurl.py            # Gauge-aware divergence/curl at every pyramid scale
-├── powerspectra.py        # Isotropic power spectrum on HEALPix patches
-├── powerspectra_lonlat.py # Power spectrum on irregular lon/lat grids
+├── powerspectra.py        # Deprecated flat power spectrum of a 2-D block of RING cells
 ├── healpix_interp.py      # Bilinear interpolation on HEALPix (NESTED)
-├── make_rectangle.py      # Rectangular HEALPix patches from bounding boxes
-├── resample.py            # HEALPix level/domain resampling and regular lat/lon conversion
-└── ps.py                  # Power spectrum utilities
+└── resample.py            # HEALPix level/domain resampling and regular lat/lon conversion
 ```
 
 ---

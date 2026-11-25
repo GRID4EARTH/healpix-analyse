@@ -28,14 +28,18 @@ dependencies = [
   # lower bound: the first release with batched nested.cone_coverage (GRID4EARTH/healpix-geo#292)
   "healpix-geo>=0.5",
   "pyproj>=3.6",
-  "termcolor",
-  "umap-learn",
-  "healpix-plot",
 ]
 
 [project.optional-dependencies]
 test = [
   "pytest>=8",
+  "healpy>=1.16",           # reference values in tests/test_components.py, test_topology.py
+]
+
+# Spin != 0 transforms of HEALPixSHT (map2alm_spin, alm2map_spin, uv_to_curl_div)
+sht = [
+  "quaternionic",
+  "spherical",
 ]
 
 scipy = [

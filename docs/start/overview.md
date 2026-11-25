@@ -102,12 +102,8 @@ dependencies) with the answer.
   `HealPixUp`, the transforms and `neighbour_reduce`.
 - **Tuples.** `HealPixDown`, `HealPixUp` and `resample_healpix` return
   `(values, cell_ids)`.
-- **Not exported.** `HealPixConv`, `HEALPixSHT`, `binary_dilation`,
-  `binary_erosion`, `get_interp_val`, `get_interp_weights` and
-  `resample_to_latlon_grid` are imported from their modules (the API
-  reference gives the path).
-- **Known issues** documented on their pages: `alm2map_latlon` halves the
-  m > 0 terms; `HealPixDown(mode="maxpool")` on a regional domain with
+- **Known issues** documented on their pages:
+  `HealPixDown(mode="maxpool")` on a regional domain with
   incomplete parents; `HEALPixSHT.uv_to_curl_div` applies no ℓ factor.
 
 ## What the modules do
@@ -136,10 +132,9 @@ spherical harmonic transform of whole-sphere HEALPix maps (spin 0, 1, 2);
 `alm_latlon` does spin 0 on any iso-latitude grid; `fft_local` (`LocalFFT`)
 takes the FFT and the spectrum of a regional patch; `wavelet_spectrum`
 (`HealPixWaveletSpectrum`) gives NaN-aware band powers per level, on the full
-sphere or a regional domain; `ps`, `powerspectra` and
-`powerspectra_lonlat` are experimental flat spectra; `alm` holds the
-`AlmCoeffs` container (unused by the other modules) and the experimental
-`AlmTransform`.
+sphere or a regional domain; `powerspectra` is a deprecated flat spectrum;
+`alm` holds the `AlmCoeffs` container (not exported, unused by the other
+modules) and the experimental `AlmTransform`.
 
 **Other tools.** `down` and `up` change the level by one; `decomp` builds an
 exactly invertible pyramid; `resample` moves data between levels and domains;
