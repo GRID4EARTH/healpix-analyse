@@ -200,7 +200,7 @@ from healpix_analyse.radial_filter import (
 #
 # The backbone is loaded at run time from Meta's own distribution and is
 # subject to the DINOv3 License; nothing of it is vendored here (see
-# docs/dino.md).
+# docs/other/dino.md).
 # ---------------------------------------------------------------------------
 
 from healpix_analyse.dino import (

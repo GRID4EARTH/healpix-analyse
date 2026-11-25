@@ -4,6 +4,7 @@ import torch
 from healpix_analyse.alm import AlmTransform
 
 from typing import Generic, Tuple, Optional, Sequence, Union
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 ArrayLike = Union[np.ndarray, torch.Tensor, Sequence[float], Sequence[int]]
 
@@ -47,6 +48,7 @@ def powerspectra_lonlat(
     Pk : ndarray
         Azimuthally averaged 1D power spectrum.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     lon = np.asarray(lon)
     lat = np.asarray(lat)
     data = np.asarray(data)

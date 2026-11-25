@@ -82,6 +82,7 @@ from ._neighbourhood import (
 from ._weighted_neighbourhood import (
     weighted_neighbourhood_reduce,
 )
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 Kernel = Callable[[np.ndarray, np.ndarray], Any]
 
@@ -741,6 +742,7 @@ def directional_filter(
     In the example above, ``135 degrees`` has its normal geographical
     meaning: southeast, measured clockwise from North.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     cells = _validate_cell_ids(
         cell_ids,
         name="cell_ids",

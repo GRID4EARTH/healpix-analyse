@@ -1,9 +1,11 @@
 from cdshealpix import from_ring, to_ring
 import healpix_geo
 import numpy as np
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 def make_healpix_rectangle_from_lonlat(bbox, level, ellipsoid):
     """bbox = (lon_min, lat_min, lon_max, lat_max)"""
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     cell_ids, _, _ = healpix_geo.nested.zone_coverage(bbox=bbox,
                                                       depth=level, 

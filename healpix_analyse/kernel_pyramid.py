@@ -98,6 +98,7 @@ import torch
 from healpix_analyse.convol import HealPixConv, _local_kernel_grid
 from healpix_analyse.decomp import HealPixDecomp
 from healpix_analyse.validation import direct_spherical_convolution
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 KernelFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
 """A kernel profile ``fn(rho_pix, phi_rad) -> weight``.
@@ -340,6 +341,7 @@ class HealPixKernelPyramid:
             mislabeled. Accepted case-insensitively (canonicalized against
             ``healpix_geo``'s own registry).
         """
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         if compact_kernel_sz < 1 or compact_kernel_sz % 2 == 0:
             raise ValueError("compact_kernel_sz must be a positive odd integer")
         channels = int(channels)
@@ -460,6 +462,7 @@ class HealPixKernelPyramid:
         one fit per channel), so ``reference_fn`` need not know about
         channels at all.
         """
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         channels = int(channels)
         if channels < 1:
             raise ValueError("channels must be a positive integer")
@@ -572,7 +575,7 @@ class HealPixKernelPyramid:
         represented well by *small* (``compact_kernel_sz``) per-band
         kernels: most of the target's reach comes from the pyramid's
         coarsening itself, and each band only has to correct the local
-        shape at its own scale. See ``docs/pyramid_convolution.md`` for the
+        shape at its own scale. See ``docs/conv/pyramid_conv_maths.md`` for the
         derivation and honest limits (reach is still bounded by
         ``decomp.Jmax``; a target wider than the coarsest band's own reach
         cannot be represented regardless of how the taps are fit).
@@ -613,6 +616,7 @@ class HealPixKernelPyramid:
         implemented, a currently unaddressed limitation, not a silent
         approximation.
         """
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         if decomp.partial:
             raise ValueError(
                 "calibrate_joint requires a full-sphere HealPixDecomp "

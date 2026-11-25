@@ -65,7 +65,7 @@ here would complicate the one thing this class is for.
 from __future__ import annotations
 
 import hashlib
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -74,6 +74,7 @@ import healpix_geo.nested as hgn
 
 from healpix_analyse.convol import HealPixConv
 from healpix_analyse.decomp import HealPixDecomp
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 __all__ = ["HealPixWideConv"]
 
@@ -89,6 +90,20 @@ def _domain_key(cell_ids: np.ndarray) -> str:
     return hashlib.blake2b(
         np.ascontiguousarray(cell_ids, dtype=np.int64).tobytes(), digest_size=16
     ).hexdigest()
+
+
+def _sort_ids(cell_ids) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """``cell_ids`` as sorted ``int64``, plus the permutation that sorted them.
+
+    The permutation is ``None`` when ``cell_ids`` is already sorted, so the
+    common case costs one ``O(N)`` check. Otherwise ``ids[order]`` is sorted
+    and ``sorted_values[np.argsort(order)]`` restores the input order.
+    """
+    ids = np.ascontiguousarray(_as_numpy(cell_ids), dtype=np.int64).reshape(-1)
+    if ids.size < 2 or bool(np.all(ids[1:] >= ids[:-1])):
+        return ids, None
+    order = np.argsort(ids, kind="stable")
+    return np.ascontiguousarray(ids[order]), order
 
 
 class HealPixWideConv:
@@ -153,6 +168,7 @@ class HealPixWideConv:
         dtype: torch.dtype = torch.float64,
         device=None,
     ):
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         k = np.asarray(_as_numpy(kernel_image), dtype=np.float64)
         if k.ndim != 2 or k.shape[0] != k.shape[1]:
             raise ValueError(f"kernel_image must be square 2-D; got shape {k.shape}")
@@ -394,7 +410,8 @@ class HealPixWideConv:
             Values on ``cell_ids``. Numpy arrays and torch tensors (CPU or
             GPU) are both accepted.
         cell_ids : array-like of int, shape ``[N]``
-            HEALPix NESTED cell ids at ``self.level``.
+            HEALPix NESTED cell ids at ``self.level``, in any order: they
+            are sorted internally and ``y`` comes back in the order given.
 
         Returns
         -------
@@ -402,7 +419,7 @@ class HealPixWideConv:
             Numpy in, numpy out; torch in, torch out on the input's own
             device.
         """
-        cell_ids = np.ascontiguousarray(_as_numpy(cell_ids), dtype=np.int64)
+        cell_ids, order = _sort_ids(cell_ids)
         state = self._prepare(cell_ids)
         decomp = state["decomp"]
         convs = state["convs"]
@@ -419,6 +436,8 @@ class HealPixWideConv:
             )
         leading = t.shape[:-1]
         flat = t.reshape(-1, cell_ids.size)          # [B, N]
+        if order is not None:
+            flat = flat[:, torch.as_tensor(order, device=flat.device)]
 
         bands = decomp.compute(flat).bands
         filtered = []
@@ -428,6 +447,8 @@ class HealPixWideConv:
             filtered.append(out.reshape(flat.shape[0], -1))
         y = decomp.invert(filtered)
         y = torch.as_tensor(y, dtype=self.dtype, device=self.device)
+        if order is not None:
+            y = y[..., torch.as_tensor(np.argsort(order), device=y.device)]
         y = y.reshape(*leading, cell_ids.size)
 
         if was_torch:
@@ -446,20 +467,20 @@ class HealPixWideConv:
         Parameters
         ----------
         cell_ids : array-like of int, shape ``[N]``
+            In any order; the field is returned in that order.
         centre_cell : int, optional
             Where to centre the kernel. Defaults to the same cell the fit
             uses (the domain's own centroid, :meth:`reference_centre`).
         """
-        cell_ids = np.ascontiguousarray(_as_numpy(cell_ids), dtype=np.int64)
+        cell_ids, order = _sort_ids(cell_ids)
         if centre_cell is None:
             centre_cell = self._centre_cell(cell_ids)
-        return self._kernel_field(cell_ids, int(centre_cell))
+        field = self._kernel_field(cell_ids, int(centre_cell))
+        return field if order is None else field[np.argsort(order)]
 
     def reference_centre(self, cell_ids) -> int:
         """The cell the per-band fit is centred on (the domain's centroid)."""
-        return self._centre_cell(
-            np.ascontiguousarray(_as_numpy(cell_ids), dtype=np.int64)
-        )
+        return self._centre_cell(_sort_ids(cell_ids)[0])
 
     def band_kernels(self, cell_ids=None) -> tuple:
         """The fitted per-band stencils, each ``(compact_kernel_sz,) * 2``."""
@@ -485,9 +506,7 @@ class HealPixWideConv:
 
     def _state(self, cell_ids):
         if cell_ids is not None:
-            return self._prepare(
-                np.ascontiguousarray(_as_numpy(cell_ids), dtype=np.int64)
-            )
+            return self._prepare(_sort_ids(cell_ids)[0])
         if self._last_key is None:
             raise RuntimeError(
                 "nothing fitted yet -- call the operator once (or pass cell_ids)"
@@ -495,6 +514,8 @@ class HealPixWideConv:
         return self._cache[self._last_key]
 
     def _prepare(self, cell_ids: np.ndarray) -> dict:
+        # ``cell_ids`` must be sorted (callers pass it through ``_sort_ids``):
+        # the Dirac and kernel-field placement below use ``np.searchsorted``.
         key = _domain_key(cell_ids)
         self._last_key = key
         if key in self._cache:

@@ -4,6 +4,7 @@ import torch
 from healpix_analyse.alm import AlmTransform
 
 from typing import Generic, Tuple, Optional, Sequence, Union
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 ArrayLike = Union[np.ndarray, torch.Tensor, Sequence[float], Sequence[int]]
 
@@ -36,6 +37,7 @@ def powerspectra(cell_ids,
         Pk : ndarray
             Azimuthally averaged power spectrum over radial frequency bins (arbitrary units unless you add a normalization).
         """
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         # 2D FFT and power
         
         if ltf is None:

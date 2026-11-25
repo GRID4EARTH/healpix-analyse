@@ -7,9 +7,16 @@ side) matches names **case-sensitively**: it accepts e.g. ``"WGS84"`` and
 sources do not all agree on a casing -- for example EOPF/GRID4EARTH
 Sentinel-2 HEALPix products declare their ellipsoid as the lowercase
 string ``"wgs84"``. Rather than have every caller (and every notebook)
-remember to re-case that string by hand, every constructor in this package
-that accepts an ``ellipsoid`` argument canonicalizes it once, here, at
-construction time.
+remember to re-case that string by hand, the public constructors and
+functions of this package that accept an ``ellipsoid`` argument pass it
+through :func:`canonicalize_ellipsoid` on entry, so ``"wgs84"``,
+``"Wgs84"``, ``"Sphere"`` or ``"SPHERE"`` work wherever ``"WGS84"`` or
+``"sphere"`` do. Names ``healpix_geo`` does not know under any of these
+casings are passed through unchanged and fail with ``healpix_geo``'s own
+error at the point of use.
+
+Known exception: ``healpix_analyse.alm.AlmTransform`` does not canonicalize
+yet (``powerspectra`` does it before calling it).
 """
 
 from __future__ import annotations
