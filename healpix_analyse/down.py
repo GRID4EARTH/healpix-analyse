@@ -26,7 +26,7 @@ same type and leading dimensions.  The leading dimensions are flattened into
 one row axis by a view, so a contiguous ``[B*C, N]`` tensor goes through
 Down/Up without any permute or copy.
 
-Compute backends (``backend=``, see :mod:`healpix_analyse._updown_backend`):
+Compute backends (``backend=``, see ``healpix_analyse._updown_backend``):
 
 * ``mean`` / ``maxpool`` on contiguous NESTED data (the full sphere, or a
   regional domain with sorted ``cell_ids`` and complete parents) reduce a
@@ -242,7 +242,7 @@ class _SparseOperatorMixin:
             self.register_buffer(f"{name}_val", T.values().clone(), persistent=False)
 
     def _ell_ops(self):
-        """The stored operator and its backward as :class:`_ub.Ell`."""
+        """The stored operator and its backward as ``_ub.Ell`` tuples."""
         R, C = self._M_size
         return (_ub.Ell(self._ell_idx, self._ell_w, C),
                 _ub.Ell(self._ellT_idx, self._ellT_w, R))

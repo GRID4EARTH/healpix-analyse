@@ -25,7 +25,7 @@ CSR buffers, the reference), built once in the constructor: they follow
 cell takes the value of its parent (``paired_down`` a ``mean`` Down on
 contiguous NESTED data), no matrix is stored at all: the forward is an
 ``expand`` of the scaled coarse values, bit-identical to the reference.  See
-:mod:`healpix_analyse._updown_backend`.
+``healpix_analyse._updown_backend``.
 
 Dependencies: numpy, torch, healpix_geo.
 """
