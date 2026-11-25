@@ -81,6 +81,28 @@
   `lmax >= (N_r + 1) / 2`; irregular rings failed on CUDA input (kernel
   built on the CPU). New tests in `tests/test_alm_latlon.py`.
 
+### Fixed
+- Ellipsoid names in any casing (`"wgs84"`, `"Wgs84"`, `"Sphere"`,
+  `"SPHERE"`, ...) are accepted by the public functions and constructors
+  that take `ellipsoid`, including `get_interp_val` / `get_interp_weights`,
+  which rejected `"wgs84"` and `"Sphere"`, and the WGS84-only filters
+  (`radial_filter`, `gaussian_filter`, `neighbour_reduce` and its
+  `*_filter` shortcuts, `directional_filter`), which raised
+  `NotImplementedError` for `"wgs84"`. `dino.set_ellipsoid` now also
+  accepts title case. `AlmTransform` is not covered yet (#96).
+- `HealPixWideConv` accepts `cell_ids` in any order: it sorts them
+  internally and returns the result in the order given (it used to give
+  wrong results silently on unsorted ids). A permutation of the same domain
+  reuses the cached fit (#96).
+- Doc paths in warnings and docstrings point to the reorganised pages
+  (`docs/conv/large_conv.md`, `docs/conv/radial_filter.md`,
+  `docs/conv/pyramid_conv_maths.md`, `docs/other/dino.md`); the
+  `radial_filter` docstrings name the helpers the code calls
+  (`build_metric_neighbourhood_geometry`,
+  `compact_weighted_neighbourhood_reduce`); `nested_to_tiles` documents
+  that repeated ids follow `duplicates`, and `GetDINOV3SAT` lists the
+  `"percell"` projection (#96).
+
 ## 2026.11.1 (2026-11-23)
 
 ### Added

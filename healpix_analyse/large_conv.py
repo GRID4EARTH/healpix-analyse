@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from healpix_analyse.convol import HealPixConv, _DEFAULT_CACHE_DIR
 from healpix_analyse.down import HealPixDown
 from healpix_analyse.up import HealPixUp
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -215,6 +216,7 @@ class LargeConv(nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         cache_dir: "Path | str | None" = _DEFAULT_CACHE_DIR,
     ) -> None:
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__()
 
         if isinstance(level, bool) or int(level) != level or int(level) < 0:
@@ -496,6 +498,7 @@ class LargeConv(nn.Module):
         go to :class:`LargeConv`.  See :func:`gaussian_plan` for the accuracy
         and the limits.
         """
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         if reference_cell is None and cell_ids is not None:
             # here, so that a wide-domain warning points at the caller
             reference_cell = _centre_cell(level, cell_ids, str(ellipsoid))
@@ -674,7 +677,7 @@ def _centre_cell(level, cell_ids, ellipsoid, stacklevel=2):
         warnings.warn(
             f"cell_ids reach {spread:.0f} degrees from the cell chosen for the "
             f"calibration ({int(ids[k])}); the width is calibrated there only and "
-            "can be off by about 20 % at other latitudes (see docs/large_conv.md); "
+            "can be off by about 20 % at other latitudes (see docs/conv/large_conv.md); "
             "pass reference_cell, or smooth each region with its own layer",
             stacklevel=stacklevel + 1,
         )
@@ -732,6 +735,7 @@ def down_up_blur(
     most ``min(patch_depth, level) - 3``, otherwise the blur would reach the
     patch edge and a ``ValueError`` is raised.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     level, n_levels, patch_depth, depth = _check_options(level, n_levels, patch_depth)
     opts = _options(
         ellipsoid, radius_deg, sigma_deg, weight_norm, up_norm, level, depth, reference_cell
@@ -885,9 +889,10 @@ def gaussian_plan(
     and the equatorial block when neither is given.  The width is exact for
     the response to the centre cell of that patch (interpolation error of
     the table 4e-4 relative in the benchmark) and an approximation for
-    other cells and other places; see ``docs/large_conv.md``.
+    other cells and other places; see ``docs/conv/large_conv.md``.
     :meth:`LargeConv.from_gaussian` does all of this in one call.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     level = _as_int("level", level, 0)
     sigma = _resolve_sigma(level, sigma, sigma_m)
     patch_depth = _as_int("patch_depth", patch_depth, 1)

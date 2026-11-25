@@ -70,6 +70,7 @@ import numpy as np
 import torch
 
 import healpix_geo
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 try:
     import quaternionic
@@ -196,6 +197,7 @@ class HEALPixSHT:
         device:    Optional[Union[str, torch.device]] = None,
         ellipsoid: str                         = "sphere",
     ) -> None:
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         if isinstance(level, bool) or int(level) != level or int(level) < 0:
             raise ValueError("level must be an integer >= 0.")
         if dtype not in (torch.float32, torch.float64):
