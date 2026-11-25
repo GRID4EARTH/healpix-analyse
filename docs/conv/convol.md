@@ -5,6 +5,9 @@ sphere with a learned kernel, equivariantly: the same stencil is applied at
 every cell, transported into a local frame, so the result does not depend on
 how the pixel grid happens to be oriented there.
 
+```{include} ../_generated/glance/healpix_conv.md
+```
+
 It works on full-sky maps and on partial-sky patches, takes NumPy arrays or
 Torch tensors, and is differentiable end to end.
 
@@ -31,8 +34,8 @@ Key design choices:
   as registered buffers. The forward pass is purely index-and-multiply.
 - **Fully vectorised**: no Python loops over pixels or gauges in either the
   constructor or the forward pass.
-- **Differentiable**: every operation in the hot path (`index_select`,
-  `einsum`, arithmetic) is supported by PyTorch autograd.
+- **Differentiable**: every operation in the hot path (gathers, weighted
+  sums, batched matrix products) is supported by PyTorch autograd.
 
 ---
 
@@ -298,6 +301,7 @@ HealPixConv(
     device             = None,
     ellipsoid          = "WGS84",
     dtype              = torch.float32,
+    cache_dir          = <default>,   # $HEALPIXCONV_CACHE or ~/.cache/healpixconv
 )
 ```
 
@@ -312,7 +316,7 @@ HealPixConv(
 | `singularity_lonlat` | `(lon, lat)` or `[(lon₁,lat₁),(lon₂,lat₂)]` or `None` | `None` | Geographic coordinates of the desired singularity point(s) in degrees. For `"projected_ref"`: one pair. For `"two_ref"`: a list of two pairs. Overrides `ref_direction`. |
 | `ref_direction` | `array (3,)` or `(2, 3)` or `None` | `None` | Low-level alternative: raw unit reference vector(s). Shape `(3,)` for `"projected_ref"`, `(2, 3)` for `"two_ref"`. Ignored when `singularity_lonlat` is provided. |
 | `cell_ids` | `array-like` or `None` | `None` | NESTED pixel indices for a partial-sky patch. `None` = full sphere. |
-| `nest` | `bool` | `True` | Pixel ordering of the input map. `True` = NESTED, `False` = RING. |
+| `nest` | `bool` | `True` | Kept for compatibility. The geometry is always built on NESTED ids: the flag only enters the cache key and has no effect on the result. Pass NESTED data. |
 | `use_norm` | `bool` | `False` | Apply GroupNorm + ReLU after the convolution. |
 | `device` | `str` or `torch.device` or `None` | `None` | Target device. Defaults to CUDA if available, else CPU. |
 | `ellipsoid` | `str` | `"WGS84"` | Reference ellipsoid for healpix_geo coordinate conversions. |
@@ -420,8 +424,8 @@ gauge_type='two_ref':
 
 | Buffer / tensor | Shape | Description |
 |---|---|---|
-| `_pos_safe` | `[G, 4, K·P]` | Column indices into the sorted input for each bilinear neighbour |
-| `_w_norm` | `[G, 4, K·P]` | Renormalised bilinear weights |
+| `_pos_safe` | `[4, G, K·P]` (int64) | Column indices into the sorted input for each bilinear neighbour |
+| `_w_norm` | `[4, G, K·P]` (layer dtype) | Renormalised bilinear weights |
 | `_sort_order` | `[K]` | Index that sorts pixel ids ascending |
 | `_inv_order` | `[K]` | Inverse permutation to restore original order |
 | `weight` | `[G, C_in, C_out, P]` | Learned kernel (nn.Parameter) |
@@ -445,20 +449,47 @@ typical configurations (nside=64, G=4, kernel_sz=3):
 
 #### Forward pass (per batch)
 
-The forward is a single `index_select` over `[G · 4 · K · P]` entries,
-followed by a weighted sum and one `einsum`. On GPU (A100) with batch size
-8, nside=64, G=4, C_in=16, C_out=32: typically under 5 ms.
+The forward gathers the input at the four bilinear neighbours of every
+stencil point (a loop over the 4 neighbours), forms the weighted sum and
+applies the kernel with a batched matrix product. The gathered tensor has
+`B · C_in · G · K · P` values, and the code comments put the peak at about
+twice that. GPU timings are to be measured (none is published in the
+repository).
 
 #### Memory
 
-The dominant buffers are `_pos_safe` and `_w_norm`, each of shape
-`[G, 4, K·P]`. For nside=128, G=4, kernel_sz=5 (P=25):
+The dominant buffers are `_pos_safe` (int64) and `_w_norm` (float32 for a
+float32 layer), each of shape `[4, G, K·P]`. For nside=128, G=4,
+kernel_sz=5 (P=25):
 
 ```
 K = 12 × 128² = 196 608
-Buffer size = 4 × 4 × 196 608 × 25 × 4 bytes (float32) ≈ 750 MB
+entries per buffer = 4 × 4 × 196 608 × 25 = 78 643 200
+_pos_safe : 78 643 200 × 8 bytes ≈ 629 MB
+_w_norm   : 78 643 200 × 4 bytes ≈ 315 MB
+total                            ≈ 944 MB   (1 258 MB for a float64 layer)
 ```
 
-For very large nside, consider reducing G or kernel_sz, or using
-`torch.float16` for the buffers.
+For very large nside, consider reducing G or kernel_sz. The memory of the
+forward pass comes on top: it grows as `B · C_in · G · K · P`. Making this
+layer cheaper for GPU training is tracked in a separate optimisation issue.
+
+#### Geometry cache on disk
+
+The geometry (stencil rotation, bilinear binding) is saved after the first
+construction and reloaded afterwards: about 0.8 s to build at nside 64,
+G = 4, against about 5 ms to reload (figures from the code comments). The
+cache directory is `cache_dir`, by default `$HEALPIXCONV_CACHE` or
+`~/.cache/healpixconv`; `cache_dir=None` disables it. The key holds nside,
+`kernel_sz`, G, the gauge type and reference directions, the ellipsoid and the
+cell ids (in order), but not the dtype: the buffers are stored as int64 and
+float32, so a float64 layer built from the cache gets float32-precision
+weights. `set_kernel` also casts the kernel to float32.
+
+#### Edges of a regional domain
+
+A stencil point whose bilinear neighbours are not in `cell_ids` takes the
+neighbours of the centre point of the same stencil: at the edge of a regional
+domain the missing samples are silently replaced by the centre value. Include a
+margin around the area of interest.
 

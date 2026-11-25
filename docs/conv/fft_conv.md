@@ -5,6 +5,9 @@ to data stored on a local NESTED HEALPix patch. It reuses the pole-safe
 gnomonic projection from `LocalFFT` and evaluates the planar convolution with
 `torch.fft.rfft2`/`irfft2`.
 
+```{include} ../_generated/glance/fft_conv.md
+```
+
 ```text
 HEALPix values → gnomonic projection → zero-padded FFT convolution
                → inverse FFT → HEALPix back-projection
@@ -56,6 +59,7 @@ HealPixFFTConv(
     dtype=torch.float32,
     device=None,
     cache_kernel_fft=True,
+    projection="average",
 )
 ```
 

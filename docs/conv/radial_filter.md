@@ -2,6 +2,9 @@
 
 `radial_filter` applies a user-defined isotropic kernel to values on a NESTED HEALPix grid using **physical WGS84 centre-to-centre distance in metres**.
 
+```{include} ../_generated/glance/radial_filter.md
+```
+
 A convenience `gaussian_filter` wrapper provides normalized Gaussian smoothing using `sigma_m` rather than a pixel-based standard deviation.
 
 Candidate cells and cell-centre coordinates come from healpix-geo (one batched
@@ -481,7 +484,7 @@ The spatial neighbourhood infrastructure is shared rather than independently rei
 
 ## Relationship to directional filtering
 
-Radial and directional filters share the same relative-neighbour geometry and weighted aggregation layers but intentionally expose different scientific kernels.
+Radial and directional filters both use WGS84 geodesic distances from the cell-centre neighbourhoods of healpix-geo, but they are built on different internal geometry builders and reducers, and they expose different scientific kernels.
 
 Radial filtering uses only distance:
 

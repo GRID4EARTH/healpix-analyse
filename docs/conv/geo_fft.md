@@ -7,6 +7,9 @@ azimuths from the block centre, so that the distortion of the HEALPix cells is
 built into the kernel image. Missing data are handled by normalized
 convolution, computed as a ratio of two FFTs.
 
+```{include} ../_generated/glance/geo_fft.md
+```
+
 ```text
 HEALPix block → image on the (i, j) face lattice (zeros where missing)
              → zero-padded FFT convolution by k(geodesic distance, azimuth)
@@ -179,11 +182,9 @@ at the pixel scale.
 
 ## API
 
-```{eval-rst}
-.. autoclass:: healpix_analyse.geo_fft.HealPixGeoFFT
-   :members: forward, raw, support
-.. autofunction:: healpix_analyse.geo_fft.geo_fft_convolve
-.. autofunction:: healpix_analyse.geo_fft.make_kernel
-.. autofunction:: healpix_analyse.geo_fft.register_kernel
-.. autofunction:: healpix_analyse.geo_fft.lattice_geometry
-```
+The signatures and docstrings are in the API reference:
+{py:class}`~healpix_analyse.geo_fft.HealPixGeoFFT` (methods `forward`, `raw`,
+`support`), {py:func}`~healpix_analyse.geo_fft.geo_fft_convolve`, and, in the
+module page {doc}`/autoapi/healpix_analyse/geo_fft/index`, `make_kernel`,
+`register_kernel` and `lattice_geometry` (not exported from
+`healpix_analyse`).

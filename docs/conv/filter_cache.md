@@ -1,7 +1,13 @@
 # Filter caches
 
+```{include} ../_generated/glance/filter_cache.md
+```
+
 `radial_filter` and `gaussian_filter` keep bounded least-recently-used caches
-for value-independent metric geometry and Gaussian weights. The defaults are:
+for value-independent metric geometry and Gaussian weights (the Gaussian
+weights only for the default `normalization="present"` with
+`width_rule="sampled"`). The filter operators also fill the geometry cache.
+The caches live in memory; nothing is written to disk. The defaults are:
 
 ```text
 geometry: 192 MiB
@@ -13,9 +19,10 @@ If one filter plan exceeds either limit, that entry is not cached. A
 repeat will rebuild the data, and gives two safe options:
 
 1. increase the relevant limit after checking available process memory; or
-2. process spatial tiles with a halo of at least
-   `radius_m = sigma_m * truncate`, discard halo outputs, and stitch only the
-   tile interiors.
+2. process spatial tiles with a halo of at least the filter radius
+   (`radius_m`, or `sigma_m * truncate` for a Gaussian; with
+   `width_rule="matched"` the radius is `truncate * max(sigma_m, 0.6 cell)`),
+   discard halo outputs, and stitch only the tile interiors.
 
 Splitting without a halo changes neighbourhoods at tile boundaries and does
 not preserve the filtering result.

@@ -5,6 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(".."))
 # local extensions (docs/_ext): the tool catalogue generator
+# (tools.yaml -> decision tables, "At a glance" boxes, API by family, llms.txt)
 sys.path.insert(0, os.path.abspath("_ext"))
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ extensions = [
     "sphinx.ext.mathjax",
     "sphinx_design",
     "myst_nb",
+    "tool_catalogue",
 ]
 
 # ---------------------------------------------------------------------------
@@ -163,7 +165,11 @@ intersphinx_mapping = {
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
 # llms.txt and llms-full.txt (generated from tools.yaml) go to the site root
+html_extra_path = ["_generated/extra"]
+# llms.txt and llms-full.txt (generated from tools.yaml) go to the site root
 html_baseurl = "https://grid4earth.eu/healpix-analyse/"
+# Every public symbol must be in tools.yaml (see docs/_ext/tool_catalogue.py)
+tool_catalogue_complete = False
 html_title = "healpix-analyse"
 html_theme_options = {
     "navigation_depth": 4,

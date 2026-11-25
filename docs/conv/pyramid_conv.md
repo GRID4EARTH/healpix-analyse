@@ -6,6 +6,12 @@
 build masked, NaN-aware, multiscale spherical filters that stay `O(N)` in
 the number of pixels.
 
+```{include} ../_generated/glance/kernel_pyramid.md
+```
+
+```{include} ../_generated/glance/pyramid_conv.md
+```
+
 This page is the guide. The mathematics, implementation notes and calibration
 are in {doc}`/conv/pyramid_conv_maths`; the validation report is in the
 developer notes ({doc}`/dev/pyramid_conv_validation`). It does not claim to

@@ -62,7 +62,7 @@ in `tests/test_decomp_weighted.py` and `tests/test_pyramid_conv.py`):
 full `compute_weighted → apply_pyramid → invert` forward pass, geometry
 cache warm after the first build):
 
-| level | npix | Jmax | one-time build (s) | forward pass (ms) | forward / pixel (×1e-6 ms) |
+| level | npix | Jmax | one-time build (s) | forward pass (ms) | forward / pixel (µs) |
 |---:|---:|---:|---:|---:|---:|
 | 5 | 12,288 | 2 | 0.02 | 33.5 | 2.73 |
 | 6 | 49,152 | 3 | 8.08 | 122.9 | 2.50 |

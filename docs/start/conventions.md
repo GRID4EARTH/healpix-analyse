@@ -101,6 +101,11 @@ Widths are **standard deviations** (one-axis RMS widths) of a Gaussian, not
 FWHM (FWHM = 2.355 σ). "One cell" is the nominal cell size,
 `sqrt(4π / (12 · 4**L))` radians, about 6.4 km at level 10 on the Earth.
 
+### Kernel conventions
+
+A fixed kernel is written in five ways, with different arguments, units and
+angle directions; see {doc}`/conv/kernel_conventions`.
+
 ## Values: shapes, NumPy and Torch
 
 There is no single rule. The most common one is "the last axis is the cell

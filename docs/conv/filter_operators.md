@@ -5,6 +5,9 @@ total of a field (`normalization="source"`), or stop the kernel at a coast
 (`blocked_cells`). The filters themselves are described in
 {doc}`/conv/radial_filter`.
 
+```{include} ../_generated/glance/filter_operators.md
+```
+
 ## Reusable weights
 
 The weights of a filter can be built once and applied many times, for example
@@ -73,8 +76,8 @@ straight-line distance, so a kernel that is wider than a strip of land puts
 weight on the far side of it, and land cells only act as zero padding. With it:
 
 - a blocked cell **receives nothing and gives nothing**: its row is empty (the
-  output there is zero) and it appears in no row (its input value is ignored); the output there is zero
-  also with `renormalize_missing=True`;
+  output there is zero, also with `renormalize_missing=True`) and it appears
+  in no row (its input value is ignored);
 - a cell reaches another one only along a path of neighbouring non-blocked
   cells, and the kernel sees the length of the **shortest such path**, not the
   straight distance. A strait lets weight through at the water distance, an
@@ -160,7 +163,7 @@ differ only in it:
 | `"source"` | **kept** (reflecting coast): every source cell divides its outgoing weights by their sum over the cells it reaches | free | sum to exactly 1 (to rounding): the total is conserved, and never above 1 for a non-negative signal | not preserved (rises or falls next to land) |
 | `"present"` | renormalised per output cell over the cells that reach it | sum to 1 | free | preserved on water |
 
-`"source"` is new and works without `blocked_cells` too, where it makes the
+`"source"` works without `blocked_cells` too, where it makes the
 domain edge reflecting. In the interior it differs from `"present"` only
 through the cell-to-cell variation (about 1e-4) of the kernel sum. With
 `width_rule="matched"` the blend with the identity below about 0.6 cell is

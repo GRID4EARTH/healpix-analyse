@@ -4,6 +4,9 @@
 kernel that depends on **how far** and **in which compass direction** a
 neighbour lies.
 
+```{include} ../_generated/glance/directional_filter.md
+```
+
 Both are physical: distance in metres, direction as a geographical azimuth,
 geometry computed between cell centres on WGS84. Nothing in the public API
 refers to pixel offsets, HEALPix ring numbers, or neighbour-list ordering — so
@@ -25,7 +28,7 @@ import numpy as np
 from healpix_geo import nested
 from healpix_analyse.directional_filter import directional_filter
 
-level = 14                                     # ~2.4 m cells
+level = 14                                     # cells of about 400 m
 cell_ids = nested.cone_coverage((2.35, 48.85), 0.02, level)   # a patch over Paris
 cell_ids = np.asarray(getattr(cell_ids, "data", cell_ids), dtype=np.uint64).reshape(-1)
 values = np.random.rand(cell_ids.size)

@@ -6,6 +6,9 @@ top-hat a kilometre across. You hand it the kernel the way you naturally hold
 it — an image, a formula in metres, a raster — and it works out by itself the
 small per-band kernels that reproduce it through a scale pyramid.
 
+```{include} ../_generated/glance/wide_conv.md
+```
+
 ```python
 import numpy as np
 from healpix_analyse import HealPixWideConv
@@ -523,7 +526,8 @@ over many small patches: batch them, or reuse one domain.
 | `HealPixConv` | one compact stencil | `kernel_sz // 2` px | no | yes, dense |
 | `HealPixKernelPyramid` + `HealPixPyramidConv` | an analytic profile per band | multiscale | yes (`"normalized"`) | yes, block-diagonal |
 | **`HealPixWideConv`** | **one wide kernel, given as an image** | **multiscale** | **no** | **no** |
-| `LargeConv` / `HealPixFFTConv` | arbitrary, via FFT on a local grid | grid-limited | see their docs | see their docs |
+| `LargeConv` | learned compact kernel on a coarsened grid (Down → `HealPixConv` → Up, no FFT) | wide, set by the number of levels | zero padding at the domain edge | multi-channel |
+| `HealPixFFTConv` | learned, by FFT on a gnomonic tangent grid of one patch | the patch (radius 10° by default) | one NaN makes all NaN | multi-channel |
 
 `HealPixKernelPyramid.calibrate_joint` solves a related problem — fitting all
 bands jointly against one wide target operator, probed through the full

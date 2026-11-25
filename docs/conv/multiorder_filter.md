@@ -8,6 +8,9 @@ that level); the result is a `FilterOperator` over the leaves in input order, to
 be applied with `apply_filter_operator`. **Land is a place without a leaf**,
 and leaves listed in the optional boolean `blocked` are land inside the set.
 
+```{include} ../_generated/glance/multiorder_filter.md
+```
+
 ```python
 op = multiorder_filter_operator(
     levels, cell_ids, sigma_m=5_000.0, normalization="source",

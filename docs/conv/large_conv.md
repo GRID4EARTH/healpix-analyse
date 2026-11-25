@@ -4,6 +4,9 @@
 the expensive fine-resolution interpolation stencil required by a direct
 `HealPixConv`.
 
+```{include} ../_generated/glance/large_conv.md
+```
+
 It applies a matched multiresolution operator:
 
 $$
