@@ -49,8 +49,9 @@ different ways of estimating the same physical quantities from ERA5 10-m wind:
 
 1. **Global spectral reference.** The global eastward and northward wind maps
    are transformed with spin-1 spherical harmonics. The E/B coefficients are
-   multiplied by $\sqrt{\ell(\ell+1)}/R$ before synthesis, yielding physical
-   divergence and outward-normal curl in `s^-1`. This is feasible on the full
+   multiplied by $-\sqrt{\ell(\ell+1)}/R$ before synthesis, yielding physical
+   divergence and outward-normal curl in `s^-1`; this is what
+   `HEALPixSHT.uv_to_curl_div` returns ({doc}`/sht/healpix_sht`). This is feasible on the full
    sphere because the ALM transform has complete global support.
 2. **Local masked experiment.** The same global `u` and `v` maps are sampled
    onto a coastal NESTED HEALPix domain. `HealPixDecomp` builds a local

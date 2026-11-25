@@ -1089,11 +1089,17 @@ class HEALPixSHT:
     # ------------------------------------------------------------------
 
     def _ell_factor(self) -> torch.Tensor:
-        """√(ℓ(ℓ+1)) in the flat alm layout, shape (K,), real dtype."""
-        fac = torch.empty(self.n_alm, dtype=self.dtype, device=self.device)
-        for m in range(self.lmax + 1):
-            ell = torch.arange(m, self.lmax + 1, dtype=self.dtype, device=self.device)
-            fac[self._alm_slice(m)] = torch.sqrt(ell * (ell + 1.0))
+        """√(ℓ(ℓ+1)) in the flat alm layout, shape (K,), real dtype.
+
+        Built on first use and cached (a non-grad constant).
+        """
+        fac = getattr(self, "_ell_factor_cache", None)
+        if fac is None:
+            fac = torch.empty(self.n_alm, dtype=self.dtype, device=self.device)
+            for m in range(self.lmax + 1):
+                ell = torch.arange(m, self.lmax + 1, dtype=self.dtype, device=self.device)
+                fac[self._alm_slice(m)] = torch.sqrt(ell * (ell + 1.0))
+            self._ell_factor_cache = fac
         return fac
 
     def uv_to_eb(
