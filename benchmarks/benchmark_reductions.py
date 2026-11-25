@@ -156,13 +156,22 @@ def _package_info():
 # Operators: build() -> apply(x) callable, input shape
 # ---------------------------------------------------------------------------
 
+_REDUCER_CACHE = {}
+
+
 def _build(op, level, ids, device, dtype):
     if op in REDUCTIONS:
         from healpix_analyse import HealPixNeighbourReducer
-        red = HealPixNeighbourReducer(ids, level, radius_m=1.6 * spacing_m(level))
+        key = (level, len(ids))
+        if key not in _REDUCER_CACHE:     # one geometry for all the reductions
+            _REDUCER_CACHE.clear()
+            _REDUCER_CACHE[key] = HealPixNeighbourReducer(
+                ids, level, radius_m=1.6 * spacing_m(level))
+        red = _REDUCER_CACHE[key]
         return (lambda x: red(x, reduction=op)), (len(ids),)
     if op == "gradient":
-        import healpix_analyse.gradient as gmod
+        import importlib
+        gmod = importlib.import_module("healpix_analyse.gradient")
         if hasattr(gmod, "HealPixGradient"):
             g = gmod.HealPixGradient(ids, level)
             return (lambda x: torch.stack(g(x), 1)), (len(ids),)

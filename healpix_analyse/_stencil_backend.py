@@ -67,6 +67,8 @@ _MAX_KP_TRITON = 256
 _MAX_KP_MEDIAN_TRITON = 64
 # Elements of one chunk of the materialised median / generic path.
 _CHUNK_ELEMENTS = 1 << 24
+# Longest rows of the rank-based median of the torch backend (KP^2 per cell).
+_MAX_KP_RANK = 32
 
 
 def triton_available() -> bool:
@@ -253,6 +255,12 @@ def _row_chunks(n_rows, width):
         yield r0, min(n_rows, r0 + step)
 
 
+def _tap_order(kp, device):
+    """``[KP(i), KP(j)]`` bool: ``j < i``."""
+    k = torch.arange(kp, device=device)
+    return k[None, :] < k[:, None]
+
+
 def _torch_median(x, sd, need_sel):
     B = x.shape[0]
     N, KP = sd.idx.shape
@@ -261,21 +269,35 @@ def _torch_median(x, sd, need_sel):
     sel = (torch.empty(2, B, N, dtype=torch.int16, device=x.device)
            if need_sel else None)
     cnt = sd.cnt.long()
-    for r0, r1 in _row_chunks(N, B * KP):
+    rank_path = KP <= _MAX_KP_RANK
+    for r0, r1 in _row_chunks(N, B * KP * (KP if rank_path else 1)):
         g = xe[:, sd.idx[r0:r1].long()]                     # [B, R, KP]
-        s, si = torch.sort(g, dim=-1, stable=True)
         c = cnt[r0:r1]
         i_lo = ((c - 1) // 2).expand(B, -1)[..., None]
         i_hi = (c // 2).expand(B, -1)[..., None]
-        lo = s.gather(-1, i_lo)[..., 0]
-        hi = s.gather(-1, i_hi)[..., 0]
+        if rank_path:
+            # rank of every value in its row, ties broken by tap (= a stable
+            # sort); the +inf pads sit after the valid taps, so the valid
+            # values take the ranks 0..cnt-1.  Faster than torch.sort on CPU
+            # for short rows.
+            less = (g[..., None, :] < g[..., :, None]) | (
+                (g[..., None, :] == g[..., :, None]) & _tap_order(KP, g.device))
+            rank = less.sum(dim=-1)                         # [B, R, KP]
+            s_lo = torch.argmax((rank == i_lo).to(torch.uint8), dim=-1, keepdim=True)
+            s_hi = torch.argmax((rank == i_hi).to(torch.uint8), dim=-1, keepdim=True)
+        else:
+            _, si = torch.sort(g, dim=-1, stable=True)
+            s_lo = si.gather(-1, i_lo)
+            s_hi = si.gather(-1, i_hi)
+        lo = g.gather(-1, s_lo)[..., 0]
+        hi = g.gather(-1, s_hi)[..., 0]
         odd = (c % 2 == 1)
         val = torch.where(odd, hi, (lo + hi) / 2)
         has_nan = torch.isnan(g).any(dim=-1)
         out[:, r0:r1] = torch.where(has_nan, torch.full_like(val, float("nan")), val)
         if need_sel:
-            s_lo = si.gather(-1, i_lo)[..., 0].to(torch.int16)
-            s_hi = si.gather(-1, i_hi)[..., 0].to(torch.int16)
+            s_lo = s_lo[..., 0].to(torch.int16)
+            s_hi = s_hi[..., 0].to(torch.int16)
             s_lo = torch.where(odd | has_nan, torch.full_like(s_lo, -1), s_lo)
             s_hi = torch.where(has_nan, torch.full_like(s_hi, -1), s_hi)
             sel[0, :, r0:r1] = s_lo
