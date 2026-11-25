@@ -39,6 +39,7 @@ you actually want to run.
 | Extra | `pip install -e ".[…]"` | What it is for |
 |---|---|---|
 | `scipy` | `scipy` | SciPy, only for `shortest_path="scipy"` of `multiorder_filter_operator` ({doc}`radial_filter`) |
+| `triton` | `triton` | the fused CUDA kernels of `HealPixConv` ({doc}`convol_api`); the Linux CUDA wheels of PyTorch usually include it already |
 | `dino` | `dino` | DINOv3 embeddings via torch-hub ({doc}`dino`) |
 | `dino-hf` | `dino-hf` | the same, loading the weights from Hugging Face instead |
 | `examples` | `examples` | the Sentinel-2 example scripts: xarray, zarr, obstore, UMAP, scikit-learn, matplotlib, cartopy |

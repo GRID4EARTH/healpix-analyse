@@ -31,8 +31,9 @@ Key design choices:
   as registered buffers. The forward pass is purely index-and-multiply.
 - **Fully vectorised**: no Python loops over pixels or gauges in either the
   constructor or the forward pass.
-- **Differentiable**: every operation in the hot path (`index_select`,
-  `einsum`, arithmetic) is supported by PyTorch autograd.
+- **Differentiable**, with a hand-written backward that never stores the
+  interpolated stencil values; fused Triton kernels on CUDA (see
+  {doc}`convol_api`).
 
 ---
 

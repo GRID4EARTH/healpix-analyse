@@ -2,7 +2,46 @@
 
 ## Unreleased
 
+### Added
+- `HealPixConv(backend="auto" | "triton" | "torch", deterministic=False)`
+  (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
+  passes run as fused Triton kernels when the optional `triton` package is
+  installed (new extra `triton`; the Linux CUDA wheels of PyTorch usually
+  ship it already). 16-bit data accumulate in fp32, and under
+  `torch.autocast` the kernels compute in the autocast dtype. Everything else
+  (CPU, float64, no Triton) runs a PyTorch loop over the stencil taps with a
+  hand-written backward. Neither backend materialises the gathered
+  `[B, C_in, G, K, P]` tensor, so training needs a fraction of the memory
+  and configurations that ran out of memory on an 80 GB GPU now fit.
+  `deterministic=True` (or `torch.use_deterministic_algorithms(True)`)
+  computes the input gradient of the Triton backend without atomics, by a
+  gather on the transposed stencil map (built at the first backward pass),
+  and gives the same bits at every run.
+- `benchmarks/benchmark_healpix_conv.py`: forward, forward + backward, peak
+  memory and geometry build time of `HealPixConv`, on CPU or CUDA, one JSON
+  line per run, and the gain table between two versions.
+
 ### Changed
+- `HealPixConv` stores its stencil as int32 neighbour positions in the order
+  of the input (the sort permutation of a regional domain is folded in), in a
+  tap-major layout: no per-call copy of the input, and half the index memory.
+  The geometry is no longer part of the `state_dict` (it is rebuilt or
+  reloaded from the disk cache at construction); state_dicts that hold the
+  former `_pos_safe` and `_w_norm` entries still load. `_pos_safe` and
+  `_w_norm` remain readable as views built on access.
+- `HealPixConv` follows `module.to(...)`, `.cuda()`, `.double()`, ...: the
+  computation runs on the device and in the dtype of its parameters and
+  buffers (`self.device` and `self.dtype` report them), with no per-call
+  `.to()` of the buffers. With `use_norm=True` the `GroupNorm` is created in
+  the layer dtype.
+- `HealPixConv` geometry cache (format 3): the key hashes the raw bytes of
+  `cell_ids` instead of serialising them, float64 layers keep float64
+  bilinear weights in the cache (they were rounded to float32), and float16 or
+  bfloat16 layers build their geometry in float32. Caches written by earlier
+  versions are ignored and rebuilt once.
+- `HealPixConv.set_kernel` copies the kernel in the layer dtype (it went
+  through float32, which truncated the float64 kernels of `HealPixWideConv`
+  and of the kernel pyramid), and accepts tensors.
 - `LocalFFT.blur_floor_px` (called by `HealPixFFTConv.set_gaussian` and
   `LocalFFT.check_width` since 2026.11.1) no longer uses SciPy: the moments of
   the round-trip response are accumulated per grid pixel with
