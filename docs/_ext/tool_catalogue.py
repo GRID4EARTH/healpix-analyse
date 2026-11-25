@@ -240,7 +240,11 @@ def _api_page(cat, qual):
                          + ", ".join(f"`{q}`" for q in tool["not_exported"])
                          + " from its module.")
             out.append(note + "\n\n")
-            out.append("```{autoapisummary}\n" + "\n".join(names) + "\n```\n\n")
+            # eval-rst: the table cells autoapisummary emits are reST; the
+            # current module lets short references in the summaries resolve
+            module = names[0].rsplit(".", 1)[0]
+            out.append(f"```{{eval-rst}}\n.. py:currentmodule:: {module}\n\n.. autoapisummary::\n\n"
+                       + "".join(f"   {n}\n" for n in names) + "```\n\n")
     return "".join(out)
 
 

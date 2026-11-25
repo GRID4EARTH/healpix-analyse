@@ -1,140 +1,157 @@
-# Overview
+# Which tool for which task?
 
-`healpix-analyse` is a toolkit for analysing signals stored on HEALPix grids,
-aimed at Earth Observation data. This page is the map: what each module is for,
-and the few conventions that hold everywhere.
+`healpix-analyse` has about seventy public functions and classes, and several
+of them can do the same job in different ways. This page is the decision
+guide: answer the questions below, in order, and follow the branch. Every
+tool is described on its own page with what it is good at, what it is bad at
+and what to use instead; the full list is the table of the {doc}`home page
+</index>`.
+
+```{admonition} For AI assistants
+:class: note
+
+Before proposing a tool, ask the user the five questions of the next section
+if their description does not already answer them, then follow the decision
+tree. The machine-readable catalogue of every tool (pros, cons, alternatives)
+is [`llms-full.txt`](https://grid4earth.eu/healpix-analyse/llms-full.txt).
+State the limits that apply (domain, gaps, differentiability, optional
+dependencies) with the answer.
+```
+
+## Five questions about your data
+
+1. **Domain: the whole sphere, or a regional domain?** A regional domain is a
+   set of NESTED cell ids: a Sentinel-2 scene, a basin, a coastal strip.
+   Spherical harmonics need the whole sphere; the local FFT tools need one
+   patch (radius 10° by default); most other tools accept both.
+2. **Gaps: are there missing values (NaN, clouds, land)?** Many tools let NaN
+   propagate. The NaN-aware ones are listed in {doc}`conventions`.
+3. **Scale: is it given in metres, or in cells?** Tools in metres keep the
+   same meaning at every level; tools in cells (kernels, stencils) do not.
+4. **Learning: are the weights learned (a neural-network layer), or fixed?**
+5. **Gradients: must the result be differentiable** (inside a loss or a
+   network)? Some tools are NumPy only.
+
+## Decision tree
+
+**I want a smoothed or filtered field** (family A, {doc}`/conv/index`)
+
+- Gaussian, width in metres, any domain → `gaussian_filter`
+  ({doc}`/conv/radial_filter`); below one cell, `width_rule="matched"`.
+  - The total must be conserved, the same filter is applied many times, or
+    land must stop the kernel → `gaussian_filter_operator`
+    (`normalization="source"`, `blocked_cells`) ({doc}`/conv/filter_operators`).
+  - Cells of different levels → `multiorder_filter_operator`.
+  - Very wide (tens of cells) on a large domain → `LargeConv.from_gaussian`.
+  - All the options side by side: {doc}`/conv/compare_gaussian`.
+- Any kernel of the distance in metres → `radial_filter`; of the distance and
+  the bearing (sun, wind) → `directional_filter`.
+- A wide fixed kernel written as a formula or a raster →
+  {doc}`/conv/compare_wide`: `HealPixGeoFFT` inside one base face with gaps,
+  `HealPixPyramidConv` with gaps on any domain, `HealPixWideConv` otherwise.
+- An unweighted median, maximum, mode or count over a radius →
+  `neighbour_reduce` (family B).
+
+**I want a learned convolution** (family A)
+
+- Small kernel (3×3, 5×5), equivariant to the grid orientation →
+  `HealPixConv` ({doc}`/conv/convol`).
+- Wide receptive field under a memory budget → `LargeConv`.
+- One large kernel on one regional patch → `HealPixFFTConv`.
+- Pooling and unpooling layers → `HealPixDown`, `HealPixUp` (family D).
+
+**I want a statistic, a derivative or objects** (family B, {doc}`/stats/index`)
+
+- Statistic over a radius → `neighbour_reduce` (NaN-aware mean: a top-hat
+  `radial_filter`), see {doc}`/stats/compare_neighbourhood`.
+- Gradient of a scalar field → `gradient`.
+- Divergence and curl of a flow → `HealPixDivCurl` on a regional domain,
+  spherical harmonics on the whole sphere ({doc}`/stats/compare_divcurl`).
+- Grow or shrink a mask → `binary_dilation`, `binary_erosion`; label regions
+  and measure their area → `connected_components`, `component_area`;
+  differentiable shape statistics → Minkowski functionals.
+
+**I want a spectrum or a transform** (family C, {doc}`/sht/index`)
+
+- Whole sphere, HEALPix → `HEALPixSHT` (`anafast`).
+- Whole sphere, ERA5 or another lat/lon grid → `anafast_latlon`.
+- Regional patch → `local_ps` (`LocalFFT`).
+- All the spectra side by side: {doc}`/sht/compare_power_spectra`.
+
+**I want another resolution, other points or embeddings** (family D,
+{doc}`/other/index`)
+
+- One level coarser or finer → `HealPixDown`, `HealPixUp`; any level and
+  domain → `resample_healpix`; every scale, exactly invertible →
+  `HealPixDecomp`. See {doc}`/other/compare_resolution`.
+- Values at stations or tracks → `get_interp_val`.
+- Foundation-model embeddings of Sentinel-2 → `GetDINOV3SAT` (experimental).
+
+## Common traps
+
+- **Several conventions for the level, the width and the ellipsoid.** Check
+  {doc}`conventions`: for instance `HealPixDown` uses `level` and degrees on
+  WGS84, `gaussian_filter` uses `refinement_level` and metres on WGS84,
+  `HealPixFFTConv` defaults to the sphere.
+- **NaN propagates** through the convolutions, `HealPixDown("smooth")`,
+  `HealPixUp`, the transforms and `neighbour_reduce`.
+- **Tuples.** `HealPixDown`, `HealPixUp` and `resample_healpix` return
+  `(values, cell_ids)`.
+- **Not exported.** `HealPixConv`, `HEALPixSHT`, `binary_dilation`,
+  `binary_erosion`, `get_interp_val`, `get_interp_weights` and
+  `resample_to_latlon_grid` are imported from their modules (the API
+  reference gives the path).
+- **Known issues** documented on their pages: `alm2map_latlon` halves the
+  m > 0 terms; `HealPixDown(mode="maxpool")` on a regional domain with
+  incomplete parents; `HEALPixSHT.uv_to_curl_div` applies no ℓ factor.
 
 ## What the modules do
 
-**Spherical harmonics.** `healpix_sht` is the fast path for a full-sky HEALPix
-map: a ring-based transform for spin-0, spin-1 and spin-2 fields, with power
-spectra. `alm_latlon` does the same for *any* iso-latitude grid — ERA5, a
-regular lat/lon grid, a Gaussian grid — so you can compare a model and an
-observation without regridding either. `alm` holds the coefficients themselves
-(`AlmCoeffs`); the same module also defines `AlmTransform`, a local FFT-based
-SHT that `powerspectra`/`powerspectra_lonlat` build on — see {doc}`/sht/powerspectra`
-for what is production-ready today and what is still in development.
+**Convolution and filtering.** `convol` (`HealPixConv`) is a
+gauge-equivariant convolution with a small learned stencil; `large_conv`
+(`LargeConv`) reaches a wide receptive field by coarsening, a compact
+convolution and refining; `fft_conv` (`HealPixFFTConv`) convolves one patch
+with a large learned kernel by FFT; `geo_fft` (`HealPixGeoFFT`) convolves a
+block inside one base face with a fixed geodesic kernel by FFT, gaps included;
+`wide_conv` (`HealPixWideConv`) applies a wide fixed kernel written in metres;
+`kernel_pyramid` and `pyramid_conv` filter every band of a pyramid, NaN-aware;
+`radial_filter`, `multiorder_filter` and `directional_filter` filter by
+distance (and bearing) in metres on WGS84.
 
-**Convolution and scale.** Three convolution operators cover different regimes,
-and the choice matters more than it looks — see {ref}`choosing-a-convolution`
-below for the full comparison:
+**Statistics and local analysis.** `neighbour_reduce` takes unweighted
+statistics within a radius in metres; `gradient` gives East/North derivatives
+from the immediate neighbours; `divcurl` gives divergence and curl at one or
+every scale; `morphology` dilates and erodes masks by a radius in metres;
+`components` labels connected regions with the immediate NESTED neighbours and
+measures their areas; `minkowski` computes differentiable area, perimeter and
+Euler characteristic.
 
-- `convol` (`HealPixConv`) is a gauge-equivariant convolution: a small, fixed
-  stencil transported over the sphere so that the result does not depend on
-  how the pixel grid happens to be oriented. Best for small learned kernels
-  (3×3, 5×5) on the full sphere or a patch.
-- `fft_conv` (`HealPixFFTConv`) evaluates a large learned kernel by FFT on one
-  local gnomonic patch (it reuses `fft_local`). Not gauge-equivariant; the
-  right tool when the kernel itself is large and the domain is one patch.
-- `large_conv` (`LargeConv`) reaches a wide receptive field cheaply, by
-  coarsening (`down`), convolving a small compact kernel, and refining again
-  (`up`). The right tool for wide spherical context under a fixed memory
-  budget.
+**Spherical harmonics and FFT.** `healpix_sht` (`HEALPixSHT`) is the
+spherical harmonic transform of whole-sphere HEALPix maps (spin 0, 1, 2);
+`alm_latlon` does spin 0 on any iso-latitude grid; `fft_local` (`LocalFFT`)
+takes the FFT and the spectrum of a regional patch; `ps`, `powerspectra` and
+`powerspectra_lonlat` are experimental flat spectra; `alm` holds the
+`AlmCoeffs` container (unused by the other modules) and the experimental
+`AlmTransform`.
 
-`down` and `up` are the two halves of that coarsening on their own — smooth or
-max-pool coarsening, and its adjoint — and are also useful standalone in a
-U-Net encoder/decoder. `decomp` turns them into a multiscale pyramid that
-reconstructs the original map exactly, masks included, and `divcurl` reads
-divergence and curl off every level of that pyramid. `resample` moves data
-between levels and between partial-sky domains, and to and from lat/lon.
-
-`kernel_pyramid`/`pyramid_conv` (`HealPixKernelPyramid`, `HealPixPyramidConv`)
-add a fourth, NaN/weight-aware option: one small, fixed `HealPixConv` kernel
-per `decomp` band, applied identically to a data and a confidence channel and
-combined with a single division after synthesis. This is a **block-diagonal**
-approximation of the true (inter-band-coupled) target operator — see
-{doc}`/conv/pyramid_conv` for exactly what that means, its measured accuracy,
-and what it does not do.
-
-**Point interpolation.** `healpix_interp` bilinearly interpolates a map (or
-just returns cells and weights) at arbitrary lon/lat. For `ellipsoid="sphere"`
-it is a direct NumPy port of `healpy`'s own RING-scheme algorithm, validated
-to return identical pixels and float64-precision-identical weights — see
-{doc}`/other/interpolation` for the exact-equivalence guarantee and how it was
-checked. Non-spherical ellipsoids (`WGS84`, etc., no `healpy` equivalent) go
-through `healpix_geo.nested.bilinear_interpolation` instead.
-
-**Local flat-sky analysis.** Over a small patch the sphere is flat enough to use
-a plain 2D FFT. `fft_local` (`LocalFFT`) builds the local tangent plane and the
-FFT on top of it, with CUDA and autograd, and its own `.ps()` method reduces
-the result to an isotropic 1D spectrum; `fft_conv` reuses the same projection
-to convolve with kernels too large for a stencil. `powerspectra` and
-`powerspectra_lonlat` offer a similar 1D spectrum through a different,
-still-developing code path — see {doc}`/sht/powerspectra` before choosing between
-them.
-
-**Neighbourhood operators.** These work in *metres on WGS84*, not in pixels, so
-their meaning does not drift with latitude. `neighbour_reduce` takes means,
-medians, extrema and counts over a physical radius; `radial_filter` weights by
-distance (including a Gaussian); `directional_filter` weights by azimuth;
-`gradient` gives East/North derivatives and directional derivatives.
-
-**Morphology and topology.** `morphology` dilates and erodes masks on the NESTED
-neighbour graph; `components` labels connected regions and measures their area;
-`minkowski` computes area, perimeter and Euler characteristic, differentiably,
-for single or multiple thresholds.
-
-**Foundation-model embeddings.** `dino` (`GetDINOV3SAT`) runs an unmodified
-DINOv3 SAT-493M backbone on HEALPix data and maps every token back to a HEALPix
-cell. See {doc}`/other/dino`, and read its licence section before publishing results.
-
-(choosing-a-convolution)=
-## Choosing a convolution
-
-| Need | Use | Domain | Learned weights | Gauge-equivariant | Typical cost |
-|---|---|---|---|---|---|
-| Small learned kernel (3×3, 5×5), e.g. one layer of a spherical U-Net | `HealPixConv` | Full sphere or patch | Yes | Yes | O(K·G·kernel²) — expensive at high nside / kernel size / gauge count |
-| Large learned kernel on one local image (e.g. a wide filter on a Sentinel-2 tile) | `HealPixFFTConv` | One local patch (≤10° by default) | Yes | No | Fast for large kernels; not worth it for small ones |
-| Wide receptive field under a memory budget, full sphere or a large patch | `LargeConv` | Full sphere or large patch | Yes (compact kernel) | Yes (internal `HealPixConv`) | O(K/4^L · compact_kernel²) — cheap |
-| Smoothing / pooling with no learned weights, pyramid building block | `HealPixDown` / `HealPixUp` | Full sphere or patch | No | n/a | Sparse operator, cheap |
-| Masked/NaN-aware multiscale filtering (block-diagonal per-band kernel) | `HealPixKernelPyramid` + `HealPixPyramidConv` | Full sphere or patch | Optional (analytic or calibrated) | Yes (per band) | O(K·compact_kernel²) per band |
-| Isotropic physical filter, scale given in metres | `radial_filter` / `gaussian_filter` | Full sphere or patch | No (user kernel, fixed) | n/a | Depends on neighbourhood size |
-| Directional physical filter (distance + real-world bearing) | `directional_filter` | Full sphere or patch | No | n/a | Same |
-| Unweighted local reduction (mean / median / min / max / count) | `neighbour_reduce` | Full sphere or patch | No | n/a | Cheapest |
-
-Rule of thumb: need learned weights and equivariance → `HealPixConv` (small
-kernel) or `LargeConv` (wide context); need a large explicit learned kernel on
-one local patch → `HealPixFFTConv`; no weights to learn, just a physical scale
-→ `radial_filter` / `directional_filter` / `neighbour_reduce`.
-
-## Conventions that hold everywhere
-
-**Differentiable by default.** The hot paths are `torch.fft`, `einsum`,
-`index_select` and sparse products — all supported by autograd. Geometry tables
-(Legendre polynomials, interpolation weights, phase matrices) are computed once
-and stored as non-gradient buffers.
-
-**NumPy or Torch, single map or batch.** Every operator accepts `np.ndarray` and
-`torch.Tensor` and returns the same type it was given. Shapes `[N]` and `[B, N]`
-both work.
-
-**Full-sky or partial-sky.** Operators take either a complete map or an
-arbitrary set of NESTED cell ids, so you can work on one scene without padding
-it out to the whole sphere.
-
-**Geometry comes from `healpix-geo`.** Cell centres, vertices, neighbours and
-ellipsoidal distances are the GRID4EARTH library's, not `healpy`'s.
-
-**One SHT convention**, orthonormal, the same one `healpy` and the CMB
-literature use:
-
-$$a_{\ell m} = \int f(\theta, \varphi)\, Y_{\ell m}^*(\theta, \varphi)\, d\Omega$$
-
-$$C_\ell = \frac{1}{2\ell+1} \left[ |a_{\ell 0}|^2 + 2 \sum_{m=1}^{\ell} |a_{\ell m}|^2 \right]$$
+**Other tools.** `down` and `up` change the level by one; `decomp` builds an
+exactly invertible pyramid; `resample` moves data between levels and domains;
+`healpix_interp` interpolates at points; `dino` computes DINOv3 embeddings;
+`validation` is a reference convolution for tests.
 
 ## A first example
 
-An angular power spectrum of a full-sky map, going through `alm_latlon` so that
-the same code would work on an ERA5 grid:
+An angular power spectrum of a whole-sphere map, going through `alm_latlon`
+so that the same code would work on an ERA5 grid:
 
 ```python
 import numpy as np
 from healpix_geo import nested
-from healpix_analyse.alm_latlon import build_rings_from_latlon, anafast_latlon
+from healpix_analyse import build_rings_from_latlon, anafast_latlon
 
 depth = 6                              # HEALPix level, nside = 64
 npix  = 12 * 4 ** depth
-lmax  = 3 * 2 ** depth
+lmax  = 3 * 2 ** depth - 1
 
 im = np.random.randn(npix)             # the map to analyse, NESTED order
 
@@ -150,10 +167,11 @@ cl = anafast_latlon(
     im[sort_idx], ring_theta, ring_phi_list, ring_counts,
     lmax=lmax, quadrature="equal_area",
 )
-print(cl.shape)                        # torch.Size([193])
+print(cl.shape)                        # torch.Size([192])
 ```
 
-On a full-sky HEALPix map specifically, {doc}`/sht/healpix_sht` does this faster.
+On a whole-sphere HEALPix map, {doc}`/sht/healpix_sht` does the same with
+cached tables (at the cost of their memory).
 
 ## Where this sits
 

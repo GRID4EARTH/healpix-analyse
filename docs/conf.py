@@ -169,7 +169,7 @@ html_extra_path = ["_generated/extra"]
 # llms.txt and llms-full.txt (generated from tools.yaml) go to the site root
 html_baseurl = "https://grid4earth.eu/healpix-analyse/"
 # Every public symbol must be in tools.yaml (see docs/_ext/tool_catalogue.py)
-tool_catalogue_complete = False
+tool_catalogue_complete = True
 html_title = "healpix-analyse"
 html_theme_options = {
     "navigation_depth": 4,

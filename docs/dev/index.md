@@ -7,6 +7,7 @@ of the user guides. You do not need them to use the package.
 ---
 maxdepth: 1
 ---
+tool_choice_eval
 convol_internals
 radial_filter_architecture
 large_conv_gaussian_validation

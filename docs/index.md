@@ -59,6 +59,16 @@ interpolation at points, tiles, DINOv3 embeddings.
 :::
 ::::
 
+## Every tool, one line each
+
+What each tool is for, with its page. The same catalogue, with the pros, cons
+and alternatives of every tool, is published for AI assistants as
+[`llms.txt`](https://grid4earth.eu/healpix-analyse/llms.txt) and
+[`llms-full.txt`](https://grid4earth.eu/healpix-analyse/llms-full.txt).
+
+```{include} _generated/decisions_all.md
+```
+
 For the signature of any function, see the {doc}`API reference <api/index>`.
 
 ```{toctree}
