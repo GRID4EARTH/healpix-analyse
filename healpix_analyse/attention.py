@@ -17,7 +17,7 @@ Local self-attention layers on HEALPix maps (issue #109, section 3).
     stencil of :class:`~healpix_analyse.convol.HealPixConv`, with one relative
     position bias per head and tap shared over the sphere.  Fused Triton
     kernels on CUDA, a PyTorch tap loop otherwise
-    (:mod:`healpix_analyse._attention_backend`).
+    (``healpix_analyse._attention_backend``).
 
 Global attention on patch tokens (ViT, MAE) needs no layer of its own: it is
 standard attention on the tokens of the patch extraction.
@@ -357,7 +357,7 @@ class HealPixWindowAttention(nn.Module):
         return self._blocks
 
     def plan(self) -> WindowPlan:
-        """The windows as a :class:`~healpix_analyse._attention_backend.WindowPlan`."""
+        """The windows as a ``WindowPlan`` (``healpix_analyse._attention_backend``)."""
         return WindowPlan(self.N, self.n_windows, self.window_len, self.key_len,
                           self._q_index, self._kv_index, self._q_inv, self._kv_mask,
                           self._kptr, self._kent)
@@ -410,7 +410,7 @@ class HealPixNeighbourhoodAttention(nn.Module):
     softmax: the ``[B, H, G, N, P, D]`` gathered keys and values are never
     materialised, and the backward is deterministic (no atomics).  On CPU and
     in float64 a PyTorch loop over the taps runs instead (see
-    :mod:`healpix_analyse._attention_backend`).
+    ``healpix_analyse._attention_backend``).
 
     Parameters
     ----------

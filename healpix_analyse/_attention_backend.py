@@ -156,14 +156,13 @@ def _gather_tap(t, idx_p, w_p):
 
 
 def _scatter_tap(dst, idx_p, w_p, h):
-    """dst [N, BH, D] + the scatter of sum_j w_p[j] * h (h [G, N, BH, D])."""
+    """dst [N, BH, D] + the scatter of sum_j w_p[j] * h (h [G, N, BH, D]), one index_add."""
     _, BH, D = dst.shape
-    inplace = not torch.is_grad_enabled()
-    for j in range(4):
-        src = (h * w_p[j].to(h.dtype).view(*w_p[j].shape, 1, 1)).reshape(-1, BH, D)
-        idx = idx_p[j].reshape(-1).long()
-        dst = dst.index_add_(0, idx, src) if inplace else dst.index_add(0, idx, src)
-    return dst
+    src = (h.unsqueeze(0) * w_p.to(h.dtype)[..., None, None]).reshape(-1, BH, D)
+    idx = idx_p.reshape(-1).long()
+    if torch.is_grad_enabled():
+        return dst.index_add(0, idx, src)
+    return dst.index_add_(0, idx, src)
 
 
 def _torch_scores(qt, kt, bias, idx, w, valid, scale, B):
