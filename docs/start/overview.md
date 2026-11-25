@@ -104,7 +104,7 @@ dependencies) with the answer.
   `(values, cell_ids)`.
 - **Known issues** documented on their pages:
   `HealPixDown(mode="maxpool")` on a regional domain with
-  incomplete parents; `HEALPixSHT.uv_to_curl_div` applies no ℓ factor.
+  incomplete parents.
 
 ## What the modules do
 

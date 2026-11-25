@@ -4,7 +4,7 @@
 map**: analysis, synthesis and power spectra, differentiable throughout. It
 handles scalar fields (spin-0), CMB polarisation (spin-2) and vector fields
 (spin-1), including a one-call split of any `(u, v)` flow into its divergence
-and curl.
+and relative vorticity.
 
 ```{include} ../_generated/glance/healpix_sht.md
 ```
@@ -123,30 +123,42 @@ cl_EB  = cl_EEB[2]
 
 ---
 
-## Spin-1: curl and divergence decomposition
+## Spin-1: divergence and vorticity
 
 This is perhaps the most powerful feature of `healpix_sht` for Earth-observation
 and fluid-dynamics applications.
 
 ### The problem
 
-Any smooth vector field **v** = (u, v) defined on the sphere can be uniquely
-decomposed into two scalar potentials:
+Any smooth tangent vector field **u** = (u, v) on the sphere splits into a
+gradient and a rotational part:
 
 ```
-v = ∇Φ  +  ∇×Ψ
+u = ∇χ  +  k × ∇ψ
 ```
 
-where **∇Φ** is the **divergent** (irrotational) part and **∇×Ψ** is the
-**rotational** (non-divergent) part.  This is the Helmholtz–Hodge decomposition
-on the sphere.
+where χ is the **velocity potential** (the divergent, irrotational part) and
+ψ the **streamfunction** (the rotational, non-divergent part); **k** is the
+local upward unit vector. This is the Helmholtz–Hodge decomposition on the
+sphere. The divergence and the relative vorticity follow from the two
+potentials:
 
-The two scalar maps **div** and **curl** (or equivalently **Φ** and **Ψ**)
-are reconstructed via spin-1 spherical harmonics.  In terms of the E/B
-decomposition of a spin-1 field:
+```
+div  = ∇·u        = ∇²χ
+curl = k·(∇ × u)  = ∇²ψ
+```
 
-- **almE** encodes the **divergent** component (gradient mode)
-- **almB** encodes the **rotational** component (curl mode)
+In terms of the spin-1 E/B decomposition of `(Q, U) = (-v, u)`:
+
+- **almE** is the **gradient** (curl-free) part, carried by χ;
+- **almB** is the **rotational** (divergence-free) part, carried by ψ.
+
+On a sphere of radius R, for each multipole ℓ:
+
+```
+almE_ℓm = √(ℓ(ℓ+1))/R · χ_ℓm     div_ℓm  = -√(ℓ(ℓ+1))/R · almE_ℓm = -ℓ(ℓ+1)/R² · χ_ℓm
+almB_ℓm = √(ℓ(ℓ+1))/R · ψ_ℓm     curl_ℓm = -√(ℓ(ℓ+1))/R · almB_ℓm = -ℓ(ℓ+1)/R² · ψ_ℓm
+```
 
 ### One-call interface: `uv_to_curl_div`
 
@@ -157,22 +169,37 @@ import numpy as np
 nside = 64
 sht   = HEALPixSHT(level=6)
 
-# Wind or ocean current field: u = east component, v = north component
+# Wind or ocean current field in m/s: u = east component, v = north component
 u = np.random.randn(12 * nside**2).astype(np.float32)
 v = np.random.randn(12 * nside**2).astype(np.float32)
 
-# --- one call: vector field → its E (gradient) and B (rotational) parts ---
-div, curl = sht.uv_to_curl_div(u, v)
-# div  : E (gradient) part as a map,   shape (N,)  real Tensor, not in s⁻¹
-# curl : B (rotational) part as a map, shape (N,)  real Tensor, not in s⁻¹
+# --- one call: vector field → divergence and relative vorticity ---
+div, curl = sht.uv_to_curl_div(u, v)          # radius defaults to 6 371 008.8 m
+# div  : divergence,          shape (N,) real Tensor, in s⁻¹
+# curl : relative vorticity,  shape (N,) real Tensor, in s⁻¹
 ```
+
+`radius=` sets the sphere radius in the length unit of `u` and `v`; the
+default is the IUGG mean Earth radius, the same as the `radius_m` default of
+`HealPixDivCurl` ({doc}`/stats/divcurl`).
 
 ### What each output represents
 
 | Output | What it is | Zero when… |
 |--------|-----------------|------------|
-| `div`  | E (gradient) part of the flow, synthesised as a scalar map; its sign pattern shows sources and sinks, but no ℓ factor or radius is applied, so it is not the divergence in s⁻¹ | the field is purely rotational (e.g. geostrophic flow) |
-| `curl` | B (rotational) part of the flow, synthesised as a scalar map; not the vorticity in s⁻¹ (same reason) | the field is purely potential (e.g. gravity waves) |
+| `div`  | divergence ∇·u, in s⁻¹ for u, v in m/s; positive where the flow spreads out (sources) | the field is purely rotational (e.g. geostrophic flow) |
+| `curl` | relative vorticity k·(∇ × u), in s⁻¹; positive for counter-clockwise rotation seen from above (cyclonic in the northern hemisphere) | the field is purely potential (irrotational) |
+
+### E/B potential maps: `uv_to_eb`
+
+`uv_to_eb(u, v)` returns the E and B parts synthesised as scalar maps without
+any ℓ factor: `almE, almB = map2alm_spin(-v, u, spin=1)`, then
+`alm2map(almE)` and `alm2map(almB)`. Both keep the units of `u` and `v`.
+These are the maps that `uv_to_curl_div` returned before #94.
+
+```python
+E, B = sht.uv_to_eb(u, v)   # gradient (E) and rotational (B) parts, in m/s
+```
 
 ### Step-by-step version
 
@@ -180,24 +207,29 @@ If you need the intermediate harmonic coefficients (e.g. for filtering
 or cross-spectra), use the calls that `uv_to_curl_div` makes itself:
 
 ```python
-# the same decomposition as uv_to_curl_div
+import torch
+
+R = 6371008.8
 almE, almB = sht.map2alm_spin(-v, u, spin=1)
 
 # optional: filter in harmonic space (e.g. low-pass at l < 50)
-almE_filtered = almE.clone()
-almB_filtered = almB.clone()
-# ... set high-l coefficients to zero ...
+# ... set high-l coefficients of almE and almB to zero ...
 
-# reconstruct as scalar maps, like uv_to_curl_div
-div_filtered = sht.alm2map(almE_filtered)
-curl_filtered = sht.alm2map(almB_filtered)
+# the factor -sqrt(l(l+1))/R in the flat alm layout
+fac = torch.empty(sht.n_alm, dtype=sht.dtype, device=sht.device)
+for m in range(sht.lmax + 1):
+    ell = torch.arange(m, sht.lmax + 1, dtype=sht.dtype, device=sht.device)
+    fac[sht._alm_slice(m)] = -torch.sqrt(ell * (ell + 1.0)) / R
+
+div  = sht.alm2map(almE * fac)   # same as uv_to_curl_div
+curl = sht.alm2map(almB * fac)
 ```
 
-```{warning}
-`uv_to_curl_div` applies no ℓ-dependent factor and no Earth radius: its
-outputs are the E and B parts of the flow synthesised as scalar maps, not the
-divergence and vorticity in s⁻¹. See the reference section below, and
-{doc}`/stats/compare_divcurl` for the local alternatives.
+```{note}
+The factor √(ℓ(ℓ+1)) grows with ℓ, so noise near `lmax` (including the
+quadrature error of the HEALPix analysis) is amplified. For smooth fields, a
+smaller `lmax` (e.g. `2 * nside`) gives cleaner derivatives. For a regional
+domain or a mask, see {doc}`/stats/compare_divcurl`.
 ```
 
 ### Application: separating wind regimes
@@ -210,8 +242,8 @@ sht   = HEALPixSHT(level=7)
 # u10, v10: 10-metre wind components on a HEALPix grid, ring-ordered
 div, curl = sht.uv_to_curl_div(u10, v10)
 
-# div  captures convergence zones (precipitation, fronts)
-# curl captures cyclones, anticyclones, jet streams
+# div  (s⁻¹) captures convergence zones (precipitation, fronts)
+# curl (s⁻¹) captures cyclones, anticyclones, jet streams
 ```
 
 ### Application: ocean surface currents
@@ -396,21 +428,21 @@ Spin-s analysis: (Q, U) → E-mode and B-mode spherical harmonic coefficients.
 
 | `spin` | Physical interpretation |
 |--------|------------------------|
-| `0` | Scalar pair: the code returns `almE = -map2alm(Q)`, `almB = -map2alm(U)` (note the sign) |
-| `1` | Vector field: `almE` = divergent part, `almB` = rotational part |
+| `0` | Scalar pair: returns `almE = -map2alm(Q)`, `almB = -map2alm(U)`. The minus sign is the HEALPix spin convention `Q + iU = -Σ (almE + i almB) sY_ℓm` at s = 0, the same as `healpy.map2alm_spin(..., 0)`; call `map2alm` for plain scalar coefficients |
+| `1` | Vector field: `almE` = gradient (curl-free) part, `almB` = rotational (divergence-free) part |
 | `2` | CMB polarisation: `almE` = E-modes, `almB` = B-modes |
 
 | Parameter | Description |
 |-----------|-------------|
 | `Q` | `(..., N)` real Tensor — first component (Stokes Q). |
-| `U` | `(..., N)` real Tensor — second component (Stokes U). For a vector field `(u east, v north)`, `uv_to_curl_div` passes `Q = -v`, `U = u`. |
+| `U` | `(..., N)` real Tensor — second component (Stokes U). For a vector field `(u east, v north)`, `uv_to_eb` and `uv_to_curl_div` pass `Q = -v`, `U = u`. |
 | `spin` | `int`, default `2`. The examples use `0`, `1` and `2`; the code does not restrict it. |
 | `nest` | `bool`. NESTED ordering. |
 
 Returns `(almE, almB)`, each a complex Tensor of shape `(..., K)`.
 
 > **Requires** the `quaternionic` and `spherical` packages for `spin > 0`.
-> They are not declared in any extra of the package: install them yourself
+> Install them with the `sht` extra, `pip install 'healpix-analyse[sht]'`
 > (see {doc}`/start/installation`).
 
 ---
@@ -430,30 +462,47 @@ Returns `(Q, U)`, each a real Tensor of shape `(..., N)`.
 
 ---
 
-#### `sht.uv_to_curl_div(u, v, nest=False)` → `(div, curl)`
+#### `sht.uv_to_curl_div(u, v, nest=False, radius=6371008.8)` → `(div, curl)`
 
-One-call Helmholtz–Hodge decomposition of a tangent-plane vector field.
+Divergence and relative vorticity of a tangent vector field on the whole
+sphere.
 
 What the code does: `almE, almB = map2alm_spin(-v, u, spin=1)`, then
-`div = alm2map(almE)` and `curl = alm2map(almB)` (spin-0 synthesis). No
-ℓ-dependent factor and no Earth radius are applied, so the two maps are the
-scalar potentials' E and B components synthesised as maps, not the
-divergence and vorticity in s⁻¹. To get physical units, multiply the alm by
-`sqrt(ℓ(ℓ+1)) / R` before the synthesis, as the div/curl validation pipeline
-does ({doc}`/stats/divcurl`). Needs `quaternionic` and `spherical`.
+`div = alm2map(-√(ℓ(ℓ+1))/radius · almE)` and
+`curl = alm2map(-√(ℓ(ℓ+1))/radius · almB)` (spin-0 synthesis). The
+div/curl validation pipeline ({doc}`/stats/divcurl`) applies the same
+factor and signs. Needs `quaternionic` and `spherical`.
 
 | Parameter | Description |
 |-----------|-------------|
 | `u` | `(..., N)` real Tensor — east component. |
 | `v` | `(..., N)` real Tensor — north component. |
 | `nest` | `bool`. NESTED ordering. |
+| `radius` | `float`, default `6371008.8` (IUGG mean Earth radius, m). In the length unit of `u` and `v`. |
 
 Returns:
 
 | Output | Description |
 |--------|-------------|
-| `div`  | E (gradient) part of the flow: where it is positive or negative shows sources and sinks, up to the ℓ-dependent factor above. |
-| `curl` | B (rotational) part of the flow: rotation, up to the same factor. |
+| `div`  | Divergence ∇·u = ∇²χ, in s⁻¹ for `u`, `v` in m/s. |
+| `curl` | Relative vorticity k·(∇ × u) = ∇²ψ, in s⁻¹; positive counter-clockwise seen from above. |
+
+---
+
+#### `sht.uv_to_eb(u, v, nest=False)` → `(E, B)`
+
+E/B potential maps of a tangent vector field: `almE, almB =
+map2alm_spin(-v, u, spin=1)`, then `E = alm2map(almE)`, `B = alm2map(almB)`,
+with no ℓ factor. `E` is the gradient (curl-free) part, `B` the rotational
+(divergence-free) part, both in the units of `u` and `v`. In harmonic space,
+`div_ℓm = -√(ℓ(ℓ+1))/R · E_ℓm` and `curl_ℓm = -√(ℓ(ℓ+1))/R · B_ℓm`. Needs
+`quaternionic` and `spherical`.
+
+| Parameter | Description |
+|-----------|-------------|
+| `u` | `(..., N)` real Tensor — east component. |
+| `v` | `(..., N)` real Tensor — north component. |
+| `nest` | `bool`. NESTED ordering. |
 
 ---
 

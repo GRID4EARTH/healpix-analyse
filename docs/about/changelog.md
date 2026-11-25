@@ -3,6 +3,15 @@
 ## Unreleased
 
 ### Changed
+- `HEALPixSHT.uv_to_curl_div` now returns the divergence and the relative
+  vorticity, in s⁻¹ for u, v in m/s (#94): the spin-1 E/B coefficients are
+  multiplied by −√(ℓ(ℓ+1))/R before the spin-0 synthesis, with the new
+  parameter `radius=` (default 6 371 008.8 m, the IUGG mean Earth radius).
+  Before, it returned the E/B potential maps in the units of u and v; they
+  are now `HEALPixSHT.uv_to_eb(u, v, nest=False)`. The docstring labels,
+  which were inverted, are fixed. The `-map2alm` sign of
+  `map2alm_spin(Q, U, spin=0)` is kept (it is the HEALPix spin convention
+  and matches `healpy.map2alm_spin`) and is now documented.
 - `build_healpix_adjacency` (HEALPix Minkowski functionals) no longer imports
   `healpy`, which no dependency declared: the neighbours come from
   `healpix_geo.nested.neighbours`, the backend of the connected components,
