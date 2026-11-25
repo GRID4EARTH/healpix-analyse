@@ -16,13 +16,18 @@ Four modes:
 HEALPix cells have equal area, so "mean" and "smooth_conservative" conserve
 the global mean of a NaN-free full-sphere field; "smooth" does not.
 
-Works on the full sphere or on a partial-sky subset.  Resolution is exposed
-through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
+Works on the full sphere or on a regional domain (``cell_ids``).
+Resolution is exposed through the Grid4Earth ``level`` convention, with
+``nside = 2**level``.
 
 Accepts numpy arrays or torch tensors of shape ``[N]`` or ``[B, N]`` and
 returns an output of the same type and number of dimensions.
 
-Dependencies: numpy, torch, healpy.
+The linear modes keep their sparse matrix, and its transpose for the
+gradient, as CSR buffers built once in the constructor: they follow
+``.to()`` and no sparse tensor is assembled in ``forward``.
+
+Dependencies: numpy, torch, healpix_geo.
 """
 
 from __future__ import annotations
@@ -34,7 +39,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import healpix_geo
-from pyproj import Transformer
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 # ---------------------------------------------------------------------------
@@ -90,15 +94,140 @@ def _restore_output(
     if was_1d:
         t = t.squeeze(0)   # [N]
     if is_numpy:
+        if t.dtype == torch.bfloat16:      # numpy has no bfloat16
+            t = t.float()
         return t.detach().cpu().numpy()
     return t
+
+
+# ---------------------------------------------------------------------------
+# Sparse operator kept as CSR buffers (built once, follows .to())
+# ---------------------------------------------------------------------------
+
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+
+# Buffers that keep at least float32 when the module is cast to a 16-bit
+# dtype: the sparse matrix (CPU sparse kernels have no 16-bit version) and the
+# normalisation / coverage vectors.
+_KEEP_PRECISION = ("_M_val", "_MT_val", "_coverage", "_col_sum", "_col_l2")
+
+
+def _storage_dtype(dtype: torch.dtype) -> torch.dtype:
+    """dtype of the stored matrix for a module of dtype ``dtype``."""
+    return torch.float32 if dtype in _HALF_DTYPES else dtype
+
+class _CsrMatmul(torch.autograd.Function):
+    """
+    ``y = M @ x`` for a CSR matrix ``M`` and a dense ``x`` ``[N_in, B]``.
+
+    The backward pass is ``M^T @ g`` with the CSR transpose given by the
+    caller, so no transpose (and no coalesce) is computed at each call.  The
+    backward is itself a ``_CsrMatmul``, hence twice differentiable.  The
+    matrix is a constant: no gradient is returned for it.
+    """
+
+    @staticmethod
+    def forward(ctx, x, M, MT):  # noqa: D102
+        ctx.M, ctx.MT = M, MT
+        return torch.sparse.mm(M, x)
+
+    @staticmethod
+    def backward(ctx, g):  # noqa: D102
+        return _CsrMatmul.apply(g, ctx.MT, ctx.M), None, None
+
+
+class _SparseOperatorMixin:
+    """
+    Store a sparse ``[R, C]`` matrix and its transpose as CSR buffers.
+
+    The components (``crow_indices``, ``col_indices``, ``values``) are plain
+    dense buffers, so they follow ``.to()``, ``.double()``, ``.cuda()``...
+    ``forward`` wraps them in CSR tensors without copying.  The buffers are
+    not persistent: the matrix is entirely determined by the constructor
+    arguments, so it is not written to the ``state_dict``.  The
+    ``_M_indices`` / ``_M_values`` keys written by older versions are
+    accepted and ignored.
+
+    dtype rule, shared by every mode of ``HealPixDown`` and ``HealPixUp``:
+    the output has the module dtype ``self.dtype``, which starts as the
+    constructor ``dtype`` and follows ``.to(dtype)``, ``.double()``,
+    ``.half()``...  (``self.device`` follows ``.to(device)`` likewise).  With
+    a 16-bit dtype the matrix and the normalisation vectors stay in float32
+    (or in their previous precision): the linear part is computed there and
+    the output is cast to the 16-bit dtype.
+    """
+
+    def _apply(self, fn, *args, **kwargs):
+        keep = {n: b for n, b in self._buffers.items()
+                if n in _KEEP_PRECISION and b is not None}
+        probe = fn(torch.zeros((), dtype=self.dtype, device=self.device))
+        out = super()._apply(fn, *args, **kwargs)
+        self.dtype, self.device = probe.dtype, probe.device
+        for n, old in keep.items():
+            new = self._buffers[n]
+            if new.dtype in _HALF_DTYPES and old.dtype not in _HALF_DTYPES:
+                self._buffers[n] = old.to(device=new.device)
+        return out
+
+    def _compute_dtype(self) -> torch.dtype:
+        """dtype in which the sparse product is computed."""
+        return self._M_val.dtype if self.dtype in _HALF_DTYPES else self.dtype
+
+    def _register_sparse(self, M: torch.Tensor) -> None:
+        M = M.coalesce().to(_storage_dtype(M.dtype))
+        with warnings.catch_warnings():
+            # torch warns once per process that CSR support is "beta"
+            warnings.filterwarnings("ignore", message=".*Sparse CSR tensor support")
+            Mc = M.to_sparse_csr()
+            MTc = M.t().coalesce().to_sparse_csr()
+        # int32 indices when they fit: half the memory, and the CPU kernel
+        # (MKL) would otherwise convert int64 indices at every call
+        itype = torch.int32 if max(M.size() + (M._nnz(),)) < 2**31 else torch.int64
+        for name, T in (("_M", Mc), ("_MT", MTc)):
+            self.register_buffer(f"{name}_crow", T.crow_indices().to(itype), persistent=False)
+            self.register_buffer(f"{name}_col", T.col_indices().to(itype), persistent=False)
+            self.register_buffer(f"{name}_val", T.values().clone(), persistent=False)
+        self._M_size = tuple(M.size())
+
+    def _csr(self, transpose: bool = False) -> torch.Tensor:
+        """The stored matrix (or its transpose) as a CSR tensor, no copy."""
+        name = "_MT" if transpose else "_M"
+        R, C = self._M_size
+        return torch.sparse_csr_tensor(
+            getattr(self, f"{name}_crow"),
+            getattr(self, f"{name}_col"),
+            getattr(self, f"{name}_val"),
+            size=(C, R) if transpose else (R, C),
+        )
+
+    def _apply_sparse(self, t: torch.Tensor) -> torch.Tensor:
+        """``M @ t`` for a batch ``t`` of shape ``[B, C]``; returns ``[B, R]``."""
+        return _CsrMatmul.apply(t.T, self._csr(), self._csr(transpose=True)).T
+
+    def _sparse_coo(self) -> torch.Tensor:
+        """The stored matrix as a coalesced COO tensor."""
+        return self._csr().to_sparse().coalesce()
+
+    # Read-only views of the former COO buffers (kept for existing callers).
+    @property
+    def _M_indices(self) -> torch.Tensor:
+        return self._sparse_coo().indices()
+
+    @property
+    def _M_values(self) -> torch.Tensor:
+        return self._sparse_coo().values()
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        for key in ("_M_indices", "_M_values"):
+            state_dict.pop(prefix + key, None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
 # HealPixDown
 # ---------------------------------------------------------------------------
 
-class HealPixDown(nn.Module):
+class HealPixDown(_SparseOperatorMixin, nn.Module):
     """
     HEALPix downsampling: reduce resolution by a factor of 2.
 
@@ -109,7 +238,7 @@ class HealPixDown(nn.Module):
     over the 4 direct NESTED children (``mode="maxpool"``), or their
     unweighted mean (``mode="mean"``).
 
-    Can operate on the full sphere or on a partial-sky subset.
+    Can operate on the full sphere or on a regional domain.
 
     Parameters
     ----------
@@ -129,11 +258,11 @@ class HealPixDown(nn.Module):
         to use for a hierarchy of maps.  *smooth* does not have this
         property: its weights are normalised per output cell only, which
         preserves constant fields but not the global mean.
-        On a partial sky, a coarse cell is the mean of the children
+        On a regional domain, a coarse cell is the mean of the children
         present in ``cell_ids``; :attr:`coverage` gives the fraction of
         children present, and the mean of the output weighted by
         :attr:`coverage` equals the mean of the input.  This holds for one
-        step: chaining partial-sky operators with incomplete parents gives
+        step: chaining regional-domain operators with incomplete parents gives
         a mean of means.  To stay conservative over several steps, run the
         data and a map of ones through the chain, multiply each step's
         output by that step's :attr:`coverage`, and divide the two at the
@@ -147,7 +276,7 @@ class HealPixDown(nn.Module):
         added.  A constant field is preserved (``delta`` is then zero up to
         round-off).  The shift is the same for every cell, so a negative
         ``delta`` can make a non-negative field (a probability, say)
-        slightly negative: positivity is not kept.  On a partial sky the
+        slightly negative: positivity is not kept.  On a regional domain the
         means are weighted by :attr:`coverage` (the fraction of the 4
         children present), as for *mean*.  NaN: ``delta`` is built from
         finite values only, so a NaN stays local and the finite output
@@ -198,10 +327,10 @@ class HealPixDown(nn.Module):
     >>> y.shape
     (12288,)   # 12 * 32**2
 
-    Partial sky:
+    Regional domain (the cells within 20 degrees of lon = lat = 0):
 
-    >>> import healpy as hp
-    >>> cell_ids = hp.query_disc(nside, hp.ang2vec(np.pi/2, 0), 0.3, nest=True)
+    >>> from healpix_geo import nested
+    >>> cell_ids, _, _ = nested.cone_coverage((0.0, 0.0), 20.0, level)
     >>> down = HealPixDown(level=level, cell_ids=cell_ids)
     >>> y, coarse_ids = down(x[cell_ids])
     """
@@ -257,7 +386,7 @@ class HealPixDown(nn.Module):
                 "mode='smooth_conservative' requires weight_norm='l1'."
             )
 
-        # ---- partial sky ----
+        # ---- regional domain ----
         self.partial = cell_ids is not None
         if self.partial:
             cell_ids_in = np.asarray(cell_ids, dtype=np.int64).ravel()
@@ -290,10 +419,7 @@ class HealPixDown(nn.Module):
             self.radius_rad = np.radians(self.radius_deg)
             self.sigma_rad  = np.radians(self.sigma_deg)
 
-            M = self._build_smooth_matrix()
-            self.register_buffer("_M_indices", M.indices().clone())
-            self.register_buffer("_M_values",  M.values().clone())
-            self._M_size = M.size()
+            self._register_sparse(self._build_smooth_matrix())
             if self.mode == "smooth_conservative":
                 children = 4 * self._cell_ids_out[:, None] + np.arange(4)
                 if self.partial:
@@ -341,7 +467,7 @@ class HealPixDown(nn.Module):
         olevel = int(np.log2(self.nside_out))
 
         # ------------------------------------------------------------------
-        # Partial-sky column lookup  (vectorisable via searchsorted)
+        # Regional-domain column lookup  (vectorisable via searchsorted)
         # ------------------------------------------------------------------
         if self.partial:
             # Columns index the *input array*, i.e. the order of cell_ids_in,
@@ -431,7 +557,7 @@ class HealPixDown(nn.Module):
             valid_mask  [i_out, :s] = True
 
         # ------------------------------------------------------------------
-        # 4a. Partial-sky availability mask — vectorised over ALL rows at once
+        # 4a. Regional-domain availability mask — vectorised over ALL rows at once
         # ------------------------------------------------------------------
         if self.partial:
             safe_cands_flat = np.where(valid_mask.ravel(), cands_padded.ravel(), 0)
@@ -514,137 +640,19 @@ class HealPixDown(nn.Module):
         # ------------------------------------------------------------------
         rows_t = torch.as_tensor(rows_arr, dtype=torch.long,  device=self.device)
         cols_t = torch.as_tensor(cols_arr, dtype=torch.long,  device=self.device)
-        vals_t = torch.as_tensor(vals_arr, dtype=self.dtype,  device=self.device)
+        vdtype = _storage_dtype(self.dtype)
+        vals_t = torch.as_tensor(vals_arr, dtype=vdtype,  device=self.device)
 
         M = torch.sparse_coo_tensor(
             torch.stack([rows_t, cols_t]),
             vals_t,
             size=(self.N_out, self.N_in),
             device=self.device,
-            dtype=self.dtype,
+            dtype=vdtype,
         ).coalesce()
         return M
 
 
-    # Also vectorize _normalize_weights — keep for potential external usage,
-    # but it is no longer called inside _build_smooth_matrix.
-    def _normalize_weights_vec(self, w: np.ndarray) -> np.ndarray:
-        """
-        Row-wise normalisation of a 2-D weight matrix (N_out, K).
-        Vectorised replacement — same semantics as the original scalar version.
-        """
-        if self.weight_norm == "l1":
-            s = w.sum(axis=-1, keepdims=True)
-            return np.where(s > 0, w / s, np.ones_like(w) / max(w.shape[-1], 1))
-        if self.weight_norm == "l2":
-            s2 = (w * w).sum(axis=-1, keepdims=True)
-            return np.where(
-                s2 > 0,
-                w / np.sqrt(s2),
-                np.ones_like(w) / max(np.sqrt(w.shape[-1]), 1.0),
-            )
-        return w  # "none"
-        
-        def _normalize_weights(self, w: np.ndarray) -> np.ndarray:
-            if self.weight_norm == "l1":
-                s = w.sum()
-                return w / s if s > 0 else np.ones_like(w) / max(len(w), 1)
-            if self.weight_norm == "l2":
-                s2 = (w * w).sum()
-                return w / np.sqrt(s2) if s2 > 0 else np.ones_like(w) / max(np.sqrt(len(w)), 1.0)
-            return w  # "none"
-    '''
-    def _build_smooth_matrix(self) -> torch.Tensor:
-        """
-        Build sparse matrix M of shape (N_out, N_in):
-            y[i_out] = sum_j M[i_out, j_in] * x[j_in]
-        with Gaussian weights based on haversine distance.
-        """
-        cell_ids_out = self._cell_ids_out   # coarse pixel ids [N_out]
-        cell_ids_in  = self._cell_ids_in    # fine pixel ids [N_in] (None = full sphere)
-
-        # For fast column lookup when partial sky: sorted ids + searchsorted
-        if self.partial:
-            ids_in_sorted = np.sort(cell_ids_in)
-            # Map fine pixel id → column index in the sparse matrix
-            def _col(pix_arr):
-                idx = np.searchsorted(ids_in_sorted, pix_arr)
-                idx = np.clip(idx, 0, len(ids_in_sorted) - 1)
-                mask = ids_in_sorted[idx] == pix_arr
-                return idx, mask
-        else:
-            def _col(pix_arr):
-                return pix_arr.astype(np.int64), np.ones(len(pix_arr), dtype=bool)
-
-        rows, cols, vals = [], [], []
-        
-        ilevel=int(np.log2(self.nside_in))
-        olevel=int(np.log2(self.nside_out))
-        for i_out, p_out in enumerate(cell_ids_out):
-            #theta0, phi0 = hp.pix2ang(self.nside_out, int(p_out), nest=True)
-            lon0, lat0 = healpix_geo.nested.healpix_to_lonlat(int(p_out), olevel,ellipsoid=self.ellipsoid)
-            #lat0 = 0.5 * np.pi - theta0
-            # Query fine pixels within the disc
-            #vec0 = hp.ang2vec(theta0, phi0)
-            #cand2 = np.asarray(
-            #    hp.query_disc(self.nside_in, vec0, self.radius_rad,
-            #                  inclusive=True, nest=True),
-            #    dtype=np.int64
-            #)
-            cand,_,_ = healpix_geo.nested.cone_coverage((lon0,lat0), np.rad2deg(self.radius_rad),ilevel,ellipsoid=self.ellipsoid)
-            
-            # Fallback: use 4 NESTED children if disc is empty
-            if cand.size == 0:
-                cand = (4 * p_out + np.arange(4)).astype(np.int64)
-
-            # Filter to available input pixels when partial sky
-            col_idx, in_mask = _col(cand)
-            cand    = cand[in_mask]
-            col_idx = col_idx[in_mask]
-
-            if len(cand) == 0:
-                # No available fine pixels: skip this coarse pixel
-                warnings.warn(
-                    f"Coarse pixel {p_out} has no available input pixels in "
-                    "cell_ids; it will produce zero output.",
-                    UserWarning,
-                    stacklevel=3,
-                )
-                continue
-
-            # Gaussian weights
-            lon_c, lat_c = healpix_geo.nested.healpix_to_lonlat(cand.tolist(), ilevel,ellipsoid=self.ellipsoid)
-            
-            #theta_c, phi_c = hp.pix2ang(self.nside_in, cand.tolist(), nest=True)
-            #lat_c = 0.5 * np.pi - theta_c
-            gamma = self._haversine(np.deg2rad(lat0), np.deg2rad(lon0), np.deg2rad(lat_c), np.deg2rad(lon_c))
-            
-            w = np.exp(-0.5 * (gamma / self.sigma_rad) ** 2)
-            w[gamma > self.radius_rad] = 0.0
-            if w.sum() <= 0.0:
-                w[:] = 1.0
-
-            w = self._normalize_weights(w)
-
-            for j, (col, wv) in enumerate(zip(col_idx, w)):
-                if wv != 0.0:
-                    rows.append(i_out)
-                    cols.append(int(col))
-                    vals.append(float(wv))
-
-        rows_t = torch.tensor(rows, dtype=torch.long,   device=self.device)
-        cols_t = torch.tensor(cols, dtype=torch.long,   device=self.device)
-        vals_t = torch.tensor(vals, dtype=self.dtype,   device=self.device)
-
-        M = torch.sparse_coo_tensor(
-            torch.stack([rows_t, cols_t]),
-            vals_t,
-            size=(self.N_out, self.N_in),
-            device=self.device,
-            dtype=self.dtype,
-        ).coalesce()
-        return M
-    '''
     def _build_maxpool_children(self) -> None:
         """
         Precompute the child index mapping for the maxpool mode.
@@ -653,25 +661,20 @@ class HealPixDown(nn.Module):
         cell_ids_out = self._cell_ids_out  # coarse pixel ids
 
         if self.partial:
-            # For each coarse pixel, collect available children from cell_ids_in
-            ids_in_set = set(self._cell_ids_in.tolist())
-            children_list = []
-            fallback = int(self._cell_ids_in[0])  # safe fallback index (column 0)
-
-            for p_out in cell_ids_out:
-                ch = [int(4 * p_out + k) for k in range(4)]
-                # Replace missing children with fallback column 0
-                ch_avail = [c if c in ids_in_set else fallback for c in ch]
-                children_list.append(ch_avail)
-
-            # Map absolute pixel ids → column indices in cell_ids_in (input
-            # array order, hence the argsort after the sorted lookup)
-            order         = np.argsort(self._cell_ids_in, kind="stable")
-            ids_in_sorted = self._cell_ids_in[order]
-            children_np   = np.array(children_list, dtype=np.int64)  # [N_out, 4]
-            flat           = children_np.ravel()
-            col_idx        = order[np.searchsorted(ids_in_sorted, flat)]
-            children_idx   = col_idx.reshape(children_np.shape)
+            # Position of each child in the input array (cell_ids need not be
+            # sorted).  A child absent from cell_ids is replaced by a present
+            # child of the same parent, which leaves the max unchanged; every
+            # parent has at least one, by construction of cell_ids_out.
+            children = 4 * cell_ids_out[:, None] + np.arange(4, dtype=np.int64)
+            order = np.argsort(self._cell_ids_in, kind="stable")
+            ids_sorted = self._cell_ids_in[order]
+            pos = np.clip(
+                np.searchsorted(ids_sorted, children), 0, len(ids_sorted) - 1
+            )
+            valid = ids_sorted[pos] == children                 # [N_out, 4]
+            col = order[pos]
+            first = col[np.arange(len(col)), valid.argmax(axis=1)]
+            children_idx = np.where(valid, col, first[:, None])
         else:
             children_idx = np.stack([
                 4 * cell_ids_out,
@@ -692,7 +695,7 @@ class HealPixDown(nn.Module):
         Registers ``_children_idx`` of shape [N_out, 4] (positions in the
         input array, in the order of ``cell_ids``) and ``_children_valid``
         of shape [N_out, 4] (False where a child is absent from a
-        partial-sky ``cell_ids``).
+        regional ``cell_ids``).
         """
         children = 4 * self._cell_ids_out[:, None] + np.arange(4, dtype=np.int64)
 
@@ -813,21 +816,19 @@ class HealPixDown(nn.Module):
         by :class:`~healpix_analyse.up.HealPixUp` (``paired_down=...``).
         """
         if self.mode in ("smooth", "smooth_conservative"):
-            return torch.sparse_coo_tensor(
-                self._M_indices, self._M_values, size=self._M_size,
-                device=self._M_values.device, dtype=self._M_values.dtype,
-            ).coalesce()
+            return self._sparse_coo()
         if self.mode != "mean":
             raise ValueError("maxpool is not linear; it has no sparse matrix.")
         idx = self._children_idx
         valid = self._children_valid
         rows = torch.arange(self.N_out, device=idx.device)[:, None].expand_as(idx)
-        n = valid.sum(dim=-1, keepdim=True).to(self.dtype).expand(idx.shape)
+        vdtype = _storage_dtype(self.dtype)
+        n = valid.sum(dim=-1, keepdim=True).to(vdtype).expand(idx.shape)
         return torch.sparse_coo_tensor(
             torch.stack([rows[valid], idx[valid]]),
             1.0 / n[valid],
             size=(self.N_out, self.N_in),
-            device=idx.device, dtype=self.dtype,
+            device=idx.device, dtype=vdtype,
         ).coalesce()
 
     @property
@@ -837,7 +838,7 @@ class HealPixDown(nn.Module):
         present in ``cell_ids`` (``mode="mean"`` and
         ``"smooth_conservative"``).
 
-        All ones on the full sphere.  On a partial sky, the mean of the
+        All ones on the full sphere.  On a regional domain, the mean of the
         output weighted by this array equals the mean of the input.  It
         does not depend on the data; for the NaN-skipping mean use
         :meth:`valid_fraction`.
@@ -876,7 +877,11 @@ class HealPixDown(nn.Module):
         cell_ids_out : np.ndarray
             NESTED pixel indices of the output pixels at ``nside_out``.
         """
-        t, is_numpy, was_1d = _prepare_input(x, self.device, self.dtype)
+        # self.device / self.dtype follow .to(); the sparse product of a
+        # 16-bit module is computed in the stored precision (float32)
+        linear = self.mode in ("smooth", "smooth_conservative")
+        dtype = self._compute_dtype() if linear else self.dtype
+        t, is_numpy, was_1d = _prepare_input(x, self.device, dtype)
         B, N = t.shape
 
         if N != self.N_in:
@@ -885,18 +890,11 @@ class HealPixDown(nn.Module):
             )
 
         if self.mode in ("smooth", "smooth_conservative"):
-            M = torch.sparse_coo_tensor(
-                self._M_indices.to(device=t.device),
-                self._M_values.to(device=t.device, dtype=t.dtype),
-                size=self._M_size,
-                device=t.device,
-                dtype=t.dtype,
-            )
-            # M: [N_out, N_in];  t: [B, N_in]
-            # y_T = M @ t.T  →  [N_out, B]
-            y = torch.sparse.mm(M, t.T).T   # [B, N_out]
+            # M: [N_out, N_in] CSR, built once;  t: [B, N_in]
+            y = self._apply_sparse(t)       # [B, N_out]
             if self.mode == "smooth_conservative":
                 y = self._conserve_mean(t, y)
+            y = y.to(self.dtype)
 
         elif self.mode == "mean":
             gathered, valid = self._gather_children(t)          # [B, N_out, 4]

@@ -14,10 +14,7 @@ are listed too, with the module to import them from.
 
 ## Modules
 
-The same docstrings, one page per source module. The legacy modules
-`LocalizedFlatSkyAlm` and `LocalizedAlm_optimized_v13_fixed` (they import
-`foscat`, which is not a dependency), `make_rectangle` (it imports
-`cdshealpix`) and the script `demo_ps` are not listed.
+The same docstrings, one page per source module.
 
 ```{toctree}
 ---

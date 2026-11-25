@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed
+- `build_healpix_adjacency` (HEALPix Minkowski functionals) no longer imports
+  `healpy`, which no dependency declared: the neighbours come from
+  `healpix_geo.nested.neighbours`, the backend of the connected components,
+  and the edges and triangles are built with vectorised NumPy instead of a
+  Python loop over the cells (#96, item 4). The output is unchanged; an input
+  without any edge now returns tensors of shape `[0, 2]` and `[0, 3]`
+  instead of `[0]`, and duplicated `cell_ids` raise `ValueError` (the loop
+  built an asymmetric graph from them and lost triangles).
+- Topology tests: hard-coded NESTED neighbours at levels 0 and 1 (base-cell
+  corners with 7 neighbours included); the comparisons with `healpy` run only
+  when it is installed (#41). The private topology adapter rotates the
+  `healpix-geo` direction order with one copy instead of two.
+
 ### Added
 - Wavelet power spectrum (`healpix_analyse.wavelet_spectrum`):
   `HealPixWaveletSpectrum` (complex Morlet, 4 orientations),
@@ -52,6 +66,116 @@
   installed, this also takes its import (about 0.7 s of the 5 to 7 s of
   `import healpix_analyse` on a laptop) off the package import; the first
   call of `direct_spherical_convolution` pays it instead.
+- `AlmTransform` no longer prints in its constructor; the diagnostics are
+  printed only with `debug=True`. `AlmTransform(method="alm")` now raises
+  `NotImplementedError` instead of silently running the FFT path.
+- `AlmCoeffs` is no longer exported from `healpix_analyse` (no function
+  returns it); import it from `healpix_analyse.alm`.
+- Packaging: `termcolor`, `umap-learn` and `healpix-plot` are no longer core
+  dependencies (the package does not import them). `termcolor` stays in the
+  `dino` and `examples` extras and `umap-learn` in the `examples` extra;
+  `healpix-plot` is not on PyPI, so it is in no pyproject extra, only in the
+  pixi `examples` feature (git source). New extra `sht` (`quaternionic`,
+  `spherical`) for the spin ≠ 0 transforms of `HEALPixSHT`, whose
+  `ImportError` now names it. `healpy`, used only by the tests, is added to
+  the `test` extra and moved from the pixi core dependencies to the pixi
+  `test` feature. `resample_to_latlon_grid` raises an `ImportError` naming
+  the `scipy` extra when SciPy is missing.
+- `HealPixConv`, `HEALPixSHT`, `binary_dilation`, `binary_erosion`,
+  `get_interp_val`, `get_interp_weights` and `resample_to_latlon_grid` are
+  now exported from `healpix_analyse`. `quaternionic` and `spherical` are
+  imported on first spin ≠ 0 use, not when `healpix_sht` is imported.
+- `alm2map_latlon`: `lmax` now defaults to `None` and is deduced from the
+  length of `alm`; a value that does not match raises `ValueError`.
+  `grid_summary` defaults to `lmax=64`, like `map2alm_latlon` and
+  `anafast_latlon` (it was 24).
+
+### Fixed
+- `alm2map_latlon` returned the m > 0 terms at half amplitude: the synthesis
+  of a real field now carries the factor 2 of the pair ±m, and
+  `alm2map_latlon(map2alm_latlon(f))` returns a band-limited `f` to rounding
+  error with an exact quadrature (#92).
+- `alm_latlon`: uniform rings with an odd number of points lost one
+  frequency in the analysis, which corrupted the aliased modes when
+  `lmax >= (N_r + 1) / 2`; irregular rings failed on CUDA input (kernel
+  built on the CPU). New tests in `tests/test_alm_latlon.py`.
+- `HealPixDown(mode="maxpool")` on a regional domain: a child absent from
+  `cell_ids` was replaced by the first input cell, which can belong to
+  another parent (cells `[100, 4, 5, 6]` at level 2 with values
+  `[50, 1, 2, 3]` gave `[50, 50]`); it is now replaced by a present child of
+  the same parent, so a parent is the max of its children present (#93).
+- `docs/other/down.md`, `docs/other/up.md`: the regional-domain examples
+  read a single-centre `cone_coverage` result as one array; with
+  healpix-geo 0.5 it is a tuple `(cell_ids, depths, fully_covered)`, and the
+  old recipe gave repeated ids.
+
+### Performance
+- `HealPixDown` (`"smooth"`, `"smooth_conservative"`) and `HealPixUp` keep
+  their matrix and its transpose as CSR buffers (int32 indices) built once in
+  the constructor; they follow `.to()`. `forward` no longer assembles a COO
+  tensor at each call, and the gradient applies the stored transpose (twice
+  differentiable). Level 8 → 7, one CPU thread, one map: `HealPixDown`
+  forward 167 → 12 ms, forward + backward 370 → 15 ms with a per-call peak
+  of 151 → 6 MiB; `HealPixUp` forward 153 → 10 ms, forward + backward
+  575 → 36 ms (157 → 9 MiB) (#59).
+- `HealPixDown` and `HealPixUp`: one dtype rule for every mode. The output
+  has the module dtype, which follows `.to(dtype)`, `.double()`, `.half()`
+  (before, `"mean"` and `"maxpool"` kept the constructor dtype). After a cast
+  to `bfloat16` or `float16`, the matrix and the normalisation vectors stay
+  in float32 (the CPU sparse kernels have no 16-bit version), the linear
+  part is computed there, and the output is cast to the 16-bit dtype. A
+  `bfloat16` result for a numpy input is returned as float32.
+
+### Compatibility
+- The matrix of `HealPixDown` / `HealPixUp` is no longer in the
+  `state_dict`. Loading a `state_dict` saved by an older version still works
+  (its `_M_indices` / `_M_values` are ignored), but a `state_dict` saved by
+  this version has no `_M_*` keys, so older versions fail to load it with
+  `strict=True`. Whole modules pickled (`torch.save(module)`) by an older
+  version do not unpickle with this version: rebuild them from their
+  constructor arguments.
+
+### Removed
+- `down.py`: the old `_build_smooth_matrix` kept in a string, the unused
+  `_normalize_weights_vec`, and the unused `pyproj` import; the `down.py` /
+  `up.py` docstrings use healpix-geo instead of healpy (#61, #96).
+- `healpix_analyse.powerspectra_lonlat`: it could not run (1-D cell ids
+  passed to `AlmTransform`, `lon`/`lat`/`weights` ignored). For lon/lat
+  iso-latitude grids, use `build_rings_from_latlon` + `anafast_latlon`.
+- `healpix_analyse.ps` (a plain 2-D FFT of a NumPy array, not HEALPix).
+- The legacy modules `LocalizedFlatSkyAlm`, `LocalizedAlm_optimized_v13_fixed`
+  and the script `demo_ps` (they import `foscat`, which is not a dependency),
+  and `make_rectangle` (it imports `cdshealpix`; no module of the package used
+  it). The notebooks `Test_rectangle`, `Test_resampling_powerspectra` and
+  `Test_resampling_powerspectra-s2-l2a` still import `make_rectangle` and `ps`.
+
+### Fixed
+- Ellipsoid names in any casing (`"wgs84"`, `"Wgs84"`, `"Sphere"`,
+  `"SPHERE"`, ...) are accepted by the public functions and constructors
+  that take `ellipsoid`, including `get_interp_val` / `get_interp_weights`,
+  which rejected `"wgs84"` and `"Sphere"`, and the WGS84-only filters
+  (`radial_filter`, `gaussian_filter`, `neighbour_reduce` and its
+  `*_filter` shortcuts, `directional_filter`), which raised
+  `NotImplementedError` for `"wgs84"`. `dino.set_ellipsoid` now also
+  accepts title case. `AlmTransform` is not covered yet (#96).
+- `HealPixWideConv` accepts `cell_ids` in any order: it sorts them
+  internally and returns the result in the order given (it used to give
+  wrong results silently on unsorted ids). A permutation of the same domain
+  reuses the cached fit (#96).
+- Doc paths in warnings and docstrings point to the reorganised pages
+  (`docs/conv/large_conv.md`, `docs/conv/radial_filter.md`,
+  `docs/conv/pyramid_conv_maths.md`, `docs/other/dino.md`); the
+  `radial_filter` docstrings name the helpers the code calls
+  (`build_metric_neighbourhood_geometry`,
+  `compact_weighted_neighbourhood_reduce`); `nested_to_tiles` documents
+  that repeated ids follow `duplicates`, and `GetDINOV3SAT` lists the
+  `"percell"` projection (#96).
+
+### Deprecated
+- `healpix_analyse.powerspectra.powerspectra` emits a `DeprecationWarning`
+  and will be removed. Use `HEALPixSHT.anafast` on the full sphere,
+  `HealPixWaveletSpectrum` on a regional domain or with missing data, and
+  `build_rings_from_latlon` + `anafast_latlon` on lon/lat grids.
 
 ## 2026.11.1 (2026-11-23)
 

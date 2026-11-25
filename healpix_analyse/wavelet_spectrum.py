@@ -34,6 +34,7 @@ import torch.nn as nn
 
 from healpix_analyse.convol import HealPixConv, _DEFAULT_CACHE_DIR
 from healpix_analyse.down import HealPixDown
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 KernelFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
@@ -261,6 +262,7 @@ class _WaveletSpectrumBase(nn.Module):
         device,
         cache_dir,
     ):
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__()
         if isinstance(level, bool) or int(level) != level or int(level) < 1:
             raise ValueError("level must be an integer >= 1.")
@@ -865,6 +867,7 @@ class HealPixWaveletSpectrum(_WaveletSpectrumBase):
         device=None,
         cache_dir=_DEFAULT_CACHE_DIR,
     ):
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__(
             level, cell_ids, n_scales, wavelet, scales_per_octave, kernel_sz,
             4 * int(scales_per_octave) if n_gauges is None else int(n_gauges),
@@ -907,6 +910,7 @@ class HealPixIsotropicWaveletSpectrum(_WaveletSpectrumBase):
         device=None,
         cache_dir=_DEFAULT_CACHE_DIR,
     ):
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__(
             level, cell_ids, n_scales, wavelet, scales_per_octave, kernel_sz,
             1, "phi", None, None, down_mode, edge, coverage_weight, min_coverage,

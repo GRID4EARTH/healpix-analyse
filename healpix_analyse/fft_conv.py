@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from healpix_analyse.fft_local import LocalFFT, _next_power_of_two
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -139,6 +140,7 @@ class HealPixFFTConv(nn.Module):
         cache_kernel_fft: bool = True,
         projection: str = "average",
     ) -> None:
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__()
 
         if isinstance(level, bool) or int(level) != level or int(level) < 0:

@@ -13,7 +13,6 @@ python = ">=3.10,<3.14"
 jupyterlab = ">=4.5.5,<5"
 pytorch = ">=2.0,<3"
 pyproj = ">=3.6"
-healpy = ">=1.16"
 
 
 [pypi-dependencies]
@@ -55,6 +54,13 @@ healpix-plot = { git = "https://github.com/GRID4EARTH/healpix-plot" }
 [feature.test.dependencies]
 pytest = "*"
 pytest-cov = "*"
+# reference values in tests/test_components.py and tests/test_topology.py
+healpy = ">=1.16"
+
+# --- spin != 0 transforms of HEALPixSHT (extra `sht` in pyproject.toml) ------
+[feature.sht.pypi-dependencies]
+quaternionic = "*"
+spherical = "*"
 
 [feature.docs.dependencies]
 pyyaml = "*"
@@ -86,7 +92,7 @@ isort = "*"
 
 
 [environments]
-default = ["test", "dev", "affine", "dino", "examples"]
+default = ["test", "dev", "affine", "dino", "examples", "sht"]
 docs = ["docs"]
 # a lighter environment when only the embeddings are needed
 dino = ["dino", "examples"]

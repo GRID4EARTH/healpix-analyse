@@ -66,6 +66,7 @@ from .radial_filter import (
     _validate_normalization,
     _validate_positive_finite,
 )
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 _NORMALIZATIONS = ("present", "source")
 _CORRECTIONS = ("none", "lattice")
@@ -554,6 +555,7 @@ def multiorder_filter_operator(
         Rows and columns follow the input order.  Apply with
         :func:`apply_filter_operator`.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     normalization = _validate_normalization(normalization, _NORMALIZATIONS)
     if shortest_path not in _SHORTEST_PATHS:
         raise ValueError(

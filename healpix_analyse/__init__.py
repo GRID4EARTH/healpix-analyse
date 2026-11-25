@@ -76,13 +76,18 @@ from healpix_analyse.divcurl import (
 from healpix_analyse.resample import (
     HealPixResampler,
     resample_healpix,
+    resample_to_latlon_grid,
 )
+from healpix_analyse.healpix_interp import get_interp_val, get_interp_weights
+from healpix_analyse.convol import HealPixConv
+from healpix_analyse.morphology import binary_dilation, binary_erosion
 
 
 # ---------------------------------------------------------------------------
 # Spherical harmonic transforms
 # ---------------------------------------------------------------------------
 
+from healpix_analyse.healpix_sht import HEALPixSHT
 from healpix_analyse.alm_latlon import (
     build_rings_from_latlon,
     anafast_latlon,
@@ -91,8 +96,6 @@ from healpix_analyse.alm_latlon import (
     compute_weights,
     grid_summary,
 )
-
-from healpix_analyse.alm import AlmCoeffs
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +203,7 @@ from healpix_analyse.radial_filter import (
 #
 # The backbone is loaded at run time from Meta's own distribution and is
 # subject to the DINOv3 License; nothing of it is vendored here (see
-# docs/dino.md).
+# docs/other/dino.md).
 # ---------------------------------------------------------------------------
 
 from healpix_analyse.dino import (
@@ -240,21 +243,23 @@ __all__ = [
     "HealPixDivCurlPyramid",
     "HealPixResampler",
     "resample_healpix",
+    "resample_to_latlon_grid",
+    "get_interp_val",
+    "get_interp_weights",
+    "HealPixConv",
+    "binary_dilation",
+    "binary_erosion",
 
     # ------------------------------------------------------------------
     # Spherical harmonic transforms
     # ------------------------------------------------------------------
+    "HEALPixSHT",
     "build_rings_from_latlon",
     "anafast_latlon",
     "map2alm_latlon",
     "alm2map_latlon",
     "compute_weights",
     "grid_summary",
-
-    # ------------------------------------------------------------------
-    # ALM containers
-    # ------------------------------------------------------------------
-    "AlmCoeffs",
 
     # ------------------------------------------------------------------
     # Local flat-sky FFT

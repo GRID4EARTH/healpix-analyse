@@ -24,8 +24,8 @@ The intended separation is::
     physical neighbourhood
             |
             v
-    shared WGS84 geometry
-        distance_m
+    build_metric_neighbourhood_geometry()
+        WGS84 distance_m
             |
             v
       kernel(distance_m)
@@ -34,7 +34,7 @@ The intended separation is::
     supplied radial weights
             |
             v
-    weighted_neighbourhood_reduce()
+    compact_weighted_neighbourhood_reduce()
             |
             v
           output
@@ -63,6 +63,7 @@ from ._neighbourhood import (
 )
 from ._land_barrier import _SEARCH_FACTOR, barrier_pairs
 from ._weighted_neighbourhood import compact_weighted_neighbourhood_reduce
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = np.ndarray | torch.Tensor
@@ -1172,7 +1173,7 @@ def gaussian_filter_operator(
     so their effective width differs from ``sigma_m``.
 
     With ``blocked_cells`` the three normalisations give, near blocked
-    cells, the following behaviours (``docs/radial_filter.md`` has the
+    cells, the following behaviours (``docs/conv/radial_filter.md`` has the
     details and the measured numbers):
 
     - ``"full_disc"``: mass that would go to blocked cells or behind them is
@@ -1196,6 +1197,7 @@ def gaussian_filter_operator(
     rows near blocked cells are searched, so the cost grows with the length
     of the coast, not with the size of the domain.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     sigma, truncation, radius = _validate_gaussian_parameters(
         sigma_m, truncate, width_rule=width_rule, refinement_level=refinement_level
     )
@@ -1298,6 +1300,7 @@ def radial_filter_operator(
     :func:`gaussian_filter_operator`, equality with the filter holds for
     values without NaN: see :func:`apply_filter_operator`.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     _validate_normalization(normalization, _OPERATOR_NORMALIZATIONS)
     cells = _validate_cell_ids(cell_ids, name="cell_ids")
     output_domain = _validate_domain(cells, domain)
@@ -1549,16 +1552,16 @@ def radial_filter(
            processing-domain filter
                     |
                     v
-       shared relative WGS84 geometry
+        build_metric_neighbourhood_geometry
                     |
                     v
-                distance_m
+            WGS84 distance_m
                     |
                     v
            user radial kernel
                     |
                     v
-       weighted_neighbourhood_reduce
+        compact_weighted_neighbourhood_reduce
                     |
                     v
                   output
@@ -1582,6 +1585,7 @@ def radial_filter(
             normalize=True,
         )
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     cells = _validate_cell_ids(
         cell_ids,
         name="cell_ids",
@@ -1754,6 +1758,7 @@ def gaussian_filter(
     over time steps, build the operator once and apply it with
     :func:`apply_filter_operator`.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     sigma, truncation, radius = _validate_gaussian_parameters(
         sigma_m,
         truncate,

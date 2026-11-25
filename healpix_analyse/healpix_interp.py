@@ -34,6 +34,7 @@ Auteurs : Claude (Anthropic)
 import numpy as np
 from healpix_geo import ring as _hg_ring
 from healpix_geo.nested import bilinear_interpolation as _nested_bilinear_interpolation
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +260,7 @@ def get_interp_weights(
     ValueError
         Si lon et lat n'ont pas la même forme.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     lon = np.asarray(lon, dtype=np.float64)
     lat = np.asarray(lat, dtype=np.float64)
     if lon.shape != lat.shape:
@@ -356,6 +358,7 @@ def get_interp_val(
         import healpy as hp
         hpx_map_nested = hp.reorder(hpx_map_ring, r2n=True)
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     lon = np.asarray(lon, dtype=np.float64)
     lat = np.asarray(lat, dtype=np.float64)
     scalar_input = lon.ndim == 0

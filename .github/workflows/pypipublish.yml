@@ -7,9 +7,13 @@ on:
     branches:
       - main
 
+permissions: {}
+
 jobs:
   build-artifacts:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: |
       github.repository == 'GRID4EARTH/healpix-analyse'
       && (
@@ -22,7 +26,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -45,7 +49,7 @@ jobs:
             echo "✅ Looks good"
           fi
       - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: releases
           path: dist
@@ -61,7 +65,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: releases
           path: dist

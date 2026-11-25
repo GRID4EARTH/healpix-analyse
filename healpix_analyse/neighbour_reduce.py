@@ -49,6 +49,7 @@ from healpix_analyse._neighbourhood import (
     NeighbourhoodMethod,
     build_neighbourhoods,
 )
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = np.ndarray | torch.Tensor
@@ -551,6 +552,7 @@ class HealPixNeighbourReducer:
         include_self: bool = True,
         ellipsoid: str = "WGS84",
     ) -> None:
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         refinement_level = _validate_refinement_level(
             refinement_level
         )
@@ -1025,6 +1027,7 @@ def neighbour_reduce(
     Other reductions raise ``ValueError`` on an empty effective
     neighbourhood.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     reducer = HealPixNeighbourReducer(
         cell_ids,
@@ -1054,6 +1057,7 @@ def median_filter(
     ellipsoid: str = "WGS84",
 ) -> ArrayLike:
     """Apply a numerical median over HEALPix neighbourhoods."""
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     return neighbour_reduce(
         values,
@@ -1080,6 +1084,7 @@ def mean_filter(
     ellipsoid: str = "WGS84",
 ) -> ArrayLike:
     """Apply a mean over HEALPix neighbourhoods."""
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     return neighbour_reduce(
         values,
@@ -1106,6 +1111,7 @@ def min_filter(
     ellipsoid: str = "WGS84",
 ) -> ArrayLike:
     """Apply a minimum over HEALPix neighbourhoods."""
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     return neighbour_reduce(
         values,
@@ -1132,6 +1138,7 @@ def max_filter(
     ellipsoid: str = "WGS84",
 ) -> ArrayLike:
     """Apply a maximum over HEALPix neighbourhoods."""
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     return neighbour_reduce(
         values,
