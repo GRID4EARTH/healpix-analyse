@@ -18,7 +18,9 @@ conv
     during the step above what is allocated before it (the layer, its
     geometry and the input), as in issue #90; ``*_total_GiB`` is the absolute
     peak, layer and geometry included.  On Linux CPUs the peak resident set
-    size above the one before the step is sampled every 2 ms.
+    size above the one before the step is sampled every 2 ms; run with
+    ``MALLOC_MMAP_THRESHOLD_=65536`` so that glibc returns freed tensors to
+    the system and the resident set follows the allocations.
 geometry
     Build time of the geometry, stage by stage, for regional domains at
     several levels (no disk cache).

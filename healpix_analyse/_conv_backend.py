@@ -172,7 +172,9 @@ def _gather_tap(xt, idx_p, w_p):
     B, C = xt.shape[1], xt.shape[2]
     acc = None
     for j in range(4):
-        v = xt.index_select(0, idx_p[j].reshape(-1)).view(G, K, B, C)
+        # int64 per tap: index_select / index_add_ take a slow path with int32
+        # indices on CPU (index_add_ is ~10x slower), and the copy is small
+        v = xt.index_select(0, idx_p[j].reshape(-1).long()).view(G, K, B, C)
         v = v * w_p[j].view(G, K, 1, 1)
         acc = v if acc is None else acc.add_(v)
     return acc.view(G, K * B, C)
@@ -208,7 +210,7 @@ def _torch_backward(x, weight, idx, w, gy, need_x, need_w):
             h = torch.bmm(gyt, weight[..., p].transpose(1, 2)).view(G, K, B * C)
             for j in range(4):
                 gx_flat.index_add_(
-                    0, idx[p, j].reshape(-1),
+                    0, idx[p, j].reshape(-1).long(),
                     (h * w[p, j].view(G, K, 1)).view(G * K, B * C),
                 )
     gx = gx_flat.view(K, B, C).permute(1, 2, 0) if need_x else None
