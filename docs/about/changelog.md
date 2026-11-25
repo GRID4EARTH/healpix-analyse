@@ -16,10 +16,46 @@
   `deterministic=True` (or `torch.use_deterministic_algorithms(True)`)
   computes the input gradient of the Triton backend without atomics, by a
   gather on the transposed stencil map (built at the first backward pass),
-  and gives the same bits at every run.
+  and gives the same bits at every run. `missing="local_mean"` keeps the
+  PyTorch reference path (gathered tensor and matrix product) on every
+  device.
 - `benchmarks/benchmark_healpix_conv.py`: forward, forward + backward, peak
   memory and geometry build time of `HealPixConv`, on CPU or CUDA, one JSON
   line per run, and the gain table between two versions.
+- Wavelet power spectrum (`healpix_analyse.wavelet_spectrum`):
+  `HealPixWaveletSpectrum` (complex Morlet, 4 orientations),
+  `HealPixIsotropicWaveletSpectrum` (angle-averaged Morlet, no orientation)
+  and the function `wavelet_power_spectrum`, with the profiles
+  `wavelet_morlet` and `wavelet_morlet_isotropic`. Band powers per HEALPix
+  level (down to level 0, or two per octave with `scales_per_octave=2`), on
+  the full sphere or a regional domain with NaN: the field goes down with
+  `HealPixDown` on the pair (w (x − M), w) (`down_mode="mean"` by default,
+  area-weighted, so that the sums are conserved; `"smooth"` as an option),
+  missing stencil points are completed with the local mean, and each valid
+  pixel is weighted by the coverage of its kernel. Returns the frequency 0
+  (the mean of the level-0 pixels, which is the mean of the valid pixels),
+  the low-pass variance, `n_eff`, optional S1 and local maps; `cross()` gives
+  co-spectra and coherence of two fields on the same cells; `windows()` and
+  `littlewood_paley()` measure the band responses and fit band constants on
+  the full sphere. Differentiable, batched, CPU or GPU; no SciPy. Per map on
+  the full sphere, the finest band agrees with the band-averaged
+  `HEALPixSHT.anafast` within about 4 %; the coarser bands within 9 % one
+  level down and 19 % two levels down with the default descent (within 5 %
+  with `down_mode="smooth"`), measured at level 4. Page:
+  `docs/sht/wavelet_spectrum.md`.
+- `HealPixConv(missing="local_mean")`: NaN values (and `mask=` zeros) are
+  missing exactly like pixels outside `cell_ids`; a stencil point takes the
+  renormalised bilinear interpolation of its valid neighbours, or the local
+  mean of the valid stencil values when it has none
+  (`local_mean_weights`). Finite outputs and gradients everywhere.
+  `mask=` is `[N]`, `[B, N]` or `[B, C_in, N]`.
+  `completed_stencil()` returns the stencil values and their valid
+  fraction. The geometry of this mode is built in float64 (then cast), so
+  float32 and float64 layers agree at the domain border. The default,
+  `missing="centre"`, is the existing behaviour (identical outputs). The
+  geometry cache now also stores the in-domain fraction of each stencil
+  point; a file without it is recomputed once when `missing="local_mean"`
+  needs it.
 
 ### Changed
 - `HealPixConv` stores its stencil as int32 neighbour positions in the order

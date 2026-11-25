@@ -39,8 +39,8 @@ needs_cuda = pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA")
 # Reference: main before #90
 # ---------------------------------------------------------------------------
 
-def reference_geometry(conv, cell_ids, dtype, device):
-    """pos_safe, w_norm [4, G, K*P] and sort_order [K], built as on main."""
+def reference_geometry(conv, cell_ids, dtype, device, return_support=False):
+    """pos_safe, w_norm [4, G, K*P] and sort_order [K] (and support [G, K*P]), as on main."""
     level, G, P, K = conv.level, conv.G, conv.P, conv.K
     ids_np = (np.arange(12 * 4**level, dtype=np.int64) if cell_ids is None
               else np.asarray(cell_ids, dtype=np.int64).ravel())
@@ -59,9 +59,10 @@ def reference_geometry(conv, cell_ids, dtype, device):
     w_all = w_flat.view(4, K, G, P).permute(2, 0, 1, 3).reshape(G, 4, K * P)
     ids_sorted_t = torch.as_tensor(np.sort(ids_np), device=device, dtype=torch.long)
     sort_order = torch.as_tensor(np.argsort(ids_np), device=device, dtype=torch.long)
-    pos, w = _bind_support_batched(idx_all.clone(), w_all.clone(), ids_sorted_t,
-                                   conv.kernel_sz, K, P, device)
-    return pos.permute(1, 0, 2).contiguous(), w.permute(1, 0, 2).contiguous(), sort_order
+    pos, w, support = _bind_support_batched(idx_all.clone(), w_all.clone(), ids_sorted_t,
+                                            conv.kernel_sz, K, P, device, return_support=True)
+    geom = (pos.permute(1, 0, 2).contiguous(), w.permute(1, 0, 2).contiguous(), sort_order)
+    return geom + (support,) if return_support else geom
 
 
 def reference_forward(conv, geom, t):
@@ -78,6 +79,41 @@ def reference_forward(conv, geom, t):
     g_mat = gathered.permute(2, 0, 3, 1, 4).contiguous().view(G, B * K, C_in * P)
     W_mat = conv.weight.permute(0, 1, 3, 2).contiguous().view(G, C_in * P, C_out)
     y = torch.bmm(g_mat, W_mat).view(G, B, K, C_out).permute(1, 0, 3, 2).reshape(B, G * C_out, K)
+    return y + conv.bias.view(1, -1, 1)
+
+
+def reference_local_mean_forward(conv, geom, support, t, mask=None):
+    """HealPixConv.forward of main (3510979) with missing="local_mean" (autograd)."""
+    pos, wn, so = geom
+    B, C, N = t.shape
+    G, P, K = conv.G, conv.P, conv.K
+    wn = wn.to(t.dtype)
+    sup = support.to(t.dtype).view(1, 1, G, K, P)
+    v = torch.isfinite(t).to(t.dtype)
+    if mask is not None:
+        v = v * torch.as_tensor(mask, dtype=t.dtype).expand(B, C, N)
+    xz = torch.where(v > 0, t, torch.zeros_like(t))
+    vx = (xz * v)[:, :, so]
+    vs = v[:, :, so]
+    ivx = t.new_zeros(B, C, G, K, P)
+    iv = t.new_zeros(B, C, G, K, P)
+    for j in range(4):
+        pj = pos[j].reshape(-1)
+        wj = wn[j].view(1, 1, G, K, P)
+        ivx = ivx + vx.index_select(2, pj).view(B, C, G, K, P) * wj
+        iv = iv + vs.index_select(2, pj).view(B, C, G, K, P) * wj
+    cov = iv * sup
+    a = conv._local_mean_w.to(t.dtype).view(1, 1, 1, 1, P)
+    num = (a * ivx * sup).sum(-1, keepdim=True)
+    den = (a * cov).sum(-1, keepdim=True)
+    has_den = den > 1e-6
+    xbar = torch.where(has_den, num / torch.where(has_den, den, torch.ones_like(den)),
+                       torch.zeros_like(den))
+    has = cov > 1e-6
+    z = torch.where(has, ivx / torch.where(has, iv, torch.ones_like(iv)), xbar.expand_as(ivx))
+    g_mat = z.permute(2, 0, 3, 1, 4).contiguous().view(G, B * K, C * P)
+    W_mat = conv.weight.permute(0, 1, 3, 2).contiguous().view(G, C * P, conv.out_channels)
+    y = torch.bmm(g_mat, W_mat).view(G, B, K, -1).permute(1, 0, 3, 2).reshape(B, -1, K)
     return y + conv.bias.view(1, -1, 1)
 
 
@@ -157,6 +193,50 @@ def test_torch_backend_matches_reference(case):
     got = run(conv, x0, conv)
     errs = rel_errs(got, ref)
     assert max(errs) < 1e-12, errs
+
+
+@pytest.mark.parametrize("with_mask", [False, True])
+def test_local_mean_matches_main(with_mask):
+    """missing="local_mean" keeps the reference path of main (3510979): same
+    outputs and gradients (x, weight, bias), NaN and masked pixels included."""
+    cs = CASES["regional"]
+    conv = make_conv(cs, torch.float64, "cpu", missing="local_mean",
+                     local_mean_weights=np.linspace(1.0, 2.0, cs["k"] ** 2))
+    geom = reference_geometry(conv, cs["cell_ids"], torch.float64, torch.device("cpu"),
+                              return_support=True)
+    gen = torch.Generator().manual_seed(4)
+    x0 = torch.randn(cs["B"], cs["C"], conv.K, dtype=torch.float64, generator=gen)
+    x0[:, :, ::9] = float("nan")
+    mask = None
+    if with_mask:
+        mask = (torch.rand(cs["B"], 1, conv.K, generator=gen, dtype=torch.float64) > 0.2).double()
+    ref = run(conv, x0, lambda x: reference_local_mean_forward(conv, geom[:3], geom[3], x, mask))
+    got = run(conv, x0, lambda x: conv(x, mask=mask))
+    for a, b in zip(got, ref):
+        assert torch.isfinite(a).all()
+    errs = rel_errs(got, ref)
+    assert max(errs) < 1e-12, errs
+
+
+def test_legacy_whole_module_pickle():
+    """A layer pickled whole before #90 holds _pos_safe / _w_norm buffers."""
+    import pickle
+
+    conv = HealPixConv(2, 2, 3, kernel_sz=3, n_gauges=2, device="cpu",
+                       dtype=torch.float64, cache_dir=None)
+    x = torch.randn(1, 2, conv.K, dtype=torch.float64)
+    y = conv(x)
+    state = conv.__dict__.copy()
+    bufs = dict(state["_buffers"])
+    bufs["_pos_safe"], bufs["_w_norm"] = conv._pos_safe, conv._w_norm
+    del bufs["_tap_idx"], bufs["_tap_w"]
+    state["_buffers"] = bufs
+    for name in ("backend", "deterministic", "_tmap"):
+        state.pop(name, None)
+    old = HealPixConv.__new__(HealPixConv)
+    old.__setstate__(state)
+    old = pickle.loads(pickle.dumps(old))
+    assert torch.equal(old(x), y)
 
 
 def test_gradcheck_level2():
