@@ -103,8 +103,14 @@ def cmd_run(args):
         if args.only and not any(s in cfg["name"] for s in args.only):
             continue
         ids = regional_ids(cfg["level"], cfg["m"]) if cfg.get("m") else None
-        for backend in args.backends:
-            rec = dict(config=cfg["name"], backend=backend, device=str(device),
+        for variant in args.backends:
+            backend, _, opt = variant.partition(":")
+            import healpix_analyse._patches_backend as pb
+            if opt in ("cl0", "cl1"):
+                pb.GATHER_CL_MIN_C = pb.FOLD_CL_MIN_C = (1 << 30) if opt == "cl0" else 1
+            else:
+                pb.GATHER_CL_MIN_C = pb.FOLD_CL_MIN_C = 8
+            rec = dict(config=cfg["name"], backend=variant, device=str(device),
                        dtype=args.dtype, torch=torch.__version__)
             try:
                 gc.collect()

@@ -222,11 +222,11 @@ if _HAS_TRITON:
         for br, nw in ((64, 4), (128, 4), (256, 8))
     ]
 
-    @triton.autotune(configs=_GATHER_CONFIGS, key=["C", "J", "P", "SIZE"])
+    @triton.autotune(configs=_GATHER_CONFIGS, key=["C", "J", "P", "CL", "SIZE"])
     @triton.jit
     def _gather_kernel(x_ptr, idx_ptr, w_ptr, sel_ptr, y_ptr,
                        C, K, R_FULL, G, P, NSEL, SEL_SB, SIZE,
-                       J: tl.constexpr, HAS_SEL: tl.constexpr,
+                       J: tl.constexpr, HAS_SEL: tl.constexpr, CL: tl.constexpr,
                        BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr):
         """y[b, i, g, c, p] = sum_j w[j, r] x[b, c, idx[j, r]], r = (sel[b, i]*G + g)*P + p."""
         pid_r = tl.program_id(0)
@@ -245,12 +245,18 @@ if _HAS_TRITON:
         c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         c_ok = c < C
         ok = r_ok[:, None] & c_ok[None, :]
-        x_base = x_ptr + (b * C + c.to(tl.int64))[None, :] * K
+        if CL:   # x is [B, K, C]: one contiguous run of C values per neighbour
+            x_base = x_ptr + b * K * C + c[None, :]
+        else:    # x is [B, C, K]
+            x_base = x_ptr + (b * C + c.to(tl.int64))[None, :] * K
         acc = tl.zeros((BLOCK_R, BLOCK_C), dtype=tl.float32)
         for j in tl.static_range(J):
             ix = tl.load(idx_ptr + j * R_FULL + row, mask=r_ok, other=0).to(tl.int64)
             wv = tl.load(w_ptr + j * R_FULL + row, mask=r_ok, other=0.0).to(tl.float32)
-            v = tl.load(x_base + ix[:, None], mask=ok, other=0.0).to(tl.float32)
+            if CL:
+                v = tl.load(x_base + ix[:, None] * C, mask=ok, other=0.0).to(tl.float32)
+            else:
+                v = tl.load(x_base + ix[:, None], mask=ok, other=0.0).to(tl.float32)
             acc += wv[:, None] * v
         g = q // P
         p = q - g * P
@@ -262,11 +268,12 @@ if _HAS_TRITON:
         for bs, nw in ((32, 2), (64, 4), (128, 4), (256, 8))
     ]
 
-    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "SIZE"])
+    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "CL", "SIZE"])
     @triton.jit
     def _fold_kernel(y_ptr, inv_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr,
                      C, K, NY, G, P, INV_SB, SIZE,
                      HAS_INV: tl.constexpr, NORM: tl.constexpr, WRITE_SCALE: tl.constexpr,
+                     CL: tl.constexpr,
                      BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr):
         """x[b, c, s] = sum_e tw[e] y[b, i(e), g(e), c, p(e)] / norm[b, s], no atomics.
 
@@ -309,7 +316,10 @@ if _HAS_TRITON:
                 nacc += wv
             if NORM == 2:
                 nacc += tl.where(ok, 1.0, 0.0)
-            off = (yrow * C)[:, None] * P + c[None, :] * P + p[:, None]
+            if CL:   # y is [B, NY, G, P, C]
+                off = ((yrow * P + p) * C)[:, None] + c[None, :]
+            else:
+                off = (yrow * C)[:, None] * P + c[None, :] * P + p[:, None]
             v = tl.load(y_base + off, mask=ok[:, None] & c_ok[None, :], other=0.0)
             acc += wv[:, None] * v.to(tl.float32)
         if NORM != 0:
@@ -331,8 +341,18 @@ def _size_class(n):
     return max(0, int(n).bit_length() // 2)
 
 
+# Channels-last staging: copy the input to [B, K, C] (gather) or the patches to
+# [B, NY, G, P, C] (fold) when C >= these thresholds, so that every neighbour
+# read is one contiguous run of C values instead of C scattered words.
+# Set from the A100 measurements of benchmarks/benchmark_patches.py.
+GATHER_CL_MIN_C = 8
+FOLD_CL_MIN_C = 8
+
+
 def _triton_extract(x, geom, sel):
     B, C, K = x.shape
+    cl = C >= GATHER_CL_MIN_C
+    x = x.transpose(1, 2).contiguous() if cl else x.contiguous()
     G, P = geom.G, geom.P
     if sel is None:
         nsel, sel_t, sel_sb = geom.M, geom.idx, 0      # sel_ptr unused
@@ -353,7 +373,7 @@ def _triton_extract(x, geom, sel):
         _gather_kernel[grid](
             x, geom.idx, geom.w, sel_t, y,
             C, K, R_full, G, P, nsel, sel_sb, _size_class(nsel * G * P),
-            J=geom.J, HAS_SEL=sel is not None, BLOCK_C=BLOCK_C,
+            J=geom.J, HAS_SEL=sel is not None, CL=cl, BLOCK_C=BLOCK_C,
         )
     return y
 
@@ -375,6 +395,8 @@ def _triton_fold(y, geom, inv=None, norm="none", want_scale=False):
     if x.numel() == 0:
         return x, scale
     inv_sb = inv.stride(0) if (inv is not None and inv.shape[0] > 1) else 0
+    cl = C >= FOLD_CL_MIN_C
+    y = y.transpose(3, 4).contiguous() if cl else y.contiguous()
     BLOCK_C = _block_c(C)
 
     def grid(meta):
@@ -385,7 +407,7 @@ def _triton_fold(y, geom, inv=None, norm="none", want_scale=False):
             y, inv if inv is not None else ptr, ptr, rows, tw, x,
             scale if scale is not None else tw,
             C, K, NY, G, P, inv_sb, _size_class(K),
-            HAS_INV=inv is not None, NORM=mode, WRITE_SCALE=scale is not None,
+            HAS_INV=inv is not None, NORM=mode, WRITE_SCALE=scale is not None, CL=cl,
             BLOCK_C=BLOCK_C,
         )
     return x, scale
@@ -435,7 +457,7 @@ def inverse_selection(sel, M):
 
 def _extract(x, geom, sel, use_tri):
     if use_tri:
-        return _triton_extract(x.contiguous(), geom, sel)
+        return _triton_extract(x, geom, sel)
     return _torch_extract(x, geom, sel)
 
 
