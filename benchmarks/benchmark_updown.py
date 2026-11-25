@@ -23,7 +23,8 @@ the fine level (the input of Down, the output of Up).  The input has
 ``rows = B * C`` maps ``[rows, N]``.
 
 Measures, as in ``benchmark_healpix_conv.py``: forward time (no grad),
-forward + backward time (loss ``y.square().mean()``, gradient for x), and the
+forward + backward time (``y.backward(g)`` with a fixed random ``g``, so that
+only the operator and its gradient are timed), and the
 peak memory of each above what is allocated before it (on CUDA: allocator
 peak; on Linux CPUs: sampled resident set, run with
 ``MALLOC_MMAP_THRESHOLD_=65536`` for it and take times from a run without).
@@ -219,9 +220,11 @@ def cmd_run(args):
                         with torch.no_grad():
                             layer(x)
 
+                    gy = torch.randn(rows[level], layer.N_out, device=device).to(dtype)
+
                     def fwdbwd():
                         xr = x.detach().requires_grad_(True)
-                        layer(xr)[0].float().square().mean().backward()
+                        layer(xr)[0].backward(gy)
 
                     es = x.element_size()
                     n_out = layer.N_out
@@ -307,7 +310,8 @@ def cmd_roofline(args):
         r = rec["results"].get(args.variant, {})
         if not r or "error" in r or "fwd_GBps" not in r:
             continue
-        peak = args.peak or PEAK_GBPS.get(rec.get("gpu") or "", None)
+        gpu = rec.get("gpu") or ""
+        peak = args.peak or next((v for k, v in PEAK_GBPS.items() if k in gpu), None)
         pct = (lambda v: f"{100 * v / peak:.0f}%") if peak else (lambda v: "n/a")
         print(f"| {name} | {_fmt_ms(r['fwd_ms'])} | {r['fwd_GBps']:,.0f} | {pct(r['fwd_GBps'])} "
               f"| {_fmt_ms(r['fwdbwd_ms'])} | {r['fwdbwd_GBps']:,.0f} | {pct(r['fwdbwd_GBps'])} |")

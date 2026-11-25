@@ -1040,6 +1040,10 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
             y = _ub.conservative_matmul(t, fwd, bwd, self._coverage, self.dtype,
                                         self._compute_dtype(), backend=self.backend)
 
+        elif self.mode == "mean" and self._blocks and not self.skipna:
+            # contiguous NESTED blocks: fused kernel on CUDA, a view elsewhere
+            y = _ub.mean4(t, self.backend, partial=self.partial)  # [B, N_out]
+
         elif self.mode == "mean":
             gathered, valid = self._gather_children(t)          # [B, N_out, 4]
             if valid is None:

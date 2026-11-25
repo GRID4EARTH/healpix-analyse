@@ -185,14 +185,14 @@ _INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 if _HAS_TRITON:
 
     if _INTERPRET:   # the CPU interpreter: one config per kernel
-        _ELL_CONFIGS = [triton.Config({"BLOCK_I": 64, "BLOCK_B": 2}, num_warps=4)]
+        _ELL_CONFIGS = [triton.Config({"BLOCK_I": 32, "BLOCK_B": 2}, num_warps=4)]
         _EW_CONFIGS = [triton.Config({"BLOCK": 128}, num_warps=4)]
     else:
-        # a small space of likely winners (gather-bound kernels: wide row
-        # tiles, a few batch rows per program to reuse the operator entries)
+        # a small space of likely winners: the gather kernel keeps a
+        # [BLOCK_I, R] operator tile in registers and reuses it for BLOCK_B rows
         _ELL_CONFIGS = [
             triton.Config({"BLOCK_I": bi, "BLOCK_B": bb}, num_warps=nw)
-            for bi, bb, nw in ((256, 1, 4), (512, 2, 4), (256, 4, 4), (512, 4, 8))
+            for bi, bb, nw in ((64, 8, 4), (128, 8, 8), (64, 16, 4), (128, 4, 4), (256, 2, 8))
         ]
         _EW_CONFIGS = [
             triton.Config({"BLOCK": bl}, num_warps=nw) for bl, nw in ((1024, 4), (2048, 8))
@@ -205,18 +205,23 @@ if _HAS_TRITON:
 
     # ---- ELL gather-reduce ------------------------------------------------
 
-    @triton.autotune(configs=_ELL_CONFIGS, key=["R", "B_CLASS", "SIZE", "HAS_PRO", "HAS_EPI"])
+    @triton.autotune(configs=_ELL_CONFIGS, key=["R_PAD", "B_CLASS", "SIZE", "HAS_PRO", "HAS_EPI"])
     @triton.jit
     def _ell_kernel(x_ptr, idx_ptr, w_ptr, div_ptr, out_ptr,
                     pro_y_ptr, pro_c_ptr, pro_s_ptr, epi_x_ptr, epi_s_ptr,
                     B, N_in, N_out, R, B_CLASS, SIZE,
+                    R_PAD: tl.constexpr,
                     HAS_DIV: tl.constexpr, HAS_PRO: tl.constexpr, HAS_EPI: tl.constexpr,
                     BLOCK_I: tl.constexpr, BLOCK_B: tl.constexpr):
         """out[b, i] = (sum_r w[i, r] * x'[b, idx[i, r]]) / div[i] + epi[b, i].
 
-        fp32 accumulation; the slots are summed in order (deterministic).
-        One program: BLOCK_I rows of the operator for BLOCK_B rows of x, so
-        each (idx, w) entry is read once for BLOCK_B rows.
+        One program: BLOCK_I rows of the operator for BLOCK_B rows of x.  The
+        whole ``[BLOCK_I, R]`` tile of indices and weights is loaded once, in
+        registers, and reused for the BLOCK_B rows of x; each gather is one
+        2-D load of independent addresses, so the memory latency is hidden
+        (a loop over the R slots would chain R dependent loads).  fp32
+        accumulation; the reduction order over the slots is fixed by the
+        compiled kernel, so the result is the same at every run.
 
         Optional prologue (backward of ``smooth_conservative``):
         ``x'[b, k] = x[b, k] - s[b] * c[k] * finite(y[b, k])``.
@@ -226,35 +231,37 @@ if _HAS_TRITON:
         pid_b = tl.program_id(1)
         i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
         i_ok = i < N_out
-        b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
-        b_ok = b < B
-        xrow = b.to(tl.int64) * N_in
-        erow = i.to(tl.int64) * R
+        r = tl.arange(0, R_PAD)
+        e_ok = i_ok[:, None] & (r < R)[None, :]
+        eoff = i.to(tl.int64)[:, None] * R + r[None, :]
+        col = tl.load(idx_ptr + eoff, mask=e_ok, other=N_in)            # [BI, RP]
+        wt = tl.load(w_ptr + eoff, mask=e_ok, other=0.0).to(tl.float32)
+        ok = col < N_in
+        col64 = col.to(tl.int64)
         if HAS_PRO:
-            s_pro = tl.load(pro_s_ptr + b, mask=b_ok, other=0.0)
-        acc = tl.zeros((BLOCK_B, BLOCK_I), dtype=tl.float32)
-        for r in range(0, R):
-            col = tl.load(idx_ptr + erow + r, mask=i_ok, other=N_in)
-            wr = tl.load(w_ptr + erow + r, mask=i_ok, other=0.0).to(tl.float32)
-            ok = col < N_in
-            m2 = b_ok[:, None] & ok[None, :]
-            off = xrow[:, None] + col.to(tl.int64)[None, :]
+            cv = tl.load(pro_c_ptr + col, mask=ok, other=0.0).to(tl.float32)
+        if HAS_DIV:
+            d = tl.load(div_ptr + i, mask=i_ok, other=1.0).to(tl.float32)
+        for bb in tl.static_range(BLOCK_B):
+            b = pid_b * BLOCK_B + bb
+            b_ok = b < B
+            m2 = ok & b_ok
+            off = b.to(tl.int64) * N_in + col64
             xv = tl.load(x_ptr + off, mask=m2, other=0.0).to(tl.float32)
             if HAS_PRO:
                 yv = tl.load(pro_y_ptr + off, mask=m2, other=0.0)
-                cv = tl.load(pro_c_ptr + col, mask=ok, other=0.0).to(tl.float32)
-                xv = xv - tl.where(_finite(yv), s_pro[:, None] * cv[None, :], 0.0)
-            acc += xv * wr[None, :]
-        if HAS_DIV:
-            d = tl.load(div_ptr + i, mask=i_ok, other=1.0).to(tl.float32)
-            acc = tl.math.div_rn(acc, d[None, :] + tl.zeros_like(acc))
-        yoff = b.to(tl.int64)[:, None] * N_out + i[None, :]
-        m_out = b_ok[:, None] & i_ok[None, :]
-        if HAS_EPI:
-            zv = tl.load(epi_x_ptr + yoff, mask=m_out, other=0.0)
-            s_epi = tl.load(epi_s_ptr + b, mask=b_ok, other=0.0)
-            acc += tl.where(_finite(zv), s_epi[:, None] + tl.zeros_like(acc), 0.0)
-        tl.store(out_ptr + yoff, acc.to(out_ptr.dtype.element_ty), mask=m_out)
+                s_pro = tl.load(pro_s_ptr + b, mask=b_ok, other=0.0)
+                xv = xv - tl.where(_finite(yv), s_pro * cv, 0.0)
+            acc = tl.sum(xv * wt, axis=1)                                 # [BI]
+            if HAS_DIV:
+                acc = tl.math.div_rn(acc, d)
+            yoff = b.to(tl.int64) * N_out + i
+            m_out = i_ok & b_ok
+            if HAS_EPI:
+                zv = tl.load(epi_x_ptr + yoff, mask=m_out, other=0.0)
+                s_epi = tl.load(epi_s_ptr + b, mask=b_ok, other=0.0)
+                acc += tl.where(_finite(zv), s_epi, 0.0)
+            tl.store(out_ptr + yoff, acc.to(out_ptr.dtype.element_ty), mask=m_out)
 
     # ---- max over blocks of 4 (contiguous NESTED maxpool) -----------------
 
@@ -305,6 +312,35 @@ if _HAS_TRITON:
         v = tl.where(k[None, :] == a[:, None], g[:, None], 0.0)
         tl.store(gx_ptr + p.to(tl.int64)[:, None] * 4 + k[None, :],
                  v.to(gx_ptr.dtype.element_ty), mask=ok[:, None])
+
+    # ---- mean over blocks of 4 (contiguous NESTED mean) --------------------
+
+    @triton.autotune(configs=_EW_CONFIGS, key=["SIZE"])
+    @triton.jit
+    def _mean4_fwd_kernel(x_ptr, y_ptr, M, SIZE, PAIRWISE: tl.constexpr, BLOCK: tl.constexpr):
+        """y[p] = mean(x[4p:4p+4]), summed in fp32 in the order of torch.mean."""
+        p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        ok = p < M
+        v0, v1, v2, v3 = _quad(x_ptr, p, ok)
+        v0, v1 = v0.to(tl.float32), v1.to(tl.float32)
+        v2, v3 = v2.to(tl.float32), v3.to(tl.float32)
+        if PAIRWISE:
+            s = (v0 + v1) + (v2 + v3)
+        else:
+            s = ((v0 + v1) + v2) + v3
+        tl.store(y_ptr + p, (s * 0.25).to(y_ptr.dtype.element_ty), mask=ok)
+
+    @triton.autotune(configs=_EW_CONFIGS, key=["SIZE"])
+    @triton.jit
+    def _mean4_bwd_kernel(g_ptr, gx_ptr, M, SIZE, BLOCK: tl.constexpr):
+        """gx[4p + k] = g[p] / 4 (exact: a power of two)."""
+        p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        ok = p < M
+        g = tl.load(g_ptr + p, mask=ok, other=0.0).to(tl.float32) * 0.25
+        g = g.to(gx_ptr.dtype.element_ty)
+        k = tl.arange(0, 4)
+        tl.store(gx_ptr + p.to(tl.int64)[:, None] * 4 + k[None, :],
+                 g[:, None] + tl.zeros((BLOCK, 4), dtype=g.dtype), mask=ok[:, None])
 
     # ---- copy each parent to its 4 children (contiguous NESTED Up) --------
 
@@ -407,6 +443,7 @@ def _ell_triton(x, idx, w, div, out_dtype, pro=None, epi=None):
     _ell_kernel[grid](x, idx, w, div if div is not None else dummy, y,
                       py, pc, ps, ez, es,
                       B, n_in, n_out, R, _size_class(B), _size_class(n_out),
+                      R_PAD=max(2, 1 << (R - 1).bit_length()),
                       HAS_DIV=div is not None, HAS_PRO=pro is not None,
                       HAS_EPI=epi is not None)
     return y
@@ -545,6 +582,53 @@ def max4(x, backend="auto"):
     if _fused_ok(x, backend):
         return _Max4.apply(x.contiguous())
     return x.reshape(x.shape[0], -1, 4).max(dim=-1).values
+
+
+# Order of the 4-term sum, chosen to match torch.mean on CUDA so that the fused
+# kernel is bit-identical to the reference (checked by the CUDA tests).
+_MEAN_PAIRWISE = False
+
+
+class _Mean4(torch.autograd.Function):
+    """Mean over contiguous blocks of 4 (``mean`` on contiguous NESTED data):
+    one read of the input, one write of the output; the backward writes
+    ``g / 4`` to the 4 children in one pass."""
+
+    @staticmethod
+    def forward(ctx, x):  # noqa: D102
+        B, N = x.shape
+        m = B * (N // 4)
+        y = torch.empty((B, N // 4), dtype=x.dtype, device=x.device)
+        if m:
+            _mean4_fwd_kernel[_ew_grid(m)](x, y, m, _size_class(m), PAIRWISE=_MEAN_PAIRWISE)
+        ctx.n = N
+        return y
+
+    @staticmethod
+    def backward(ctx, g):  # noqa: D102
+        if torch.is_grad_enabled():            # double backward: differentiable form
+            return (g.unsqueeze(-1) / 4).expand(g.shape[0], g.shape[1], 4).reshape(
+                g.shape[0], ctx.n)
+        g = g.contiguous()
+        gx = torch.empty((g.shape[0], ctx.n), dtype=g.dtype, device=g.device)
+        m = g.numel()
+        if m:
+            _mean4_bwd_kernel[_ew_grid(m)](g, gx, m, _size_class(m))
+        return gx
+
+
+def mean4(x, backend="auto", partial=False):
+    """``x [B, 4M] -> [B, M]``: mean over contiguous blocks of 4.
+
+    Fused Triton kernels on CUDA.  Elsewhere the operations of the reference
+    (``mean`` on the full sphere, ``sum / 4`` on a regional domain), on a view.
+    """
+    if _fused_ok(x, backend):
+        return _Mean4.apply(x.contiguous())
+    g = x.reshape(x.shape[0], -1, 4)
+    if not partial:
+        return g.mean(dim=-1)
+    return g.sum(dim=-1) / torch.full((), 4, dtype=x.dtype, device=x.device)
 
 
 class _Expand4(torch.autograd.Function):

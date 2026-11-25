@@ -370,6 +370,16 @@ def test_fused_kernels_match_reference(dtype):
     gref = torch.zeros(3, 300, 4, dtype=dtype, device=dev).scatter_(
         -1, ref.indices[..., None], g[..., None]).reshape(3, -1)
     assert torch.equal(gx, gref)
+    # mean: forward equal to torch.mean (bit for bit on CUDA), backward g / 4
+    xr = x.detach().nan_to_num().requires_grad_(True)
+    y = _ub._Mean4.apply(xr)
+    y_ref = xr.detach().reshape(3, -1, 4).mean(-1)
+    if _INTERPRET:
+        torch.testing.assert_close(y.detach(), y_ref, **TOL[dtype])
+    else:
+        assert torch.equal(y.detach(), y_ref)
+    (gx,) = torch.autograd.grad(y, xr, g)
+    assert torch.equal(gx, (g / 4).repeat_interleave(4, dim=1))
     # expand: bit-identical forward, gradient to rounding
     v = torch.full((300,), 0.25, device=dev)
     d = torch.rand(300, generator=gen).to(dev) + 0.1
