@@ -9,7 +9,6 @@ import healpix_geo
 import numpy as np
 import pytest
 import torch
-from scipy import ndimage
 
 from healpix_analyse import HealPixFFTConv
 from healpix_analyse.fft_local import (
@@ -45,14 +44,33 @@ def _layer(ids, sigma, projection, kernel_sz=None):
     return layer
 
 
-def _interior(layer, sigma):
-    tr = layer.transform
+def _distance_to_outside(tr):
+    """Distance, in grid pixels, from each cell to the nearest uncovered grid pixel.
+
+    This is ``scipy.ndimage.distance_transform_edt(coverage)`` read at the grid
+    pixel of each cell, computed by brute force on integer coordinates (so
+    exactly), which keeps these tests free of SciPy.
+    """
     px = tr.pixel_size_rad
     centre = 0.5 * (tr.grid_size - 1)
-    gx = np.rint(tr.projected_x.numpy() / px + centre).astype(int)
-    gy = np.rint(tr.projected_y.numpy() / px + centre).astype(int)
-    edt = ndimage.distance_transform_edt(tr.coverage_mask.numpy())[gy, gx]
-    return edt >= math.ceil(5 * sigma) + 2
+    gx = np.rint(tr.projected_x.numpy() / px + centre).astype(np.int64)
+    gy = np.rint(tr.projected_y.numpy() / px + centre).astype(np.int64)
+    cells = np.stack((gy, gx), axis=1)
+    outside = np.argwhere(~tr.coverage_mask.numpy().astype(bool)).astype(np.int64)
+    if outside.size == 0:
+        return np.full(len(cells), np.inf)
+    out_sq = (outside**2).sum(axis=1)
+    d2 = np.empty(len(cells), dtype=np.int64)
+    for start in range(0, len(cells), 1024):  # bounded memory: 1024 x M at a time
+        block = cells[start:start + 1024]
+        d2[start:start + 1024] = (
+            (block**2).sum(axis=1)[:, None] + out_sq[None, :] - 2 * block @ outside.T
+        ).min(axis=1)
+    return np.sqrt(d2)
+
+
+def _interior(layer, sigma):
+    return _distance_to_outside(layer.transform) >= math.ceil(5 * sigma) + 2
 
 
 def _responses(layer, cells):
@@ -82,13 +100,7 @@ def test_average_column_sums_are_not_one(ids):
 
 def test_conservative_edge_mass_is_lost_not_gained(ids):
     layer = _layer(ids, 2.0, "conservative")
-    tr = layer.transform
-    px = tr.pixel_size_rad
-    centre = 0.5 * (tr.grid_size - 1)
-    gx = np.rint(tr.projected_x.numpy() / px + centre).astype(int)
-    gy = np.rint(tr.projected_y.numpy() / px + centre).astype(int)
-    edt = ndimage.distance_transform_edt(tr.coverage_mask.numpy())[gy, gx]
-    edge = np.flatnonzero(edt <= 2)
+    edge = np.flatnonzero(_distance_to_outside(layer.transform) <= 2)
     sums = _responses(layer, edge).sum(axis=1)
     assert sums.max() <= 1.0 + 1e-9
     assert sums.min() < 0.95  # something does leave through the edge

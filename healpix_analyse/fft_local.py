@@ -619,24 +619,33 @@ class LocalFFT(nn.Module):
         -------
         numpy.ndarray, shape [N] or [N, 2]
         """
-        import scipy.sparse as sparse
-
-        n = self.n_cells
         g2 = self.grid_size * self.grid_size
-        indices = self._grid_indices.cpu().numpy()
-        weights = self._grid_weights.cpu().numpy().astype(np.float64)
+        indices = self._grid_indices.cpu().numpy()                      # [N, 4]
+        weights = self._grid_weights.cpu().numpy().astype(np.float64)   # [N, 4]
         inverse = self._grid_inverse_density.cpu().numpy().astype(np.float64)
-        rows = indices.reshape(-1)
-        cols = np.repeat(np.arange(n), 4)
-        gather = sparse.csr_matrix((weights.reshape(-1), (cols, rows)), shape=(n, g2))
-        response = (gather @ sparse.diags(inverse) @ gather.T).tocoo()
         x = self.projected_x.cpu().numpy().astype(np.float64) / self.pixel_size_rad
         y = self.projected_y.cpu().numpy().astype(np.float64) / self.pixel_size_rad
-        mass = np.bincount(response.col, weights=response.data, minlength=n)
+
+        # With G[i, g] the bilinear weight of cell i on grid pixel g, the
+        # response of cell j is R[i, j] = sum_g G[i, g] inverse[g] G[j, g].
+        # Its moments about cell j only need, for each grid pixel g, the
+        # moments of the cells i that deposit on g, which bincount gathers in
+        # O(N): the N x N matrix R is never formed.
+        flat = indices.reshape(-1)
+        w_flat = weights.reshape(-1)
+        s0 = np.bincount(flat, weights=w_flat, minlength=g2)          # sum_i G[i, g]
+        outer = weights * inverse[indices]                             # G[j, g] inverse[g]
+        mass = (outer * s0[indices]).sum(axis=1)                       # sum_i R[i, j]
         m2 = []
         for axis in (x, y):
-            d2 = (axis[response.row] - axis[response.col]) ** 2
-            m2.append(np.bincount(response.col, weights=response.data * d2, minlength=n) / mass)
+            a = np.repeat(axis, indices.shape[1])
+            s1 = np.bincount(flat, weights=w_flat * a, minlength=g2)
+            centroid = np.divide(s1, s0, out=np.zeros(g2), where=s0 > 0)
+            # sum_i G[i, g] (a_i - a_j)^2, taken about the centroid of pixel g
+            # so that no large terms cancel
+            spread = np.bincount(flat, weights=w_flat * (a - centroid[flat]) ** 2, minlength=g2)
+            offset = s0[indices] * (axis[:, None] - centroid[indices]) ** 2
+            m2.append((outer * (spread[indices] + offset)).sum(axis=1) / mass)
         m2 = np.stack(m2, axis=-1)
         if per_axis:
             return np.sqrt(m2)
