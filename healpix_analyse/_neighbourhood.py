@@ -15,6 +15,7 @@ from typing import Literal
 import numpy as np
 from healpix_geo import nested
 from pyproj import Geod
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 NeighbourhoodMethod = Literal[
@@ -432,6 +433,7 @@ def relative_geometry_from_neighbours(
     HEALPix positional neighbour labels are never used to define geographic
     East or North.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     if ellipsoid != "WGS84":
         raise NotImplementedError(
             "Relative neighbour geometry currently supports "
@@ -567,6 +569,7 @@ def build_relative_geometry(
     immediate/local fixed-window operators rather than physical-radius
     operators.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     neighbourhoods = build_ring_neighbourhoods(
         cells,
         refinement_level,
@@ -591,6 +594,7 @@ def build_neighbourhoods(
     ellipsoid: str,
 ) -> list[np.ndarray]:
     """Build a geometric neighbourhood for each HEALPix cell."""
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     validate_neighbourhood(neighbourhood)
 
     cells_array = np.asarray(cells, dtype=np.uint64)
@@ -810,6 +814,7 @@ def relative_geometry_from_neighbourhoods(
     physical-radius, topological-ring, and future candidate-selection methods
     can all share the same WGS84 distance and azimuth implementation.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     padded_neighbour_ids, _ = _pad_neighbourhoods(
         neighbourhoods,
     )
@@ -830,6 +835,7 @@ def metric_geometry_from_neighbourhoods(
     ellipsoid: str = "WGS84",
 ) -> MetricNeighbourhoodGeometry:
     """Compute only the WGS84 distances required by radial kernels."""
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     if ellipsoid != "WGS84":
         raise NotImplementedError(
             "Metric neighbour geometry currently supports "
@@ -896,6 +902,7 @@ def build_metric_neighbourhood_geometry(
     domain centres, and the distances used for the radius cutoff are retained
     directly in the returned geometry.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     if ellipsoid != "WGS84":
         raise NotImplementedError(
             "Metric neighbour geometry currently supports "
@@ -1011,6 +1018,7 @@ def build_outside_domain_distances(
     needs.  Only distances are returned: cells outside the domain carry no
     values.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     if ellipsoid != "WGS84":
         raise NotImplementedError(
             "Metric neighbour geometry currently supports "
@@ -1101,6 +1109,7 @@ def build_metric_geometry_from_vectorized_ring(
     cannot recover a true neighbour omitted by an insufficient topological
     ring. ``max_candidate_pairs`` bounds each temporary candidate matrix.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     if ellipsoid != "WGS84":
         raise NotImplementedError(
             "Metric neighbour geometry currently supports "

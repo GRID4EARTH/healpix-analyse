@@ -11,13 +11,18 @@ The operation is defined as the *adjoint* (transpose) of the smooth
 downsampling matrix from :mod:`healpix_analyse.down`, with an optional
 diagonal normalisation that improves round-trip consistency.
 
-Works on the full sphere or on a partial-sky subset.  Resolution is exposed
-through the Grid4Earth ``level`` convention, with ``nside = 2**level``.
+Works on the full sphere or on a regional domain (``cell_ids``).
+Resolution is exposed through the Grid4Earth ``level`` convention, with
+``nside = 2**level``.
 
 Accepts numpy arrays or torch tensors of shape ``[N]`` or ``[B, N]`` and
 returns an output of the same type and number of dimensions.
 
-Dependencies: numpy, torch, healpy.
+The matrix and its transpose are kept as CSR buffers built once in the
+constructor: they follow ``.to()`` and no sparse tensor is assembled in
+``forward``.
+
+Dependencies: numpy, torch, healpix_geo.
 """
 
 from __future__ import annotations
@@ -28,25 +33,20 @@ from typing import Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-import healpix_geo
 
-'''
-try:
-    import healpy as hp
-except ImportError as e:
-    raise ImportError(
-        "healpy is required by healpix_analyse.up. "
-        "Install it with:  pip install healpy"
-    ) from e
-'''
-
-from healpix_analyse.down import HealPixDown, _prepare_input, _restore_output
+from healpix_analyse.down import (
+    HealPixDown,
+    _SparseOperatorMixin,
+    _storage_dtype,
+    _prepare_input,
+    _restore_output,
+)
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
 
-class HealPixUp(nn.Module):
+class HealPixUp(_SparseOperatorMixin, nn.Module):
     """
     HEALPix upsampling: increase resolution by a factor of 2.
 
@@ -87,7 +87,7 @@ class HealPixUp(nn.Module):
     eps : float, default 1e-12
         Small value added to the denominator to avoid division by zero.
     cell_ids : array-like of int or None
-        Coarse pixel indices (NESTED) for partial-sky operation.
+        Coarse pixel indices (NESTED) for a regional domain.
         If ``None``, the operator covers the full sphere.
     device : torch.device or str or None
         Device for computation.  Defaults to CUDA if available, else CPU.
@@ -121,10 +121,10 @@ class HealPixUp(nn.Module):
     >>> y.shape
     (49152,)   # 12 * 64**2
 
-    Partial sky:
+    Regional domain (the cells within 20 degrees of lon = lat = 0):
 
-    >>> import healpy as hp
-    >>> cell_ids_coarse = hp.query_disc(nside, hp.ang2vec(np.pi/2, 0), 0.3, nest=True)
+    >>> from healpix_geo import nested
+    >>> cell_ids_coarse, _, _ = nested.cone_coverage((0.0, 0.0), 20.0, level)
     >>> up = HealPixUp(level=level, cell_ids=cell_ids_coarse)
     >>> y, fine_ids = up(x[cell_ids_coarse])
     """
@@ -175,7 +175,7 @@ class HealPixUp(nn.Module):
             raise ValueError("up_norm must be 'adjoint', 'col_l1', or 'diag_l2'.")
         self.eps = float(eps)
 
-        # ---- partial sky / exact pairing ----
+        # ---- regional domain / exact pairing ----
         if paired_down is not None:
             if cell_ids is not None:
                 raise ValueError(
@@ -251,13 +251,11 @@ class HealPixUp(nn.Module):
             down = paired_down
 
         # Reconstruct Down matrix M_down: [N_in_coarse, N_out_fine]
-        M_down = down.sparse_matrix().to(device=self.device, dtype=self.dtype).coalesce()
+        vdtype = _storage_dtype(self.dtype)
+        M_down = down.sparse_matrix().to(device=self.device, dtype=vdtype).coalesce()
 
         # Transpose → M_up: [N_out_fine, N_in_coarse]
-        M_up = self._transpose_sparse(M_down)
-        self.register_buffer("_M_indices", M_up.indices().clone())
-        self.register_buffer("_M_values",  M_up.values().clone())
-        self._M_size = M_up.size()
+        self._register_sparse(self._transpose_sparse(M_down))
 
         # Diagonal normalisation vectors (computed from M_down once)
         if self.up_norm in ("col_l1", "diag_l2"):
@@ -265,8 +263,8 @@ class HealPixUp(nn.Module):
             vals = M_down.values()
             cols = idx[1]   # fine-grid column indices
 
-            col_sum = torch.zeros(self.N_out, device=self.device, dtype=self.dtype)
-            col_l2  = torch.zeros(self.N_out, device=self.device, dtype=self.dtype)
+            col_sum = torch.zeros(self.N_out, device=self.device, dtype=vdtype)
+            col_l2  = torch.zeros(self.N_out, device=self.device, dtype=vdtype)
             col_sum.scatter_add_(0, cols, vals)
             col_l2.scatter_add_(0, cols, vals * vals)
 
@@ -321,7 +319,11 @@ class HealPixUp(nn.Module):
         cell_ids_out : np.ndarray
             NESTED pixel indices of the output pixels at ``nside_out``.
         """
-        t, is_numpy, was_1d = _prepare_input(x, self.device, self.dtype)
+        # self.device / self.dtype follow .to(); a 16-bit module computes in
+        # the stored precision (float32) and casts the output
+        t, is_numpy, was_1d = _prepare_input(
+            x, self.device, self._compute_dtype()
+        )
         B, N = t.shape
 
         if N != self.N_in:
@@ -329,16 +331,8 @@ class HealPixUp(nn.Module):
                 f"Expected input with {self.N_in} pixels, got {N}."
             )
 
-        M_T = torch.sparse_coo_tensor(
-            self._M_indices.to(device=t.device),
-            self._M_values.to(device=t.device, dtype=t.dtype),
-            size=self._M_size,
-            device=t.device,
-            dtype=t.dtype,
-        )
-
-        # M_T: [N_out, N_in];  t: [B, N_in]
-        y = torch.sparse.mm(M_T, t.T).T   # [B, N_out]
+        # M^T: [N_out, N_in] CSR, built once;  t: [B, N_in]
+        y = self._apply_sparse(t)         # [B, N_out]
 
         # Optional diagonal normalisation
         if self.up_norm == "col_l1" and self._col_sum is not None:
@@ -351,4 +345,5 @@ class HealPixUp(nn.Module):
 
         # up_norm == "adjoint" → no correction
 
+        y = y.to(self.dtype)
         return _restore_output(y, is_numpy, was_1d), self._cell_ids_out

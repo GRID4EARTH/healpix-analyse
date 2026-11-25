@@ -402,3 +402,28 @@ def test_from_radial_convolves_a_dirac_into_its_own_kernel(capsys):
     rel = np.sqrt(np.mean((y - K) ** 2)) / np.sqrt(np.mean(K ** 2))
     print(f"[measured] recipe '4: fn(r) in m': rel RMS(conv(dirac) - K) = {rel:.4f}")
     assert rel < 0.25
+
+
+def test_unsorted_cell_ids_are_permutation_equivariant():
+    """conv(x[perm], ids[perm]) == conv(x, ids)[perm]: the order is irrelevant."""
+    cell_ids, _ = _square_domain(side=64)
+    conv = HealPixWideConv(_exp_kernel_image(n=8), LEVEL, Jmax=3)
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((2, cell_ids.size))
+    y = conv(x, cell_ids)
+
+    perm = rng.permutation(cell_ids.size)
+    y_perm = conv(x[:, perm], cell_ids[perm])
+    assert np.allclose(y_perm, y[:, perm], atol=1e-10)
+    # the same domain in another order reuses the fit
+    assert len(conv._cache) == 1
+
+    # torch in, torch out, still in the caller's order
+    y_t = conv(torch.as_tensor(x[:, perm]), torch.as_tensor(cell_ids[perm]))
+    assert torch.is_tensor(y_t)
+    assert np.allclose(y_t.numpy(), y[:, perm], atol=1e-10)
+
+    # the other per-domain helpers follow the caller's order too
+    field = conv.kernel_as_field(cell_ids)
+    assert np.array_equal(conv.kernel_as_field(cell_ids[perm]), field[perm])
+    assert conv.reference_centre(cell_ids[perm]) == conv.reference_centre(cell_ids)

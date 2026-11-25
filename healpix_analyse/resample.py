@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from healpix_analyse.down import HealPixDown
 from healpix_analyse.up import HealPixUp
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -136,6 +137,7 @@ class HealPixResampler(nn.Module):
         eps: float = 1e-12,
         down_mode: str = "smooth",
     ) -> None:
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__()
 
         self.in_level = _validate_level(in_level, "in_level")
@@ -507,6 +509,7 @@ def resample_healpix(
     Construct :class:`HealPixResampler` directly when several maps share the
     same input/output geometry, so the sparse operators can be reused.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     operator = HealPixResampler(
         in_level=in_level,
         out_level=out_level,

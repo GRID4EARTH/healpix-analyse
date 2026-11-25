@@ -52,6 +52,7 @@ from ._topology import (
     Connectivity,
     nested_neighbours,
 )
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 try:
     import torch
@@ -934,6 +935,7 @@ def healpix_cell_area(
     For the Sentinel-2 HEALPix processing chain, ``WGS84`` is the
     intended reference ellipsoid.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     refinement_level = (
         _validate_refinement_level(
@@ -981,6 +983,7 @@ def component_area(
             =
         component cell count * HEALPix cell area
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     sizes = component_size(
         labels
@@ -1086,6 +1089,7 @@ def remove_small_components(
         Boolean mask after removing components below the selected
         threshold.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
     # Exactly one threshold definition must be provided.
     if (

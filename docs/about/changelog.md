@@ -99,6 +99,68 @@
   frequency in the analysis, which corrupted the aliased modes when
   `lmax >= (N_r + 1) / 2`; irregular rings failed on CUDA input (kernel
   built on the CPU). New tests in `tests/test_alm_latlon.py`.
+- `HealPixDown(mode="maxpool")` on a regional domain: a child absent from
+  `cell_ids` was replaced by the first input cell, which can belong to
+  another parent (cells `[100, 4, 5, 6]` at level 2 with values
+  `[50, 1, 2, 3]` gave `[50, 50]`); it is now replaced by a present child of
+  the same parent, so a parent is the max of its children present (#93).
+- `docs/other/down.md`, `docs/other/up.md`: the regional-domain examples
+  read a single-centre `cone_coverage` result as one array; with
+  healpix-geo 0.5 it is a tuple `(cell_ids, depths, fully_covered)`, and the
+  old recipe gave repeated ids.
+
+### Performance
+- `HealPixDown` (`"smooth"`, `"smooth_conservative"`) and `HealPixUp` keep
+  their matrix and its transpose as CSR buffers (int32 indices) built once in
+  the constructor; they follow `.to()`. `forward` no longer assembles a COO
+  tensor at each call, and the gradient applies the stored transpose (twice
+  differentiable). Level 8 → 7, one CPU thread, one map: `HealPixDown`
+  forward 167 → 12 ms, forward + backward 370 → 15 ms with a per-call peak
+  of 151 → 6 MiB; `HealPixUp` forward 153 → 10 ms, forward + backward
+  575 → 36 ms (157 → 9 MiB) (#59).
+- `HealPixDown` and `HealPixUp`: one dtype rule for every mode. The output
+  has the module dtype, which follows `.to(dtype)`, `.double()`, `.half()`
+  (before, `"mean"` and `"maxpool"` kept the constructor dtype). After a cast
+  to `bfloat16` or `float16`, the matrix and the normalisation vectors stay
+  in float32 (the CPU sparse kernels have no 16-bit version), the linear
+  part is computed there, and the output is cast to the 16-bit dtype. A
+  `bfloat16` result for a numpy input is returned as float32.
+
+### Compatibility
+- The matrix of `HealPixDown` / `HealPixUp` is no longer in the
+  `state_dict`. Loading a `state_dict` saved by an older version still works
+  (its `_M_indices` / `_M_values` are ignored), but a `state_dict` saved by
+  this version has no `_M_*` keys, so older versions fail to load it with
+  `strict=True`. Whole modules pickled (`torch.save(module)`) by an older
+  version do not unpickle with this version: rebuild them from their
+  constructor arguments.
+
+### Removed
+- `down.py`: the old `_build_smooth_matrix` kept in a string, the unused
+  `_normalize_weights_vec`, and the unused `pyproj` import; the `down.py` /
+  `up.py` docstrings use healpix-geo instead of healpy (#61, #96).
+
+### Fixed
+- Ellipsoid names in any casing (`"wgs84"`, `"Wgs84"`, `"Sphere"`,
+  `"SPHERE"`, ...) are accepted by the public functions and constructors
+  that take `ellipsoid`, including `get_interp_val` / `get_interp_weights`,
+  which rejected `"wgs84"` and `"Sphere"`, and the WGS84-only filters
+  (`radial_filter`, `gaussian_filter`, `neighbour_reduce` and its
+  `*_filter` shortcuts, `directional_filter`), which raised
+  `NotImplementedError` for `"wgs84"`. `dino.set_ellipsoid` now also
+  accepts title case. `AlmTransform` is not covered yet (#96).
+- `HealPixWideConv` accepts `cell_ids` in any order: it sorts them
+  internally and returns the result in the order given (it used to give
+  wrong results silently on unsorted ids). A permutation of the same domain
+  reuses the cached fit (#96).
+- Doc paths in warnings and docstrings point to the reorganised pages
+  (`docs/conv/large_conv.md`, `docs/conv/radial_filter.md`,
+  `docs/conv/pyramid_conv_maths.md`, `docs/other/dino.md`); the
+  `radial_filter` docstrings name the helpers the code calls
+  (`build_metric_neighbourhood_geometry`,
+  `compact_weighted_neighbourhood_reduce`); `nested_to_tiles` documents
+  that repeated ids follow `duplicates`, and `GetDINOV3SAT` lists the
+  `"percell"` projection (#96).
 
 ### Deprecated
 - `healpix_analyse.powerspectra.powerspectra` emits a `DeprecationWarning`
