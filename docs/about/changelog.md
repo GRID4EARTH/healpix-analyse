@@ -26,6 +26,28 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- Neighbourhood reductions and the local gradient run as vectorised stencil
+  operations (#109, section 4). `HealPixNeighbourReducer` no longer loops
+  over the output cells in Python: its neighbourhoods are built once with
+  vectorised NumPy and stored padded, and a call is a gather-reduce, a loop
+  over the neighbours on CPU and fused Triton kernels on CUDA for `sum`,
+  `mean`, `min`, `max` and `median` of floating-point data (the median by
+  ranking the neighbours in registers). Their backward passes are written by
+  hand and deterministic (a gather on the transposed neighbourhoods on
+  CUDA); `min`, `max` and `median` keep the subgradient of torch, with ties
+  going to the first cell in the order of `cell_ids`. `std`, `mode`, `any`,
+  `all` and integer reductions are vectorised too. New keyword
+  `backend="auto" | "triton" | "torch"` of `HealPixNeighbourReducer.__call__`.
+  Values are unchanged (exact for `min`, `max`, `median`, `count`, `mode`,
+  `any`, `all`; to rounding for the sums).
+- `HealPixGradient`: the least-squares East/North gradient as a reusable
+  operator. The WGS84 geometry is built once, a call takes values
+  `[..., N]`, and float32 / float64 tensors run a fused kernel (Triton on
+  CUDA, a loop over the 8 neighbours otherwise) with a deterministic
+  hand-written backward, without building the `[..., N, 8]` gathered tensor.
+  `gradient()` delegates to it (same values to about 1e-12 relative in
+  float64). `benchmarks/benchmark_reductions.py` measures the reductions,
+  the gradient and `HealPixDivCurl`.
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is

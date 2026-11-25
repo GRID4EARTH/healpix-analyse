@@ -30,6 +30,9 @@ run
         1-D values on those versions).
     ``divcurl``
         ``HealPixDivCurl`` (kernel 3, one gauge) on ``velocity [B, 2, N]``.
+    ``divcurl_conv``
+        Its ``HealPixConv`` (3 -> 6 channels) alone, on ``[B, 3, N]``: the
+        rest of ``divcurl`` is the embedding and the contraction.
 
     A reference implementation that is too slow is skipped: once one call
     exceeds ``--budget`` seconds, larger levels of the same operator are not
@@ -53,7 +56,7 @@ import torch
 
 OOM = getattr(torch, "OutOfMemoryError", getattr(torch.cuda, "OutOfMemoryError", RuntimeError))
 REDUCTIONS = ("mean", "median", "max", "min", "count")
-OPS = REDUCTIONS + ("gradient", "divcurl")
+OPS = REDUCTIONS + ("gradient", "divcurl", "divcurl_conv")
 
 
 def regional_ids(level):
@@ -183,6 +186,9 @@ def _build(op, level, ids, device, dtype):
             return torch.stack(rows)
 
         return apply, (len(ids),)
+    if op == "divcurl_conv":       # the HealPixConv part of HealPixDivCurl alone
+        fn, _ = _build("divcurl", level, ids, device, dtype)
+        return fn.conv, (3, len(ids))
     if op == "divcurl":
         from healpix_analyse import HealPixDivCurl
         full = len(ids) == 12 * 4 ** level

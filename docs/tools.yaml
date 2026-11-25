@@ -853,19 +853,24 @@ tools:
   ellipsoid: '"WGS84" (the only accepted value with the cell-centre neighbourhood)'
   io: "values [..., N] -> [..., len(domain)]; NumPy in -> NumPy out; dtype depends on the reduction"
   differentiable: for mean, sum, min, max, median, std (Torch); not for count, mode, any, all
-  gpu: the reduction runs on the input device; neighbourhoods built on CPU
+  gpu: >-
+    the reduction runs on the input device; fused Triton kernels on CUDA for
+    sum, mean, min, max and median (optional triton extra); neighbourhoods
+    built on CPU
   nan: propagates (mean, std, min, max, median)
   cost: >-
-    A Python loop over the output cells; in one CPU test (20 000 cells,
-    level 12, 3 km) mean_filter took about 0.5 s per call, slower than
-    radial_filter with a top-hat kernel. HealPixNeighbourReducer keeps the
-    neighbourhoods between calls.
+    Neighbourhoods built once (vectorised NumPy, plus healpix-geo and pyproj
+    geodesics); a call is a gather-reduce over the padded neighbourhoods,
+    with no per-cell loop: a loop over the neighbours on CPU, one fused
+    kernel on CUDA, and a deterministic hand-written backward.
+    HealPixNeighbourReducer keeps the neighbourhoods between calls;
+    neighbour_reduce rebuilds them. Timings in benchmarks/benchmark_reductions.py.
   pros:
     - Ten reductions, including categorical ones (mode, any, all, count).
     - Radius in metres, the same meaning at every level.
   cons:
     - NaN propagates; no weights.
-    - Not the cheapest operator (per-cell Python loop).
+    - neighbour_reduce rebuilds the neighbourhoods at every call (use HealPixNeighbourReducer).
   use_instead:
     - when: a weighted or NaN-aware mean
       use: radial_filter / gaussian_filter
@@ -879,7 +884,7 @@ tools:
   title: East/North gradient of a scalar field (gradient)
   family: B
   page: stats/gradient
-  symbols: [gradient, gradient_magnitude, directional_derivative]
+  symbols: [gradient, gradient_magnitude, directional_derivative, HealPixGradient]
   summary: >-
     Least-squares East and North derivatives of a scalar field from the
     immediate neighbours of each cell, in units per metre on WGS84; its
@@ -888,20 +893,27 @@ tools:
     - compute the slope, gradient or gradient magnitude of a field (e.g. a DEM, SST fronts)
     - do: compute the derivative of a field along a direction (azimuth from North)
       use: [directional_derivative]
+    - do: compute gradients of many fields or batches (e.g. inside a model) without rebuilding the geometry
+      use: [HealPixGradient]
   keywords: [gradient, slope, aspect, DEM, fronts, derivative, east, north, azimuth]
   domain: whole sphere or regional set of cell ids; `domain` selects the output cells
   ordering: NESTED
   ellipsoid: hard-coded "WGS84" (no argument)
-  io: "1-D values only -> (grad_east, grad_north) in units per metre; NumPy in -> NumPy out"
-  differentiable: yes (Torch)
-  gpu: the fit runs on the input device; geometry on CPU at every call
+  io: "gradient(): 1-D values; HealPixGradient: values [..., N] -> (grad_east, grad_north) [..., len(domain)] in units per metre; NumPy in -> NumPy out"
+  differentiable: yes (Torch); deterministic hand-written backward for float32 / float64
+  gpu: >-
+    the fit runs on the input device (fused Triton kernel on CUDA for float32 /
+    float64 with the optional triton extra); geometry built on CPU
   nan: NaN neighbours are dropped; a cell gets NaN when its value is not finite or fewer than 2 valid neighbours remain or the fit is degenerate
-  cost: the geometry is rebuilt at every call (no cache); to be measured
+  cost: >-
+    gradient() rebuilds the WGS84 geometry at every call (most of its time);
+    HealPixGradient builds it once, then a call is one gather over the 8
+    neighbours, with no [N, K] tensor. Timings in benchmarks/benchmark_reductions.py.
   pros:
     - True East/North directions and metric distances, no Cartesian assumption.
     - Works on regional domains and across base-cell boundaries.
   cons:
-    - One 1-D field per call; no radius, no weights (immediate neighbours only).
+    - gradient() takes one 1-D field per call (HealPixGradient takes batches); no radius, no weights (immediate neighbours only).
     - WGS84 hard-coded.
   use_instead:
     - when: a smoother gradient over a larger scale
