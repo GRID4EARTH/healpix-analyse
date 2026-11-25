@@ -214,6 +214,26 @@ from healpix_analyse.dino import (
     tiles_to_nested,
 )
 
+# ---------------------------------------------------------------------------
+# AI layers: masked normalisation, pooling and positional encodings (#109)
+# ---------------------------------------------------------------------------
+
+from healpix_analyse.masked_norm import (
+    HealPixGroupNorm,
+    HealPixLayerNorm,
+    HealPixBatchNorm,
+    HealPixGlobalPool,
+    HealPixRegionPool,
+    global_pool,
+    region_pool,
+)
+from healpix_analyse.positional_encoding import (
+    HealPixPositionalEncoding,
+    healpix_positional_encoding,
+    positional_encoding_cache_info,
+    clear_positional_encoding_cache,
+)
+
 __all__ = [
     # ------------------------------------------------------------------
     # Multi-resolution operators
@@ -342,4 +362,19 @@ __all__ = [
     "load_dinov3_sat",
     "nested_to_tiles",
     "tiles_to_nested",
+
+    # ------------------------------------------------------------------
+    # AI layers: masked normalisation, pooling, positional encodings
+    # ------------------------------------------------------------------
+    "HealPixGroupNorm",
+    "HealPixLayerNorm",
+    "HealPixBatchNorm",
+    "HealPixGlobalPool",
+    "HealPixRegionPool",
+    "global_pool",
+    "region_pool",
+    "HealPixPositionalEncoding",
+    "healpix_positional_encoding",
+    "positional_encoding_cache_info",
+    "clear_positional_encoding_cache",
 ]
