@@ -139,6 +139,15 @@
 - `down.py`: the old `_build_smooth_matrix` kept in a string, the unused
   `_normalize_weights_vec`, and the unused `pyproj` import; the `down.py` /
   `up.py` docstrings use healpix-geo instead of healpy (#61, #96).
+- `healpix_analyse.powerspectra_lonlat`: it could not run (1-D cell ids
+  passed to `AlmTransform`, `lon`/`lat`/`weights` ignored). For lon/lat
+  iso-latitude grids, use `build_rings_from_latlon` + `anafast_latlon`.
+- `healpix_analyse.ps` (a plain 2-D FFT of a NumPy array, not HEALPix).
+- The legacy modules `LocalizedFlatSkyAlm`, `LocalizedAlm_optimized_v13_fixed`
+  and the script `demo_ps` (they import `foscat`, which is not a dependency),
+  and `make_rectangle` (it imports `cdshealpix`; no module of the package used
+  it). The notebooks `Test_rectangle`, `Test_resampling_powerspectra` and
+  `Test_resampling_powerspectra-s2-l2a` still import `make_rectangle` and `ps`.
 
 ### Fixed
 - Ellipsoid names in any casing (`"wgs84"`, `"Wgs84"`, `"Sphere"`,
@@ -167,17 +176,6 @@
   and will be removed. Use `HEALPixSHT.anafast` on the full sphere,
   `HealPixWaveletSpectrum` on a regional domain or with missing data, and
   `build_rings_from_latlon` + `anafast_latlon` on lon/lat grids.
-
-### Removed
-- `healpix_analyse.powerspectra_lonlat`: it could not run (1-D cell ids
-  passed to `AlmTransform`, `lon`/`lat`/`weights` ignored). For lon/lat
-  iso-latitude grids, use `build_rings_from_latlon` + `anafast_latlon`.
-- `healpix_analyse.ps` (a plain 2-D FFT of a NumPy array, not HEALPix).
-- The legacy modules `LocalizedFlatSkyAlm`, `LocalizedAlm_optimized_v13_fixed`
-  and the script `demo_ps` (they import `foscat`, which is not a dependency),
-  and `make_rectangle` (it imports `cdshealpix`; no module of the package used
-  it). The notebooks `Test_rectangle`, `Test_resampling_powerspectra` and
-  `Test_resampling_powerspectra-s2-l2a` still import `make_rectangle` and `ps`.
 
 ## 2026.11.1 (2026-11-23)
 
