@@ -106,8 +106,8 @@ dependencies) with the answer.
   `binary_erosion`, `get_interp_val`, `get_interp_weights` and
   `resample_to_latlon_grid` are imported from their modules (the API
   reference gives the path).
-- **Known issues** documented on their pages: `alm2map_latlon` halves the
-  m > 0 terms; `HealPixDown(mode="maxpool")` on a regional domain with
+- **Known issues** documented on their pages:
+  `HealPixDown(mode="maxpool")` on a regional domain with
   incomplete parents; `HEALPixSHT.uv_to_curl_div` applies no ℓ factor.
 
 ## What the modules do

@@ -659,8 +659,6 @@ tools:
     - Only NumPy and Torch; float64 throughout.
   cons:
     - Spin 0 only.
-    - "Known issue: `alm2map_latlon` returns the m > 0 terms at half amplitude (measured)."
-    - "Different `lmax` defaults: 64 for `map2alm_latlon` and `anafast_latlon`, 24 for `alm2map_latlon` and `grid_summary`."
     - Synthesis uses a direct DFT per ring; tables are not cached.
   use_instead:
     - when: whole-sphere HEALPix map and enough memory for the tables, or spin-1 / spin-2 fields
