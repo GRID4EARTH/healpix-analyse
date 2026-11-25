@@ -49,6 +49,7 @@ from healpix_analyse.augment import (
     RandomMask,
     RandomRotation,
     RandomShift,
+    RandomSO3,
     RandomZoom,
 )
 from healpix_analyse.healpix_interp import get_interp_weights
@@ -75,7 +76,10 @@ PIPELINES = {
     "noise_mask": ([AdditiveNoise(0.1), RandomMask(0.75, block=64)], {}),
     "gauge": ([RandomGaugeRotation(4, flip=0.5)], {}),
     "mae_full": (GEOM + [AdditiveNoise(0.05), RandomMask(0.75, block=64)], {}),
+    # full sphere at --full-level, batch --full-batch (cell_ids=None)
+    "so3_full_sphere": ([RandomSO3()], {}),
 }
+FULL_SPHERE = {"so3_full_sphere"}
 
 
 def _sync(dev):
@@ -144,16 +148,20 @@ def run(args):
     for name in args.pipelines:
         for C in args.channels:
             if name == "naive":
-                r = _naive(args.level, ids, B, C, dev, args.reps, dtype)
+                r = _naive(args.level, ids, args.batch, C, dev, args.reps, dtype)
                 rows.append(dict(pipeline=name, backend="numpy+torch", C=C, **r))
-                _emit(rows[-1], args, B)
+                _emit(rows[-1], args, args.batch)
                 continue
             tr, kw = PIPELINES[name]
             Ce = C * 4 if name == "gauge" else C
+            full = name in FULL_SPHERE
+            lev = args.full_level if full else args.level
+            ncell = 12 * 4**lev if full else args.cells
+            B = args.full_batch if full else args.batch
             for be in backends:
-                aug = HealPixAugment(tr, args.level, ids, backend=be, **kw).to(dev)
+                aug = HealPixAugment(tr, lev, None if full else ids, backend=be, **kw).to(dev)
                 gen = torch.Generator().manual_seed(0)
-                x = torch.randn(B, Ce, args.cells, device=dev, dtype=dtype)
+                x = torch.randn(B, Ce, ncell, device=dev, dtype=dtype)
                 gy = torch.randn_like(x)
                 plan = aug.sample(B, gen)
                 t_plan = _time(lambda: aug.sample(B, gen), dev, args.reps)
@@ -182,18 +190,21 @@ def run(args):
                     grp.geo()
                     row["geom_s"] = _time(lambda: fused_augment_triton(grp.geo(), None), dev, args.reps)
                     es = x.element_size()
-                    nbytes = B * Ce * args.cells * es * 2 + B * args.cells * 8
+                    nbytes = B * Ce * ncell * es * 2 + B * ncell * 8
                     row["fwd_GBps"] = nbytes / t_apply / 1e9
                     row["peak_GBps"] = _peak_bw(dev)
                     if t_fb is not None:
                         row["bwd_s"] = t_fb - t_total
+                row.update(level=lev, cells=ncell)
                 rows.append(row)
                 _emit(rows[-1], args, B)
     return rows
 
 
 def _emit(r, args, B):
-    r.update(device=args.device, B=B, cells=args.cells, level=args.level, dtype=args.dtype,
+    r.setdefault("cells", args.cells)
+    r.setdefault("level", args.level)
+    r.update(device=args.device, B=B, dtype=args.dtype,
              threads=torch.get_num_threads(), label=args.label,
              samples_per_s=B / r["total_s"] if r.get("total_s") else None)
     line = json.dumps(r)
@@ -212,15 +223,16 @@ def table(paths):
     def ms(v):
         return "—" if v is None else f"{1e3 * v:.1f}"
 
-    print("| device | dtype | pipeline | backend | C | taps | plan ms | apply ms | geometry ms "
+    print("| device | dtype | pipeline | B x cells | backend | C | taps | plan ms | apply ms | geometry ms "
           "| fwd+bwd ms | samples/s | fwd GB/s (% peak) |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
         bw = "—"
         if r.get("fwd_GBps"):
             pk = r.get("peak_GBps")
             bw = f"{r['fwd_GBps']:.0f}" + (f" ({100 * r['fwd_GBps'] / pk:.0f} %)" if pk else "")
-        print(f"| {r['device']} | {r.get('dtype', '')} | {r['pipeline']} | {r['backend']} | {r['C']} | "
+        print(f"| {r['device']} | {r.get('dtype', '')} | {r['pipeline']} | {r['B']} x {r['cells']} | "
+              f"{r['backend']} | {r['C']} | "
               f"{r.get('taps', '—')} | {ms(r.get('plan_s'))} | {ms(r.get('apply_s'))} | "
               f"{ms(r.get('geom_s'))} | {ms(r.get('fwd_bwd_s'))} | {r['samples_per_s']:.0f} | {bw} |")
 
@@ -232,6 +244,8 @@ def main(argv=None):
     ap.add_argument("--level", type=int, default=10)
     ap.add_argument("--cells", type=int, default=4**8)
     ap.add_argument("--channels", type=int, nargs="+", default=[1, 4])
+    ap.add_argument("--full-level", type=int, default=8, help="level of the full-sphere case")
+    ap.add_argument("--full-batch", type=int, default=16, help="batch of the full-sphere case")
     ap.add_argument("--pipelines", nargs="+", default=list(PIPELINES) + ["naive"],
                     choices=list(PIPELINES) + ["naive"])
     ap.add_argument("--backends", nargs="*", default=None)

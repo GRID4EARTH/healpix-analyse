@@ -368,11 +368,9 @@ if _HAS_TRITON:
     def _aug_configs():
         if os.environ.get("TRITON_INTERPRET", "0") == "1":
             return [triton.Config({"BLOCK": 64}, num_warps=4)]
-        return [
-            triton.Config({"BLOCK": bl}, num_warps=nw)
-            for bl in (64, 128, 256) for nw in (2, 4, 8)
-            if not (bl == 64 and nw == 8)
-        ]
+        # A small space of likely winners (the kernel is latency-bound on
+        # the gathers and the binary searches: enough warps, medium tiles).
+        return [triton.Config({"BLOCK": bl}, num_warps=nw) for bl, nw in ((128, 4), (256, 4), (256, 8))]
 
     @triton.autotune(configs=_aug_configs(),
                      key=["N", "C", "T", "GATHER", "SCATTER", "STORE_MAP", "HAS_A", "HAS_R"],
@@ -798,7 +796,7 @@ def gather_torch(src: torch.Tensor, gmap: GatherMap, fill: float) -> torch.Tenso
 
 if _HAS_TRITON:
 
-    def _cfg(name, sizes=(128, 256, 512), warps=(2, 4, 8)):
+    def _cfg(name, sizes=(128, 256), warps=(4, 8)):
         if os.environ.get("TRITON_INTERPRET", "0") == "1":
             return [triton.Config({name: 64}, num_warps=4)]
         return [triton.Config({name: s}, num_warps=w) for s in sizes for w in warps]
@@ -859,7 +857,7 @@ if _HAS_TRITON:
             tl.atomic_add(gs_b + ij.to(tl.int64)[None, :], wj[None, :] * g,
                           mask=mc[:, None] & ok[None, :])
 
-    @triton.autotune(configs=_cfg("BLOCK_R", sizes=(64, 128, 256)), key=["C", "NS"])
+    @triton.autotune(configs=_cfg("BLOCK_R", sizes=(64, 128)), key=["C", "NS"])
     @triton.jit
     def _gather_bwd_csr_kernel(
         gout_ptr, rowptr_ptr, ent_ptr, w_ptr, gsrc_ptr,
