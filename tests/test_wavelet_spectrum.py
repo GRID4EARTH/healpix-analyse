@@ -92,20 +92,36 @@ def test_gradcheck_float64():
     assert torch.autograd.gradcheck(f, (v,), eps=1e-6, atol=1e-6, rtol=1e-4)
 
 
-def test_against_band_averaged_anafast():
+# tolerance per band level, input level 3 (bands at level 0 are not tested)
+_ANAFAST_TOL = {
+    "smooth": {3: 0.06, 2: 0.06, 1: 0.20},
+    "mean": {3: 0.06, 2: 0.25, 1: 0.40},
+}
+
+
+@pytest.mark.parametrize("down_mode", ["mean", "smooth"])
+def test_against_band_averaged_anafast(down_mode):
     """Full sphere, level 3: P_s against sum_ell C_hat_ell * response[s, ell].
 
-    The response is measured once with ``windows()`` (exact for a
-    rotation-invariant operator).  The spectrum is invariant only up to the
-    pixelisation and the finite number of orientations, so a single map
-    deviates from the band-averaged anafast by a few per cent at the levels
-    where the stencil is local (measured: at most 4.2 % at level 4 and
-    5 % at level 3 over 60 maps; 6 % is the tolerance).  At level 1 the
-    5x5 stencil reaches 83 degrees (tolerance 20 %) and at level 0 it covers
-    the sphere, which is not tested.
+    The response is measured once with ``windows()``: the expected band
+    power of an isotropic field is exactly sum_ell C_ell response[s, ell].
+    One map deviates from it because the operator is not exactly
+    rotation-invariant (pixelisation, finite number of orientations, and
+    the descent).  Measured per map over 40 maps at level 3 (60 at level 4):
+
+    - ``"smooth"``: at most 5 % for the bands at levels 3 and 2 (4.2 % at
+      levels 4 to 2 from level 4), 8 % at level 1, where the 5x5 stencil
+      reaches 83 degrees;
+    - ``"mean"`` (the default): the finest band is unchanged (5 %), but the
+      boxcar descent folds multipoles beyond the grid of each coarser level
+      into its band in a way that depends on the orientation of the field
+      relative to the pixels: up to 23 % one level down and 32 % two levels
+      down (8.5 % and 19 % from level 4).
+
+    Level 0 (the stencil covers the sphere) is not tested.
     """
     level = 3
-    ws = _make(HealPixWaveletSpectrum, level=level)
+    ws = _make(HealPixWaveletSpectrum, level=level, down_mode=down_mode)
     win = ws.windows()
     sht = HEALPixSHT(level, dtype=torch.float64, device="cpu")
     L = sht.lmax
@@ -121,8 +137,8 @@ def test_against_band_averaged_anafast():
         chat = sht.anafast(maps, nest=True).double()
         rel = (ws(maps).power_total / (chat @ win.response.T) - 1).abs()
         lev = ws._levels
-        assert rel[:, lev >= 2].max() < 0.06, rel.max(0).values
-        assert rel[:, lev == 1].max() < 0.20, rel.max(0).values
+        for j, tol in _ANAFAST_TOL[down_mode].items():
+            assert rel[:, lev == j].max() < tol, (j, rel.max(0).values)
 
 
 def test_littlewood_paley_closes_the_variance():
@@ -216,8 +232,9 @@ def test_down_mode_and_n_scales_validation():
         with pytest.raises(ValueError, match="n_scales"):
             _make(HealPixIsotropicWaveletSpectrum, level=2, n_scales=bad)
     assert _make(HealPixIsotropicWaveletSpectrum, n_scales=1)._levels.tolist() == [3]
-    # "mean" keeps q/m a weighted mean of the valid pixels too
-    ws = _make(HealPixWaveletSpectrum, cell_ids=REGION, down_mode="mean")
+    assert _make(HealPixIsotropicWaveletSpectrum, level=2).down_mode == "mean"
+    # "smooth" keeps q/m a weighted mean of the valid pixels too
+    ws = _make(HealPixWaveletSpectrum, cell_ids=REGION, down_mode="smooth")
     x = torch.full((len(REGION),), 287.15, dtype=torch.float64)
     x[_nan_mask(len(REGION), 0.2, 10)] = float("nan")
     out = ws(x)
@@ -251,8 +268,9 @@ def test_building_leaves_the_global_rng_alone():
         assert torch.all(conv.weight == 0) and torch.all(conv.bias == 0)
 
 
-def test_monopole_is_the_weighted_mean_of_the_valid_pixels():
-    ws = _make(HealPixWaveletSpectrum, cell_ids=REGION)
+@pytest.mark.parametrize("down_mode", ["mean", "smooth"])
+def test_monopole_is_the_weighted_mean_of_the_valid_pixels(down_mode):
+    ws = _make(HealPixWaveletSpectrum, cell_ids=REGION, down_mode=down_mode)
     n = len(REGION)
     x = 2.0 * torch.randn(3, n, dtype=torch.float64) + 5.0
     x[:, _nan_mask(n, 0.3, 12)] = float("nan")
@@ -335,3 +353,84 @@ def test_float32_matches_float64(cls):
     torch.testing.assert_close(o32.monopole.double(), o64.monopole, rtol=1e-6, atol=0)
     torch.testing.assert_close(o32.power_total.double(), o64.power_total, rtol=1e-3, atol=0)
     torch.testing.assert_close(o32.lowpass_var.double(), o64.lowpass_var, rtol=2e-2, atol=0)
+
+
+def _region_with_partial_parents():
+    """Base pixels 0 and 4 at level 3, with holes, shuffled.
+
+    The holes leave parents with 1 to 3 of their 4 children at every level:
+    a whole level-1 quarter (cells 0-15), one level-2 cell (256-259) and
+    30 % of the remaining cells at random.
+    """
+    rng = np.random.default_rng(30)
+    ids = np.concatenate([np.arange(16, 64), np.arange(260, 320)])
+    ids = ids[rng.random(ids.size) > 0.3]
+    return rng.permutation(ids).astype(np.int64)
+
+
+def _weighted_mean(x, wt):
+    ok = torch.isfinite(x)
+    if wt is None:
+        return torch.nanmean(x, -1)
+    return torch.where(ok, wt * x, 0).sum(-1) / torch.where(ok, wt, 0).sum(-1)
+
+
+@pytest.mark.parametrize("domain", ["full", "region"])
+def test_mean_descent_monopole_is_the_mean_of_the_level0_pixels(domain):
+    """down_mode="mean" (the default): sum q_0 / sum m_0 = sum w x / sum w.
+
+    HealPixDown(mode="mean") divides by the number of children present in
+    cell_ids; the spectrum multiplies by that number / 4 (area-weighted),
+    which conserves the sums level to level on a regional domain too.
+    """
+    ids = None if domain == "full" else _region_with_partial_parents()
+    ws = _make(HealPixWaveletSpectrum, cell_ids=ids)
+    assert ws.down_mode == "mean"
+    n = ws.n_cells[0]
+    gen = torch.Generator().manual_seed(31)
+    x = 7.0 + 3.0 * torch.randn(2, n, dtype=torch.float64, generator=gen)
+    x[:, _nan_mask(n, 0.3, 32)] = float("nan")
+    x[1, _nan_mask(n, 0.4, 33)] = float("nan")
+    wt = 0.1 + 0.9 * torch.rand(n, dtype=torch.float64, generator=gen)
+    ok = torch.isfinite(x)
+    if ids is not None:
+        assert all(float(d.coverage.min()) < 1.0 for d in ws.downs)
+    for weights in (None, wt):
+        expected = _weighted_mean(x, weights)
+        out = ws(x, weights=weights)
+        torch.testing.assert_close(out.monopole, expected, rtol=1e-12, atol=0)
+        # the level-0 pixels of the uncentred pair carry the same mean
+        w = ok.double() * (1.0 if weights is None else weights)
+        q, m = torch.where(ok, w * x, 0), w
+        for di in range(len(ws.downs)):
+            q, m = ws._down_step(di, q, m)
+        torch.testing.assert_close(q.sum(-1) / m.sum(-1), expected, rtol=1e-12, atol=0)
+        assert float(m.max()) <= 1.0 + 1e-12
+        x0 = torch.where(m > 0, q / torch.where(m > 0, m, 1), 0)
+        var0 = (m * (x0 - expected[:, None]) ** 2).sum(-1) / m.sum(-1)
+        torch.testing.assert_close(out.lowpass_var, var0, rtol=1e-10, atol=0)
+        if ids is not None:
+            # without the n_P / 4 factor the level-0 mean is biased
+            q, m = torch.where(ok, w * x, 0), w
+            for d in ws.downs:
+                q, _ = d(q)
+                m, _ = d(m)
+            assert torch.all((q.sum(-1) / m.sum(-1) - expected).abs() > 1e-6)
+
+
+@pytest.mark.parametrize("cls", [HealPixWaveletSpectrum, HealPixIsotropicWaveletSpectrum])
+def test_a_regional_domain_is_the_full_sphere_with_nan_outside(cls):
+    # with the area-weighted mean descent, a cell outside cell_ids counts
+    # exactly like a NaN, at every level
+    ids = _region_with_partial_parents()
+    n_full = 12 * 4 ** 3
+    gen = torch.Generator().manual_seed(34)
+    x = torch.randn(2, len(ids), dtype=torch.float64, generator=gen)
+    x[:, _nan_mask(len(ids), 0.2, 35)] = float("nan")
+    xf = torch.full((2, n_full), float("nan"), dtype=torch.float64)
+    xf[:, torch.as_tensor(ids)] = x
+    a = _make(cls, cell_ids=ids, s1=True)(x)
+    b = _make(cls, s1=True)(xf)
+    for f in ("power", "s1", "monopole", "lowpass_var", "n_eff"):
+        torch.testing.assert_close(getattr(a, f), getattr(b, f), rtol=1e-9, atol=1e-12,
+                                   equal_nan=True)

@@ -51,20 +51,34 @@ Torch); outputs are Torch tensors with the same leading dimensions.
 Let `x` be the map at level J, `w` its weight (0 where `x` is NaN or masked,
 optionally a `weights=` map in [0, 1]).
 
-1. **Frequency 0.** `M = Σ w x / Σ w`, the mean of the valid pixels. It is the
-   mean of the 12 level-0 pixels when these are the NESTED sums of their
-   descendants; `smooth` does not conserve the mean (see {doc}`/other/down`),
-   so `M` is computed exactly from the input.
-2. **Descent.** The pair `(q, m) = (w (x − M), w)` goes down with
-   `HealPixDown(mode="smooth")` to level 0; `q_j / m_j` is the Gaussian mean
-   of the valid descendants, already centred. `down_mode="mean"` is the other
-   accepted descent; `maxpool` and `smooth_conservative` raise, because they
-   do not keep `q / m` a weighted mean of the valid pixels.
+1. **Descent.** The pair `(q, m) = (w x, w)` goes down to level 0 with
+   `HealPixDown(mode="mean")` (`down_mode="mean"`, the default), made
+   area-weighted: a coarse value is the sum of its 4 children divided by 4, a
+   child outside `cell_ids` counting 0. (`HealPixDown` divides by the number
+   `n_P` of children present in `cell_ids`; the spectrum multiplies by
+   `n_P / 4`.) The sums are then conserved,
+   `Σ_k q_{j,k} = Σ_k q_{J,k} / 4^{J−j}`, on a regional domain as on the full
+   sphere; `m_j` stays in [0, 1], `q_j / m_j` is the mean of the valid
+   descendants, and a cell outside `cell_ids` counts exactly like a NaN, so
+   a regional domain gives the same spectrum as the full sphere with NaN
+   outside it.
    The fraction `f_j` of descendants with `w > 0` goes down the same way, and
    a level-`j` pixel is valid when `f_j ≥ min_valid` (0.5); at J, every pixel
    with `w > 0` is valid. A `weights=` taper therefore never drops a pixel
    from a band: it only sets its share of the averages (`u = m · e`, below).
-3. **Bands.** At every level `j` from J down to 0, the centred field
+2. **Frequency 0.** `M = Σ_k q_{0,k} / Σ_k m_{0,k}`, the `m`-weighted mean
+   of the level-0 pixels, which by the conservation above is
+   `Σ w x / Σ w`, the mean of the valid pixels (within 1e-12 in float64 in
+   the tests). In practice `q` is first centred on the direct
+   mean `M̂ = Σ w x / Σ w`, `q = w (x − M̂)` (see below), and
+   `M = M̂ + Σ q_0 / Σ m_0`, the same number.
+   `down_mode="smooth"` (the Gaussian descent of `HealPixDown`) is the other
+   accepted descent: it aliases less (next section) but does not conserve
+   the mean (see {doc}`/other/down`), so `M` is then the direct mean `M̂`
+   and the level-0 pixels do not average to it. `maxpool` and
+   `smooth_conservative` raise, because they do not keep `q / m` a weighted
+   mean of the valid pixels.
+3. **Bands.** At every level `j` from J down to 0, the field
    `x_j = q_j / m_j` is convolved with the wavelet
    (`HealPixConv(missing="local_mean")`, below). For orientation `g` and the
    weights `u` of the next section:
@@ -77,12 +91,14 @@ S1_j^{(g)} = \frac{\sum_k u_{j,k}\,|y^{(g)}_{j,k}| / \sqrt{e_{j,k}}}{\sum_k u_{j
 $$
 
 4. **Low-pass.** `P_low`, the `m`-weighted variance of the 12 level-0 pixels
-   around `M` (multipoles ℓ of about 1 and 2).
+   around `M` (multipoles ℓ of about 1 and 2 with `"smooth"`; with `"mean"`
+   it also picks up aliased power from all scales, next section).
 
 The wavelets have zero sum, so they do not see `M`. Centring before the
-descent avoids the float32 cancellation of a field such as SST in kelvin at
-the coarse levels: in float32 (the default) the band powers agree with float64
-within the rounding of the input. `S1` (the mean `|y|`)
+descent (the descent is linear, so it changes nothing else) avoids the
+float32 cancellation of a field such as SST in kelvin at the coarse levels:
+in float32 (the default) the band powers agree with float64 within the
+rounding of the input. `S1` (the mean `|y|`)
 is optional (`s1=True`); higher-order scattering statistics are not part of
 this module.
 
@@ -190,6 +206,29 @@ is the centroid of each band. It costs `(lmax + 1)²` maps and the tables of
 variance. The band powers themselves are returned unnormalised (unit-L2
 taps).
 
+Both are measured through the operator itself, so they follow the descent.
+`ell_nominal` (`k₀` over the pixel size of the level) and `scale_km` do not
+depend on it. Measured at level 4 (full sphere, float64):
+
+| | `down_mode="mean"` (default) | `down_mode="smooth"` |
+|---|---|---|
+| `ell_eff / ell_nominal`, bands below J | 1.03 to 1.26 | 0.49 to 0.71 |
+| share of the band from ℓ > 3 nside_j, white noise | 44 to 55 % | ≤ 1.1 % |
+| same, `C_ℓ ∝ (ℓ+1)⁻³` | 5 to 13 % | ≤ 0.05 % |
+| `lowpass` window summed over ℓ (white noise) | 0.88 | 0.09 |
+| Littlewood–Paley ripple, oriented / isotropic | 0.21 / 0.53 | 0.39 / 0.47 |
+
+The finest band does not go through the descent and is the same for both.
+The boxcar of `"mean"` barely attenuates the top of each band, so the bands
+sit at their nominal ℓ; but it does not cut the multipoles that the grid of
+level `j` cannot represent (ℓ > 3 nside_j), and folds them into the band and
+into the low-pass. For a red field such as SST this is 5 to 13 % of a
+coarse band; for white noise, about half. The Gaussian of `"smooth"` cuts
+them, at the price of bands centred at about 0.6 times their nominal ℓ and
+of a mean that is not conserved. The windows include the aliased part, so
+the comparison of a band with the `anafast` of the same map stays exact on
+average; map to map it scatters more (next section).
+
 ## Validation
 
 Measured with the tests of `tests/test_wavelet_spectrum.py` and
@@ -198,17 +237,34 @@ Measured with the tests of `tests/test_wavelet_spectrum.py` and
 - **Against `anafast`** (full sphere, `ellipsoid="sphere"`): each map's band
   power against `Σ_ℓ Ĉ_ℓ response[s, ℓ]`, with `Ĉ_ℓ` the `anafast` of the same
   map. At level 4, over 60 Gaussian maps with `C_ℓ ∝ (ℓ+1)^{-α}`,
-  α = 0, 2, 3: within 4.2 % (oriented) and 3.7 % (isotropic) for the bands of
-  levels 4 to 2, 5–9 % at level 1, and up to 48 % at level 0, where the 5×5
-  stencil covers the sphere. The test uses level 3 with a 6 % tolerance for
-  levels ≥ 2 and 20 % at level 1. The residual comes from the pixelisation
-  and the finite number of orientations: the operator is not exactly
-  rotation-invariant.
+  α = 0, 2, 3, the largest deviation per band (oriented / isotropic):
+
+  | Band level | 4 (finest) | 3 | 2 | 1 | 0 |
+  |---|---|---|---|---|---|
+  | `"mean"` (default) | 4.1 / 2.7 % | 8.5 / 7.5 % | 19 / 15 % | 53 / 48 % | 132 / 152 % |
+  | `"smooth"` | 4.1 / 2.7 % | 1.1 / 1.6 % | 3.9 / 3.6 % | 5.3 / 6.8 % | 48 / 51 % |
+
+  At level 0 the 5×5 stencil covers the sphere. The residual comes from the
+  pixelisation, the finite number of orientations and, below the finest
+  band, the descent: the operator is not exactly rotation-invariant, and the
+  power that the boxcar folds into a band depends on how the field sits on
+  the pixels. The test runs at level 3, with tolerances per descent (6 % for
+  the finest band; with `"mean"` 25 % one level down and 40 % two levels
+  down, with `"smooth"` 6 % and 20 %).
 - **Littlewood–Paley** at level 4: with the fitted constants, the weighted
-  band powers match the variance of power-law maps within 1–7 %; the fitted
-  sum of windows still varies by 39 % (oriented) and 47 % (isotropic) over
-  `1 ≤ ℓ ≤ 3 nside − 1`, because no band reaches the highest multipoles and
-  the level-0 band overlaps the low-pass.
+  band powers match the variance of power-law maps within 9 % with either
+  descent (`"mean"`: at most 6.3 % oriented and 8.0 % isotropic; `"smooth"`:
+  6.9 % and 8.4 %); the fitted
+  sum of windows still varies by 21 % (oriented) and 53 % (isotropic) over
+  `1 ≤ ℓ ≤ 3 nside − 1` with `"mean"` (39 % and 47 % with `"smooth"`),
+  because no band reaches the highest multipoles and the level-0 band
+  overlaps the low-pass.
+- **Frequency 0**: with `"mean"`, `monopole` equals `Σ w x / Σ w` (the
+  `nanmean` without `weights=`) within 1e-12 on random fields with NaN, on
+  the full sphere and on an unsorted regional domain whose parents miss
+  some of their children at every level, and so does `Σ q_0 / Σ m_0` of the
+  descent itself; without the `n_P / 4` factor the latter is off. A regional
+  domain gives the same spectrum as the full sphere with NaN outside it.
 - **Constants and NaN**: a constant map with 20 % NaN, on the full sphere or a
   regional domain, gives zero band powers and the right frequency 0 for every
   edge mode; NaN inputs give finite outputs and gradients, and the gradient at
@@ -240,6 +296,11 @@ as `HealPixConv` and `HealPixDown`; no SciPy.
   constants are fitted on demand on the full sphere at small levels; tuning
   `σ`, `k₀` and the coarse bands to reduce the ripple, and shipping constants
   for large levels, remain to be done.
+- With the default `"mean"` descent the bands below the input level alias
+  (see the windows above); `"smooth"` does not, but does not conserve the
+  mean. Taking the bands from the Gaussian descent and only the frequency 0
+  and the low-pass from the mean descent would give both, for one more
+  descent of `(q, m)`; not done here.
 - Validation on ERA5 SST at level 8 (real coastlines), GPU timing, and a
   performance path for levels ≥ 10 (with the gather optimisation of
   `HealPixConv`) are still to do.

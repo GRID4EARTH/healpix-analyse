@@ -716,7 +716,7 @@ tools:
   family: C
   page: sht/wavelet_spectrum
   symbols: [HealPixWaveletSpectrum, HealPixIsotropicWaveletSpectrum, wavelet_power_spectrum, wavelet_morlet, wavelet_morlet_isotropic]
-  also: [cross, windows, littlewood_paley, scales_per_octave, coverage_weight]
+  also: [cross, windows, littlewood_paley, scales_per_octave, coverage_weight, down_mode]
   summary: >-
     Band power spectrum, one band per HEALPix level (or two per octave), on
     the full sphere or a regional domain with NaN (land, clouds, swaths): a
@@ -751,9 +751,11 @@ tools:
     - Any mask and NaN, full sphere or regional domain; a result at every valid pixel.
     - Differentiable, batched, GPU; usable as a loss.
     - "Orientation resolved (G = 4), or isotropic and cheaper; cross-spectra and coherence."
-    - "Agrees with band-averaged `anafast` within about 4 % per map on the full sphere (bands at levels >= 2)."
+    - "The frequency 0 is the mean of the level-0 pixels, equal to the mean of the valid pixels (area-weighted mean descent, the default)."
+    - "Per map on the full sphere, the finest band agrees with band-averaged `anafast` within about 4 %."
   cons:
     - One band per octave (or two), not a C_ell per ell.
+    - "The default mean descent aliases: below the input level, a band also picks up multipoles beyond its grid (about half of the power for white noise, 5-13 % for C_ell ~ ell^-3), and agrees with band-averaged `anafast` within 9 % one level down and 19 % two levels down; `down_mode=\"smooth\"` aliases about 1 % (within 5 %) but does not conserve the mean."
     - "Band powers are unnormalised by default; the Littlewood-Paley constants are fitted on demand at small levels."
     - Bands at levels 0 and 1 are global filters, not local ones.
     - Validation on real coastlines (ERA5 SST at level 8) and GPU timing still to do.

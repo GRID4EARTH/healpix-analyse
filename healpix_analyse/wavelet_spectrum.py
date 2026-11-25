@@ -8,14 +8,16 @@ The spectrum is built from two existing operators:
   outside ``cell_ids`` are completed instead of propagated;
 - :class:`~healpix_analyse.down.HealPixDown` takes the field one level down,
   carrying the pair (q, m) = (w (x - M), w) so that missing pixels are handled by a
-  normalised convolution.
+  normalised convolution.  The default descent, ``mode="mean"`` made
+  area-weighted, conserves the sums of (q, m) from level to level.
 
 At every level ``j`` (fine to coarse, down to level 0), the band power is the
 weighted mean of ``|y_j|^2`` over the valid pixels, with weights that account
 for the part of the kernel that fell on missing pixels.  The mean of the
-valid input pixels is returned as the frequency-0 term, and the variance of
-the level-0 pixels as the low-pass residual.  Everything is PyTorch,
-differentiable with respect to the data, and runs on CPU or GPU.  No SciPy.
+level-0 pixels, which is the mean of the valid input pixels, is returned as
+the frequency-0 term, and their variance around it as the low-pass
+residual.  Everything is PyTorch, differentiable with respect to the data,
+and runs on CPU or GPU.  No SciPy.
 
 Design and validation: ``docs/sht/wavelet_spectrum.md``.
 """
@@ -283,6 +285,7 @@ class _WaveletSpectrumBase(nn.Module):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device)
         self.dtype = dtype
+        self.down_mode = down_mode
         self.level = int(level)
         self.Q = Q
         self.edge = edge
@@ -332,7 +335,7 @@ class _WaveletSpectrumBase(nn.Module):
         j_min = 0 if int(n_scales) == -1 else max(0, J - int(n_scales) + 1)
         self.band_levels = list(range(J, j_min - 1, -1))
 
-        convs, downs, taps_l, band_q, wide = [], [], [], [], []
+        convs, downs, area, taps_l, band_q, wide = [], [], [], [], [], []
         ids = None if cell_ids is None else np.asarray(cell_ids, dtype=np.int64).ravel()
         self.partial = ids is not None
         self.n_cells = []
@@ -379,10 +382,25 @@ class _WaveletSpectrumBase(nn.Module):
                 down = HealPixDown(level=j, mode=down_mode, ellipsoid=ellipsoid,
                                    cell_ids=ids, device=self.device, dtype=dtype)
                 downs.append(down)
+                # HealPixDown(mode="mean") divides by the number n_P of
+                # children present in cell_ids.  Times n_P / 4, a coarse
+                # value is the sum over its 4 children / 4, absent children
+                # counting 0 (area-weighted): then sum_k q_j = sum_k q_J / 4^(J-j)
+                # on a regional domain as on the full sphere, m stays in
+                # [0, 1], and a pixel outside cell_ids counts like a NaN.
+                area.append(torch.as_tensor(down.coverage, dtype=dtype)
+                            if down_mode == "mean" and ids is not None else None)
                 ids = None if ids is None else np.asarray(down.cell_ids_out, dtype=np.int64)
         self.convs = nn.ModuleList([c for c in convs if c is not None])
         self._conv_of_level = convs          # per level J..0, None without a band
         self.downs = nn.ModuleList(downs)
+        self._area = []
+        for i, a in enumerate(area):
+            if a is None:
+                self._area.append(None)
+                continue
+            self.register_buffer(f"_area_{i}", a, persistent=False)
+            self._area.append(f"_area_{i}")
 
         # taps as buffers (complex for the anisotropic class)
         cdtype = torch.complex64 if dtype == torch.float32 else torch.complex128
@@ -436,6 +454,19 @@ class _WaveletSpectrumBase(nn.Module):
             w = w * torch.broadcast_to(wt, lead + (n,)).reshape(-1, n)
         return t, w, lead
 
+    def _down_step(self, di, *fields):
+        """Take each ``[B, N_j]`` field one level down with ``self.downs[di]``.
+
+        With ``down_mode="mean"`` on a regional domain, the output is
+        multiplied by ``n_P / 4`` (area-weighted mean, see ``__init__``).
+        """
+        B = fields[0].shape[0]
+        y, _ = self.downs[di](torch.cat(fields, dim=0))
+        name = self._area[di]
+        if name is not None:
+            y = y * getattr(self, name)
+        return y.split(B, dim=0)
+
     def _run(self, t, w):
         """Descent and bands: returns ([dict(y, d, u, j) per band level], M, P_low)."""
         q = w * torch.where(w > 0, t, torch.zeros_like(t))
@@ -444,6 +475,9 @@ class _WaveletSpectrumBase(nn.Module):
         # validity of a pixel does not depend on a weights= taper, which only
         # sets its share of the averages through u = m e
         f = (w > 0).to(self.dtype)
+        # direct mean of the valid pixels: the monopole with "smooth" (which
+        # does not conserve the mean); with "mean", the centring constant Mc,
+        # corrected at level 0 below
         M, ok_m = _safe_div(q.sum(-1), m.sum(-1))          # [B]
         M = torch.where(ok_m, M, torch.full_like(M, float("nan")))
         Mc = torch.where(ok_m, M, torch.zeros_like(M))[:, None]
@@ -490,14 +524,19 @@ class _WaveletSpectrumBase(nn.Module):
                     u = base.expand_as(e)
                 out.append({"y": y, "d": d, "u": u, "j": j})
             if j >= 1:
-                down = self.downs[di]
+                q, m, f = self._down_step(di, q, m, f)
                 di += 1
-                q, _ = down(q)
-                m, _ = down(m)
-                f, _ = down(f)
-        # level 0: low-pass residual around the frequency 0
-        x0, _ = _safe_div(q, m)                             # already centred
+        # level 0: frequency 0 and low-pass residual around it
+        x0, _ = _safe_div(q, m)                             # centred on Mc
         x0 = torch.where(m > 0, x0, torch.zeros_like(x0))
+        if self.down_mode == "mean":
+            # The area-weighted mean descent conserves the sums, so the
+            # m-weighted mean of the level-0 pixels, sum q0 / sum m0 of the
+            # uncentred pair, is the mean of the input.  With q centred on
+            # Mc, it is Mc + dM; dM is 0 up to rounding.
+            dM, _ = _safe_div(q.sum(-1), m.sum(-1))
+            M = M + dM
+            x0 = torch.where(m > 0, x0 - dM[:, None], torch.zeros_like(x0))
         P_low, ok_low = _safe_div((m * x0 ** 2).sum(-1), m.sum(-1))
         P_low = torch.where(ok_low & ok_m, P_low, torch.full_like(P_low, float("nan")))
         return out, M, P_low
@@ -758,11 +797,20 @@ class HealPixWaveletSpectrum(_WaveletSpectrumBase):
         Orientations; None = 4 Q.
     gauge_type, singularity_lonlat, ref_direction
         As in :class:`~healpix_analyse.convol.HealPixConv`.
-    down_mode : {"smooth", "mean"}, default "smooth"
-        ``HealPixDown`` mode of the descent of ``(q, m) = (w (x - M), w)``.  Only
-        these two keep ``q / m`` a weighted mean of the valid pixels; the
-        other modes raise (``maxpool`` lets a missing child win,
-        ``smooth_conservative`` biases ``q / m`` near coasts).
+    down_mode : {"mean", "smooth"}, default "mean"
+        ``HealPixDown`` mode of the descent of ``(q, m) = (w (x - M), w)``.
+        ``"mean"``: the mean of the 4 children, area-weighted on a regional
+        domain (a child outside ``cell_ids`` counts 0, like a NaN), which
+        conserves the sums: the monopole is the ``m``-weighted mean of the
+        level-0 pixels, ``sum q_0 / sum m_0``, equal to the mean of the
+        valid input pixels.  The boxcar aliases: below ``level``, a band also
+        picks up multipoles beyond the grid of its level (about half of the
+        power for white noise, 5 to 13 % for a C_ell ~ ell^-3 spectrum).
+        ``"smooth"``: the Gaussian descent, which aliases about 1 % but does
+        not conserve the mean; the monopole is then computed directly from
+        the input.  Only these two keep ``q / m`` a weighted mean of the
+        valid pixels; the other modes raise (``maxpool`` lets a missing
+        child win, ``smooth_conservative`` biases ``q / m`` near coasts).
     edge : {"mean_corrected", "complete", "none"}, default "mean_corrected"
         Missing stencil points: completed with the local mean (``|y|^2`` divided
         by the coverage e); outputs with an incomplete kernel dropped; or set
@@ -774,7 +822,8 @@ class HealPixWaveletSpectrum(_WaveletSpectrumBase):
         With ``mean_corrected``: drop the pixels whose coverage e is below.
     min_valid : float, default 0.5
         A coarse pixel is valid when the fraction of its descendants with a
-        positive weight (carried down like m) is at least this; at ``level``
+        positive weight (carried down like m; with ``"mean"``, a descendant
+        outside ``cell_ids`` counts as missing) is at least this; at ``level``
         itself, every pixel with a positive weight is valid.  A ``weights=``
         taper never makes a pixel invalid: it only sets the share of each
         valid pixel in the averages (``u = m e``).
@@ -803,7 +852,7 @@ class HealPixWaveletSpectrum(_WaveletSpectrumBase):
         gauge_type: str = "phi",
         singularity_lonlat=None,
         ref_direction=None,
-        down_mode: str = "smooth",
+        down_mode: str = "mean",
         edge: str = "mean_corrected",
         coverage_weight: bool = True,
         min_coverage: float = 0.0,
@@ -845,7 +894,7 @@ class HealPixIsotropicWaveletSpectrum(_WaveletSpectrumBase):
         wavelet: Optional[KernelFn] = None,
         scales_per_octave: int = 1,
         kernel_sz: Optional[int] = None,
-        down_mode: str = "smooth",
+        down_mode: str = "mean",
         edge: str = "mean_corrected",
         coverage_weight: bool = True,
         min_coverage: float = 0.0,

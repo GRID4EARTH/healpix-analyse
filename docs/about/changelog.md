@@ -10,15 +10,19 @@
   `wavelet_morlet` and `wavelet_morlet_isotropic`. Band powers per HEALPix
   level (down to level 0, or two per octave with `scales_per_octave=2`), on
   the full sphere or a regional domain with NaN: the field goes down with
-  `HealPixDown` on the pair (w (x − M), w), missing stencil points are completed
-  with the local mean, and each valid pixel is weighted by the coverage of
-  its kernel. Returns the frequency 0 (mean of the valid pixels), the
-  low-pass variance, `n_eff`, optional S1 and local maps; `cross()` gives
+  `HealPixDown` on the pair (w (x − M), w) (`down_mode="mean"` by default,
+  area-weighted, so that the sums are conserved; `"smooth"` as an option),
+  missing stencil points are completed with the local mean, and each valid
+  pixel is weighted by the coverage of its kernel. Returns the frequency 0
+  (the mean of the level-0 pixels, which is the mean of the valid pixels),
+  the low-pass variance, `n_eff`, optional S1 and local maps; `cross()` gives
   co-spectra and coherence of two fields on the same cells; `windows()` and
   `littlewood_paley()` measure the band responses and fit band constants on
-  the full sphere. Differentiable, batched, CPU or GPU; no SciPy. Agrees
-  with the band-averaged `HEALPixSHT.anafast` within about 4 % per map on
-  the full sphere (bands at levels >= 2, measured at level 4). Page:
+  the full sphere. Differentiable, batched, CPU or GPU; no SciPy. Per map on
+  the full sphere, the finest band agrees with the band-averaged
+  `HEALPixSHT.anafast` within about 4 %; the coarser bands within 9 % one
+  level down and 19 % two levels down with the default descent (within 5 %
+  with `down_mode="smooth"`), measured at level 4. Page:
   `docs/sht/wavelet_spectrum.md`.
 - `HealPixConv(missing="local_mean")`: NaN values (and `mask=` zeros) are
   missing exactly like pixels outside `cell_ids`; a stencil point takes the
