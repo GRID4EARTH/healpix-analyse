@@ -206,3 +206,132 @@ def test_function_form():
     a = wavelet_power_spectrum(x, 3, isotropic=True, ellipsoid="sphere", **F64)
     b = _make(HealPixIsotropicWaveletSpectrum)(x)
     torch.testing.assert_close(a.power_total, b.power_total)
+
+
+def test_down_mode_and_n_scales_validation():
+    for bad in ("maxpool", "smooth_conservative"):
+        with pytest.raises(ValueError, match="down_mode"):
+            _make(HealPixWaveletSpectrum, level=2, down_mode=bad)
+    for bad in (0, -2, 1.5, True):
+        with pytest.raises(ValueError, match="n_scales"):
+            _make(HealPixIsotropicWaveletSpectrum, level=2, n_scales=bad)
+    assert _make(HealPixIsotropicWaveletSpectrum, n_scales=1)._levels.tolist() == [3]
+    # "mean" keeps q/m a weighted mean of the valid pixels too
+    ws = _make(HealPixWaveletSpectrum, cell_ids=REGION, down_mode="mean")
+    x = torch.full((len(REGION),), 287.15, dtype=torch.float64)
+    x[_nan_mask(len(REGION), 0.2, 10)] = float("nan")
+    out = ws(x)
+    assert torch.allclose(out.monopole, torch.tensor(287.15, dtype=torch.float64))
+    assert torch.all(out.power_total.abs() < 1e-18)
+    assert abs(float(out.lowpass_var)) < 1e-18
+
+
+def test_sample_without_valid_pixel_is_nan():
+    ws = _make(HealPixIsotropicWaveletSpectrum, level=2)
+    x = torch.randn(3, 12 * 4 ** 2, dtype=torch.float64)
+    x[1] = float("nan")
+    wt = torch.ones_like(x)
+    wt[2] = 0.0
+    out = ws(x, weights=wt)
+    assert torch.isfinite(out.power_total[0]).all()
+    assert torch.isfinite(out.monopole[0]) and torch.isfinite(out.lowpass_var[0])
+    for b in (1, 2):
+        assert torch.isnan(out.power_total[b]).all()
+        assert torch.isnan(out.monopole[b]) and torch.isnan(out.lowpass_var[b])
+        assert torch.all(out.n_eff[b] == 0)
+
+
+def test_building_leaves_the_global_rng_alone():
+    torch.manual_seed(123)
+    ref = torch.rand(4)
+    torch.manual_seed(123)
+    ws = _make(HealPixWaveletSpectrum, level=2)
+    assert torch.equal(torch.rand(4), ref)
+    for conv in ws.convs:
+        assert torch.all(conv.weight == 0) and torch.all(conv.bias == 0)
+
+
+def test_monopole_is_the_weighted_mean_of_the_valid_pixels():
+    ws = _make(HealPixWaveletSpectrum, cell_ids=REGION)
+    n = len(REGION)
+    x = 2.0 * torch.randn(3, n, dtype=torch.float64) + 5.0
+    x[:, _nan_mask(n, 0.3, 12)] = float("nan")
+    x[1, _nan_mask(n, 0.5, 13)] = float("nan")
+    torch.testing.assert_close(ws(x).monopole, torch.nanmean(x, -1))
+    wt = torch.as_tensor(np.random.default_rng(14).random(n))
+    ok = torch.isfinite(x)
+    expected = torch.where(ok, wt * x, 0).sum(-1) / torch.where(ok, wt, 0).sum(-1)
+    torch.testing.assert_close(ws(x, weights=wt).monopole, expected)
+
+
+def test_values_under_nan_or_zero_weight_are_ignored():
+    ws = _make(HealPixWaveletSpectrum, cell_ids=REGION, s1=True)
+    n = len(REGION)
+    rng = np.random.default_rng(15)
+    x = torch.randn(n, dtype=torch.float64)
+    hole = _nan_mask(n, 0.2, 16)
+    wt = torch.as_tensor(rng.uniform(0.2, 1.0, n))
+    wt[hole] = 0.0
+    a = ws(x, weights=wt)
+    x2 = x.clone()
+    x2[hole] = 1e3 * torch.randn(int(hole.sum()), dtype=torch.float64)
+    b = ws(x2, weights=wt)                                       # other values under w = 0
+    x3 = x.clone()
+    x3[hole] = float("nan")
+    c = ws(x3, weights=wt)                                       # NaN instead of w = 0
+    for o in (b, c):
+        for f in ("power", "s1", "monopole", "lowpass_var", "n_eff"):
+            torch.testing.assert_close(getattr(o, f), getattr(a, f), equal_nan=True)
+
+
+def test_a_uniform_taper_changes_nothing():
+    # validity does not depend on the weights: a taper of 0.4 (below
+    # min_valid) keeps every pixel in every band and only scales n_eff
+    ws = _make(HealPixWaveletSpectrum, cell_ids=REGION)
+    n = len(REGION)
+    x = torch.randn(2, n, dtype=torch.float64)
+    x[:, _nan_mask(n, 0.2, 17)] = float("nan")
+    a = ws(x)
+    b = ws(x, weights=torch.full((n,), 0.4, dtype=torch.float64))
+    for f in ("power", "monopole", "lowpass_var"):
+        torch.testing.assert_close(getattr(b, f), getattr(a, f), equal_nan=True)
+    torch.testing.assert_close(b.n_eff, 0.4 * a.n_eff)
+
+
+@pytest.mark.parametrize("cls", [HealPixWaveletSpectrum, HealPixIsotropicWaveletSpectrum])
+def test_unsorted_cell_ids(cls):
+    # base pixels 0, 4 and 5 at level 3: not an arange, then shuffled
+    region = np.concatenate([np.arange(0, 64), np.arange(256, 384)]).astype(np.int64)
+    perm = np.random.default_rng(18).permutation(len(region))
+    x = torch.randn(2, len(region), dtype=torch.float64)
+    x[:, _nan_mask(len(region), 0.2, 19)] = float("nan")
+    a = _make(cls, cell_ids=region, s1=True)(x)
+    b = _make(cls, cell_ids=region[perm], s1=True)(x[:, perm])
+    for f in ("power", "s1", "monopole", "lowpass_var", "n_eff"):
+        torch.testing.assert_close(getattr(b, f), getattr(a, f), equal_nan=True)
+
+
+@pytest.mark.parametrize("cls", [HealPixWaveletSpectrum, HealPixIsotropicWaveletSpectrum])
+def test_float32_matches_float64(cls):
+    """float32, the default, on a regional domain with NaN and a 287 K offset.
+
+    Measured over 20 maps (polar and equatorial domains): the band powers
+    agree within the rounding of the float32 input (at most 2.3e-4, at
+    level 0).  Two things keep them there: the field is centred before the
+    descent (else up to 0.7 % off at the coarse bands), and the geometry of
+    HealPixConv(missing="local_mean") is built in float64 (else up to 1.5 %
+    off at the finest band, from stencil points at the domain border).
+    lowpass_var, the variance of 3 level-0 pixels (down to 1e-4 K^2), is
+    limited by the float32 resolution of the mean (3e-5 K at 287 K).
+    """
+    kw = dict(ellipsoid="sphere", device="cpu", cache_dir=None, cell_ids=REGION)
+    n = len(REGION)
+    gen = torch.Generator().manual_seed(21)
+    x = 287.15 + torch.randn(2, n, dtype=torch.float64, generator=gen)   # SST in kelvin
+    x[:, _nan_mask(n, 0.2, 20)] = float("nan")
+    o64 = cls(3, dtype=torch.float64, **kw)(x)
+    o32 = cls(3, dtype=torch.float32, **kw)(x.float())
+    assert o32.power_total.dtype == torch.float32
+    torch.testing.assert_close(o32.monopole.double(), o64.monopole, rtol=1e-6, atol=0)
+    torch.testing.assert_close(o32.power_total.double(), o64.power_total, rtol=1e-3, atol=0)
+    torch.testing.assert_close(o32.lowpass_var.double(), o64.lowpass_var, rtol=2e-2, atol=0)

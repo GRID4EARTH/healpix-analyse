@@ -75,6 +75,7 @@ def _geometry_cache_key(
     nest: bool,
     cell_ids,             # np.ndarray or None
     ellipsoid: str,
+    float64_geometry: bool = False,
 ) -> str:
     """
     Return a hex digest that uniquely identifies a set of geometry parameters.
@@ -82,6 +83,9 @@ def _geometry_cache_key(
     Only the fields that affect _get_interp_weights / _bind_support_batched
     are included.  dtype and device are intentionally excluded: the buffers
     are stored as float32/int64 CPU tensors and cast at load time.
+    ``float64_geometry`` (missing="local_mean") marks a geometry always built
+    in float64; it enters the key only when True, so the keys of the default
+    mode are unchanged.
     """
     state: dict = {
         # Bump when the meaning/layout of any cached buffer changes.
@@ -106,6 +110,8 @@ def _geometry_cache_key(
             else np.asarray(cell_ids, dtype=np.int64).ravel().tolist()
         ),
     }
+    if float64_geometry:
+        state["geometry_dtype"] = "float64"
     blob = json.dumps(state, sort_keys=True).encode()
     return hashlib.sha256(blob).hexdigest()
 
@@ -195,6 +201,31 @@ def _prepare_input_conv(x, device, dtype):
             f"Input must have shape [N], [B, N] or [B, C, N]; got {tuple(t.shape)}"
         )
     return t, is_numpy, was_1d, was_2d
+
+
+def _mask_as_bcn(mask, t):
+    """Pixel weights of ``missing="local_mean"`` as ``[B, C, N]``, like ``t``.
+
+    Accepts ``[N]`` (every sample and channel), ``[B, N]`` (per sample, every
+    channel) or ``[B, C, N]``; B and C may be 1.  Any other shape raises, so
+    that a per-channel ``[C, N]`` mask is never read as per-sample.  Non-finite
+    values count as 0 and the weights are clamped to [0, 1].
+    """
+    B, C, N = t.shape
+    m = torch.as_tensor(mask, device=t.device, dtype=t.dtype)
+    shape = tuple(m.shape)
+    if m.dim() == 1:
+        m = m.view(1, 1, -1)
+    elif m.dim() == 2:
+        m = m.unsqueeze(1)
+    if (m.dim() != 3 or m.shape[-1] != N or m.shape[0] not in (1, B)
+            or m.shape[1] not in (1, C)):
+        raise ValueError(
+            f"mask must have shape [N], [B, N] or [B, C, N] with N={N}, B={B} "
+            f"(or 1), C={C} (or 1); got {shape}."
+        )
+    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m)).clamp(0.0, 1.0)
+    return m.expand(B, C, N)
 
 
 def _restore_output_conv(t, is_numpy, was_1d):
@@ -631,6 +662,11 @@ class HealPixConv(nn.Module):
         local mean of the valid stencil values of the same output pixel
         (weighted by ``local_mean_weights``).  Every pixel gets a finite
         output, and so do the gradients.  Costs a second gather (the mask).
+        The geometry of this mode is always built in float64, then cast to
+        ``dtype``: the choice between the two rules depends on the valid
+        fraction of each stencil point, and a float32 build (``acos`` near
+        the poles) gives points just outside the domain spurious fractions
+        (5e-4 at level 6).  It is cached apart from the default mode.
     local_mean_weights : array-like [P] or None
         Non-negative weights of the stencil points in the local mean of
         ``missing="local_mean"``.  None = uniform.
@@ -653,6 +689,10 @@ class HealPixConv(nn.Module):
     ...     singularity_lonlat=(-160.0, 0.0),  # central Pacific
     ... )
     """
+
+    # Class default, so that a layer pickled whole before missing= existed
+    # still runs forward() and repr() after unpickling.
+    missing = "centre"
 
     def __init__(
         self,
@@ -841,7 +881,12 @@ class HealPixConv(nn.Module):
             nest       = self.nest,
             cell_ids   = cell_ids,
             ellipsoid  = self.ellipsoid,
+            float64_geometry = self.missing == "local_mean",
         )
+        # missing="local_mean" switches rules on the valid fraction of each
+        # stencil point, which a float32 build gets wrong just outside the
+        # domain (acos near the poles): build that geometry in float64
+        geo_dtype = torch.float64 if self.missing == "local_mean" else self.dtype
         _cached = (
             _load_geometry_cache(_cache_dir_resolved, _cache_key,
                                  self.device, self.dtype)
@@ -873,20 +918,20 @@ class HealPixConv(nn.Module):
             ph = np.deg2rad(np.asarray(lon, dtype=np.float64))
 
             R_tot = _build_rotation_matrices(
-                th, ph, self.G, self.gauge_type, self.device, self.dtype,
+                th, ph, self.G, self.gauge_type, self.device, geo_dtype,
                 ref_direction=self.ref_direction,
             )  # [K, G, 3, 3]
 
             vec_t = torch.as_tensor(
                 _local_kernel_grid(self.kernel_sz, self.nside),
-                device=self.device, dtype=self.dtype,
+                device=self.device, dtype=geo_dtype,
             )  # [P, 3]
 
             rotated = torch.einsum("kgij,pj->kgpi", R_tot, vec_t)
             flat    = rotated.reshape(-1, 3)   # [K*G*P, 3]
 
             idx_flat, w_flat = _get_interp_weights(
-                self.nside, flat, self.nest, self.device, self.dtype
+                self.nside, flat, self.nest, self.device, geo_dtype
             )  # [4, K*G*P]
 
             idx_all = (
@@ -924,7 +969,8 @@ class HealPixConv(nn.Module):
 
             # OPT 1 — contiguous layout [4, G, K*P]
             pos_all    = pos_all.permute(1, 0, 2).contiguous()
-            w_all_norm = w_all_norm.permute(1, 0, 2).contiguous()
+            w_all_norm = (w_all_norm.permute(1, 0, 2)
+                          .to(dtype=self.dtype).contiguous())
 
             self.register_buffer("_sort_order", sort_order_t)
             self.register_buffer("_inv_order",  inv_order_t)
@@ -1054,8 +1100,11 @@ class HealPixConv(nn.Module):
         x : array-like, shape [N], [B, N] or [B, C_in, N]
         mask : array-like or None
             Only with ``missing="local_mean"``: weights in [0, 1] of the
-            pixels (0 = missing), broadcastable to ``x``.  NaN values of
-            ``x`` are always missing.  None = ``isfinite(x)``.
+            pixels (0 = missing).  Shape ``[N]`` (every sample and channel),
+            ``[B, N]`` (one mask per sample, for every channel) or
+            ``[B, C_in, N]`` (one mask per channel); B and C_in may be 1.
+            Any other shape raises.  NaN values of ``x`` are always
+            missing.  None = ``isfinite(x)``.
 
         Returns
         -------
@@ -1209,11 +1258,7 @@ class HealPixConv(nn.Module):
 
         v = torch.isfinite(t).to(t.dtype)
         if mask is not None:
-            m = torch.as_tensor(mask, device=t.device, dtype=t.dtype)
-            m = torch.where(torch.isfinite(m), m, torch.zeros_like(m)).clamp(0.0, 1.0)
-            if m.dim() == 2 and t.dim() == 3:
-                m = m.unsqueeze(1)          # [B, N] -> [B, 1, N]
-            v = v * m
+            v = v * _mask_as_bcn(mask, t)
         xz = torch.where(v > 0, t, torch.zeros_like(t))
         vx = (xz * v)[:, :, so]
         vs = v[:, :, so]
@@ -1229,17 +1274,18 @@ class HealPixConv(nn.Module):
         # wn is renormalised over the neighbours inside the domain; sup puts
         # back the fraction outside it (0 for a point with no neighbour in it)
         cov = iv * sup
-        eps = 1e-6
-        has = cov > eps
-        one = torch.ones_like(iv)
-        z_direct = ivx / torch.where(has, iv, one)
-
         a = self._local_mean_w.to(device=t.device, dtype=t.dtype).view(1, 1, 1, 1, P)
         num = (a * ivx * sup).sum(-1, keepdim=True)
         den = (a * cov).sum(-1, keepdim=True)
-        has_den = den > eps
+        has_den = den > 1e-6
         xbar = torch.where(has_den, num / torch.where(has_den, den, torch.ones_like(den)),
                            torch.zeros_like(den))
+
+        # renormalised interpolation where a valid neighbour has weight,
+        # else the local mean (sup is exact: the geometry of this mode is
+        # built in float64, so no spurious fraction crosses the threshold)
+        has = cov > 1e-6
+        z_direct = ivx / torch.where(has, iv, torch.ones_like(iv))
         z = torch.where(has, z_direct, xbar.expand_as(z_direct))
         return z, cov
 
@@ -1250,8 +1296,9 @@ class HealPixConv(nn.Module):
         ----------
         x : array-like, shape [N], [B, N] or [B, C, N]
         mask : array-like or None
-            Weights in [0, 1] of the pixels, broadcastable to ``x``; NaN
-            values of ``x`` are always missing.
+            Weights in [0, 1] of the pixels, shape ``[N]``, ``[B, N]`` or
+            ``[B, C, N]`` as in :meth:`forward`; NaN values of ``x`` are
+            always missing.
 
         Returns
         -------
@@ -1261,8 +1308,12 @@ class HealPixConv(nn.Module):
             stencil point with no valid neighbour.
         cov : torch.Tensor [B, C, G, N, P]
             The valid fraction of each stencil point, in [0, 1].  With tap
-            weights t_p, ``(cov * t).sum(-1) / t.sum()`` is the coverage of
-            the kernel at each pixel.
+            weights t_p (real or complex),
+            ``(cov * abs(t)**2).sum(-1) / (abs(t)**2).sum()`` is the
+            coverage e of the kernel at each pixel, in [0, 1], as used by
+            :class:`~healpix_analyse.wavelet_spectrum.HealPixWaveletSpectrum`.
+            The ``abs(t)**2`` weights keep it defined for a zero-sum
+            (band-pass) kernel.
         """
         t, _, _, _ = _prepare_input_conv(x, self.device, self.dtype)
         if t.shape[-1] != self.K:

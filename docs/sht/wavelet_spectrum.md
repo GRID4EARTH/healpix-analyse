@@ -55,12 +55,17 @@ optionally a `weights=` map in [0, 1]).
    mean of the 12 level-0 pixels when these are the NESTED sums of their
    descendants; `smooth` does not conserve the mean (see {doc}`/other/down`),
    so `M` is computed exactly from the input.
-2. **Descent.** The pair `(q, m) = (w x, w)` goes down with
-   `HealPixDown(mode="smooth")` to level 0; `q_j / m_j` is the Gaussian mean of
-   the valid descendants, and a level-`j` pixel is valid when `m_j ≥ min_valid`
-   (0.5).
+2. **Descent.** The pair `(q, m) = (w (x − M), w)` goes down with
+   `HealPixDown(mode="smooth")` to level 0; `q_j / m_j` is the Gaussian mean
+   of the valid descendants, already centred. `down_mode="mean"` is the other
+   accepted descent; `maxpool` and `smooth_conservative` raise, because they
+   do not keep `q / m` a weighted mean of the valid pixels.
+   The fraction `f_j` of descendants with `w > 0` goes down the same way, and
+   a level-`j` pixel is valid when `f_j ≥ min_valid` (0.5); at J, every pixel
+   with `w > 0` is valid. A `weights=` taper therefore never drops a pixel
+   from a band: it only sets its share of the averages (`u = m · e`, below).
 3. **Bands.** At every level `j` from J down to 0, the centred field
-   `x_j = q_j / m_j − M` is convolved with the wavelet
+   `x_j = q_j / m_j` is convolved with the wavelet
    (`HealPixConv(missing="local_mean")`, below). For orientation `g` and the
    weights `u` of the next section:
 
@@ -74,8 +79,10 @@ $$
 4. **Low-pass.** `P_low`, the `m`-weighted variance of the 12 level-0 pixels
    around `M` (multipoles ℓ of about 1 and 2).
 
-The wavelets have zero sum, so they do not see `M`. The centring avoids the
-float32 cancellation of a field such as SST in kelvin. `S1` (the mean `|y|`)
+The wavelets have zero sum, so they do not see `M`. Centring before the
+descent avoids the float32 cancellation of a field such as SST in kelvin at
+the coarse levels: in float32 (the default) the band powers agree with float64
+within the rounding of the input. `S1` (the mean `|y|`)
 is optional (`s1=True`); higher-order scattering statistics are not part of
 this module.
 

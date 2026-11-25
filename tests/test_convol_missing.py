@@ -15,10 +15,10 @@ LEVEL = 3
 DOMAIN = np.arange(64 * 2, dtype=np.int64)         # base pixels 0 and 1 at level 3
 
 
-def _conv(cell_ids=DOMAIN, **kw):
+def _conv(cell_ids=DOMAIN, cache_dir=None, dtype=torch.float64, **kw):
     conv = HealPixConv(level=LEVEL, in_channels=1, out_channels=2, kernel_sz=3,
                        n_gauges=2, cell_ids=cell_ids, device="cpu",
-                       dtype=torch.float64, cache_dir=None, **kw)
+                       dtype=dtype, cache_dir=cache_dir, **kw)
     rng = np.random.default_rng(3)
     conv.set_kernel(rng.standard_normal((1, 2, 9)), bias=[0.1, -0.2, 0.3, 0.0])
     return conv
@@ -100,3 +100,96 @@ def test_local_mean_weights_validation():
         _conv(local_mean_weights=np.ones(9))
     with pytest.raises(ValueError):
         _conv(missing="zero")
+
+
+def test_mask_shapes():
+    conv = _conv(missing="local_mean")
+    n = len(DOMAIN)
+    rng = np.random.default_rng(11)
+    x = torch.randn(2, 3, n, dtype=torch.float64)
+    m = torch.as_tensor(rng.random((2, 3, n)) > 0.3, dtype=torch.float64)
+    # per channel [B, C, N]: each channel uses its own mask
+    z, cov = conv.completed_stencil(x, m)
+    for b in range(2):
+        for c in range(3):
+            zc, cc = conv.completed_stencil(x[b, c], m[b, c])
+            torch.testing.assert_close(z[b, c], zc[0, 0])
+            torch.testing.assert_close(cov[b, c], cc[0, 0])
+    # [N] applies to every sample and channel, [B, N] to every channel
+    full = m[0, 0].expand(2, 3, n)
+    torch.testing.assert_close(conv.completed_stencil(x, m[0, 0])[0],
+                               conv.completed_stencil(x, full)[0])
+    per_b = m[:, 0]
+    torch.testing.assert_close(conv.completed_stencil(x, per_b)[0],
+                               conv.completed_stencil(x, per_b[:, None].expand(2, 3, n))[0])
+    # B and C may be 1
+    torch.testing.assert_close(conv.completed_stencil(x, m[:1, :1])[0],
+                               conv.completed_stencil(x, full)[0])
+    # a [C, N] mask with C != B, or any other shape, raises
+    for bad in (m[0], m[..., :-1], m[None], m[:, :2]):
+        with pytest.raises(ValueError, match="mask must have shape"):
+            conv.completed_stencil(x, bad)
+    with pytest.raises(ValueError, match="mask must have shape"):
+        conv(x[:, :1], mask=m[0])                                 # [3, N] for B = 2
+
+
+def test_layer_pickled_before_missing_still_runs():
+    conv = _conv()
+    x = torch.randn(len(DOMAIN), dtype=torch.float64)
+    y = conv(x)
+    del conv.missing                    # as unpickled from an older version
+    assert conv.missing == "centre"
+    torch.testing.assert_close(conv(x), y)
+    assert "missing" not in repr(conv)
+
+
+def test_cache_paths(tmp_path):
+    def load(p):
+        return torch.load(p, map_location="cpu", weights_only=True)
+
+    x = torch.randn(2, len(DOMAIN), dtype=torch.float64)
+    xn = x.clone()
+    xn[0, ::7] = float("nan")
+    # the default mode and local_mean (float64 geometry) use separate files
+    _conv(cache_dir=tmp_path)
+    (centre_file,) = tmp_path.glob("healpixconv_*.pt")
+    _conv(cache_dir=tmp_path, missing="local_mean")
+    files = set(tmp_path.glob("healpixconv_*.pt"))
+    assert len(files) == 2
+    (lm_file,) = files - {centre_file}
+    assert "support" in load(lm_file)
+    # a local_mean file without the support is recomputed once, and rewritten
+    data = load(lm_file)
+    del data["support"]
+    torch.save(data, lm_file)
+    ref = _conv(missing="local_mean")
+    a = _conv(cache_dir=tmp_path, missing="local_mean")
+    torch.testing.assert_close(a(xn), ref(xn), rtol=1e-12, atol=1e-12)
+    assert "support" in load(lm_file)
+    # then read back (buffers stored in float32)
+    b = _conv(cache_dir=tmp_path, missing="local_mean")
+    torch.testing.assert_close(b(xn), ref(xn), rtol=1e-6, atol=1e-6)
+    # the default mode reads its own file
+    torch.testing.assert_close(_conv(cache_dir=tmp_path)(x), _conv()(x), rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("level", [3, 6])
+def test_local_mean_float32_matches_float64_at_the_border(level):
+    # A float32 geometry gives stencil points just outside the domain
+    # spurious valid fractions (5e-4 at level 6 near the pole), which switch
+    # them from the local mean to one neighbour: outputs off by up to 4.5
+    # here.  The geometry of local_mean is therefore built in float64.
+    dom = np.arange(2 * 4 ** level, dtype=np.int64)              # base pixels 0, 1
+    gen = torch.Generator().manual_seed(22)
+    x = torch.randn(2, len(dom), dtype=torch.float64, generator=gen)
+    x[:, ::11] = float("nan")
+    w = torch.randn(1, 2, 25, dtype=torch.float64, generator=gen)
+    out = []
+    for dtype in (torch.float64, torch.float32):
+        conv = HealPixConv(level=level, in_channels=1, out_channels=2,
+                           kernel_sz=5, n_gauges=4, cell_ids=dom,
+                           device="cpu", dtype=dtype, cache_dir=None,
+                           missing="local_mean")
+        conv.set_kernel(w.numpy())
+        out.append(conv(x.to(dtype)).double())
+    torch.testing.assert_close(out[1], out[0], rtol=1e-5, atol=1e-5)

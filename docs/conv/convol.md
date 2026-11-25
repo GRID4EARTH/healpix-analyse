@@ -264,6 +264,12 @@ missing exactly like a pixel outside `cell_ids`: a stencil point with at
 least one valid neighbour takes the renormalised interpolation of its valid
 neighbours, and a point with none takes the mean of the valid stencil values
 of the same output pixel (weights `local_mean_weights`, uniform by default).
+The geometry of this mode is always built in float64 and then cast to
+`dtype`, because the choice between the two rules depends on the valid
+fraction of each stencil point: a float32 build gives points just outside the
+domain spurious fractions (up to 5e-4 at level 6, near the poles), enough to
+switch a stencil value from the local mean to the value of one neighbour. It
+is cached apart from the default mode.
 Every pixel gets a finite output and finite gradients; the gradient at a NaN
 pixel is 0. It costs a second gather (the mask). Without missing pixels, the
 result is the same as the default.
@@ -381,7 +387,7 @@ y = conv(x, mask=valid)        # missing="local_mean" only
 | Parameter | Type | Shape | Description |
 |---|---|---|---|
 | `x` | `np.ndarray` or `torch.Tensor` | `[N]`, `[B, N]`, or `[B, C_in, N]` | Input map(s) at the HEALPix resolution of this layer. N must equal `len(cell_ids)` for partial-sky, or `12 · nside²` for full sphere. |
-| `mask` | array-like or `None` | broadcastable to `x` | Only with `missing="local_mean"`: pixel weights in [0, 1] (0 = missing). NaN values of `x` are always missing. |
+| `mask` | array-like or `None` | `[N]`, `[B, N]` or `[B, C_in, N]` | Only with `missing="local_mean"`: pixel weights in [0, 1] (0 = missing). `[N]` applies to every sample and channel, `[B, N]` to every channel of each sample; a per-channel mask must be `[B, C_in, N]` (B and C_in may be 1). Other shapes raise. NaN values of `x` are always missing. |
 
 **Returns:**
 

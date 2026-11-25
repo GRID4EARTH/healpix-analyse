@@ -7,7 +7,7 @@ The spectrum is built from two existing operators:
   each level, with ``missing="local_mean"`` so that NaN values and pixels
   outside ``cell_ids`` are completed instead of propagated;
 - :class:`~healpix_analyse.down.HealPixDown` takes the field one level down,
-  carrying the pair (q, m) = (w x, w) so that missing pixels are handled by a
+  carrying the pair (q, m) = (w (x - M), w) so that missing pixels are handled by a
   normalised convolution.
 
 At every level ``j`` (fine to coarse, down to level 0), the band power is the
@@ -216,6 +216,19 @@ def _safe_div(num, den, eps=0.0):
                        torch.zeros_like(num)), ok
 
 
+def _forked_rng(device: torch.device):
+    """Context that restores the CPU RNG, and the RNG of ``device``, on exit."""
+    if device.type == "cpu":
+        return torch.random.fork_rng(devices=[])
+    mod = getattr(torch, device.type, None)
+    if mod is None or not hasattr(mod, "get_rng_state"):
+        return torch.random.fork_rng(devices=[])
+    idx = device.index
+    if idx is None:
+        idx = mod.current_device() if hasattr(mod, "current_device") else 0
+    return torch.random.fork_rng(devices=[idx], device_type=device.type)
+
+
 class _WaveletSpectrumBase(nn.Module):
     """Shared engine of the anisotropic and isotropic classes."""
 
@@ -258,6 +271,14 @@ class _WaveletSpectrumBase(nn.Module):
             raise ValueError("min_coverage must be in [0, 1].")
         if not 0.0 < float(min_valid) <= 1.0:
             raise ValueError("min_valid must be in (0, 1].")
+        if down_mode not in ("smooth", "mean"):
+            # only these keep (q, m) a weighted mean of the valid pixels:
+            # maxpool lets a missing child (q = 0) win, smooth_conservative
+            # adds separate offsets to q and m that bias q/m near coasts
+            raise ValueError("down_mode must be 'smooth' or 'mean'.")
+        if (isinstance(n_scales, bool) or int(n_scales) != n_scales
+                or not (int(n_scales) == -1 or int(n_scales) >= 1)):
+            raise ValueError("n_scales must be -1 (all levels) or an integer >= 1.")
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device)
@@ -308,7 +329,7 @@ class _WaveletSpectrumBase(nn.Module):
                     else wavelet_morlet(sigf, k0f))
 
         J = self.level
-        j_min = 0 if int(n_scales) < 0 else max(0, J - int(n_scales) + 1)
+        j_min = 0 if int(n_scales) == -1 else max(0, J - int(n_scales) + 1)
         self.band_levels = list(range(J, j_min - 1, -1))
 
         convs, downs, taps_l, band_q, wide = [], [], [], [], []
@@ -330,13 +351,20 @@ class _WaveletSpectrumBase(nn.Module):
                     env_sig = fallback.sigma_pix
                 rho, _ = _stencil_polar(ksz)
                 env = np.exp(-0.5 * (rho / env_sig) ** 2)
-                conv = HealPixConv(
-                    level=j, in_channels=1, out_channels=1, kernel_sz=ksz,
-                    n_gauges=self.G, gauge_type=gauge_type,
-                    singularity_lonlat=singularity_lonlat, ref_direction=ref_direction,
-                    cell_ids=ids, ellipsoid=ellipsoid, dtype=dtype, device=self.device,
-                    cache_dir=cache_dir, missing="local_mean", local_mean_weights=env,
-                )
+                # HealPixConv draws its (unused here) kernel from the global
+                # RNG: fork it so that building a spectrum leaves the random
+                # stream of a training script untouched
+                with _forked_rng(self.device):
+                    conv = HealPixConv(
+                        level=j, in_channels=1, out_channels=1, kernel_sz=ksz,
+                        n_gauges=self.G, gauge_type=gauge_type,
+                        singularity_lonlat=singularity_lonlat, ref_direction=ref_direction,
+                        cell_ids=ids, ellipsoid=ellipsoid, dtype=dtype, device=self.device,
+                        cache_dir=cache_dir, missing="local_mean", local_mean_weights=env,
+                    )
+                with torch.no_grad():
+                    for p in conv.parameters():
+                        p.zero_()
                 for p in conv.parameters():
                     p.requires_grad_(False)
                 convs.append(conv)
@@ -409,18 +437,27 @@ class _WaveletSpectrumBase(nn.Module):
         return t, w, lead
 
     def _run(self, t, w):
-        """Yield per band level: dict(y, d, u, j, q_n); returns M, P_low via attrs."""
+        """Descent and bands: returns ([dict(y, d, u, j) per band level], M, P_low)."""
         q = w * torch.where(w > 0, t, torch.zeros_like(t))
         m = w
+        # fraction of valid (w > 0) descendants, carried down like m: the
+        # validity of a pixel does not depend on a weights= taper, which only
+        # sets its share of the averages through u = m e
+        f = (w > 0).to(self.dtype)
         M, ok_m = _safe_div(q.sum(-1), m.sum(-1))          # [B]
         M = torch.where(ok_m, M, torch.full_like(M, float("nan")))
         Mc = torch.where(ok_m, M, torch.zeros_like(M))[:, None]
+        # Centre before the descent: q/m is then the centred field at every
+        # level (the descent is linear), with no float32 cancellation of a
+        # field such as SST in kelvin at the coarse levels.
+        q = w * torch.where(w > 0, t - Mc, torch.zeros_like(t))
         out = []
         di = 0
         for li, j in enumerate(range(self.level, -1, -1)):
             xj, _ = _safe_div(q, m)
-            xj = torch.where(m > 0, xj - Mc, torch.zeros_like(xj))
-            vj = (m >= self.min_valid).to(self.dtype)
+            xj = torch.where(m > 0, xj, torch.zeros_like(xj))
+            # at the input level f is binary: every pixel with w > 0 is valid
+            vj = ((f >= self.min_valid) & (m > 0)).to(self.dtype)
             conv = self._conv_of_level[li]
             if conv is not None:
                 taps = getattr(self, self._taps[li])                 # [Qj, P]
@@ -457,10 +494,12 @@ class _WaveletSpectrumBase(nn.Module):
                 di += 1
                 q, _ = down(q)
                 m, _ = down(m)
+                f, _ = down(f)
         # level 0: low-pass residual around the frequency 0
-        x0, _ = _safe_div(q, m)
-        x0 = torch.where(m > 0, x0 - Mc, torch.zeros_like(x0))
-        P_low, _ = _safe_div((m * x0 ** 2).sum(-1), m.sum(-1))
+        x0, _ = _safe_div(q, m)                             # already centred
+        x0 = torch.where(m > 0, x0, torch.zeros_like(x0))
+        P_low, ok_low = _safe_div((m * x0 ** 2).sum(-1), m.sum(-1))
+        P_low = torch.where(ok_low & ok_m, P_low, torch.full_like(P_low, float("nan")))
         return out, M, P_low
 
     # ------------------------------------------------------------------
@@ -705,7 +744,7 @@ class HealPixWaveletSpectrum(_WaveletSpectrumBase):
         NESTED cell ids of a regional domain; None = full sphere.
     n_scales : int, default -1
         Number of levels with a band, from ``level`` down; -1 = all, down to
-        level 0.  The descent always goes to level 0.
+        level 0.  Otherwise at least 1.  The descent always goes to level 0.
     wavelet : callable or None
         Profile ``fn(rho_pix, phi_rad)``; None = :func:`wavelet_morlet` with
         the defaults of ``scales_per_octave``.
@@ -719,8 +758,11 @@ class HealPixWaveletSpectrum(_WaveletSpectrumBase):
         Orientations; None = 4 Q.
     gauge_type, singularity_lonlat, ref_direction
         As in :class:`~healpix_analyse.convol.HealPixConv`.
-    down_mode : str, default "smooth"
-        ``HealPixDown`` mode of the descent.
+    down_mode : {"smooth", "mean"}, default "smooth"
+        ``HealPixDown`` mode of the descent of ``(q, m) = (w (x - M), w)``.  Only
+        these two keep ``q / m`` a weighted mean of the valid pixels; the
+        other modes raise (``maxpool`` lets a missing child win,
+        ``smooth_conservative`` biases ``q / m`` near coasts).
     edge : {"mean_corrected", "complete", "none"}, default "mean_corrected"
         Missing stencil points: completed with the local mean (``|y|^2`` divided
         by the coverage e); outputs with an incomplete kernel dropped; or set
@@ -731,8 +773,11 @@ class HealPixWaveletSpectrum(_WaveletSpectrumBase):
     min_coverage : float, default 0.0
         With ``mean_corrected``: drop the pixels whose coverage e is below.
     min_valid : float, default 0.5
-        A coarse pixel is valid when its fraction of valid descendants
-        (the m of the descent) is at least this.
+        A coarse pixel is valid when the fraction of its descendants with a
+        positive weight (carried down like m) is at least this; at ``level``
+        itself, every pixel with a positive weight is valid.  A ``weights=``
+        taper never makes a pixel invalid: it only sets the share of each
+        valid pixel in the averages (``u = m e``).
     s1 : bool, default False
         Also return S1, the weighted mean of ``|y|``.
     local_maps : bool, default False

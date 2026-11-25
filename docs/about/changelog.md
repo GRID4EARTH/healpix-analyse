@@ -10,7 +10,7 @@
   `wavelet_morlet` and `wavelet_morlet_isotropic`. Band powers per HEALPix
   level (down to level 0, or two per octave with `scales_per_octave=2`), on
   the full sphere or a regional domain with NaN: the field goes down with
-  `HealPixDown` on the pair (w x, w), missing stencil points are completed
+  `HealPixDown` on the pair (w (x − M), w), missing stencil points are completed
   with the local mean, and each valid pixel is weighted by the coverage of
   its kernel. Returns the frequency 0 (mean of the valid pixels), the
   low-pass variance, `n_eff`, optional S1 and local maps; `cross()` gives
@@ -25,11 +25,14 @@
   renormalised bilinear interpolation of its valid neighbours, or the local
   mean of the valid stencil values when it has none
   (`local_mean_weights`). Finite outputs and gradients everywhere.
+  `mask=` is `[N]`, `[B, N]` or `[B, C_in, N]`.
   `completed_stencil()` returns the stencil values and their valid
-  fraction. The default, `missing="centre"`, is the existing behaviour
-  (identical outputs, same `state_dict`). The geometry cache now also stores
-  the in-domain fraction of each stencil point; older cache files are
-  recomputed once when `missing="local_mean"` needs it.
+  fraction. The geometry of this mode is built in float64 (then cast) and
+  cached apart, so float32 and float64 layers agree at the domain border.
+  The default, `missing="centre"`, is the existing behaviour
+  (identical outputs, same `state_dict`, same cache files). The geometry
+  cache now also stores the in-domain fraction of each stencil point; a
+  file without it is recomputed once when `missing="local_mean"` needs it.
 
 ### Changed
 - `LocalFFT.blur_floor_px` (called by `HealPixFFTConv.set_gaussian` and
