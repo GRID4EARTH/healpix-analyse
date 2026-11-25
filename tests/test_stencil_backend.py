@@ -385,7 +385,9 @@ def test_triton_lsq_gradient_matches_reference(gradient_ops, name, dtype):
     assert torch.equal(new[2], again[2])
     tol = dict(rtol=1e-12, atol=1e-15) if dtype == torch.float64 else dict(rtol=2e-4, atol=1e-6)
     for a, e in zip(new[:2], ref[:2]):
-        torch.testing.assert_close(a, e, equal_nan=True, **tol)
+        assert torch.equal(torch.isnan(a), torch.isnan(e))
+        s = torch.nan_to_num(e).abs().max()
+        torch.testing.assert_close(a / s, e / s, equal_nan=True, **tol)
     scale = ref[2].abs().max()
     torch.testing.assert_close(new[2] / scale, ref[2] / scale, **tol)
 

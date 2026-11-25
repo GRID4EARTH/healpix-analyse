@@ -372,13 +372,13 @@ if _HAS_TRITON:
             configs = [c for c in configs if c.kwargs["BB"] == 4][:1] or configs[:1]
         return configs
 
-    _RED_FWD_CFGS = _cfgs([({"BLOCK_N": bn, "BB": bb}, w)
-                           for bn in (16, 32, 64, 128, 256)
-                           for bb in (1, 2, 4, 8) for w in (4, 8)])
-    _BWD_CFGS = _cfgs([({"BLOCK": bl, "BB": bb}, w)
-                       for bl in (64, 128, 256) for bb in (2, 4, 8) for w in (4, 8)])
-    _LSQ_CFGS = _cfgs([({"BLOCK_N": bn, "BB": bb}, w)
-                       for bn in (32, 64, 128, 256) for bb in (1, 2, 4, 8) for w in (4, 8)])
+    # Small search spaces: every new problem shape compiles each config once.
+    _RED_FWD_CFGS = _cfgs([({"BLOCK_N": bn, "BB": bb}, 4)
+                           for bn in (16, 64, 256) for bb in (1, 4)])
+    _BWD_CFGS = _cfgs([({"BLOCK": bl, "BB": bb}, 4)
+                       for bl in (128, 256) for bb in (2, 4)])
+    _LSQ_CFGS = _cfgs([({"BLOCK_N": bn, "BB": bb}, 4)
+                       for bn in (64, 128) for bb in (1, 4)])
 
     def _meta(named_args, kwargs):
         meta = dict(named_args)
@@ -1083,8 +1083,8 @@ def lsq_gradient(x, stencil, *, backend="auto"):
 
 if _HAS_TRITON:
 
-    _EW_CFGS = _cfgs([({"BLOCK": bl, "BB": bb}, w)
-                      for bl in (256, 512, 1024) for bb in (1, 2, 4) for w in (4, 8)])
+    _EW_CFGS = _cfgs([({"BLOCK": bl, "BB": bb}, 4)
+                      for bl in (512, 1024) for bb in (1, 4)])
 
     def _prune_ew(configs, named_args, **kwargs):
         return _prune_bb([c for c in configs if c.kwargs["BB"] >= 1], _meta(named_args, kwargs)["B"])
