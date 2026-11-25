@@ -112,12 +112,7 @@ source is [`docs/tools.yaml`](docs/tools.yaml).
 pip install git+https://github.com/GRID4EARTH/healpix-analyse.git
 ```
 
-`healpix-plot`, listed as a dependency, is not on PyPI; if pip cannot resolve
-it, install it first:
-
-```bash
-pip install git+https://github.com/GRID4EARTH/healpix-plot
-```
+The core dependencies are NumPy, PyTorch, healpix-geo (≥ 0.5) and pyproj.
 
 From source, for development:
 
@@ -135,9 +130,10 @@ pixi install
 pixi run python -c "import healpix_analyse; print('ok')"
 ```
 
-Optional extras: `scipy` (a few optional features), `examples` (the
-Sentinel-2 example scripts), `notebooks` (JupyterLab), `dino` / `dino-hf`
-(DINOv3 embeddings), `docs`, `test`, `benchmark`. The
+Optional extras: `sht` (quaternionic and spherical, for spin-1 and spin-2
+`HEALPixSHT`), `scipy` (a few optional features), `examples` (the Sentinel-2
+example scripts), `notebooks` (JupyterLab), `dino` / `dino-hf` (DINOv3
+embeddings), `docs`, `test`, `benchmark`. The
 [installation page](https://grid4earth.eu/healpix-analyse/start/installation.html)
 says which feature needs which extra.
 
