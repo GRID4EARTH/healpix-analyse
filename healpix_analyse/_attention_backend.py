@@ -258,7 +258,8 @@ if _HAS_TRITON:
             spec = spec[:1]
         return [triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=1) for bm, nw in spec]
 
-    _NA_CONFIGS = _configs(((32, 4), (32, 2), (64, 4), (64, 8), (128, 8), (128, 4)))
+    # a small autotune space (the likely winners): gather-bound kernels
+    _NA_CONFIGS = _configs(((64, 4), (32, 4), (128, 8)))
 
     def _win_configs(spec):
         if _INTERPRET:
@@ -266,9 +267,9 @@ if _HAS_TRITON:
         return [triton.Config({"BLOCK_Q": bq, "BLOCK_K": bk}, num_warps=nw, num_stages=ns)
                 for bq, bk, nw, ns in spec]
 
+    # a small autotune space (the likely winners of flash attention at D <= 64)
     _WIN_CONFIGS = _win_configs((
-        (64, 32, 4, 2), (32, 32, 4, 2), (64, 64, 4, 2), (128, 64, 8, 2),
-        (64, 64, 4, 3), (128, 32, 4, 2), (32, 64, 4, 2), (128, 128, 8, 2)))
+        (64, 64, 4, 2), (64, 32, 4, 2), (128, 64, 8, 2)))
 
     # -----------------------------------------------------------------------
     # Neighbourhood attention

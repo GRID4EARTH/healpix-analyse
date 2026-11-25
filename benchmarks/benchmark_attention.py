@@ -109,6 +109,10 @@ def _qkv(B, H, N, D, dev, dtype, seed=0):
 # ---------------------------------------------------------------------------
 
 WINDOW_CONFIGS = {
+    # representative configurations for a short GPU job (levels 8 and 10)
+    "reduced": [dict(level=8, w=3, B=2, H=4, D=32, region=None),
+                dict(level=10, w=4, B=1, H=4, D=32, region=None),
+                dict(level=10, w=3, B=1, H=4, D=32, region=25.0)],
     "cpu": [dict(level=5, w=2, B=2, H=4, D=32, region=None),
             dict(level=5, w=3, B=2, H=4, D=32, region=None),
             dict(level=6, w=3, B=1, H=4, D=32, region=None),
@@ -188,6 +192,9 @@ def bench_window(args):
 # ---------------------------------------------------------------------------
 
 NA_CONFIGS = {
+    "reduced": [dict(level=8, k=3, G=1, B=2, H=4, D=32, region=None),
+                dict(level=10, k=3, G=1, B=1, H=4, D=32, region=None),
+                dict(level=10, k=3, G=1, B=1, H=4, D=32, region=25.0)],
     "cpu": [dict(level=5, k=3, G=1, B=2, H=4, D=32, region=None),
             dict(level=6, k=3, G=1, B=1, H=4, D=32, region=None),
             dict(level=6, k=5, G=1, B=1, H=4, D=32, region=None),
@@ -361,7 +368,7 @@ def main(argv=None):
     for name in ("window", "neighbourhood"):
         p = sub.add_parser(name)
         p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-        p.add_argument("--configs", choices=("cpu", "gpu"), default=None)
+        p.add_argument("--configs", choices=("cpu", "gpu", "reduced"), default=None)
         p.add_argument("--dtype", default="float32")
         p.add_argument("--reps", type=int, default=5)
         p.add_argument("--variants", nargs="*", default=None)
