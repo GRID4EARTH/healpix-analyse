@@ -43,7 +43,6 @@ when the feature that needs it is used.
 | Package | Needed by | How to get it |
 |---|---|---|
 | SciPy | `multiorder_filter_operator(shortest_path="scipy")` ({doc}`/conv/multiorder_filter`); the `"matern"`, `"voigt"` and `"screened_poisson"` kernels of `HealPixGeoFFT` ({doc}`/conv/geo_fft`); `HealPixKernelPyramid.calibrate_joint` and the `validation` helpers ({doc}`/other/validation`); `resample_to_latlon_grid` ({doc}`/other/resample`) | extra `scipy` |
-| `healpy` | `build_healpix_adjacency` and therefore the HEALPix Minkowski functionals ({doc}`/stats/minkowski`) | not in any extra: `pip install healpy` (the default pixi environment has it) |
 | `quaternionic` + `spherical` | `HEALPixSHT` with spin ≠ 0, including `uv_to_curl_div` ({doc}`/sht/healpix_sht`) | not in any extra: `pip install quaternionic spherical` |
 | `transformers` | `load_dinov3_sat(source="hf")` ({doc}`/other/dino`) | extra `dino-hf` |
 | `termcolor` | the torch-hub code of DINOv3 ({doc}`/other/dino`) | extra `dino` (also a core dependency today) |

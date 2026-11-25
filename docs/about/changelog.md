@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+- `build_healpix_adjacency` (HEALPix Minkowski functionals) no longer imports
+  `healpy`, which no dependency declared: the neighbours come from
+  `healpix_geo.nested.neighbours`, the backend of the connected components,
+  and the edges and triangles are built with vectorised NumPy instead of a
+  Python loop over the cells (#96, item 4). The output is unchanged; an input
+  without any edge now returns tensors of shape `[0, 2]` and `[0, 3]`
+  instead of `[0]`.
+- Topology tests: hard-coded NESTED neighbours at levels 0 and 1 (base-cell
+  corners with 7 neighbours included); the comparisons with `healpy` run only
+  when it is installed (#41). The private topology adapter rotates the
+  `healpix-geo` direction order with one copy instead of two.
+
 ### Added
 - Wavelet power spectrum (`healpix_analyse.wavelet_spectrum`):
   `HealPixWaveletSpectrum` (complex Morlet, 4 orientations),

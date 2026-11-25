@@ -182,5 +182,4 @@ $$C_\ell = \frac{1}{2\ell+1} \left[ |a_{\ell 0}|^2 + 2 \sum_{m=1}^{\ell} |a_{\el
 
 Cell centres, vertices and neighbours come from
 [healpix-geo](https://healpix-geo.readthedocs.io/); ellipsoidal distances come
-from `pyproj`. `healpy` is not a dependency; one exported function,
-`build_healpix_adjacency`, needs it (see {doc}`installation`).
+from `pyproj`. `healpy` is not a dependency.

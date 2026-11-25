@@ -190,6 +190,23 @@ def minkowski_curves(
 # HEALPix version — data shape [..., Npix]
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _unique_rows(rows):
+    """Unique rows of an integer [M, K] array, sorted lexicographically.
+
+    Same result as ``np.unique(rows, axis=0)``, several times faster: one
+    ``lexsort`` instead of a sort on a structured view.
+    """
+    import numpy as np
+
+    if rows.shape[0] == 0:
+        return rows
+    order = np.lexsort(rows.T[::-1])
+    rows = rows[order]
+    keep = np.ones(rows.shape[0], dtype=bool)
+    keep[1:] = np.any(rows[1:] != rows[:-1], axis=1)
+    return rows[keep]
+
+
 def build_healpix_adjacency(
     level: int,
     cell_ids=None,
@@ -201,17 +218,20 @@ def build_healpix_adjacency(
 
     This is a **one-time setup** call.  Pass the returned tensors to
     :func:`minkowski_functionals_healpix` and :func:`minkowski_curves_healpix`.
-    The computation uses healpy and is **not** differentiable, but the
-    Minkowski functions that consume the output **are** differentiable.
+    The neighbours come from ``healpix_geo.nested.neighbours`` (through the
+    private topology helper used by the connected components) and the graph
+    is built with vectorised NumPy operations.  The computation is **not**
+    differentiable, but the Minkowski functions that consume the output
+    **are** differentiable.
 
     Parameters
     ----------
     level : int
-        Grid4Earth/HEALPix level.  The internal resolution is
-        ``nside = 2**level``.
+        Grid4Earth/HEALPix level, in ``[0, 29]``.  The internal resolution
+        is ``nside = 2**level``.
     cell_ids : array-like or None
         Global HEALPix pixel indices of the map.
-        ``None`` = full sky (all ``12 * nside²`` pixels).
+        ``None`` = full sphere (all ``12 * nside²`` pixels).
     nest : bool
         ``True`` for NESTED ordering (default), ``False`` for RING.
     device : torch.device or None
@@ -220,12 +240,12 @@ def build_healpix_adjacency(
     Returns
     -------
     edges : LongTensor [E, 2]
-        Unique pairs of adjacent **local** pixel indices (i < j).
-        "Adjacent" = sharing a boundary in the HEALPix tessellation
-        (up to 8 neighbours per pixel).
+        Unique pairs of adjacent **local** pixel indices (i < j), sorted
+        lexicographically.  "Adjacent" = sharing an edge or a vertex in the
+        HEALPix tessellation (up to 8 neighbours per pixel).
     triangles : LongTensor [F, 3]
-        Unique triples of mutually adjacent local indices (i < j < k).
-        Used to compute the Euler characteristic.
+        Unique triples of mutually adjacent local indices (i < j < k),
+        sorted lexicographically.  Used to compute the Euler characteristic.
 
     Notes
     -----
@@ -237,45 +257,83 @@ def build_healpix_adjacency(
 
     For the full sphere with all pixels active this recovers
     :math:`\\chi(\\mathbb{S}^2) = 2` (Euler characteristic of the sphere).
+
+    If ``cell_ids`` contains the same cell twice, neighbours that point to
+    that cell use its last local index.
     """
-    import healpy as hp
     import numpy as np
+
+    from ._topology import _npix, nested_neighbours
 
     if isinstance(level, bool) or int(level) != level or int(level) < 0:
         raise ValueError("level must be an integer >= 0.")
-    nside = 2 ** int(level)
+    level = int(level)
 
     if cell_ids is None:
-        cell_ids = np.arange(hp.nside2npix(nside))
-    cell_ids = np.asarray(cell_ids, dtype=np.int64)
-    Npix = len(cell_ids)
+        cell_ids = np.arange(_npix(level), dtype=np.int64)
+    cell_ids = np.asarray(cell_ids, dtype=np.int64).reshape(-1)
+    n_cells = cell_ids.size
 
-    # Map global → local index for fast lookup
-    gid_to_lid = {int(g): l for l, g in enumerate(cell_ids)}
+    if n_cells == 0:
+        edges = np.empty((0, 2), dtype=np.int64)
+        triangles = np.empty((0, 3), dtype=np.int64)
+    else:
+        nested_ids = cell_ids
+        if not nest:
+            from healpix_geo import ring as healpix_geo_ring
 
-    edges_set: set = set()
-    nbrs_local: list = []          # nbrs_local[i] = set of local neighbours of pixel i
+            if np.any(cell_ids < 0) or np.any(cell_ids >= _npix(level)):
+                raise ValueError(
+                    "cell_ids contains an identifier outside the valid range "
+                    f"[0, {_npix(level)}) for level={level}"
+                )
+            nested_ids = np.asarray(
+                healpix_geo_ring.to_nested(cell_ids.astype(np.uint64), level),
+                dtype=np.int64,
+            )
 
-    for lid, gid in enumerate(cell_ids):
-        nbr_global = hp.get_all_neighbours(nside, int(gid), nest=nest)
-        local_nbrs: set = set()
-        for ng in nbr_global:
-            if ng >= 0 and ng in gid_to_lid:
-                nll = gid_to_lid[int(ng)]
-                edges_set.add((min(lid, nll), max(lid, nll)))
-                local_nbrs.add(nll)
-        nbrs_local.append(local_nbrs)
+        # Global neighbour ids, [N, 8]; -1 = missing direction.
+        nbr_global = nested_neighbours(
+            nested_ids, level, connectivity="edge_or_vertex",
+        )
 
-    edges = torch.tensor(sorted(edges_set), dtype=torch.long)  # [E, 2]
+        # Global -> local index.  With a stable sort, the last match of a
+        # duplicated id is its last local index.
+        order = np.argsort(nested_ids, kind="stable")
+        sorted_ids = nested_ids[order]
+        pos = np.searchsorted(sorted_ids, nbr_global, side="right") - 1
+        pos_c = np.clip(pos, 0, n_cells - 1)
+        found = (nbr_global >= 0) & (pos >= 0) & (sorted_ids[pos_c] == nbr_global)
+        nbr_local = np.where(found, order[pos_c], -1)             # [N, 8]
 
-    # Triangles: for each edge (i, j), find k ∈ N(i) ∩ N(j) with i < j < k
-    triangles_set: set = set()
-    for i, j in edges_set:
-        for k in nbrs_local[i] & nbrs_local[j]:
-            tri = tuple(sorted((i, j, k)))
-            triangles_set.add(tri)
+        # Edges: (min, max) of every (cell, local neighbour) pair.
+        rows = np.broadcast_to(
+            np.arange(n_cells, dtype=np.int64)[:, None], nbr_local.shape,
+        )
+        i = rows[found]
+        j = nbr_local[found]
+        edges = _unique_rows(
+            np.stack([np.minimum(i, j), np.maximum(i, j)], axis=1),
+        )
 
-    triangles = torch.tensor(sorted(triangles_set), dtype=torch.long)  # [F, 3]
+        # Triangles: for each edge (i, j), every k > j adjacent to both.
+        # Adjacency is symmetric, so k in N(i) and k in N(j).
+        if edges.shape[0] == 0:
+            triangles = np.empty((0, 3), dtype=np.int64)
+        else:
+            ei, ej = edges[:, 0], edges[:, 1]
+            cand = nbr_local[ei]                                  # [E, 8]
+            in_j = (
+                nbr_local[ej][:, None, :] == cand[:, :, None]
+            ).any(axis=-1)                                        # [E, 8]
+            keep = in_j & (cand > ej[:, None])
+            e_idx, c_idx = np.nonzero(keep)
+            triangles = _unique_rows(
+                np.stack([ei[e_idx], ej[e_idx], cand[e_idx, c_idx]], axis=1),
+            )
+
+    edges = torch.as_tensor(np.ascontiguousarray(edges), dtype=torch.long)
+    triangles = torch.as_tensor(np.ascontiguousarray(triangles), dtype=torch.long)
 
     if device is not None:
         edges     = edges.to(device)

@@ -260,10 +260,112 @@ def test_some_cells_have_seven_full_neighbours(level):
     assert np.any(counts == 7)
 
 
+# ---------------------------------------------------------------------------
+# Hard-coded reference neighbours (no healpy needed)
+# ---------------------------------------------------------------------------
+#
+# Order SW, W, NW, N, NE, E, SE, S; -1 marks a missing direction.  The
+# values are the NESTED neighbours of healpy.get_all_neighbours(..., nest=True)
+# (transposed), frozen here so that the test runs without healpy.
+
+# Level 0: the twelve base cells.  Each has six neighbours: the polar base
+# cells (0-3, 8-11) miss W and E, the equatorial ones (4-7) miss NW and S.
+LEVEL0_NEIGHBOURS = np.array(
+    [
+        [4, -1, 3, 2, 1, -1, 5, 8],
+        [5, -1, 0, 3, 2, -1, 6, 9],
+        [6, -1, 1, 0, 3, -1, 7, 10],
+        [7, -1, 2, 1, 0, -1, 4, 11],
+        [11, 7, 3, -1, 0, 5, 8, -1],
+        [8, 4, 0, -1, 1, 6, 9, -1],
+        [9, 5, 1, -1, 2, 7, 10, -1],
+        [10, 6, 2, -1, 3, 4, 11, -1],
+        [11, -1, 4, 0, 5, -1, 9, 10],
+        [8, -1, 5, 1, 6, -1, 10, 11],
+        [9, -1, 6, 2, 7, -1, 11, 8],
+        [10, -1, 7, 3, 4, -1, 8, 9],
+    ],
+    dtype=np.int64,
+)
+
+# Level 1: interior cells (8 neighbours) and base-cell corners where one
+# direction is missing (7 neighbours).
+LEVEL1_NEIGHBOURS = {
+    0: [17, 19, 2, 3, 1, 23, 22, 35],
+    3: [2, 13, 15, 11, 7, 6, 1, 0],
+    5: [4, 6, 7, 11, 10, -1, 27, 26],
+    10: [27, -1, 5, 7, 11, 9, 8, 25],
+    15: [14, 9, 11, 7, 3, 2, 13, 12],
+    16: [45, 47, 18, 19, 17, 35, 34, -1],
+    19: [18, 12, 13, -1, 2, 0, 17, 16],
+    21: [20, 22, 23, 6, 4, 26, 39, 38],
+    27: [26, 4, 5, -1, 10, 8, 25, 24],
+    32: [44, 45, 34, 35, 33, 38, 36, 40],
+    37: [36, 38, 39, 26, 24, -1, 42, 40],
+    44: [40, 41, 46, 47, 45, 34, 32, 36],
+    47: [46, 28, 29, 12, 18, 16, 45, 44],
+}
+
+# Level 1 cells with exactly seven neighbours: the two side corners
+# (W and E vertices) of every base cell.
+LEVEL1_SEVEN_NEIGHBOUR_CELLS = np.array(
+    [1, 2, 5, 6, 9, 10, 13, 14, 16, 19, 20, 23,
+     24, 27, 28, 31, 33, 34, 37, 38, 41, 42, 45, 46],
+)
+
+
+def test_level0_neighbours_hard_coded():
+    actual = nested_neighbours(
+        np.arange(12),
+        0,
+        connectivity="edge_or_vertex",
+    )
+
+    np.testing.assert_array_equal(actual, LEVEL0_NEIGHBOURS)
+    np.testing.assert_array_equal(
+        nested_edge_neighbours(np.arange(12), 0),
+        LEVEL0_NEIGHBOURS[:, [0, 2, 4, 6]],
+    )
+
+
+def test_level1_neighbours_hard_coded():
+    cells = np.array(sorted(LEVEL1_NEIGHBOURS))
+    expected = np.array(
+        [LEVEL1_NEIGHBOURS[c] for c in cells],
+        dtype=np.int64,
+    )
+
+    np.testing.assert_array_equal(
+        nested_neighbours(cells, 1, connectivity="edge_or_vertex"),
+        expected,
+    )
+    np.testing.assert_array_equal(
+        nested_edge_neighbours(cells, 1),
+        expected[:, [0, 2, 4, 6]],
+    )
+
+
+def test_level1_seven_neighbour_cells_hard_coded():
+    neighbours = nested_neighbours(
+        np.arange(48),
+        1,
+        connectivity="edge_or_vertex",
+    )
+    counts = np.sum(neighbours >= 0, axis=1)
+
+    np.testing.assert_array_equal(
+        np.nonzero(counts == 7)[0],
+        LEVEL1_SEVEN_NEIGHBOUR_CELLS,
+    )
+    assert np.all(counts[counts != 7] == 8)
+    # Missing positions are vertex (W, N, E, S) directions only.
+    assert np.all(neighbours[:, [0, 2, 4, 6]] >= 0)
+
+
 def test_edge_selection_matches_healpy_documented_order():
     """Compare the healpix-geo edge directions with the healpy reference."""
 
-    import healpy as hp
+    hp = pytest.importorskip("healpy")
 
     level = 3
     nside = 2**level
@@ -301,7 +403,7 @@ def test_edge_selection_matches_healpy_documented_order():
 def test_full_neighbour_selection_matches_healpy():
     """Ensure the private wrapper preserves healpy direction ordering."""
 
-    import healpy as hp
+    hp = pytest.importorskip("healpy")
 
     level = 3
     nside = 2**level
