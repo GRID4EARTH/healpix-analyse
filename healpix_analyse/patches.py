@@ -21,7 +21,7 @@ token-based models, and its adjoint ``fold``.
     :func:`~healpix_analyse.dino.nested_to_tiles`.  Face-oriented: the cheap
     option, a reshape (or a single gather) of the data.
 
-The compute backends are in :mod:`healpix_analyse._patches_backend`.
+The compute backends are in ``healpix_analyse._patches_backend``.
 """
 
 from __future__ import annotations
@@ -176,7 +176,7 @@ class HealPixPatches(nn.Module):
 
     In ``mode="gauge"``, a grid point whose 4 bilinear neighbours are not all
     in the domain uses the present ones, renormalised; a point with none is
-    0.  :attr:`coverage` holds, per pixel, the fraction of the bilinear weight
+    0.  ``coverage`` holds, per pixel, the fraction of the bilinear weight
     inside the domain (1 everywhere on the full sphere).  In
     ``mode="nested"``, the descendants absent from the domain are 0 and
     their coverage is 0.
@@ -398,7 +398,7 @@ class HealPixPatches(nn.Module):
         x : array-like, shape [K], [B, K] or [B, C, K]
             Values of the domain cells, in the order of ``cell_ids``.
         index : array-like of int or None
-            Masked token sampling: positions in :attr:`centre_ids` of the
+            Masked token sampling: positions in ``centre_ids`` of the
             patches to extract, shape ``[Ms]`` (the same for every sample) or
             ``[B, Ms]`` (one draw per sample, e.g. the tokens an MAE keeps).
             Only those patches are gathered.  None = all ``M`` patches.
@@ -443,7 +443,7 @@ class HealPixPatches(nn.Module):
         y : array-like [B, Ms, G, C, N, N] (or [Ms, G, C, N, N])
             Patches in the layout of :meth:`forward`.
         index : array-like of int or None
-            The positions in :attr:`centre_ids` of the ``Ms`` patches, as
+            The positions in ``centre_ids`` of the ``Ms`` patches, as
             given to :meth:`forward`.  None = all ``M`` patches.
         norm : {"weight", "count", "none"} or None
             Normalisation (None = ``fold_norm`` of the constructor).  With
