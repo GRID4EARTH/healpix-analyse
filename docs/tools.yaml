@@ -586,7 +586,7 @@ tools:
   family: C
   page: sht/healpix_sht
   symbols: [HEALPixSHT]
-  also: [map2alm, alm2map, map2alm_spin, alm2map_spin, anafast, uv_to_curl_div]
+  also: [map2alm, alm2map, map2alm_spin, alm2map_spin, anafast, uv_to_curl_div, uv_to_eb]
   summary: >-
     Ring-based spherical harmonic transform of a whole-sphere HEALPix map:
     analysis, synthesis, spin-1 and spin-2 fields, angular power spectra,
@@ -598,6 +598,8 @@ tools:
       use: [HEALPixSHT.map2alm, HEALPixSHT.alm2map]
     - do: transform a vector or spin-2 field on the whole sphere (E/B modes)
       use: [HEALPixSHT.map2alm_spin]
+    - do: compute the divergence and the relative vorticity (1/s) of a wind or current field on the whole sphere
+      use: [HEALPixSHT.uv_to_curl_div]
   keywords: [spherical harmonics, SHT, alm, C_ell, anafast, angular power spectrum, spin-2, E/B, global, healpy]
   domain: whole sphere only (the last dimension must be 12*nside^2)
   ordering: RING by default; nest=True for NESTED
@@ -616,8 +618,8 @@ tools:
   cons:
     - Whole sphere only; RING by default.
     - Memory of the tables grows as nside^3 (4.8 GB at level 8 in float32).
-    - "Spin != 0 (and `uv_to_curl_div`) needs `quaternionic` and `spherical`, (extra `sht`)."
-    - "`uv_to_curl_div` applies no ell-dependent factor: its outputs are not div and curl in 1/s."
+    - "Spin != 0 (and `uv_to_curl_div`, `uv_to_eb`) needs `quaternionic` and `spherical` (extra `sht`)."
+    - "`uv_to_curl_div` amplifies noise near lmax (factor sqrt(l(l+1))/R); use a smaller lmax for smooth fields."
   use_instead:
     - when: the grid is ERA5, a regular or Gaussian lat/lon grid, or HEALPix too large for the memory of the tables
       use: anafast_latlon / map2alm_latlon
@@ -939,7 +941,7 @@ tools:
     - Different default ellipsoids for the two classes.
   use_instead:
     - when: the field covers the whole sphere and spectral accuracy matters
-      use: "HEALPixSHT.map2alm_spin(-v, u, spin=1), multiply the alm by sqrt(l(l+1))/R, then alm2map"
+      use: "HEALPixSHT.uv_to_curl_div (spin-1 alm times -sqrt(l(l+1))/R, in 1/s)"
       page: stats/compare_divcurl
   optional_deps: none
 

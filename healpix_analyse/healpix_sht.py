@@ -31,7 +31,7 @@ permutation indices) is precomputed once and stored as non-grad constants.
 Spin support  (requires quaternionic + spherical)
 -------------------------------------------------
 spin=0 : scalar (temperature) field
-spin=1 : vector field (curl/divergence decomposition)
+spin=1 : vector field (divergence / vorticity decomposition)
 spin=2 : CMB polarisation Q/U → E/B modes
 
 The relation between (Q, U) and the spin-weighted harmonics sY_lm is:
@@ -55,6 +55,8 @@ HEALPixSHT(level, lmax, dtype, device, ellipsoid)
 .map2alm_spin(Q, U, spin, nest)            → (almE, almB)  each [..., K]
 .alm2map_spin(almE, almB, spin, nest)      → (Q, U)        each [..., N]
 .anafast(im, map2, spin, nest)             → Tensor [..., lmax+1]
+.uv_to_eb(u, v, nest)                      → (E, B) potential maps [..., N]
+.uv_to_curl_div(u, v, nest, radius)        → (div, curl) in s⁻¹    [..., N]
 
 Flat alm layout (same as healpy / alm_latlon.py):
     ``[m=0: l=0..lmax | m=1: l=1..lmax | … | m=lmax: l=lmax]``
@@ -97,6 +99,10 @@ def _import_spherical():
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
+
+# IUGG mean Earth radius in metres: the default of ``uv_to_curl_div``,
+# same value as the ``radius_m`` default of ``HealPixDivCurl``.
+_EARTH_MEAN_RADIUS_M = 6371008.8
 
 
 # ===========================================================================
@@ -721,9 +727,14 @@ class HEALPixSHT:
         For spin=2:
             Q = +P cos(2χ),  U = +P sin(2χ)  (IAU CMB convention)
         For spin=1:
-            Q = longitudinal (div) component,  U = transverse (curl) component
+            Q = θ component (pointing south), U = φ component (pointing
+            east) of a tangent vector field; for (u east, v north) pass
+            Q = -v, U = u (see ``uv_to_eb``).
         For spin=0:
-            Delegates to map2alm(Q) and map2alm(U) independently.
+            Returns ``-map2alm(Q), -map2alm(U)``.  The minus sign is the
+            HEALPix spin convention ``Q + iU = -Σ (almE + i·almB) · sY_lm``
+            taken at s = 0; it matches ``healpy.map2alm_spin(..., 0)``.
+            Call ``map2alm`` directly for plain scalar coefficients.
 
         The E/B decomposition follows:
             Σ+(m) = Σ_r  +sY_lm*(θ_r) · F_r^+(m),   F^+ = FFT(Q + iU)
@@ -744,7 +755,8 @@ class HEALPixSHT:
         almE, almB : (..., K) complex Tensors.
         """
         if spin == 0:
-            # sign_E = (-1)^(1-0//2) = -1,  sign_B = (-1)^(0+1) = -1
+            # sign_E = (-1)^(1-0//2) = -1,  sign_B = (-1)^(0+1) = -1:
+            # HEALPix/healpy spin convention, kept on purpose (see docstring).
             return -self.map2alm(Q, nest=nest), -self.map2alm(U, nest=nest)
 
         self._ensure_spin(spin)
@@ -832,7 +844,8 @@ class HEALPixSHT:
             Q(n) = Re[ Σ_{lm} (-almE + i·almB) · +2Y_lm(n) ]
             U(n) = Im[ Σ_{lm} (-almE + i·almB) · +2Y_lm(n) ]
 
-        For spin=0: delegates to alm2map(almE) and alm2map(almB).
+        For spin=0: returns ``alm2map(-almE), alm2map(-almB)``, the
+        inverse of the spin-0 sign of ``map2alm_spin`` (healpy convention).
 
         Fully differentiable with respect to almE and almB.
 
@@ -1072,33 +1085,109 @@ class HEALPixSHT:
             return cl3.reshape(leading + (3, lmax + 1))
 
     # ------------------------------------------------------------------
-    # Convenience: curl / divergence  (spin=1)
+    # Convenience: divergence / vorticity  (spin=1)
     # ------------------------------------------------------------------
 
-    def uv_to_curl_div(
+    def _ell_factor(self) -> torch.Tensor:
+        """√(ℓ(ℓ+1)) in the flat alm layout, shape (K,), real dtype.
+
+        Built on first use and cached (a non-grad constant).
+        """
+        fac = getattr(self, "_ell_factor_cache", None)
+        if fac is None:
+            fac = torch.empty(self.n_alm, dtype=self.dtype, device=self.device)
+            for m in range(self.lmax + 1):
+                ell = torch.arange(m, self.lmax + 1, dtype=self.dtype, device=self.device)
+                fac[self._alm_slice(m)] = torch.sqrt(ell * (ell + 1.0))
+            self._ell_factor_cache = fac
+        return fac
+
+    def uv_to_eb(
         self,
         u: ArrayLike,
         v: ArrayLike,
         nest: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Decompose a tangent-plane vector field (u, v) into curl and divergence.
+        E/B potential maps of a tangent vector field (u east, v north).
 
-        Uses spin=1 spherical harmonics:
-            almE (divergence-free part)  →  div map
-            almB (curl-free part)        →  curl map
+        Spin-1 analysis followed by spin-0 synthesis, without any
+        ℓ-dependent factor:
+
+            almE, almB = map2alm_spin(-v, u, spin=1)
+            E = alm2map(almE),  B = alm2map(almB)
+
+        E is the curl-free (gradient) part and B the divergence-free
+        (rotational) part.  Both keep the units of u and v.  These are the
+        maps that ``uv_to_curl_div`` used to return (before #94).
+
+        Relation to ``uv_to_curl_div``: in harmonic space, with R the radius,
+
+            div_lm  = -√(ℓ(ℓ+1)) / R · almE_lm
+            curl_lm = -√(ℓ(ℓ+1)) / R · almB_lm
+
+        and, for a flow u = ∇χ + k × ∇ψ (velocity potential χ,
+        streamfunction ψ), ``almE_lm = √(ℓ(ℓ+1)) / R · χ_lm`` and
+        ``almB_lm = √(ℓ(ℓ+1)) / R · ψ_lm``.
 
         Parameters
         ----------
         u, v : (..., N) real arrays — east and north components.
+        nest : bool  Set True for NESTED input and output.
 
         Returns
         -------
-        div, curl : (..., N) real Tensors.
+        E, B : (..., N) real Tensors — curl-free (E) and divergence-free (B)
+               potential maps, in the units of u and v.
         """
         almE, almB = self.map2alm_spin(-v, u, spin=1, nest=nest)
-        div  = self.alm2map(almE, nest=nest)
-        curl  = self.alm2map(almB, nest=nest)
+        return self.alm2map(almE, nest=nest), self.alm2map(almB, nest=nest)
+
+    def uv_to_curl_div(
+        self,
+        u: ArrayLike,
+        v: ArrayLike,
+        nest: bool = False,
+        radius: float = _EARTH_MEAN_RADIUS_M,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Divergence and relative vorticity of a tangent vector field on the
+        full sphere.
+
+        With u = ∇χ + k × ∇ψ (velocity potential χ, streamfunction ψ):
+
+            div  = ∇·u          = ∇²χ
+            curl = k·(∇ × u)    = ∇²ψ
+
+        (curl is the relative vorticity, positive counter-clockwise seen
+        from above),
+
+        computed spectrally: spin-1 analysis of (Q, U) = (-v, u), then each
+        E/B coefficient is multiplied by -√(ℓ(ℓ+1)) / ``radius`` before a
+        spin-0 synthesis.  For u, v in m s⁻¹ and ``radius`` in metres the
+        outputs are in s⁻¹.  ``uv_to_eb`` returns the same E/B maps without
+        the factor.
+
+        The factor grows with ℓ, so any noise near ``lmax`` (including the
+        quadrature error of the HEALPix analysis) is amplified; a smaller
+        ``lmax`` (e.g. 2·nside) gives cleaner derivatives of smooth fields.
+
+        Parameters
+        ----------
+        u, v   : (..., N) real arrays — east and north components.
+        nest   : bool  Set True for NESTED input and output.
+        radius : float  Sphere radius, in the length unit of u and v.
+                 Default: IUGG mean Earth radius, 6 371 008.8 m.
+
+        Returns
+        -------
+        div, curl : (..., N) real Tensors — divergence and relative
+                    vorticity (s⁻¹ for u, v in m s⁻¹).
+        """
+        almE, almB = self.map2alm_spin(-v, u, spin=1, nest=nest)
+        fac = -self._ell_factor() / float(radius)
+        div  = self.alm2map(almE * fac, nest=nest)
+        curl = self.alm2map(almB * fac, nest=nest)
         return div, curl
 
     # ------------------------------------------------------------------
