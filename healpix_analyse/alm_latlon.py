@@ -19,8 +19,9 @@ compute_weights(ring_theta, ring_phi_list, ring_counts, quadrature)
 map2alm_latlon(im, ring_theta, ring_phi_list, ring_counts, lmax, weights, quadrature)
     Map → spherical harmonic coefficients a_lm.
 
-alm2map_latlon(alm, ring_theta, ring_phi_list, ring_counts, lmax)
-    Spherical harmonic coefficients → reconstructed map (synthesis).
+alm2map_latlon(alm, ring_theta, ring_phi_list, ring_counts, lmax=None)
+    Spherical harmonic coefficients → reconstructed map (synthesis);
+    lmax is deduced from the length of alm.
 
 anafast_latlon(im, ring_theta, ring_phi_list, ring_counts, lmax, weights, quadrature)
     Map → angular power spectrum Cl.
@@ -179,9 +180,24 @@ def _rfft2fft(v: torch.Tensor) -> torch.Tensor:
     torch.Tensor, shape [..., N], complex
         Full complex spectrum.
     """
+    n     = v.shape[-1]
     r     = torch.fft.rfft(v)            # [..., N//2 + 1]
-    r_neg = r[..., 1:-1].conj().flip(-1) # conjugate of positive freqs (excl. DC & Nyquist)
+    # Negative frequencies k = N-1 .. N//2+1 are the conjugates of
+    # k = 1 .. (N-1)//2.  For even N this excludes the Nyquist bin, for
+    # odd N there is no Nyquist bin and every positive frequency is mirrored.
+    r_neg = r[..., 1:(n + 1) // 2].conj().flip(-1)
     return torch.cat([r, r_neg], dim=-1) # [..., N]
+
+
+def _lmax_from_nalm(n_alm: int) -> int:
+    """Return lmax such that n_alm = (lmax+1)(lmax+2)/2, or raise ValueError."""
+    lmax = int(round((math.sqrt(8 * n_alm + 1) - 3) / 2))
+    if lmax < 0 or (lmax + 1) * (lmax + 2) // 2 != n_alm:
+        raise ValueError(
+            f"alm has {n_alm} coefficients, which is not (lmax+1)(lmax+2)/2 "
+            "for any integer lmax."
+        )
+    return lmax
 
 
 def _check_uniform_phi(phi: np.ndarray, tol: float = 1e-10) -> Tuple[bool, float]:
@@ -560,7 +576,7 @@ def comp_tf_latlon(
             # kernel[j, m] = w_j * exp(-i m φ_j),  shape [N_r, mmax+1]
             ang = np.outer(phi_r, m_vec)             # [N_r, M]
             ker = (np.exp(-1j * ang) * w_r[:, None]).astype(np.complex128)
-            ker_t = torch.tensor(ker, dtype=cdtype)  # [N_r, M]
+            ker_t = torch.tensor(ker, dtype=cdtype, device=v.device)  # [N_r, M]
 
             # ft[..., m] = Σ_j v[..., j] * ker[j, m]
             tmp = (v.to(cdtype).unsqueeze(-1) * ker_t).sum(dim=-2)  # [..., M]
@@ -603,7 +619,7 @@ def map2alm_latlon(
         Longitudes in radians per ring.
     ring_counts : np.ndarray, shape [R]
         Number of pixels per ring.
-    lmax : int, default 24
+    lmax : int, default 64
         Maximum multipole ℓ_max.
     weights : np.ndarray [N_total], None, or "uniform"
         Per-pixel quadrature weights.
@@ -709,15 +725,21 @@ def alm2map_latlon(
     ring_theta: np.ndarray,
     ring_phi_list: Union[List[np.ndarray], np.ndarray],
     ring_counts: np.ndarray,
-    lmax: int = 24,
+    lmax: Optional[int] = None,
     limit_range: float = 1e10,
 ) -> torch.Tensor:
     """
-    Synthesise a map from spherical harmonic coefficients (inverse transform).
+    Synthesise a real map from spherical harmonic coefficients.
 
-    This is the adjoint of ``map2alm_latlon``.  The output map is evaluated
-    at the same grid positions as the input to the analysis, but it can also
-    be used to synthesise on a different target grid.
+    For a real field the coefficients with m < 0 follow from
+    a_l,-m = (-1)^m conj(a_lm), so only m ≥ 0 is stored and
+
+        f(θ,φ) = Σ_l [ a_l0 Y_l0(θ,φ) + 2 Re Σ_{m=1}^{l} a_lm Y_lm(θ,φ) ]
+
+    This is the inverse of ``map2alm_latlon`` for band-limited fields
+    (ℓ ≤ lmax) when the analysis quadrature is exact; it is not its adjoint
+    (the adjoint would carry the quadrature weights).  The map can be
+    evaluated on the grid used for the analysis or on any other ring grid.
 
     Parameters
     ----------
@@ -730,8 +752,11 @@ def alm2map_latlon(
         Longitudes in radians of the target grid.
     ring_counts : np.ndarray, shape [R]
         Number of pixels per ring of the target grid.
-    lmax : int, default 24
-        Maximum multipole used when the alm were computed.
+    lmax : int, optional
+        Maximum multipole used when the alm were computed.  By default it is
+        deduced from the last dimension of ``alm``
+        (n_alm = (lmax+1)(lmax+2)/2); a ``ValueError`` is raised when the
+        two do not match.
     limit_range : float, default 1e10
         Overflow guard in the Legendre recurrence.
 
@@ -751,6 +776,15 @@ def alm2map_latlon(
         added_batch = True
 
     alm = alm.to(torch.complex128)
+    n_alm = alm.shape[-1]
+    lmax_alm = _lmax_from_nalm(n_alm)
+    if lmax is None:
+        lmax = lmax_alm
+    elif lmax != lmax_alm:
+        raise ValueError(
+            f"alm has {n_alm} coefficients, which is lmax={lmax_alm}, "
+            f"not lmax={lmax}."
+        )
     batch_shape = alm.shape[:-1]
     device      = alm.device
 
@@ -779,9 +813,12 @@ def alm2map_latlon(
         # ft[..., r, m] = Σ_l  alm_m[l] * plm[l, r]
         # alm_m [..., L, 1] × plm_t [L, R] → sum over L → [..., R]
         contrib = (alm_m.unsqueeze(-1) * plm_t).sum(dim=-2)  # [..., R]
-        ft_synth[..., :, m] = contrib
+        # m > 0 stands for the pair (m, -m) of a real field:
+        # a_l,-m Y_l,-m = conj(a_lm Y_lm), so the pair sums to 2 Re[a_lm Y_lm].
+        ft_synth[..., :, m] = contrib if m == 0 else 2.0 * contrib
 
     # --- per-ring inverse DFT: f(θ_r, φ_j) = Re[ Σ_m ft[r,m] * exp(im φ_j) ] ---
+    # (ft already carries the factor 2 of the m > 0 terms)
     out_rings: List[torch.Tensor] = []
     m_vec = np.arange(lmax + 1, dtype=np.float64)
 
@@ -883,7 +920,7 @@ def grid_summary(
     ring_theta: np.ndarray,
     ring_phi_list: Union[List[np.ndarray], np.ndarray],
     ring_counts: np.ndarray,
-    lmax: int = 24,
+    lmax: int = 64,
 ) -> dict:
     """
     Print a human-readable summary of the grid and estimated compute cost.
@@ -893,7 +930,8 @@ def grid_summary(
     ring_theta : np.ndarray, shape [R]
     ring_phi_list : list of np.ndarray
     ring_counts : np.ndarray, shape [R]
-    lmax : int
+    lmax : int, default 64
+        Same default as ``map2alm_latlon`` and ``anafast_latlon``.
 
     Returns
     -------

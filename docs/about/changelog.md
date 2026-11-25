@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed
+- `build_healpix_adjacency` (HEALPix Minkowski functionals) no longer imports
+  `healpy`, which no dependency declared: the neighbours come from
+  `healpix_geo.nested.neighbours`, the backend of the connected components,
+  and the edges and triangles are built with vectorised NumPy instead of a
+  Python loop over the cells (#96, item 4). The output is unchanged; an input
+  without any edge now returns tensors of shape `[0, 2]` and `[0, 3]`
+  instead of `[0]`, and duplicated `cell_ids` raise `ValueError` (the loop
+  built an asymmetric graph from them and lost triangles).
+- Topology tests: hard-coded NESTED neighbours at levels 0 and 1 (base-cell
+  corners with 7 neighbours included); the comparisons with `healpy` run only
+  when it is installed (#41). The private topology adapter rotates the
+  `healpix-geo` direction order with one copy instead of two.
+
 ### Added
 - Wavelet power spectrum (`healpix_analyse.wavelet_spectrum`):
   `HealPixWaveletSpectrum` (complex Morlet, 4 orientations),
@@ -58,11 +72,33 @@
 - `AlmCoeffs` is no longer exported from `healpix_analyse` (no function
   returns it); import it from `healpix_analyse.alm`.
 - Packaging: `termcolor`, `umap-learn` and `healpix-plot` are no longer core
-  dependencies (the package does not import them; `healpix-plot` is not on
-  PyPI). They stay in the `dino` and `examples` extras. New extra `sht`
-  (`quaternionic`, `spherical`) for the spin ≠ 0 transforms of `HEALPixSHT`,
-  whose `ImportError` now names it; `healpy` moves to the `test` extra (and
-  to the pixi `test` feature).
+  dependencies (the package does not import them). `termcolor` stays in the
+  `dino` and `examples` extras and `umap-learn` in the `examples` extra;
+  `healpix-plot` is not on PyPI, so it is in no pyproject extra, only in the
+  pixi `examples` feature (git source). New extra `sht` (`quaternionic`,
+  `spherical`) for the spin ≠ 0 transforms of `HEALPixSHT`, whose
+  `ImportError` now names it. `healpy`, used only by the tests, is added to
+  the `test` extra and moved from the pixi core dependencies to the pixi
+  `test` feature. `resample_to_latlon_grid` raises an `ImportError` naming
+  the `scipy` extra when SciPy is missing.
+- `HealPixConv`, `HEALPixSHT`, `binary_dilation`, `binary_erosion`,
+  `get_interp_val`, `get_interp_weights` and `resample_to_latlon_grid` are
+  now exported from `healpix_analyse`. `quaternionic` and `spherical` are
+  imported on first spin ≠ 0 use, not when `healpix_sht` is imported.
+- `alm2map_latlon`: `lmax` now defaults to `None` and is deduced from the
+  length of `alm`; a value that does not match raises `ValueError`.
+  `grid_summary` defaults to `lmax=64`, like `map2alm_latlon` and
+  `anafast_latlon` (it was 24).
+
+### Fixed
+- `alm2map_latlon` returned the m > 0 terms at half amplitude: the synthesis
+  of a real field now carries the factor 2 of the pair ±m, and
+  `alm2map_latlon(map2alm_latlon(f))` returns a band-limited `f` to rounding
+  error with an exact quadrature (#92).
+- `alm_latlon`: uniform rings with an odd number of points lost one
+  frequency in the analysis, which corrupted the aliased modes when
+  `lmax >= (N_r + 1) / 2`; irregular rings failed on CUDA input (kernel
+  built on the CPU). New tests in `tests/test_alm_latlon.py`.
 
 ### Deprecated
 - `healpix_analyse.powerspectra.powerspectra` emits a `DeprecationWarning`

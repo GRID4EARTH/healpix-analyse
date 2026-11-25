@@ -102,8 +102,8 @@ dependencies) with the answer.
   `HealPixUp`, the transforms and `neighbour_reduce`.
 - **Tuples.** `HealPixDown`, `HealPixUp` and `resample_healpix` return
   `(values, cell_ids)`.
-- **Known issues** documented on their pages: `alm2map_latlon` halves the
-  m > 0 terms; `HealPixDown(mode="maxpool")` on a regional domain with
+- **Known issues** documented on their pages:
+  `HealPixDown(mode="maxpool")` on a regional domain with
   incomplete parents; `HEALPixSHT.uv_to_curl_div` applies no ℓ factor.
 
 ## What the modules do

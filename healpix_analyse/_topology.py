@@ -270,7 +270,12 @@ def nested_neighbours(
         )
 
     if connectivity == "edge_or_vertex":
-        neighbours = np.roll(neighbours, -1, axis=1)
+        # GEO order S, SW, W, NW, N, NE, E, SE -> SW, ..., SE, S in one
+        # copy (np.roll followed by a contiguity copy took twice as long).
+        rotated = np.empty_like(neighbours, order="C")
+        rotated[:, :7] = neighbours[:, 1:]
+        rotated[:, 7] = neighbours[:, 0]
+        return rotated
 
     return np.ascontiguousarray(
         neighbours,

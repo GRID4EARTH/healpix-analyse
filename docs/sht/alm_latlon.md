@@ -6,17 +6,6 @@
 > **Pages** this guide, with the reference details at the end ·
 > [Mathematics](alm_latlon_maths.md)
 
-```{warning}
-**Known issue: `alm2map_latlon` returns the m > 0 terms at half amplitude.**
-For a real field the synthesis is
-$f = \sum_\ell [a_{\ell 0} Y_{\ell 0} + 2\,\mathrm{Re} \sum_{m>0} a_{\ell m} Y_{\ell m}]$,
-and the code omits the factor 2. Measured on a regular 64 × 128 grid: a pure
-$m = 1$ or $m = 2$ field comes back at 0.500 of its amplitude, an $m = 0$
-field at 0.995. `map2alm_latlon` and `anafast_latlon` are not affected; until
-the fix, double the $m > 0$ coefficients before calling `alm2map_latlon`, or
-use `HEALPixSHT.alm2map` on HEALPix grids.
-```
-
 ```{include} ../_generated/glance/alm_latlon.md
 ```
 
@@ -231,10 +220,12 @@ print(alm[:3])          # a_00, a_10, a_20  (m=0 block)
 
 ## Example 5 — Round-trip analysis / synthesis
 
-`alm2map_latlon` reconstructs the map from its alm coefficients. With a
-correct synthesis the residual would measure the truncation error of the
-finite `lmax`; until the known issue above is fixed it is dominated by the
-halved $m > 0$ terms.
+`alm2map_latlon` reconstructs the map from its alm coefficients. For a
+field band-limited to $\ell \leq \ell_{\max}$ and an exact quadrature
+(Gauss-Legendre rings with uniform longitudes, $N_r \geq 2\ell_{\max} + 1$)
+the round trip returns the map to rounding error. Here the field is white
+noise on a HEALPix grid, so the residual measures the power above `lmax` and
+the quadrature error of `"equal_area"`.
 
 ```python
 from healpix_analyse.alm_latlon import map2alm_latlon, alm2map_latlon
@@ -262,7 +253,7 @@ alm = map2alm_latlon(
 
 # Synthesis (same grid)
 im_rec = alm2map_latlon(
-    alm, ring_theta, ring_phi_list, ring_counts, lmax=lmax
+    alm, ring_theta, ring_phi_list, ring_counts   # lmax deduced from alm
 )
 
 residual = (im_rec.numpy() - im_sorted)
@@ -545,7 +536,7 @@ The algorithm performs two sequential steps:
 | `ring_theta` | `np.ndarray [R]` | — | Colatitudes in radians. |
 | `ring_phi_list` | `list` of `np.ndarray` or flat `np.ndarray [N_total]` | — | Longitudes in radians per ring. |
 | `ring_counts` | `np.ndarray [R]` | — | Number of pixels per ring. |
-| `lmax` | `int` | `64` | Maximum multipole $\ell_{\max}$. (The docstring says 24; the code default is 64. `alm2map_latlon` and `grid_summary` default to 24: pass `lmax` explicitly.) |
+| `lmax` | `int` | `64` | Maximum multipole $\ell_{\max}$. Same default in `anafast_latlon` and `grid_summary`; `alm2map_latlon` deduces it from the length of `alm`. |
 | `weights` | `np.ndarray [N_total]`, `None`, or `"uniform"` | `None` | Per-pixel quadrature weights. `None`: computed automatically. `"uniform"`: $w_i = 1/N_{\text{total}}$. Any array: used as-is (ignores `quadrature`). |
 | `quadrature` | `str` | `"trapeze"` | Quadrature rule passed to `compute_weights`. Ignored when `weights` is not `None`. |
 | `limit_range` | `float` | `1e10` | Overflow guard in the Legendre recurrence. |
@@ -594,19 +585,24 @@ im_out = alm2map_latlon(
     ring_theta,
     ring_phi_list,
     ring_counts,
-    lmax=24,
+    lmax=None,
     limit_range=1e10,
 )
 ```
 
-Reconstruct a map from spherical harmonic coefficients (synthesis / inverse transform).
+Reconstruct a real map from spherical harmonic coefficients (synthesis, the
+inverse of `map2alm_latlon` for band-limited fields).
 
 $$
 f(\theta_r, \phi_j) = \text{Re}\!\left[
-\sum_{m=0}^{\ell_{\max}} \tilde{F}_r(m) \, e^{im\phi_j}
+\sum_{m=0}^{\ell_{\max}} c_m \, \tilde{F}_r(m) \, e^{im\phi_j}
 \right], \quad
-\tilde{F}_r(m) = \sum_{\ell=m}^{\ell_{\max}} a_{\ell m} \, Y_{\ell m}(\theta_r, 0)
+\tilde{F}_r(m) = \sum_{\ell=m}^{\ell_{\max}} a_{\ell m} \, Y_{\ell m}(\theta_r, 0),
+\quad c_0 = 1, \; c_{m>0} = 2
 $$
+
+The factor $c_m = 2$ accounts for the coefficients $m < 0$ of a real field,
+$a_{\ell,-m} = (-1)^m a_{\ell m}^*$, which are not stored.
 
 #### Parameters
 
@@ -616,7 +612,7 @@ $$
 | `ring_theta` | `np.ndarray [R]` | — | Colatitudes in radians of the **target** grid. |
 | `ring_phi_list` | `list` of `np.ndarray` or flat `np.ndarray [N_total]` | — | Longitudes in radians of the target grid. |
 | `ring_counts` | `np.ndarray [R]` | — | Number of pixels per ring of the target grid. |
-| `lmax` | `int` | `24` | Maximum multipole used when computing the alm. |
+| `lmax` | `int` or `None` | `None` | Maximum multipole used when computing the alm. `None`: deduced from `n_alm` $= (\ell_{\max}+1)(\ell_{\max}+2)/2$. A value that does not match the length of `alm` raises `ValueError`. |
 | `limit_range` | `float` | `1e10` | Overflow guard in the Legendre recurrence. |
 
 #### Returns
@@ -695,7 +691,7 @@ All parameters are identical to `map2alm_latlon`.
 ### `grid_summary`
 
 ```python
-info = grid_summary(ring_theta, ring_phi_list, ring_counts, lmax=24)
+info = grid_summary(ring_theta, ring_phi_list, ring_counts, lmax=64)
 ```
 
 Print a human-readable diagnostic summary of the grid geometry and estimated
@@ -708,7 +704,7 @@ computational cost.
 | `ring_theta` | `np.ndarray [R]` | — | Colatitudes in radians. |
 | `ring_phi_list` | `list` of `np.ndarray` | — | Longitudes in radians per ring. |
 | `ring_counts` | `np.ndarray [R]` | — | Number of pixels per ring. |
-| `lmax` | `int` | `24` | Maximum multipole for the cost estimate. |
+| `lmax` | `int` | `64` | Maximum multipole for the cost estimate (same default as `map2alm_latlon`). |
 
 #### Returns
 
@@ -730,13 +726,13 @@ computational cost.
 #### Example output
 
 ```
-=== Grid summary  (lmax=24) ===
+=== Grid summary  (lmax=64) ===
   Total pixels      : 786432
   Latitude rings    : 1023
   Uniform rings     : 1023/1023  (FFT acceleration)
   θ range           : [0.183°, 179.817°]
   Pixels/ring       : min=4, max=1024, mean=768.8
-  n_alm             : 325
+  n_alm             : 2145
   Cost estimate     : 7.68e+06 ops  (FFT: 7.68e+06, DFT: 0.00e+00)
 ```
 

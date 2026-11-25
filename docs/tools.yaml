@@ -658,8 +658,6 @@ tools:
     - Only NumPy and Torch; float64 throughout.
   cons:
     - Spin 0 only.
-    - "Known issue: `alm2map_latlon` returns the m > 0 terms at half amplitude (measured)."
-    - "Different `lmax` defaults: 64 for `map2alm_latlon` and `anafast_latlon`, 24 for `alm2map_latlon` and `grid_summary`."
     - Synthesis uses a direct DFT per ring; tables are not cached.
   use_instead:
     - when: whole-sphere HEALPix map and enough memory for the tables, or spin-1 / spin-2 fields
@@ -1025,17 +1023,16 @@ tools:
   differentiable: yes after setup (sigmoid thresholds; gradients also flow to a tensor threshold)
   gpu: yes (Torch)
   nan: not handled
-  cost: build_healpix_adjacency runs a Python loop over the cells (once)
+  cost: build_healpix_adjacency is built once, vectorised over the cells (healpix-geo neighbours)
   pros:
     - Differentiable, usable as a loss term; several thresholds at once.
   cons:
-    - "`build_healpix_adjacency` needs `healpy`, which is not a dependency, and is slow on large maps."
     - "`minkowski_functionals` and `minkowski_curves` work on planar images, not on HEALPix."
   use_instead:
     - when: discrete objects and their areas
       use: connected_components / component_area
       page: stats/components
-  optional_deps: healpy for build_healpix_adjacency
+  optional_deps: none
 
 # ===========================================================================
 # D. Other tools

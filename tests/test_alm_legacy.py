@@ -101,3 +101,15 @@ def test_import_does_not_load_optional_dependencies():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True,
                          text=True, check=True).stdout.strip()
     assert out == ""
+
+
+def test_resample_to_latlon_grid_names_scipy_extra(monkeypatch):
+    """Without SciPy the error names the extra to install."""
+    import sys
+
+    for mod in [m for m in sys.modules if m == "scipy" or m.startswith("scipy.")]:
+        monkeypatch.delitem(sys.modules, mod)
+    monkeypatch.setitem(sys.modules, "scipy", None)
+    grid = np.zeros((3, 4))
+    with pytest.raises(ImportError, match=r"healpix-analyse\[scipy\]"):
+        healpix_analyse.resample_to_latlon_grid(grid, grid, grid)
