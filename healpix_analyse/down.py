@@ -1034,8 +1034,11 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
             y = self._apply_sparse(t, out_dtype=self.dtype)
 
         elif self.mode == "smooth_conservative":
-            y = self._apply_sparse(t, out_dtype=self._compute_dtype())
-            y = self._conserve_mean(t, y).to(self.dtype)
+            # fused on CUDA (ELL kernel, Triton row sums, add-and-cast; the
+            # backward is one ELL gather), _conserve_mean's PyTorch form elsewhere
+            fwd, bwd = self._ell_ops()
+            y = _ub.conservative_matmul(t, fwd, bwd, self._coverage, self.dtype,
+                                        self._compute_dtype(), backend=self.backend)
 
         elif self.mode == "mean":
             gathered, valid = self._gather_children(t)          # [B, N_out, 4]
@@ -1047,8 +1050,8 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
                 )
                 y = gathered.sum(dim=-1) / valid.sum(dim=-1).to(t.dtype)
 
-        elif self._blocks:  # maxpool on contiguous NESTED blocks: a view
-            y = t.reshape(B, self.N_out, 4).max(dim=-1).values   # [B, N_out]
+        elif self._blocks:  # maxpool on contiguous NESTED blocks: blocks of 4
+            y = _ub.max4(t, self.backend)                        # [B, N_out]
 
         else:  # maxpool
             idx = self._children_idx.to(device=t.device)   # [N_out, 4]

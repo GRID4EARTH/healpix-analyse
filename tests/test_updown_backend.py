@@ -348,3 +348,62 @@ def test_cuda_fast_paths_bit_identical(dtype):
         assert fast._expand
         x = torch.randn(4, fast.N_in, device="cuda").to(dtype)
         assert torch.equal(fast(x)[0], ref(x)[0])
+
+
+@needs_triton
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_kernels_match_reference(dtype):
+    """The fused maxpool, expand and smooth_conservative kernels against
+    their PyTorch forms (values bit for bit where the reference is exact)."""
+    dev = _device()
+    gen = torch.Generator().manual_seed(3)
+    # maxpool: values identical, NaN propagated, gradient to the maximum
+    x = torch.randn(3, 4 * 300, generator=gen).to(dtype).to(dev)
+    x[0, 5] = float("nan")
+    xr = x.detach().requires_grad_(True)
+    y = _ub._Max4.apply(xr)
+    ref = x.reshape(3, -1, 4).max(dim=-1)
+    assert torch.equal(y.isnan(), ref.values.isnan())
+    assert torch.equal(torch.nan_to_num(y), torch.nan_to_num(ref.values))
+    g = torch.randn(y.shape, generator=gen).to(dtype).to(dev)
+    (gx,) = torch.autograd.grad(y, xr, g)
+    gref = torch.zeros(3, 300, 4, dtype=dtype, device=dev).scatter_(
+        -1, ref.indices[..., None], g[..., None]).reshape(3, -1)
+    assert torch.equal(gx, gref)
+    # expand: bit-identical forward, gradient to rounding
+    v = torch.full((300,), 0.25, device=dev)
+    d = torch.rand(300, generator=gen).to(dev) + 0.1
+    for dd in (None, d):
+        z = torch.randn(3, 300, generator=gen).to(dtype).to(dev).requires_grad_(True)
+        y = _ub._Expand4.apply(z, v, dd, 1e-12, dtype)
+        y_ref = (z.float() * v) if dd is None else (z.float() * v) / dd.clamp_min(1e-12)
+        y_ref = y_ref.to(dtype).repeat_interleave(4, dim=1)
+        if dtype == torch.float32 or not _INTERPRET:
+            assert torch.equal(y.detach(), y_ref.detach())
+        else:   # the interpreter emulates the fp32 -> bf16 rounding in numpy
+            torch.testing.assert_close(y, y_ref, **TOL[dtype])
+        g = torch.randn(y.shape, generator=gen).to(dtype).to(dev)
+        (gz,) = torch.autograd.grad(y, z, g)
+        (gz_ref,) = torch.autograd.grad(y_ref, z, g)
+        torch.testing.assert_close(gz, gz_ref, **TOL[dtype])
+    # smooth_conservative, NaN included
+    op = HealPixDown(LEVEL, mode="smooth_conservative", cell_ids=_unsorted_ids(LEVEL),
+                     device=dev, dtype=torch.float32)
+    fwd, bwd = op._ell_ops()
+    x = torch.randn(3, op.N_in, generator=gen).to(dtype).to(dev)
+    x[1, ::11] = float("nan")
+    xr = x.detach().requires_grad_(True)
+    y = _ub._ConservativeEll.apply(xr, fwd, bwd, op._coverage, dtype)
+    xr2 = x.detach().requires_grad_(True)
+    y_ref = _ub._conservative_reference(xr2, fwd, bwd, op._coverage,
+                                        torch.float32).to(dtype)
+    torch.testing.assert_close(y, y_ref, equal_nan=True, **TOL[dtype])
+    g = torch.randn(y.shape, generator=gen).to(dtype).to(dev)
+    (gx,) = torch.autograd.grad(y, xr, g)
+    # gradient against a float64 evaluation (the bf16 reference rounds twice)
+    x64 = x.double().requires_grad_(True)
+    y64 = _ub._conservative_reference(x64, fwd, bwd, op._coverage, torch.float64)
+    (gx64,) = torch.autograd.grad(y64, x64, g.double())
+    scale = gx64.abs().max().item()
+    tol = 1e-5 if dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(gx.double(), gx64, rtol=0, atol=tol * scale)

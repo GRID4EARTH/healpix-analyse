@@ -29,6 +29,12 @@ peak; on Linux CPUs: sampled resident set, run with
 ``MALLOC_MMAP_THRESHOLD_=65536`` for it and take times from a run without).
 ``buffers_MiB`` is the memory the operator keeps (index arrays, matrix).
 
+``fwd_GBps`` / ``fwdbwd_GBps`` are the effective bandwidths: the minimum
+traffic (input and output read or written once, plus the stored operator read
+once; twice that for forward + backward) divided by the time.  The
+``roofline`` subcommand prints them against the peak of the GPU (A100: 1555
+GB/s for 40 GB, 2039 GB/s for 80 GB).
+
 Variants (``--variants``)
 -------------------------
 default   the constructor defaults of the installed version
@@ -217,10 +223,19 @@ def cmd_run(args):
                         xr = x.detach().requires_grad_(True)
                         layer(xr)[0].float().square().mean().backward()
 
+                    es = x.element_size()
+                    n_out = layer.N_out
+                    io = rows[level] * (layer.N_in + n_out) * es
+                    op_bytes = r["buffers_MiB"] * 2**20
+                    if op.startswith("down_smooth") or op == "up_smooth":
+                        op_bytes /= 2           # the forward reads one of the two operators
+                    r["min_bytes_fwd"] = io + op_bytes
                     r["fwd_ms"] = 1e3 * timeit(fwd, device, args.reps)
                     r["fwd_peak_MiB"] = peak_mem(fwd, device)
                     r["fwdbwd_ms"] = 1e3 * timeit(fwdbwd, device, args.reps)
                     r["fwdbwd_peak_MiB"] = peak_mem(fwdbwd, device)
+                    r["fwd_GBps"] = r["min_bytes_fwd"] / r["fwd_ms"] / 1e6
+                    r["fwdbwd_GBps"] = 2 * r["min_bytes_fwd"] / r["fwdbwd_ms"] / 1e6
                     del layer, x
                 except OOM:
                     r["error"] = "OOM"
@@ -279,6 +294,25 @@ def cmd_table(args):
               f"| {after_t} | {after_m} | {sp} | {mr} |")
 
 
+PEAK_GBPS = {"A100-SXM4-80GB": 2039, "A100-PCIE-80GB": 1935, "A100 80GB PCIe": 1935,
+             "A100-SXM4-40GB": 1555, "A100-PCIE-40GB": 1555}
+
+
+def cmd_roofline(args):
+    """Effective bandwidth of each operator against the GPU peak."""
+    runs = _load(args.results)
+    print("| Operator | fwd (ms) | fwd GB/s | % peak | fwd+bwd (ms) | fwd+bwd GB/s | % peak |")
+    print("|---|---|---|---|---|---|---|")
+    for name, rec in runs.items():
+        r = rec["results"].get(args.variant, {})
+        if not r or "error" in r or "fwd_GBps" not in r:
+            continue
+        peak = args.peak or PEAK_GBPS.get(rec.get("gpu") or "", None)
+        pct = (lambda v: f"{100 * v / peak:.0f}%") if peak else (lambda v: "n/a")
+        print(f"| {name} | {_fmt_ms(r['fwd_ms'])} | {r['fwd_GBps']:,.0f} | {pct(r['fwd_GBps'])} "
+              f"| {_fmt_ms(r['fwdbwd_ms'])} | {r['fwdbwd_GBps']:,.0f} | {pct(r['fwdbwd_GBps'])} |")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -301,11 +335,15 @@ def main():
     t.add_argument("after")
     t.add_argument("--variant-before", default="default")
     t.add_argument("--variant-after", default="default")
+    f = sub.add_parser("roofline")
+    f.add_argument("results")
+    f.add_argument("--variant", default="default")
+    f.add_argument("--peak", type=float, default=None, help="peak GB/s (default: from the GPU name)")
     args = ap.parse_args()
     if args.cmd == "run" and args.rows is None:
         args.rows = "gpu" if args.device.startswith("cuda") else "cpu"
     torch.set_grad_enabled(True)
-    {"run": cmd_run, "table": cmd_table}[args.cmd](args)
+    {"run": cmd_run, "table": cmd_table, "roofline": cmd_roofline}[args.cmd](args)
 
 
 if __name__ == "__main__":

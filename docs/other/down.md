@@ -98,7 +98,7 @@ Gaussian modes).
 
 | `backend` | `"mean"` / `"maxpool"` | `"smooth"` / `"smooth_conservative"` |
 |---|---|---|
-| `"auto"` *(default)* | Contiguous NESTED data: a reduction over a `[B, N/4, 4]` view of the input, with no index array. Otherwise, a gather of the 4 children. | The matrix in ELL form (fixed fan-in, int32 indices): a Triton gather-reduce kernel on CUDA when the optional `triton` package is installed (float32, float16, bfloat16), `torch.nn.functional.embedding_bag` otherwise (CPU, float64). |
+| `"auto"` *(default)* | Contiguous NESTED data: a reduction over a `[B, N/4, 4]` view of the input, with no index array (`"maxpool"` on CUDA: a fused Triton kernel that keeps the position of the maximum in one byte, and a one-pass backward). Otherwise, a gather of the 4 children. | The matrix in ELL form (fixed fan-in, int32 indices): a Triton gather-reduce kernel on CUDA when the optional `triton` package is installed (float32, float16, bfloat16), `torch.nn.functional.embedding_bag` otherwise (CPU, float64). |
 | `"triton"` | as `"auto"` | the Triton kernel; raises if it cannot run |
 | `"torch"` | as `"auto"` | the PyTorch gather |
 | `"csr"` | the gather of the 4 children | the reference: CSR matrix and `torch.sparse.mm` |
@@ -118,7 +118,10 @@ the backward pass. The Triton kernel reads 16-bit data directly and
 accumulates in float32, so no float32 copy of a float16 or bfloat16 input is
 made; the output is cast to the module dtype. The backward is the same
 gather with the stored transpose: no atomics, the same result at every run,
-and twice differentiable. On the CPU, `embedding_bag` works on a transposed
+and twice differentiable. `"smooth_conservative"` on CUDA adds two Triton
+row reductions (float64 sums of the finite values) and one add-and-cast
+pass; its backward is a single ELL gather with the mean correction fused in.
+On the CPU, `embedding_bag` works on a transposed
 float32 (or float64) copy of the input.
 
 **Layout.** `forward` accepts `[..., N]`: the leading dimensions are

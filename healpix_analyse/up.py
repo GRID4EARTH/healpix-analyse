@@ -395,7 +395,7 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
         # kernels read 16-bit data as it is (fp32 accumulation).
         comp = self._compute_dtype()
         keep = ()
-        if self.backend != "csr" and not self._expand and self.dtype in _HALF_DTYPES:
+        if self.backend != "csr" and self.dtype in _HALF_DTYPES:
             keep = (self.dtype,)
         t, is_numpy, lead = _prepare_input(x, self.device, comp, keep)
         B, N = t.shape
@@ -415,12 +415,11 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
         if self._expand:
             # the operations of the reference on the coarse values (product by
             # the matrix entry, division by the normalisation), then a copy
-            # to the 4 children: bit-identical to the CSR product
-            y = t * self._fast_v.to(device=t.device)
-            if self._fast_d is not None:
-                y = y / self._fast_d.to(device=t.device, dtype=t.dtype).clamp_min(self.eps)
-            y = y.to(self.dtype)
-            y = y.unsqueeze(-1).expand(B, N, 4).reshape(B, 4 * N)
+            # to the 4 children: bit-identical to the CSR product.  One fused
+            # Triton kernel on CUDA (16-bit data read as it is).
+            y = _ub.expand4(t, self._fast_v.to(device=t.device),
+                            None if self._fast_d is None else self._fast_d.to(device=t.device),
+                            self.eps, self.dtype, self.backend)
 
         elif self.backend != "csr":
             div = None

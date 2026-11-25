@@ -39,6 +39,10 @@
   with `embedding_bag` elsewhere (on a transposed float32 or float64 copy of
   the input). The backward is a gather with the stored
   transpose: no atomics, deterministic, twice differentiable.
+  On CUDA the other paths are fused Triton kernels too, forward and
+  backward: `maxpool` (int8 argmax, one-pass backward), the expand Up, and
+  `smooth_conservative` (float64 row sums in Triton; the backward is one ELL
+  gather with the mean correction fused in).
   `backend="csr"` keeps the previous CSR / `torch.sparse.mm` implementation
   as the reference. `forward` now accepts `[..., N]` inputs (a `[B, C, N]`
   feature map is flattened by a view, without a copy) and returns a
