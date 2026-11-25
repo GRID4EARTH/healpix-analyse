@@ -1,10 +1,13 @@
-# HEALPixSHT — spherical harmonics on the full sky
+# HEALPixSHT — spherical harmonics on the whole sphere
 
-`healpix_sht` is the fast spherical harmonic transform for a **full-sky HEALPix
+`healpix_sht` is the spherical harmonic transform for a **whole-sphere HEALPix
 map**: analysis, synthesis and power spectra, differentiable throughout. It
 handles scalar fields (spin-0), CMB polarisation (spin-2) and vector fields
 (spin-1), including a one-call split of any `(u, v)` flow into its divergence
 and curl.
+
+```{include} ../_generated/glance/healpix_sht.md
+```
 
 ```python
 from healpix_analyse.healpix_sht import HEALPixSHT
@@ -17,11 +20,11 @@ needs `quaternionic` and `spherical`:
 pip install quaternionic spherical      # only for spin > 0
 ```
 
-For a grid that is *not* full-sky HEALPix — ERA5, a regular lat/lon grid, a
+For a grid that is *not* a whole-sphere HEALPix map — ERA5, a regular lat/lon grid, a
 Gaussian grid — use {doc}`alm_latlon </sht/alm_latlon>` instead.
 
-This page is the guide. The methods are listed in {doc}`/sht/healpix_sht`, and
-the conventions and the ring-FFT algorithm are in {doc}`/sht/healpix_sht_maths`.
+This page is the guide; the methods, shapes and costs are in the reference
+section at the end, and the conventions and the ring-FFT algorithm are in {doc}`/sht/healpix_sht_maths`.
 
 ---
 
@@ -54,8 +57,8 @@ cl     = sht.anafast(t_map)        # shape (192,)
 cl_hp  = hp.anafast(t_map, iter=0)
 
 # --- verify against healpy ---
-print(np.max(np.abs(alm.numpy() - alm_hp)))  # < 1e-6 (float32)
-print(np.max(np.abs(cl.numpy()  - cl_hp)))   # < 1e-10
+print(np.max(np.abs(alm.cpu().numpy() - alm_hp)))  # < 1e-6 (float32)
+print(np.max(np.abs(cl.cpu().numpy()  - cl_hp)))   # < 1e-10
 ```
 
 ### NESTED ordering
@@ -174,19 +177,27 @@ div, curl = sht.uv_to_curl_div(u, v)
 ### Step-by-step version
 
 If you need the intermediate harmonic coefficients (e.g. for filtering
-or cross-spectra), use the two underlying calls directly:
+or cross-spectra), use the calls that `uv_to_curl_div` makes itself:
 
 ```python
-# decompose (u, v) → E-mode (divergent) and B-mode (rotational) alm
-almE, almB = sht.map2alm_spin(u, v, spin=1)
+# the same decomposition as uv_to_curl_div
+almE, almB = sht.map2alm_spin(-v, u, spin=1)
 
 # optional: filter in harmonic space (e.g. low-pass at l < 50)
 almE_filtered = almE.clone()
 almB_filtered = almB.clone()
 # ... set high-l coefficients to zero ...
 
-# reconstruct
-div_filtered, curl_filtered = sht.alm2map_spin(almE_filtered, almB_filtered, spin=1)
+# reconstruct as scalar maps, like uv_to_curl_div
+div_filtered = sht.alm2map(almE_filtered)
+curl_filtered = sht.alm2map(almB_filtered)
+```
+
+```{warning}
+`uv_to_curl_div` applies no ℓ-dependent factor and no Earth radius: its
+outputs are the E and B parts of the flow synthesised as scalar maps, not the
+divergence and vorticity in s⁻¹. See the reference section below, and
+{doc}`/stats/compare_divcurl` for the local alternatives.
 ```
 
 ### Application: separating wind regimes
@@ -218,7 +229,7 @@ div, curl = sht.uv_to_curl_div(u_ssh, v_ssh)
 ## Power spectra
 
 `sht.anafast` below is the production-ready angular power spectrum for a
-full-sky HEALPix map, validated against `healpy`. The separate
+whole-sphere HEALPix map, validated against `healpy`. The separate
 `powerspectra`/`powerspectra_lonlat` functions in `powerspectra.py` compute a
 different, flat-sky-style spectrum through `AlmTransform` and are still under
 development — see {doc}`/sht/powerspectra` for their current status before using
@@ -306,3 +317,193 @@ class SpectralLayer(torch.nn.Module):
         return self.sht.alm2map(alm)        # synthesis
 ```
 
+---
+
+## Reference: methods, shapes and cost
+
+The docstrings are in the API reference
+({py:class}`~healpix_analyse.healpix_sht.HEALPixSHT`); this section adds the
+conventions and costs that are not in them.
+
+#### `HEALPixSHT(level, lmax=None, dtype=torch.float32, device=None, ellipsoid="sphere")`
+
+Instantiate the transform and precompute all geometry.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `level` | `int` | — | Grid4Earth/HEALPix level, integer ≥ 0. Internally, `nside = 2**level`. |
+| `lmax` | `int` or `None` | `3·2**level - 1` | Maximum multipole ℓ. |
+| `dtype` | `torch.dtype` | `torch.float32` | Real dtype for maps.  Use `torch.float64` for high-precision work. |
+| `device` | `str` or `torch.device` or `None` | auto | Computation device.  Defaults to CUDA when available. |
+| `ellipsoid` | `str` | `"sphere"` | Passed to `healpix_geo` to place the ring centres (not validated). |
+
+Errors: `ValueError` for a `dtype` other than float32/float64, and for a map
+or alm array whose last dimension is not `12·nside²` or `K`.
+
+**Read-only attributes**
+
+| Attribute | Description |
+|-----------|-------------|
+| `sht.nside` | HEALPix nside |
+| `sht.lmax` | Maximum multipole |
+| `sht.n_pix` | Total pixels: 12·nside² |
+| `sht.n_rings` | Number of iso-latitude rings: 4·nside − 1 |
+| `sht.n_alm` | Number of alm coefficients: (lmax+1)·(lmax+2)//2 |
+
+---
+
+#### `sht.map2alm(im, nest=False)` → `Tensor[..., K]`
+
+Analysis transform: HEALPix map → spherical harmonic coefficients.
+
+```
+a_lm = ∫ f(θ,φ) · Y_lm*(θ,φ) dΩ
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `im` | `(..., N)` real array-like or Tensor.  RING ordering by default. |
+| `nest` | `bool`. Set `True` for NESTED input. |
+
+Returns a complex Tensor of shape `(..., K)` where `K = (lmax+1)·(lmax+2)//2`.
+
+**alm layout** (same as healpy):
+```
+[m=0: l=0..lmax | m=1: l=1..lmax | … | m=lmax: l=lmax]
+```
+
+---
+
+#### `sht.alm2map(alm, nest=False)` → `Tensor[..., N]`
+
+Synthesis transform: a_lm → HEALPix map.
+
+```
+f(θ,φ) = Σ_{l,m} a_lm · Y_lm(θ,φ)
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `alm` | `(..., K)` complex array-like or Tensor. |
+| `nest` | `bool`. Set `True` for NESTED output. |
+
+Returns a real Tensor of shape `(..., N)`.
+
+---
+
+#### `sht.map2alm_spin(Q, U, spin=2, nest=False)` → `(almE, almB)`
+
+Spin-s analysis: (Q, U) → E-mode and B-mode spherical harmonic coefficients.
+
+| `spin` | Physical interpretation |
+|--------|------------------------|
+| `0` | Scalar pair: the code returns `almE = -map2alm(Q)`, `almB = -map2alm(U)` (note the sign) |
+| `1` | Vector field: `almE` = divergent part, `almB` = rotational part |
+| `2` | CMB polarisation: `almE` = E-modes, `almB` = B-modes |
+
+| Parameter | Description |
+|-----------|-------------|
+| `Q` | `(..., N)` real Tensor — first component (Stokes Q). |
+| `U` | `(..., N)` real Tensor — second component (Stokes U). For a vector field `(u east, v north)`, `uv_to_curl_div` passes `Q = -v`, `U = u`. |
+| `spin` | `int`, default `2`. The examples use `0`, `1` and `2`; the code does not restrict it. |
+| `nest` | `bool`. NESTED ordering. |
+
+Returns `(almE, almB)`, each a complex Tensor of shape `(..., K)`.
+
+> **Requires** the `quaternionic` and `spherical` packages for `spin > 0`.
+> They are not declared in any extra of the package: install them yourself
+> (see {doc}`/start/installation`).
+
+---
+
+#### `sht.alm2map_spin(almE, almB, spin=2, nest=False)` → `(Q, U)`
+
+Spin-s synthesis: adjoint of `map2alm_spin`.
+
+| Parameter | Description |
+|-----------|-------------|
+| `almE` | `(..., K)` complex Tensor. |
+| `almB` | `(..., K)` complex Tensor. |
+| `spin` | `int`, default `2`. |
+| `nest` | `bool`. NESTED output. |
+
+Returns `(Q, U)`, each a real Tensor of shape `(..., N)`.
+
+---
+
+#### `sht.uv_to_curl_div(u, v, nest=False)` → `(div, curl)`
+
+One-call Helmholtz–Hodge decomposition of a tangent-plane vector field.
+
+What the code does: `almE, almB = map2alm_spin(-v, u, spin=1)`, then
+`div = alm2map(almE)` and `curl = alm2map(almB)` (spin-0 synthesis). No
+ℓ-dependent factor and no Earth radius are applied, so the two maps are the
+scalar potentials' E and B components synthesised as maps, not the
+divergence and vorticity in s⁻¹. To get physical units, multiply the alm by
+`sqrt(ℓ(ℓ+1)) / R` before the synthesis, as the div/curl validation pipeline
+does ({doc}`/stats/divcurl`). Needs `quaternionic` and `spherical`.
+
+| Parameter | Description |
+|-----------|-------------|
+| `u` | `(..., N)` real Tensor — east component. |
+| `v` | `(..., N)` real Tensor — north component. |
+| `nest` | `bool`. NESTED ordering. |
+
+Returns:
+
+| Output | Description |
+|--------|-------------|
+| `div`  | E (gradient) part of the flow: where it is positive or negative shows sources and sinks, up to the ℓ-dependent factor above. |
+| `curl` | B (rotational) part of the flow: rotation, up to the same factor. |
+
+---
+
+#### `sht.anafast(im, map2=None, spin=0, nest=False)` → `Tensor`
+
+Angular power spectrum C_ℓ.
+
+| Parameter | Description |
+|-----------|-------------|
+| `im` | `(..., N)` for spin=0, or `(..., 2, N)` for spin>0 with `[Q, U]` on axis -2. |
+| `map2` | Same shape as `im`. If given, computes the cross-spectrum. |
+| `spin` | `int`. `0` for scalar; `1` or `2` for E/B modes. |
+| `nest` | `bool`. NESTED ordering. |
+
+**Returns**
+
+- `spin=0` → `(..., lmax+1)` real Tensor.
+- `spin>0` → `(..., 3, lmax+1)` real Tensor with `[C_l^EE, C_l^BB, C_l^EB]`.
+
+**Formula** (spin=0):
+
+```
+C_l = 1/(2l+1) × [ |a_{l0}|² + 2 Σ_{m=1}^{l} |a_{lm}|² ]
+```
+
+---
+
+### Cost and tuning
+
+- **Precomputation**: the Legendre tables and phase matrix are computed once
+  at `HEALPixSHT(level=...)` time; subsequent calls to `map2alm` /
+  `alm2map` reuse them. At level 6 (nside 64) the precomputation takes about
+  0.5 s according to a notebook comment (not benchmarked).
+
+- **Memory**: the two Legendre tables hold about `36·nside³` complex values
+  with the default `lmax` (computed from the code): 76 MB at level 6, 0.60 GB
+  at level 7 and 4.8 GB at level 8 in complex64 (twice that in complex128).
+  Each spin value used adds four more tables of the same size. This, not the
+  speed, limits the level you can use.
+
+- **Spin harmonics** are computed lazily on the first call to `map2alm_spin`
+  for a given spin value and cached for all subsequent calls.
+
+- **dtype**: use `torch.float32` for speed-critical applications (training,
+  large batches).  Use `torch.float64` when comparing against healpy or when
+  high numerical accuracy matters.
+
+- **GPU**: pass `device="cuda"` at construction time.  All hot-path operations
+  (`fft`, `einsum`) run natively on GPU.
+
+- **Batch size**: process many maps at once with a leading batch dimension
+  `im.shape = (B, N)` for an effective B× throughput increase on GPU.

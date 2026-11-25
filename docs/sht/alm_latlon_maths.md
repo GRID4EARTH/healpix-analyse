@@ -1,7 +1,7 @@
 # `alm_latlon` — mathematical foundations
 
 > **Module** `healpix_analyse.alm_latlon`  
-> **Parts** [1 · Quickstart](alm_latlon.md) · **2 · Mathematics** · [3 · API reference](alm_latlon.md)
+> **Pages** [guide and reference](alm_latlon.md) · **mathematics**
 
 ---
 
@@ -365,6 +365,13 @@ respectively.
 ### Current limitations
 
 - Only **scalar (spin-0)** fields.  Spin-weighted harmonics are not yet implemented.
+- Known issue: `alm2map_latlon` omits the factor 2 of the $m > 0$ terms, so
+  they come back at half amplitude (measured; see the guide).
+- Uniform rings with an **odd** number of points: the internal real-to-full
+  FFT helper returns one value too few, which corrupts the aliased modes when
+  `lmax >= (N_r + 1) / 2` (static reading of the code; HEALPix rings have an
+  even number of points and are not affected).
+- The Legendre tables are recomputed at every call (no cache).
 - `alm2map_latlon` uses a direct DFT in longitude ($O(N_r \cdot \ell_{\max})$ per ring);
   an IFFT optimisation for uniform rings is not yet implemented.
 - `lmax` must satisfy `lmax <= 3 * nside - 1` for HEALPix grids to match

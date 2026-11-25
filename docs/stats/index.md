@@ -12,4 +12,5 @@ divcurl
 morphology
 components
 minkowski
+compare_divcurl
 ```

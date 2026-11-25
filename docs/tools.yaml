@@ -538,3 +538,192 @@ tools:
       use: HealPixFFTConv
       page: conv/fft_conv
   optional_deps: "SciPy for the matern, voigt and screened_poisson kernels"
+
+# ===========================================================================
+# C. Spherical harmonics & FFT — transforms and spectra
+# ===========================================================================
+- id: healpix_sht
+  title: Spherical harmonics of a whole-sphere HEALPix map (HEALPixSHT)
+  family: C
+  page: sht/healpix_sht
+  not_exported: [healpix_analyse.healpix_sht.HEALPixSHT]
+  also: [map2alm, alm2map, map2alm_spin, alm2map_spin, anafast, uv_to_curl_div]
+  summary: >-
+    Ring-based spherical harmonic transform of a whole-sphere HEALPix map:
+    analysis, synthesis, spin-1 and spin-2 fields, angular power spectra,
+    batched and differentiable, with the Legendre tables precomputed once.
+  tasks:
+    - do: compute the alm or the angular power spectrum C_ell of a whole-sphere HEALPix map
+      use: [HEALPixSHT.anafast]
+    - do: filter a whole-sphere field in harmonic space (low-pass in ell)
+      use: [HEALPixSHT.map2alm, HEALPixSHT.alm2map]
+    - do: transform a vector or spin-2 field on the whole sphere (E/B modes)
+      use: [HEALPixSHT.map2alm_spin]
+  keywords: [spherical harmonics, SHT, alm, C_ell, anafast, angular power spectrum, spin-2, E/B, global, healpy]
+  domain: whole sphere only (the last dimension must be 12*nside^2)
+  ordering: RING by default; nest=True for NESTED
+  ellipsoid: '"sphere"'
+  io: "(..., N) NumPy or Torch -> Torch on the transform's device; alm (..., K) complex, healpy layout"
+  differentiable: yes
+  gpu: yes (CUDA by default when available)
+  nan: not handled
+  cost: >-
+    The Legendre tables hold about 36*nside^3 complex values: 76 MB at
+    level 6, 0.60 GB at level 7, 4.8 GB at level 8 in complex64; each spin
+    adds twice that. Speed against alm_latlon: to be measured.
+  pros:
+    - Matches healpy conventions (orthonormal, m-major alm layout); validated against healpy in the guide.
+    - Batched, differentiable, GPU; spin 0, 1 and 2.
+  cons:
+    - Whole sphere only; RING by default.
+    - Memory of the tables grows as nside^3 (4.8 GB at level 8 in float32).
+    - "Spin != 0 (and `uv_to_curl_div`) needs `quaternionic` and `spherical`, which are in no extra."
+    - "`uv_to_curl_div` applies no ell-dependent factor: its outputs are not div and curl in 1/s."
+    - Not exported from `healpix_analyse`.
+  use_instead:
+    - when: the grid is ERA5, a regular or Gaussian lat/lon grid, or HEALPix too large for the memory of the tables
+      use: anafast_latlon / map2alm_latlon
+      page: sht/alm_latlon
+    - when: the data cover a regional patch only
+      use: local_ps
+      page: sht/fft_local
+    - when: divergence and curl in physical units on a regional domain
+      use: HealPixDivCurl
+      page: stats/divcurl
+  optional_deps: "quaternionic and spherical for spin != 0 (not in any extra)"
+
+- id: alm_latlon
+  title: Spherical harmonics on lat/lon and other ring grids (alm_latlon)
+  family: C
+  page: sht/alm_latlon
+  symbols: [build_rings_from_latlon, map2alm_latlon, alm2map_latlon, anafast_latlon, compute_weights, grid_summary]
+  summary: >-
+    Spherical harmonic analysis of any grid made of iso-latitude rings (ERA5,
+    regular and Gaussian lat/lon grids, HEALPix): group the samples into
+    rings, choose a quadrature, get alm or C_ell in float64.
+  tasks:
+    - do: compute the angular power spectrum of an ERA5 or other lat/lon field
+      use: [anafast_latlon]
+    - do: compare spectra of a model on a lat/lon grid and observations on HEALPix without regridding
+      use: [anafast_latlon]
+  keywords: [ERA5, ECMWF, Gaussian grid, lat/lon, regular grid, quadrature, Gauss-Legendre, C_ell, alm]
+  domain: whole sphere (any iso-latitude rings; no mask correction)
+  ordering: samples sorted by rings with the sort_idx of build_rings_from_latlon
+  ellipsoid: not applicable (colatitudes and longitudes in radians)
+  io: "(..., n_pix) NumPy or Torch -> Torch float64 / complex128"
+  differentiable: yes for Torch input
+  gpu: the uniform-ring path follows the input device; the irregular-ring path builds a kernel on the CPU
+  nan: not handled
+  cost: the Legendre tables are recomputed in float64 at every call (no cache); grid_summary gives an estimate of the longitude stage
+  pros:
+    - Any iso-latitude grid; three quadratures (trapeze, Gauss-Legendre, equal area) or your own weights.
+    - Only NumPy and Torch; float64 throughout.
+  cons:
+    - Spin 0 only.
+    - "Known issue: `alm2map_latlon` returns the m > 0 terms at half amplitude (measured)."
+    - "Different `lmax` defaults: 64 for `map2alm_latlon` and `anafast_latlon`, 24 for `alm2map_latlon` and `grid_summary`."
+    - Synthesis uses a direct DFT per ring; tables are not cached.
+  use_instead:
+    - when: whole-sphere HEALPix map and enough memory for the tables, or spin-1 / spin-2 fields
+      use: HEALPixSHT
+      page: sht/healpix_sht
+    - when: the data cover a regional patch only
+      use: local_ps
+      page: sht/fft_local
+  optional_deps: none
+
+- id: local_fft
+  title: Local FFT and spectrum of a regional patch (LocalFFT)
+  family: C
+  page: sht/fft_local
+  symbols: [LocalFFT, local_fft, local_ifft, local_ps]
+  not_exported: [healpix_analyse.fft_local.check_kernel_width]
+  summary: >-
+    Project a regional patch of NESTED cells onto a local gnomonic tangent
+    grid, take its 2-D FFT, invert it, and reduce it to a 1-D radial power
+    spectrum (local_ps), on CPU or GPU and differentiably.
+  tasks:
+    - do: compute the power spectrum of a regional patch (one scene, one basin)
+      use: [local_ps]
+    - do: take the 2-D FFT of a regional patch, filter it and go back
+      use: [LocalFFT]
+  keywords: [local FFT, flat sky, tangent plane, gnomonic, power spectrum, Sentinel-2 scene, patch, wavenumber]
+  domain: one regional patch of radius at most max_patch_radius_deg (10 degrees by default, up to 90)
+  ordering: NESTED
+  ellipsoid: '"sphere"'
+  io: "[..., N] NumPy or Torch -> [..., grid, grid] spectrum; NumPy in -> NumPy out"
+  differentiable: yes, in the data
+  gpu: yes (CUDA by default when available)
+  nan: not handled; NaN propagates
+  cost: geometry built once at construction; FFT of the next power of two covering the patch
+  pros:
+    - "`local_ps` is the production-ready local spectrum (linear bins up to Nyquist)."
+    - Batched, differentiable, GPU.
+  cons:
+    - The inverse is a fast interpolating inverse, not a least-squares reconstruction.
+    - "Frequencies are in cycles per tangent unit (about cycles per radian): the spectrum is not a C_ell without calibration."
+    - One patch only (radius 10 degrees by default); no mask correction or apodisation.
+  use_instead:
+    - when: the field covers the whole sphere
+      use: HEALPixSHT.anafast or anafast_latlon
+      page: sht/compare_power_spectra
+    - when: you want to convolve, not to analyse
+      use: HealPixFFTConv or HealPixGeoFFT
+      page: conv/compare_fft
+  optional_deps: none
+
+- id: flat_spectra
+  title: Experimental flat spectra (ps, powerspectra, powerspectra_lonlat)
+  family: C
+  page: sht/powerspectra
+  status: experimental
+  not_exported: [healpix_analyse.ps.ps, healpix_analyse.powerspectra.powerspectra, healpix_analyse.powerspectra_lonlat.powerspectra_lonlat]
+  summary: >-
+    Radial power spectra from a plain 2-D FFT: of a regular 2-D array (ps),
+    or of HEALPix cells through the experimental AlmTransform (powerspectra,
+    powerspectra_lonlat).
+  tasks:
+    - do: get the radial spectrum of a regular 2-D array I have already gridded
+      use: [ps]
+  keywords: [2-D FFT, radial spectrum, regular array, experimental]
+  domain: a regular 2-D array (ps); a 2-D array of RING cell ids (powerspectra)
+  differentiable: no (NumPy binning)
+  cost: plain FFT
+  pros:
+    - "`ps` is simple and self-contained."
+  cons:
+    - Not exported; not differentiable.
+    - "`powerspectra_lonlat` cannot run as written; `powerspectra` prints diagnostics and its `method=\"alm\"` runs the FFT path."
+  use_instead:
+    - when: a HEALPix patch
+      use: local_ps
+      page: sht/fft_local
+    - when: the whole sphere
+      use: HEALPixSHT.anafast or anafast_latlon
+      page: sht/compare_power_spectra
+  optional_deps: matplotlib only for the plotting options
+
+- id: alm_coeffs
+  title: Coefficient container (AlmCoeffs)
+  family: C
+  page: sht/alm_coeffs
+  symbols: [AlmCoeffs]
+  status: unused
+  summary: >-
+    A dataclass holding coefficients (alm), their degrees and orders (l, m)
+    and metadata, with device helpers. No function of the package returns it.
+  tasks:
+    - store spherical harmonic coefficients with their (l, m) indices and metadata
+  keywords: [container, dataclass, alm]
+  domain: not applicable
+  differentiable: holds tensors; no computation
+  cost: none
+  pros:
+    - Validates shapes; .to(), .cpu(), .cuda(), .clone().
+  cons:
+    - Not used by any function of the package (open question whether to keep it).
+  use_instead:
+    - when: you need the coefficients of a map
+      use: HEALPixSHT.map2alm or map2alm_latlon (plain tensors, healpy layout)
+      page: sht/healpix_sht
+  optional_deps: none

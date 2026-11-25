@@ -6,6 +6,9 @@ intended for local flat-sky analysis, image-like diagnostics and local power
 spectra—not as a replacement for a spherical harmonic transform on large
 regions or the full sphere.
 
+```{include} ../_generated/glance/local_fft.md
+```
+
 The implementation is:
 
 - compatible with NESTED HEALPix identifiers;
@@ -298,6 +301,10 @@ the returned axis in cycles per metre on a sphere of radius $R$:
 frequency_per_metre = frequency / R
 ```
 
+In the flat-sky approximation a frequency $f$ in cycles per radian
+corresponds to a multipole $\ell \approx 2\pi f$. This is only an
+approximation: see the last point of *Errors and limitations*.
+
 The radial reduction uses PyTorch scatter operations. Torch inputs remain on
 their device and gradients propagate from the one-dimensional power back to
 the Fourier coefficients and input data.
@@ -456,5 +463,5 @@ isotropic power spectrum for a local patch, described above. The separate
   reconstruction.
 - `float32` is recommended for throughput; `float64` is useful for numerical
   validation.
-- The local tangent-plane spectrum should not be interpreted as a full-sky
-  spherical $C_\ell$ without an explicit flat-sky-to-spherical calibration.
+- The local tangent-plane spectrum should not be interpreted as a
+  whole-sphere spherical $C_\ell$ without an explicit flat-sky-to-spherical calibration.

@@ -97,14 +97,23 @@ to be computed exactly with a standard 1-D FFT.
                                 conjugate-negative frequency aliases
 ```
 
-### Speed comparison
+### Cost compared with `alm_latlon`
 
-| Method | Legendre sums | Complexity |
-|--------|--------------|-----------|
-| `alm_latlon` (pixel-by-pixel) | 12·nside² | O(lmax² · nside²) |
-| `healpix_sht` (ring-by-ring) | 4·nside − 1 | O(lmax² · nside) |
-| Speed-up | ~3·nside | e.g. ×192 at nside=64 |
+Both transforms are ring-based: a per-ring FFT in longitude, then a Legendre
+projection over the `4·nside − 1` rings for every `m`. An earlier version of
+this page counted `alm_latlon` as "pixel-by-pixel" (12·nside² Legendre sums)
+and concluded on a speed-up of about 3·nside; that premise is wrong, and the
+same claim in the module docstring of `healpix_sht` should be read with this
+in mind.
 
-At `nside=64` (lmax=191), the ring-based approach performs ~255 Legendre
-summations instead of ~49 000 — a factor of ~192 reduction.
+The real differences are:
 
+- `HEALPixSHT` computes its Legendre tables once at construction and keeps
+  them (memory: about `36·nside³` complex values, see the guide), while
+  `alm_latlon` recomputes them in float64 at every call;
+- `alm2map_latlon` synthesises each ring with a direct DFT, `HEALPixSHT`
+  with an FFT;
+- `HEALPixSHT` runs in float32 or float64 on the GPU.
+
+No benchmark of the two is in the repository yet: the speed ratio is to be
+measured.

@@ -1,10 +1,28 @@
-# Flat-sky power spectra: `powerspectra`, `powerspectra_lonlat`, `ps`
+# Flat power spectra (experimental): `powerspectra`, `powerspectra_lonlat`, `ps`
 
 Three helpers compute an isotropic 1D power spectrum by binning a 2D FFT
 radially. They are not spherical-harmonic transforms and should not be
 confused with `sht.anafast` ({doc}`/sht/healpix_sht`) or `LocalFFT.ps`
 ({doc}`/sht/fft_local`), which are the production-ready spectra for, respectively,
-a full-sky HEALPix map and a local gnomonic patch.
+a whole-sphere HEALPix map and a local gnomonic patch.
+
+```{include} ../_generated/glance/flat_spectra.md
+```
+
+```{warning}
+**Experimental.** None of these three functions is exported from
+`healpix_analyse`, none is differentiable (they bin in NumPy), and
+`powerspectra_lonlat` cannot run as written (see below). Whether to keep
+them in the public API is an open question of the documentation overhaul.
+```
+
+What each one returns:
+
+| Function | Input | Output | Normalisation |
+|---|---|---|---|
+| `ps` | a regular 2-D NumPy array | 1-D radial spectrum, frequencies in cycles per array index, `min(nx, ny) // 2` linear bins; the cross-spectrum takes `abs(F1 · conj F2)` | `/(nx · ny)` |
+| `powerspectra` | a **2-D** array of RING cell ids (`AlmTransform`) | 1-D radial spectrum in cycles per `dx` | `/(nx · ny)` |
+| `powerspectra_lonlat` | lon/lat rings | — (fails, see below) | `/(nx · ny)²` in the code |
 
 ```python
 from healpix_analyse.powerspectra import powerspectra
@@ -52,8 +70,8 @@ internally and call its `.fft()` method.
 - **No handling of the 0/360° longitude wrap** in the pixel-shift correction
   (noted as a `TODO` in the source) — patches crossing the date line are not
   validated.
-- **`method="alm"` is not implemented** — only `method="fft"` (the default)
-  actually runs; `indexing_scheme` only accepts `"2D_array"` despite the
+- **`method="alm"` is not implemented** — it silently runs the same FFT path
+  as `method="fft"` (the code does not branch on `method`); `indexing_scheme` only accepts `"2D_array"` despite the
   docstring mentioning `"ring"` as a default.
 - **Debug plotting is now gated, not removed.** Earlier versions of
   `AlmTransform.fft()` (and the constructor, through `compute_phase_shift`)
@@ -61,13 +79,20 @@ internally and call its `.fft()` method.
   opened blocking plot windows even in batch/headless use. These diagnostic
   plots are now only shown when the transform is constructed with
   `debug=True`; with the default `debug=False` (used internally by
-  `powerspectra`/`powerspectra_lonlat`), no plot window opens.
+  `powerspectra`/`powerspectra_lonlat`), no plot window opens. The
+  constructor still prints diagnostic lines unconditionally.
+- **`powerspectra_lonlat` cannot run as written.** It passes a 1-D array of
+  dummy cell ids to `AlmTransform`, which unpacks a 2-D shape; the `lon`,
+  `lat` and `weights` it forwards are ignored; and it deletes its transform
+  before using it for the cross-spectrum (static reading of the code).
+- **Not differentiable.** `powerspectra` detaches the 2-D spectrum and bins it
+  in NumPy.
 
 ### Recommendation
 
 For a spectrum you can rely on today:
 
-- full-sky HEALPix map → `sht.anafast` ({doc}`/sht/healpix_sht`);
+- whole-sphere HEALPix map → `sht.anafast` ({doc}`/sht/healpix_sht`);
 - local HEALPix patch → `LocalFFT.ps` / `local_ps` ({doc}`/sht/fft_local`);
 - an array you already gridded yourself → `ps` (above).
 
