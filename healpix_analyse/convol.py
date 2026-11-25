@@ -644,9 +644,12 @@ class HealPixConv(nn.Module):
         PyTorch tap loop otherwise (CPU, float64).  Can be changed after
         construction (``conv.backend = "torch"``).  ``missing="local_mean"``
         always runs the PyTorch reference path (gathered stencil + matrix
-        product) and ignores this setting.
+        product) and ignores this setting.  A double backward
+        (``create_graph=True``, e.g. a gradient penalty) runs the backward
+        of the PyTorch tap loop on every device: the Triton kernels are not
+        differentiable themselves.
     deterministic : bool, default True
-        Triton backend only.  ``True`` computes the gradient with respect to
+        Applies to the Triton backend only.  ``True`` computes the gradient with respect to
         the input by a gather on the transposed stencil map: no atomics, the
         same bits at every run, and a training step 1.6-2.2x shorter than
         with atomics on an A100.  The cost is memory: the map is built at the
@@ -656,7 +659,10 @@ class HealPixConv(nn.Module):
         ``False`` scatters the gradient with fp32 atomics instead: no extra
         memory, but the summation order, so the last bits, vary between
         runs.  ``torch.use_deterministic_algorithms(True)`` selects the
-        gather even with ``False``.
+        gather even with ``False``.  The PyTorch backend ignores this
+        option.  On CPU it is deterministic.  On CUDA without Triton, and for
+        a double backward, its ``index_add_`` is deterministic only under
+        ``torch.use_deterministic_algorithms(True)``.
     missing : {"centre", "local_mean"}, default "centre"
         How a stencil value is formed when its pixels are missing.  Each
         stencil value is a bilinear interpolation of 4 pixels.
@@ -707,6 +713,7 @@ class HealPixConv(nn.Module):
     backend = "auto"
     deterministic = True
     _tmap = None
+    _lm_stencil = None
 
     def __init__(
         self,
@@ -1084,6 +1091,7 @@ class HealPixConv(nn.Module):
         self.device = self.weight.device
         self.dtype = self.weight.dtype
         self._tmap = None
+        self._lm_stencil = None
         return result
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
@@ -1109,7 +1117,8 @@ class HealPixConv(nn.Module):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_tmap"] = None          # derived cache, rebuilt on demand
+        state["_tmap"] = None          # derived caches, rebuilt on demand
+        state["_lm_stencil"] = None
         return state
 
     def __setstate__(self, state):
@@ -1122,6 +1131,23 @@ class HealPixConv(nn.Module):
             idx, tw = tap_geometry(pos, w, bufs["_sort_order"], self.G, self.K, self.P)
             self.register_buffer("_tap_idx", idx, persistent=False)
             self.register_buffer("_tap_w", tw, persistent=False)
+
+    def _local_mean_taps(self, device, dtype):
+        """Stencil of ``missing="local_mean"`` in the layout of its gather (cached).
+
+        Returns int64 positions ``[4, G*K*P]`` in the input order, (g, k, p)
+        with p fastest, and the weights ``[4, G, K, P]``.  Built at the first
+        call and kept, as the ``_pos_safe`` / ``_w_norm`` buffers were before
+        the tap layout, so that the forward pass does not convert the indices
+        again; ``module.to(...)`` and pickling drop it.
+        """
+        c = self._lm_stencil
+        if c is None or c[0].device != device or c[1].dtype != dtype:
+            idx = self._tap_idx.to(device=device).permute(1, 2, 3, 0)          # [4, G, K, P]
+            w = self._tap_w.to(device=device, dtype=dtype).permute(1, 2, 3, 0)
+            c = (idx.reshape(4, -1).long(), w.contiguous())
+            self._lm_stencil = c
+        return c
 
     def _transposed_map(self):
         """Transposed stencil map of the deterministic Triton backward (cached)."""
@@ -1266,25 +1292,24 @@ class HealPixConv(nn.Module):
             raise RuntimeError("needs missing='local_mean'.")
         B, C, N = t.shape
         G, P, K = self.G, self.P, self.K
-        so  = self._sort_order.to(device=t.device)
-        pos = self._pos_safe.to(device=t.device)
-        wn  = self._w_norm.to(device=t.device, dtype=t.dtype)
+        # positions in the input order of t: the same elements and weights as
+        # the sorted-order stencil of the reference implementation
+        pos, wn = self._local_mean_taps(t.device, t.dtype)
         sup = self._support.to(device=t.device, dtype=t.dtype).view(1, 1, G, K, P)
 
         v = torch.isfinite(t).to(t.dtype)
         if mask is not None:
             v = v * _mask_as_bcn(mask, t)
         xz = torch.where(v > 0, t, torch.zeros_like(t))
-        vx = (xz * v)[:, :, so]
-        vs = v[:, :, so]
+        vx = xz * v
 
         ivx = t.new_zeros(B, C, G, K, P)
         iv  = t.new_zeros(B, C, G, K, P)
         for j in range(4):
-            pj = pos[j].reshape(-1)
+            pj = pos[j]
             wj = wn[j].view(1, 1, G, K, P)
             ivx = ivx + vx.index_select(2, pj).view(B, C, G, K, P) * wj
-            iv  = iv + vs.index_select(2, pj).view(B, C, G, K, P) * wj
+            iv  = iv + v.index_select(2, pj).view(B, C, G, K, P) * wj
 
         # wn is renormalised over the neighbours inside the domain; sup puts
         # back the fraction outside it (0 for a point with no neighbour in it)

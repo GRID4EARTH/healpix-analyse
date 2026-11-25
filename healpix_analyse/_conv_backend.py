@@ -621,10 +621,14 @@ class GaugeConvFunction(torch.autograd.Function):
         opts = ctx.opts
         gx = gW = gb = None
         if need_x or need_w:
-            if opts.use_triton:
+            if opts.use_triton and not torch.is_grad_enabled():
                 gx, gW = _triton_backward(x, weight, idx, w, gy, need_x, need_w,
                                           opts.deterministic, opts.transposed)
             else:
+                # Grad mode is on in a backward pass only with create_graph=True
+                # (double backward, e.g. a gradient penalty).  The Triton
+                # kernels write into buffers outside the graph, so that case
+                # runs the PyTorch backward, whose operations autograd records.
                 gx, gW = _torch_backward(x, weight, idx, w, gy, need_x, need_w)
         if need_b:
             acc = torch.promote_types(gy.dtype, torch.float32)   # fp32 for 16-bit
@@ -699,7 +703,10 @@ def gauge_conv(x, weight, bias, idx, w, *, backend="auto", deterministic=True,
         Triton only: compute grad x by a gather on the transposed map (no
         atomics, identical results at every run); ``False`` uses fp32
         atomics.  ``torch.are_deterministic_algorithms_enabled()`` selects
-        the gather even with ``False``.
+        the gather even with ``False``.  The PyTorch backend ignores it: on
+        CUDA its ``index_add_`` is deterministic only under
+        ``torch.use_deterministic_algorithms(True)``.  A double backward
+        (``create_graph=True``) always runs the PyTorch backward.
     transposed : callable or None
         Returns the transposed map (:func:`build_transposed_map`) of
         ``idx, w``, so that the caller can cache it; called only by a

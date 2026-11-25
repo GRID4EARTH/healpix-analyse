@@ -36,7 +36,7 @@ Key design choices:
   constructor or the forward pass.
 - **Differentiable**, with a hand-written backward that never stores the
   interpolated stencil values; fused Triton kernels on CUDA (see *Backends*
-  below).
+  below). Second-order gradients (`create_graph=True`) are supported.
 
 ---
 
@@ -274,8 +274,11 @@ cache entry is the one of float64 layers.
 Every pixel gets a finite output and finite gradients; the gradient at a NaN
 pixel is 0. It costs a second gather (the mask), and it runs the PyTorch
 reference path (the gathered `[B, C_in, G, K, P]` tensor and one matrix
-product) on every device, not the fused kernels of *Backends* below. Without
-missing pixels, the result is the same as the default.
+product) on every device, not the fused kernels of *Backends* below. After
+its first forward pass, the layer keeps the stencil in the layout of that
+gather: int64 positions and the weights, `[4, G, K·P]` each, as the buffers of
+earlier versions did. Without missing pixels, the result is the same as the
+default.
 
 ```python
 conv = HealPixConv(level=6, in_channels=1, out_channels=8, kernel_sz=5,
@@ -400,6 +403,17 @@ backward pass rebuilds it.
 needs no extra memory, but the summation order, and so the last bits, vary
 between runs. `torch.use_deterministic_algorithms(True)` selects the gather in
 either case.
+
+`deterministic` applies to the Triton backend only. The PyTorch backend
+scatters the input gradient with `index_add_`, which is deterministic on CPU.
+On CUDA, where the PyTorch backend runs without Triton, it is
+non-deterministic unless `torch.use_deterministic_algorithms(True)` is set.
+
+A double backward (`create_graph=True`, for example a gradient penalty) runs
+the backward of the PyTorch tap loop on every device, because the Triton
+kernels write their gradients outside the autograd graph. It is correct, and
+as slow on a GPU as the PyTorch backend, and its determinism follows the same
+`index_add_` rule.
 
 ---
 

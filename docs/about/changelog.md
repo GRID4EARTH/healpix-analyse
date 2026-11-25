@@ -34,9 +34,13 @@
   backward pass and kept, at about the size of the stencil buffers again
   (0.2–2.6 GiB in the benchmark configurations). `deterministic=False`
   scatters the gradient with fp32 atomics instead, with no extra memory and
-  last bits that vary between runs. `missing="local_mean"` keeps the
-  PyTorch reference path (gathered tensor and matrix product) on every
-  device.
+  last bits that vary between runs. `deterministic` applies to the Triton
+  backend only: on CUDA, the PyTorch backend (used without Triton) is
+  deterministic only under `torch.use_deterministic_algorithms(True)`. A
+  double backward (`create_graph=True`) runs the PyTorch backward on every
+  device, so gradient penalties keep their second-order terms.
+  `missing="local_mean"` keeps the PyTorch reference path (gathered tensor
+  and matrix product) on every device.
 - `benchmarks/benchmark_healpix_conv.py`: forward, forward + backward, peak
   memory and geometry build time of `HealPixConv`, on CPU or CUDA, one JSON
   line per run, and the gain table between two versions.
@@ -81,8 +85,11 @@
   tap-major layout: no per-call copy of the input, and half the index memory.
   The geometry is no longer part of the `state_dict` (it is rebuilt or
   reloaded from the disk cache at construction); state_dicts that hold the
-  former `_pos_safe` and `_w_norm` entries still load. `_pos_safe` and
-  `_w_norm` remain readable as views built on access.
+  former `_pos_safe` and `_w_norm` entries still load. State dicts saved by
+  this version have no `_pos_safe` / `_w_norm` entries, so an older release
+  loads them only with `load_state_dict(..., strict=False)` (it builds the
+  geometry at construction). `_pos_safe` and `_w_norm` remain readable as
+  views built on access.
 - `HealPixConv` follows `module.to(...)`, `.cuda()`, `.double()`, ...: the
   computation runs on the device and in the dtype of its parameters and
   buffers (`self.device` and `self.dtype` report them), with no per-call

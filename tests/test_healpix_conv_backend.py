@@ -218,6 +218,30 @@ def test_local_mean_matches_main(with_mask):
     assert max(errs) < 1e-12, errs
 
 
+def test_local_mean_stencil_cache():
+    """The gather layout of missing="local_mean" is built once, follows
+    module.to() and is not pickled; results are unchanged."""
+    import pickle
+
+    cs = CASES["regional"]
+    conv = make_conv(cs, torch.float32, "cpu", missing="local_mean")
+    x0 = torch.randn(cs["B"], cs["C"], conv.K)
+    x0[:, :, ::9] = float("nan")
+    y = conv(x0)
+    pos, wn = conv._lm_stencil
+    assert pos.dtype == torch.int64 and wn.dtype == torch.float32
+    conv(x0)
+    assert conv._lm_stencil[0] is pos                     # reused, not rebuilt
+    clone = pickle.loads(pickle.dumps(conv))
+    assert clone._lm_stencil is None
+    assert torch.equal(clone(x0), y)
+    conv.double()
+    assert conv._lm_stencil is None
+    y64 = conv(x0.double())
+    assert conv._lm_stencil[1].dtype == torch.float64
+    torch.testing.assert_close(y64.float(), y, rtol=1e-5, atol=1e-5, equal_nan=True)
+
+
 def test_legacy_whole_module_pickle():
     """A layer pickled whole before #90 holds _pos_safe / _w_norm buffers."""
     import pickle
@@ -251,6 +275,20 @@ def test_gradcheck_level2():
         return cb.gauge_conv(x, W, b, conv._tap_idx, conv._tap_w, backend="torch")
 
     assert torch.autograd.gradcheck(f, (x, W, b), eps=1e-6, atol=1e-8)
+
+
+def test_gradgradcheck_torch_backend():
+    """Second-order gradients (create_graph=True, e.g. a gradient penalty)."""
+    conv = HealPixConv(1, 2, 2, kernel_sz=3, n_gauges=2, device="cpu",
+                       dtype=torch.float64, cache_dir=None)
+    x = torch.randn(1, 2, conv.K, dtype=torch.float64, requires_grad=True)
+    W = torch.randn_like(conv.weight).requires_grad_(True)
+    b = torch.randn_like(conv.bias).requires_grad_(True)
+
+    def f(x, W, b):
+        return cb.gauge_conv(x, W, b, conv._tap_idx, conv._tap_w, backend="torch")
+
+    assert torch.autograd.gradgradcheck(f, (x, W, b), eps=1e-6, atol=1e-8)
 
 
 def _rot90_taps(kernel_sz):
@@ -463,6 +501,64 @@ def test_triton_deterministic_is_bitwise_reproducible():
                                               conv._tap_w, backend="triton"))
     for u, v, t in zip(a, b, c):
         assert torch.equal(u, v) and torch.equal(u, t)
+
+
+@needs_triton
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_triton_double_backward_matches_torch(deterministic):
+    """create_graph=True on the Triton path keeps the second-order terms: a
+    gradient penalty reaches the weights as with the PyTorch backend."""
+    cs = CASES["regional"]
+    dev = torch.device("cuda")
+    conv = make_conv(cs, torch.float32, dev, deterministic=deterministic)
+    x0 = torch.randn(cs["B"], cs["C"], conv.K, device=dev)
+
+    def penalty(backend):
+        conv.backend = backend
+        conv.zero_grad(set_to_none=True)
+        x = x0.clone().requires_grad_(True)
+        y = conv(x)
+        gy = torch.sin(torch.arange(y.numel(), dtype=torch.float64, device=dev)).view_as(y)
+        loss = (y * gy.float()).sum() + y.square().sum()
+        gx, = torch.autograd.grad(loss, x, create_graph=True)
+        (loss + gx.pow(2).sum()).backward()
+        return gx.detach(), x.grad.detach(), conv.weight.grad.clone(), conv.bias.grad.clone()
+
+    got, ref = penalty("triton"), penalty("torch")
+    errs = rel_errs(got, ref)
+    assert max(errs) < 1e-5, errs
+    # the penalty does reach the weights
+    conv.backend = "triton"
+    conv.zero_grad(set_to_none=True)
+    x = x0.clone().requires_grad_(True)
+    y = conv(x)
+    gy = torch.sin(torch.arange(y.numel(), dtype=torch.float64, device=dev)).view_as(y)
+    ((y * gy.float()).sum() + y.square().sum()).backward()
+    assert (conv.weight.grad - got[2]).abs().max() > 1e-3 * got[2].abs().max()
+
+
+@needs_cuda
+def test_torch_backend_on_cuda_is_reproducible_under_deterministic_algorithms():
+    """deterministic= is a Triton option; the PyTorch backend on CUDA
+    (index_add_) gives the same bits under use_deterministic_algorithms."""
+    import warnings
+
+    cs = CASES["regional"]
+    dev = torch.device("cuda")
+    conv = make_conv(dict(cs, C=16, Co=16), torch.float32, dev, backend="torch")
+    x0 = torch.randn(cs["B"], 16, conv.K, device=dev)
+    prev = torch.are_deterministic_algorithms_enabled()
+    prev_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            a = run(conv, x0, conv)
+            b = run(conv, x0, conv)
+    finally:
+        torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+    for u, v in zip(a, b):
+        assert torch.equal(u, v)
 
 
 @needs_triton
