@@ -61,7 +61,7 @@ HealPixUp(
 | `up_norm` | `str` | `"col_l1"` | Diagonal correction applied after the transpose (see table below). |
 | `eps` | `float` | `1e-12` | Floor for the denominator in normalisation, avoids division by zero. |
 | `ellipsoid` | `str` | `"WGS84"` | Ellipsoid of the internal Down matrix (inherited from `paired_down` when given). |
-| `cell_ids` | array-like or `None` | `None` | **Coarse** pixel indices (NESTED) for partial-sky operation. `None` = full sphere. |
+| `cell_ids` | array-like or `None` | `None` | **Coarse** pixel indices (NESTED) for a regional domain. `None` = full sphere. |
 | `device` | device or `None` | auto | Torch device. Defaults to CUDA if available, else CPU. |
 | `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values. |
 | `paired_down` | `HealPixDown` or `None` | `None` | Reuse the exact matrix and fine-cell domain of an existing Down operator in mode `"smooth"`, `"smooth_conservative"` or `"mean"` (not `"maxpool"`); its `ellipsoid` and `weight_norm` are used. With a `"mean"` Down and `col_l1`, every child receives its parent's value. `cell_ids` must be omitted; `level` identifies the coarse output level. |
@@ -76,7 +76,7 @@ y, cell_ids_out = up(x)
 
 | Argument | Type | Shape | Description |
 |---|---|---|---|
-| `x` | numpy or torch | `[N]` or `[B, N]` | Input map(s) at **coarse** resolution `nside_in`. `N` must equal `len(cell_ids)` when partial sky, or `12 * nside_in²` otherwise. |
+| `x` | numpy or torch | `[N]` or `[B, N]` | Input map(s) at **coarse** resolution `nside_in`. `N` must equal `len(cell_ids)` on a regional domain, or `12 * nside_in²` otherwise. |
 
 | Return | Type | Shape | Description |
 |---|---|---|---|
@@ -111,7 +111,7 @@ pixels accumulates multiple counts.  The `up_norm` options correct for this.
 
 ---
 
-## Partial-sky operation
+## Regional domains
 
 When `cell_ids` (coarse) is provided, the fine output pixels are the
 4 NESTED children of each coarse input pixel:
@@ -170,7 +170,7 @@ y_batch, _ = up(x_batch)
 print(y_batch.shape) # (8, 49152)
 ```
 
-### Partial sky
+### Regional domain
 
 ```python
 import numpy as np

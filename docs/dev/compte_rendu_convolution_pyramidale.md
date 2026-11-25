@@ -1,5 +1,7 @@
 # Compte-rendu — Convolution pyramidale HEALPix avec NaN et jauges
 
+> **Note (2026-11).** Les chemins cités ci-dessous datent du rapport. Depuis la refonte de la documentation (#89) : `docs/pyramid_convolution.md` → `docs/conv/pyramid_conv.md`, `docs/conv/pyramid_conv_maths.md` (§A, B, D) et `docs/dev/pyramid_conv_validation.md` (§E) ; `docs/decomp.md` → `docs/other/decomp.md` ; `docs/overview.md` → `docs/start/overview.md`.
+
 **Date** : 15/09/2026
 **Dépôt** : `GRID4EARTH/healpix-analyse` — fichiers déposés localement sur la machine de l'utilisateur (`C:\Users\jmdeloui\Documents\Claude\Projects\healpix-analyse`) via le pont device bridge, **sans commit ni push git**, conformément à la préférence de l'utilisateur.
 

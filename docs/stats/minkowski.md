@@ -357,7 +357,7 @@ thresholds = torch.linspace(0.05, 0.95, T)
 curves = minkowski_curves_healpix(img, edges, triangles, thresholds)
 # curves['W0'].shape == [4, 16]
 
-# ── Partial sky ───────────────────────────────────────────────────────────
+# ── Regional domain ───────────────────────────────────────────────────────────
 from healpix_geo import nested
 patch = nested.cone_coverage((0.0, 0.0), 20.0, level)
 patch = np.asarray(getattr(patch, "data", patch), dtype=np.int64).reshape(-1)
@@ -373,4 +373,4 @@ mf_patch  = minkowski_functionals_healpix(img_patch, edges_p, tri_p)
 |---|---|
 | All-ones map | W0=1, W1=0, W2≈2/Npix (Euler char. of sphere) |
 | All-zeros map | W0=0, W1=0, W2=0 |
-| Half-sky step | W0≈0.5, W1 large (great-circle boundary), W2≈0 |
+| Half-sphere step | W0≈0.5, W1 large (great-circle boundary), W2≈0 |

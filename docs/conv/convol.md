@@ -8,7 +8,7 @@ how the pixel grid happens to be oriented there.
 ```{include} ../_generated/glance/healpix_conv.md
 ```
 
-It works on full-sky maps and on partial-sky patches, takes NumPy arrays or
+It works on whole-sphere maps and on regional patches, takes NumPy arrays or
 Torch tensors, and is differentiable end to end.
 
 This page is the guide and the reference (parameters, shapes, cost). How the
@@ -234,7 +234,7 @@ conv = HealPixConv(
 )
 ```
 
-### Partial-sky patch
+### Regional patch
 
 ```python
 import healpix_geo
@@ -351,7 +351,7 @@ HealPixConv(
 | `gauge_type` | `str` | `"phi"` | One of `"phi"`, `"cosmo"`, `"projected_ref"`, `"two_ref"`. See the section. |
 | `singularity_lonlat` | `(lon, lat)` or `[(lon₁,lat₁),(lon₂,lat₂)]` or `None` | `None` | Geographic coordinates of the desired singularity point(s) in degrees. For `"projected_ref"`: one pair. For `"two_ref"`: a list of two pairs. Overrides `ref_direction`. |
 | `ref_direction` | `array (3,)` or `(2, 3)` or `None` | `None` | Low-level alternative: raw unit reference vector(s). Shape `(3,)` for `"projected_ref"`, `(2, 3)` for `"two_ref"`. Ignored when `singularity_lonlat` is provided. |
-| `cell_ids` | `array-like` or `None` | `None` | NESTED pixel indices for a partial-sky patch. `None` = full sphere. |
+| `cell_ids` | `array-like` or `None` | `None` | NESTED pixel indices for a regional patch. `None` = full sphere. |
 | `nest` | `bool` | `True` | Kept for compatibility. The geometry is always built on NESTED ids: the flag only enters the cache key and has no effect on the result. Pass NESTED data. |
 | `use_norm` | `bool` | `False` | Apply GroupNorm + ReLU after the convolution. |
 | `device` | `str` or `torch.device` or `None` | `None` | Target device. Defaults to CUDA if available, else CPU. |
@@ -386,7 +386,7 @@ y = conv(x, mask=valid)        # missing="local_mean" only
 
 | Parameter | Type | Shape | Description |
 |---|---|---|---|
-| `x` | `np.ndarray` or `torch.Tensor` | `[N]`, `[B, N]`, or `[B, C_in, N]` | Input map(s) at the HEALPix resolution of this layer. N must equal `len(cell_ids)` for partial-sky, or `12 · nside²` for full sphere. |
+| `x` | `np.ndarray` or `torch.Tensor` | `[N]`, `[B, N]`, or `[B, C_in, N]` | Input map(s) at the HEALPix resolution of this layer. N must equal `len(cell_ids)` for a regional domain, or `12 · nside²` for the whole sphere. |
 | `mask` | array-like or `None` | `[N]`, `[B, N]` or `[B, C_in, N]` | Only with `missing="local_mean"`: pixel weights in [0, 1] (0 = missing). `[N]` applies to every sample and channel, `[B, N]` to every channel of each sample; a per-channel mask must be `[B, C_in, N]` (B and C_in may be 1). Other shapes raise. NaN values of `x` are always missing. |
 
 **Returns:**

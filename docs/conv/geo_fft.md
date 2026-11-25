@@ -172,7 +172,7 @@ patch tens of degrees wide it is not, and a warning is raised above
 `warn_extent_deg` (10°). In that regime, across base faces, or on the full
 sphere, use the convolution pyramid (`HealPixWideConv`,
 `HealPixPyramidConv`), whose cost is linear in the number of cells on any
-domain, or `HEALPixSHT` for complete full-sky maps at levels a harmonic
+domain, or `HEALPixSHT` for complete whole-sphere maps at levels a harmonic
 transform can afford.
 
 `HealPixFFTConv` is the other FFT of the package: it reprojects the patch on

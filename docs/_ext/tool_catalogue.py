@@ -20,7 +20,9 @@ At ``config-inited`` this extension
    - ``api_families.md``: the API reference, grouped by family, as
      ``autoapisummary`` tables built from the qualified names of the public
      symbols;
-3. writes ``llms.txt`` and ``llms-full.txt`` (https://llmstxt.org) into
+3. writes redirect stubs for the pages moved by the docs overhaul (the
+   ``redirects`` mapping of the catalogue), and ``llms.txt`` and
+   ``llms-full.txt`` (https://llmstxt.org) into
    ``docs/_generated/extra/``, which ``html_extra_path`` copies to the root of
    the built site.
 
@@ -40,6 +42,7 @@ import yaml
 from sphinx.errors import ExtensionError
 
 FAMILY_ORDER = ("A", "B", "C", "D")
+STATUSES = ("stable", "experimental", "unused", "legacy")
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +92,8 @@ def _check(cat, public, qual, srcdir, eval_set, require_complete=True):
                     "use_instead", "domain", "differentiable", "cost"):
             if key not in tool:
                 errors.append(f"{tid}: missing field {key!r}")
+        if tool.get("status", "stable") not in STATUSES:
+            errors.append(f"{tid}: status {tool.get('status')!r} is not one of {STATUSES}")
         if tool.get("family") not in families:
             errors.append(f"{tid}: unknown family {tool.get('family')!r}")
         page = tool.get("page", "")
@@ -110,6 +115,11 @@ def _check(cat, public, qual, srcdir, eval_set, require_complete=True):
                 errors.append(f"public symbol {name!r} is in no catalogue entry")
         elif seen[name] > 1:
             errors.append(f"public symbol {name!r} is in {seen[name]} catalogue entries")
+    for old, new in (cat.get("redirects") or {}).items():
+        if os.path.exists(os.path.join(srcdir, old + ".md")):
+            errors.append(f"redirect {old!r}: a page with that name exists")
+        if not os.path.exists(os.path.join(srcdir, new + ".md")):
+            errors.append(f"redirect {old!r}: target page {new!r} does not exist")
     for fam in families.values():
         if not os.path.exists(os.path.join(srcdir, fam["page"] + ".md")):
             errors.append(f"family page {fam['page']!r} does not exist")
@@ -219,6 +229,17 @@ def _glance(tool):
             misc.append(f"{label}: {tool[field]}")
     out.append(section("Cost and properties", misc) + f":::{nl}")
     return "".join(out)
+
+
+def _redirect_html(new):
+    """A static stub that sends an old top-level URL to its new page."""
+    target = f"{new}.html"
+    return ("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            f"<meta http-equiv=\"refresh\" content=\"0; url={target}\">\n"
+            f"<link rel=\"canonical\" href=\"{target}\">\n"
+            "<title>Page moved</title>\n</head>\n<body>\n"
+            f"<p>This page has moved to <a href=\"{target}\">{target}</a>.</p>\n"
+            "</body>\n</html>\n")
 
 
 def _api_page(cat, qual):
@@ -367,6 +388,8 @@ def generate(app, config):
     if base and not base.endswith("/"):
         base += "/"
     write(os.path.join(extra, "llms.txt"), _llms_txt(cat, base))
+    for old, new in (cat.get("redirects") or {}).items():
+        write(os.path.join(extra, f"{old}.html"), _redirect_html(new))
     write(os.path.join(extra, "llms-full.txt"), _llms_full(cat, base, srcdir))
 
 

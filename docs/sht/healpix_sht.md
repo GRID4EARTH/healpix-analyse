@@ -161,18 +161,18 @@ sht   = HEALPixSHT(level=6)
 u = np.random.randn(12 * nside**2).astype(np.float32)
 v = np.random.randn(12 * nside**2).astype(np.float32)
 
-# --- one call: vector field → divergence and curl maps ---
+# --- one call: vector field → its E (gradient) and B (rotational) parts ---
 div, curl = sht.uv_to_curl_div(u, v)
-# div  : divergence map  (∇·v),  shape (N,)  real Tensor
-# curl : vorticity map   (∇×v),  shape (N,)  real Tensor
+# div  : E (gradient) part as a map,   shape (N,)  real Tensor, not in s⁻¹
+# curl : B (rotational) part as a map, shape (N,)  real Tensor, not in s⁻¹
 ```
 
 ### What each output represents
 
-| Output | Physical meaning | Zero when… |
+| Output | What it is | Zero when… |
 |--------|-----------------|------------|
-| `div`  | Divergence ∇·**v** — sources and sinks | the field is purely rotational (e.g. geostrophic flow) |
-| `curl` | Vorticity ∇×**v** — rotation intensity | the field is purely potential (e.g. gravity waves) |
+| `div`  | E (gradient) part of the flow, synthesised as a scalar map; its sign pattern shows sources and sinks, but no ℓ factor or radius is applied, so it is not the divergence in s⁻¹ | the field is purely rotational (e.g. geostrophic flow) |
+| `curl` | B (rotational) part of the flow, synthesised as a scalar map; not the vorticity in s⁻¹ (same reason) | the field is purely potential (e.g. gravity waves) |
 
 ### Step-by-step version
 

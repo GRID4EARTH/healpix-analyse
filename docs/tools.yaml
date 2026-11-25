@@ -15,7 +15,7 @@
 #                  exported from healpix_analyse
 #   also:          other names covered (methods, options) that an answer may use
 #   use:           the names shown in the "Use" column (default: first name)
-#   status:        stable | experimental | legacy
+#   status:        stable | experimental | unused | legacy (checked by the build)
 #   summary, tasks ("I want to ..."), keywords
 #   domain, ordering, ellipsoid, io, differentiable, gpu, nan, cost
 #   pros, cons, use_instead [{when, use, page}], optional_deps
@@ -32,6 +32,45 @@ key_pages:
   - [start/conventions, "Conventions: cell ids, levels, ellipsoids, units, shapes"]
   - [start/installation, "Installation and optional dependencies"]
   - [api/index, "API reference by family"]
+
+# Pages moved by the docs overhaul (#89): old docname -> new docname.
+# The build writes a redirect stub at the old URL.
+redirects:
+  installation: start/installation
+  overview: start/overview
+  convol_doc: conv/convol
+  convol_api: conv/convol
+  convol_internals: dev/convol_internals
+  large_conv: conv/large_conv
+  fft_conv: conv/fft_conv
+  geo_fft: conv/geo_fft
+  wide_convolution: conv/wide_conv
+  pyramid_convolution: conv/pyramid_conv
+  radial_filter: conv/radial_filter
+  directional_filter: conv/directional_filter
+  directional_filter_migration: dev/directional_filter_migration
+  neighbour_reduce: stats/neighbour_reduce
+  gradient: stats/gradient
+  divcurl: stats/divcurl
+  morphology: stats/morphology
+  components: stats/components
+  minkowski: stats/minkowski
+  healpix_sht: sht/healpix_sht
+  healpix_sht_api: sht/healpix_sht
+  healpix_sht_maths: sht/healpix_sht_maths
+  alm_latlon_1_quickstart: sht/alm_latlon
+  alm_latlon_2_mathematics: sht/alm_latlon_maths
+  alm_latlon_3_api: sht/alm_latlon
+  fft_local: sht/fft_local
+  powerspectra: sht/powerspectra
+  down: other/down
+  up: other/up
+  decomp: other/decomp
+  resample_healpix: other/resample
+  healpix_interp: other/interpolation
+  dino: other/dino
+  changelog: about/changelog
+  license: about/license
 
 # Pages whose full text is copied into llms-full.txt
 full_text_pages:
@@ -277,7 +316,7 @@ tools:
   domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction
   ordering: NESTED (the `nest` flag has no effect on the geometry)
   ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
-  io: "[N], [B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); NumPy in -> NumPy out"
+  io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out"
   differentiable: yes, in the input and in the kernel weights
   gpu: yes (CUDA by default when available)
   nan: not handled by default (NaN propagates); missing="local_mean" completes NaN like pixels outside the domain
@@ -482,7 +521,7 @@ tools:
   domain: one regional patch of radius at most 10 degrees by default (max_patch_radius_deg), with a halo
   ordering: NESTED
   ellipsoid: '"sphere"'
-  io: "[N], [B, N] or [B, C_in, N] -> [B, C_out, N]; NumPy or Torch"
+  io: "[B, N] or [B, C_in, N] -> [B, C_out, N]; [N] -> [C_out, N], or [N] when C_out = 1; NumPy or Torch"
   differentiable: yes, in the input and the kernel
   gpu: yes; timing to be measured
   nan: one NaN makes the whole output NaN
@@ -897,7 +936,7 @@ tools:
     - Different default ellipsoids for the two classes.
   use_instead:
     - when: the field covers the whole sphere and spectral accuracy matters
-      use: HEALPixSHT.uv_to_curl_div with the sqrt(l(l+1))/R factor
+      use: "HEALPixSHT.map2alm_spin(-v, u, spin=1), multiply the alm by sqrt(l(l+1))/R, then alm2map"
       page: stats/compare_divcurl
   optional_deps: none
 

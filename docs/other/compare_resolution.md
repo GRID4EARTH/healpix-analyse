@@ -13,7 +13,7 @@ they conserve and in how they treat gaps.
 | `HealPixResampler`, `resample_healpix` ({doc}`resample`) | any level to any level, and one domain to another | depends on `down_mode` | normalised by the coverage; NaN where there is no support | yes | input and output domains chosen independently |
 | `HealPixDecomp` ({doc}`decomp`) | all coarser levels at once, as bands | exact synthesis (sum of the bands); the coarse band keeps the mean with `down_mode="mean"` or `"smooth_conservative"` | `compute_weighted` is NaN-aware | yes | whole sphere or regional |
 | `nested_to_tiles` / `tiles_to_nested` ({doc}`dino`) | re-layout of NESTED blocks as square images, no resampling | everything (a permutation) | `fill` = mean, zero or NaN | no (NumPy) | the blocks present |
-| `resample_to_latlon_grid` ({doc}`resample`) | scattered points to a regular lat/lon raster | — | the hull is filled with the mean | no (NumPy, SciPy) | any points |
+| `resample_to_latlon_grid` ({doc}`resample`) | scattered samples to a regular lat/lon raster with the shape of `data` (2-D) | — | points outside the convex hull of the samples get the mean of `data` | no (NumPy, SciPy) | any points, not tied to HEALPix ids |
 | `get_interp_val` ({doc}`interpolation`) | a whole-sphere map to arbitrary points (bilinear) | — | NaN if one of the four cells is NaN | no (NumPy) | whole-sphere map only |
 
 ## Rules of thumb

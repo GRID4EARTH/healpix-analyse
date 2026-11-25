@@ -117,7 +117,7 @@ Torch out on the same device", but:
 | `HealPixDown`, `HealPixUp` | `[N]` or `[B, N]` only | **tuple** `(y, cell_ids_out)`; cast to the operator `dtype` (float32 by default) |
 | `HealPixResampler`, `resample_healpix` | `[..., N]` | tuple `(y, out_cell_ids)` |
 | `HealPixDecomp` | `[..., N]` | a `HealPixPyramid` (bands in sorted cell-id order) |
-| `HealPixConv`, `LargeConv`, `HealPixFFTConv` | `[N]`, `[B, N]` or `[B, C_in, N]` | `[B, C_out_total, N]` (a 2-D input gives a 3-D output) |
+| `HealPixConv`, `LargeConv`, `HealPixFFTConv` | `[N]`, `[B, N]` or `[B, C_in, N]` | `[B, C_out_total, N]` (a 2-D input gives a 3-D output); a 1-D input gives `[C_out_total, N]`, or `[N]` when there is one output channel |
 | `HealPixDivCurl` | `[..., 2, N]` (u east, v north) | `[..., 2, N]` (div, curl) |
 | `gradient` and variants | 1-D only | NumPy or Torch |
 | radial, Gaussian and directional filters | `[..., N]` | `[..., len(domain)]`; NumPy output is at least float64 |
@@ -152,9 +152,10 @@ through `torch.autograd` (geometry, weights and kernel shapes are constants).
 
 ## GPU
 
-Tools that are `torch.nn.Module`s (the convolutions, `HealPixDown`,
-`HealPixUp`, `HealPixDecomp`, `HealPixResampler`, `HEALPixSHT`, `LocalFFT`,
-`HealPixDivCurl`) take `device=`; most default to CUDA when it is available
+Tools that take `device=` (the convolutions, `HealPixDown`, `HealPixUp`,
+`HealPixDecomp`, `HealPixResampler`, `HEALPixSHT`, `LocalFFT`,
+`HealPixDivCurl`; most are `torch.nn.Module`s, `HEALPixSHT` and
+`HealPixWideConv` are plain classes); most default to CUDA when it is available
 (`HealPixGeoFFT` defaults to the CPU). The neighbourhood tools build their
 geometry on the CPU with NumPy and run the reduction on the device of the
 input tensor. No GPU timing is published for any tool yet.

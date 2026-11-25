@@ -1,7 +1,7 @@
 # Local multiscale HEALPix decomposition
 
 `HealPixDecomp` constructs an exactly reconstructing, wavelet-like Laplacian
-pyramid for full-sky or masked NESTED HEALPix maps. It is designed for local
+pyramid for whole-sphere or masked NESTED HEALPix maps. It is designed for local
 geophysical data such as sea-surface temperature or ocean velocity, where
 land and coastline masks make global Fourier decompositions unsuitable.
 
@@ -142,7 +142,7 @@ NESTED children (`HealPixDown(mode="mean")`) and the Gaussian parameters are
 ignored. The coarse band then keeps the global mean of a NaN-free full-sphere
 map, and with `up_norm="col_l1"` the prediction copies each parent to its
 children, so every detail band sums to zero over the children of each
-parent. On a partial sky, only one step is conservative by itself (weight
+parent. On a regional domain, only one step is conservative by itself (weight
 the coarse band by `down_layers[0].coverage`); over several steps with
 incomplete parents the coarse band is a mean of means.
 
