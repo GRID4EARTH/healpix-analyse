@@ -160,23 +160,32 @@ def _torch_extract(x, geom, sel):
     G, P, GP = geom.G, geom.P, geom.G * geom.P
     w = geom.w_as(x.dtype)
     idx = geom.idx64()
+    # channels last: one row of B*C contiguous values per cell, so each
+    # neighbour is a contiguous row copy (20-37x faster than gathering along
+    # the last axis of [B, C, K] on a 16-core CPU)
+    xt = x.reshape(B * C, K).t().contiguous()                     # [K, B*C]
     if sel is None:
-        M = geom.M
-        y = None
-        for j in range(J):
-            v = x.index_select(2, idx[j]) * w[j]                  # [B, C, R]
-            y = v if y is None else y.add_(v)
-        return y.view(B, C, M, G, P).permute(0, 2, 3, 1, 4).contiguous()
-    Ms = sel.shape[1]
-    rows = (sel.long().unsqueeze(-1) * GP
-            + torch.arange(GP, device=x.device)).reshape(sel.shape[0], -1)   # [Bs, Ms*GP]
-    y = None
-    for j in range(J):
-        ij = idx[j][rows]                                          # [Bs, Ms*GP]
-        wj = w[j][rows]
-        v = torch.gather(x, 2, ij.unsqueeze(1).expand(B, C, -1)) * wj.unsqueeze(1)
-        y = v if y is None else y.add_(v)
-    return y.view(B, C, Ms, G, P).permute(0, 2, 3, 1, 4).contiguous()
+        Ms = geom.M
+        y = xt[idx[0]] * w[0, :, None]                             # [R, B*C]
+        for j in range(1, J):
+            y.addcmul_(xt[idx[j]], w[j, :, None])
+    else:
+        Ms = sel.shape[1]
+        rows = (sel.long().unsqueeze(-1) * GP
+                + torch.arange(GP, device=x.device)).reshape(sel.shape[0], -1)   # [Bs, Rs]
+        if sel.shape[0] == 1:
+            r = rows[0]
+            y = xt[idx[0][r]] * w[0][r, None]                      # [Rs, B*C]
+            for j in range(1, J):
+                y.addcmul_(xt[idx[j][r]], w[j][r, None])
+        else:                                                      # one draw per sample
+            x3 = xt.view(K, B, C)
+            bb = torch.arange(B, device=x.device).view(B, 1)
+            y = x3[idx[0][rows], bb] * w[0][rows, None]            # [B, Rs, C]
+            for j in range(1, J):
+                y.addcmul_(x3[idx[j][rows], bb], w[j][rows, None])
+            return y.view(B, Ms, G, P, C).transpose(3, 4).contiguous()
+    return y.view(Ms, G, P, B, C).permute(3, 0, 1, 4, 2).contiguous()
 
 
 def _torch_fold(y, geom, ones=False):
@@ -187,11 +196,11 @@ def _torch_fold(y, geom, ones=False):
     if ones:
         w = (w != 0).to(y.dtype)
     idx = geom.idx64()
-    yt = y.permute(0, 3, 1, 2, 4).reshape(B, C, M * G * P)
-    out = y.new_zeros(B, C, geom.K)
+    yt = y.permute(1, 2, 4, 0, 3).reshape(M * G * P, B * C)       # [R, B*C]
+    out = y.new_zeros(geom.K, B * C)
     for j in range(J):
-        out.index_add_(2, idx[j], yt * w[j])
-    return out
+        out.index_add_(0, idx[j], yt * w[j, :, None])
+    return out.t().reshape(B, C, geom.K)
 
 
 # ===========================================================================

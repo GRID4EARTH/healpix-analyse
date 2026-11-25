@@ -183,7 +183,12 @@ def test_gradcheck(mode, centres, regional):
     y = torch.randn(2, hp.M, hp.G, 2, 2, 2, dtype=torch.float64, requires_grad=True)
     assert torch.autograd.gradcheck(lambda t: hp.fold(t), (y,))
     ys = torch.randn(2, 3, hp.G, 2, 2, 2, dtype=torch.float64, requires_grad=True)
-    assert torch.autograd.gradcheck(lambda t: hp.fold(t, index=index), (ys,))
+    distinct = torch.tensor([[1, 3, 0], [2, 4, 5]]) % hp.M
+    assert torch.autograd.gradcheck(lambda t: hp.fold(t, index=distinct), (ys,))
+    # a repeated centre: the plain adjoint sums the copies, a normalised fold raises
+    assert torch.autograd.gradcheck(lambda t: hp.fold(t, index=index, norm="none"), (ys,))
+    with pytest.raises(ValueError):
+        hp.fold(ys, index=torch.tensor([[1, 1, 2]]))
     assert torch.autograd.gradgradcheck(lambda t: hp(t, index=index) ** 2, (x,))
 
 
@@ -327,7 +332,7 @@ def test_triton_matches_torch(dtype, tol, mode, centres):
     hr = HealPixPatches(5, 4, device="cuda", backend="torch", **kw)
     x = torch.randn(2, 5, ht.K, device="cuda", dtype=dtype, requires_grad=True)
     xr = x.detach().float().requires_grad_()
-    index = torch.randint(0, ht.M, (2, ht.M // 4), device="cuda")
+    index = torch.stack([torch.randperm(ht.M)[: ht.M // 4] for _ in range(2)]).cuda()
     for idx in (None, index):
         y = ht(x, index=idx)
         yr = hr(xr, index=idx)

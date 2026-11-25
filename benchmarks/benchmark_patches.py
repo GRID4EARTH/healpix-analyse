@@ -149,8 +149,20 @@ def cmd_run(args):
                     geom_bytes = geom_bytes * index.shape[1] // hp.M
                 if hp.mode == "nested" and getattr(hp, "contiguous", False) and index is None:
                     geom_bytes = 0
-                moved = x.numel() * x.element_size() + y.numel() * y.element_size() + geom_bytes
-                rec["GBps"] = moved / (rec["fwd_ms"] * 1e-3) / 1e9
+                xy_bytes = x.numel() * x.element_size() + y.numel() * y.element_size()
+                rec["GBps"] = (xy_bytes + geom_bytes) / (rec["fwd_ms"] * 1e-3) / 1e9
+                # fold / backward: y read, x written, transposed map read
+                # (ptr int64, rows int32, weights)
+                if not (hp.mode == "nested" and getattr(hp, "contiguous", False)
+                        and index is None):
+                    ptr, rows, tw = geom.transposed()
+                    map_bytes = (ptr.numel() * 8 + rows.numel() * 4
+                                 + tw.numel() * tw.element_size())
+                else:
+                    map_bytes = 0
+                rec["fold_GBps"] = (xy_bytes + map_bytes) / (rec["fold_ms"] * 1e-3) / 1e9
+                rec["fwdbwd_GBps"] = (2 * xy_bytes + geom_bytes + map_bytes) / (
+                    rec["fwdbwd_ms"] * 1e-3) / 1e9
                 # reference: a plain gather producing y.numel() values
                 flat = torch.randint(0, hp.K, (y.numel() // (B * C),), device=device)
                 xv = x.view(B * C, hp.K)
@@ -179,16 +191,19 @@ def cmd_table(args):
     def f(v, nd=1):
         return "—" if v is None else f"{v:.{nd}f}"
 
-    print("| configuration | backend | fwd ms | fwd+bwd ms | fold ms | gather fwd / fwd+bwd ms "
-          "| fwd+bwd / gather | fwd GB/s | peak GiB |")
-    print("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    print("| configuration | backend | dtype | fwd ms | fwd+bwd ms | fold ms "
+          "| gather fwd / fwd+bwd ms | fwd+bwd / gather | GB/s fwd / fwd+bwd / fold "
+          "| peak GiB |")
+    print("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
     for r in rows:
         if "error" in r:
-            print(f"| {r['config']} | {r['backend']} | {r['error'][:60]} |||||||")
+            print(f"| {r['config']} | {r['backend']} | {r['dtype']} | {r['error'][:60]} ||||||||")
             continue
-        print(f"| {r['config']} | {r['backend']} | {f(r['fwd_ms'], 2)} | {f(r['fwdbwd_ms'], 2)} "
-              f"| {f(r['fold_ms'], 2)} | {f(r['gather_ms'], 2)} / {f(r['gather_bwd_ms'], 2)} "
-              f"| {f(r['ratio'], 2)} | {f(r['GBps'], 0)} | {f(r.get('peak_GiB'), 2)} |")
+        print(f"| {r['config']} | {r['backend']} | {r['dtype']} | {f(r['fwd_ms'], 2)} "
+              f"| {f(r['fwdbwd_ms'], 2)} | {f(r['fold_ms'], 2)} "
+              f"| {f(r['gather_ms'], 2)} / {f(r['gather_bwd_ms'], 2)} | {f(r['ratio'], 2)} "
+              f"| {f(r['GBps'], 0)} / {f(r.get('fwdbwd_GBps'), 0)} / {f(r.get('fold_GBps'), 0)} "
+              f"| {f(r.get('peak_GiB'), 2)} |")
 
 
 def main():
