@@ -62,7 +62,7 @@ w  [4, K·G·P]    — bilinear weights (sum to 1 per stencil point)
 ```
 
 These are reshaped to `[G, 4, K·P]` and stored as persistent buffers
-`_pos_safe` and `_w_norm`. For partial-sky inputs, neighbours outside the
+`_pos_safe` and `_w_norm`. For regional-domain inputs, neighbours outside the
 patch are masked and weights are renormalised; stencil points with no
 available neighbour fall back to the centre pixel.
 

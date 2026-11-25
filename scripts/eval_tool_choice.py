@@ -63,6 +63,8 @@ def ask(client, model, catalogue, question):
     )
     if response.stop_reason == "refusal":
         return None
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("the answer was cut at max_tokens; raise max_tokens")
     text = next(b.text for b in response.content if b.type == "text")
     return json.loads(text)
 

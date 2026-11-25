@@ -12,3 +12,6 @@ sphinx-autoapi>=3.0
 
 # Extensions utiles
 sphinx-design>=0.5
+
+# The tool catalogue (docs/tools.yaml) is read by docs/_ext/tool_catalogue.py
+pyyaml

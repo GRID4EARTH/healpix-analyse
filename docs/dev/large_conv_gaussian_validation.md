@@ -73,7 +73,7 @@ times more cells). Other cells and other places differ, as follows.
   impulses that close to an edge are this effect; with the margin of the
   table above they disappear (0.988 or better at 9 cells and above). The
   next bullet gives the same effect at the edge of a real partial domain.
-- **Domain edge (partial sky).** Down and Up use zero padding, so the tail
+- **Domain edge (regional domain).** Down and Up use zero padding, so the tail
   that falls outside the domain is lost. In a 15-degree disc at level 8
   (13 411 cells), the response to a cell at 0.92 of the radius is
   narrower than requested by 6.4 % (sigma 3 cells) and 12.7 % (sigma 6),

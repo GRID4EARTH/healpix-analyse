@@ -27,7 +27,7 @@ affine = "*"
 
 # --- DINOv3 embeddings (healpix_analyse.dino) -------------------------------
 # The backbone is fetched at run time from Meta's distribution and is governed
-# by the DINOv3 License; the SAT-493M weights are gated (see docs/dino.md).
+# by the DINOv3 License; the SAT-493M weights are gated (see docs/other/dino.md).
 # Only what the DINOv3 code needs to import is declared here.
 [feature.dino.dependencies]
 termcolor = "*"
@@ -57,6 +57,7 @@ pytest = "*"
 pytest-cov = "*"
 
 [feature.docs.dependencies]
+pyyaml = "*"
 fftw = "*"
 sphinx = "*"
 pydata-sphinx-theme = "*"

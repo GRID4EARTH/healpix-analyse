@@ -165,8 +165,8 @@ intersphinx_mapping = {
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
 # llms.txt and llms-full.txt (generated from tools.yaml) go to the site root
+# (with the redirect stubs of the pages moved by the docs overhaul, #89)
 html_extra_path = ["_generated/extra"]
-# llms.txt and llms-full.txt (generated from tools.yaml) go to the site root
 html_baseurl = "https://grid4earth.eu/healpix-analyse/"
 # Every public symbol must be in tools.yaml (see docs/_ext/tool_catalogue.py)
 tool_catalogue_complete = True

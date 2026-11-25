@@ -64,7 +64,7 @@ HealPixDown(
 | `radius_deg` | `float` or `None` | auto | Angular radius of the Gaussian disc (degrees). Default ≈ 3 × pixel size. Used with `"smooth"` and `"smooth_conservative"`. |
 | `sigma_deg` | `float` or `None` | auto | Gaussian sigma (degrees). Default = `radius_deg / 2`. Used with `"smooth"` and `"smooth_conservative"`. |
 | `weight_norm` | `str` | `"l1"` | Per-output-pixel weight normalisation in `"smooth"` mode: `"l1"` (sum=1, preserves constants), `"l2"` (sum of squares=1, preserves energy), `"none"` (raw Gaussian). |
-| `cell_ids` | array-like or `None` | `None` | Input pixel indices (NESTED ordering) for partial-sky operation. `None` = full sphere. |
+| `cell_ids` | array-like or `None` | `None` | Input pixel indices (NESTED ordering) for a regional domain. `None` = full sphere. |
 | `device` | device or `None` | auto | Torch device. Defaults to CUDA if available, else CPU. |
 | `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values; the input is cast to it. |
 | `skipna` | `bool` | `False` | Only with `mode="mean"`: average the finite children only (otherwise `ValueError`). |
@@ -79,7 +79,7 @@ y, cell_ids_out = down(x)
 
 | Argument | Type | Shape | Description |
 |---|---|---|---|
-| `x` | numpy or torch | `[N]` or `[B, N]` | Input map(s) at fine resolution `nside_in`. `N` must equal `len(cell_ids)` when partial sky, or `12 * nside_in²` otherwise. |
+| `x` | numpy or torch | `[N]` or `[B, N]` | Input map(s) at fine resolution `nside_in`. `N` must equal `len(cell_ids)` on a regional domain, or `12 * nside_in²` otherwise. |
 
 | Return | Type | Shape | Description |
 |---|---|---|---|
@@ -134,15 +134,15 @@ field below). The offset is linear in `x`, and a constant field is preserved
 drift comes from is shifted as much as any other. `weight_norm` must be
 `"l1"`.
 
-- **Partial sky:** the means are weighted by `coverage` (the fraction of the 4
+- **Regional domain:** the means are weighted by `coverage` (the fraction of the 4
   children present in `cell_ids`), as for `"mean"`: the coverage-weighted mean
   of the output equals the mean of the input. As for `"mean"`, this holds for
   one step; chaining operators over incomplete parents gives a mean of means.
 - **NaN:** `δ` is built from finite values only, so a NaN stays where
   `"smooth"` puts it (it reaches the output cells whose disc contains it) and
   does not spread through `δ`. The finite output cells then have the same
-  mean as the finite input cells (to round-off, coverage-weighted on a partial
-  sky), but they are not the same cells; the conservation of the mean of the
+  mean as the finite input cells (to round-off, coverage-weighted on a regional
+  domain), but they are not the same cells; the conservation of the mean of the
   whole map is a statement for NaN-free input. `skipna` is not available.
 - **Positivity:** the correction is one uniform shift. A negative `δ` can make
   a non-negative field (a probability, say) slightly negative, so positivity
@@ -165,7 +165,7 @@ to level 0, float64, `ellipsoid="sphere"`, one CPU thread
 | Drift of the global mean, level 8 → 0 | +0.48 K | 6e-14 K | 0 |
 | Constant field preserved | yes | yes | yes |
 | Coarse cells reached by a fine cell (level 5 → 4; min / median / max over all fine cells) | 5 / 7 / 9 | 5 / 7 / 9 | 1 |
-| Partial sky | yes | yes (coverage-weighted mean) | yes |
+| Regional domain | yes | yes (coverage-weighted mean) | yes |
 | Build the level-8 operator | 1.5 s | 1.6 s | 0.003 s |
 | Apply, level 8 → 7 | 56 ms | 54 ms | a reshape and a mean |
 
@@ -193,7 +193,7 @@ when every parent has its four children, or pad the domain to whole parents.
 
 ---
 
-## Partial-sky operation
+## Regional domains
 
 When `cell_ids` is provided, the operator works on a subset of the
 sphere.  The coarse output cell ids are automatically derived as the
@@ -232,7 +232,7 @@ y_batch, _ = down(x_batch)
 print(y_batch.shape) # (8, 12288)
 ```
 
-### Partial sky
+### Regional domain
 
 ```python
 import numpy as np
