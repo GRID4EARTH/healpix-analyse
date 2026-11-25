@@ -437,6 +437,8 @@ def triton_available() -> bool:
 
 
 _INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
+# HEALPIX_AUTOTUNE=full widens the autotune space (slower first call).
+_FULL_TUNE = os.environ.get("HEALPIX_AUTOTUNE") == "full"
 _RED_BLOCK = 1024           # tile of the reductions (fixed: sets the summation order)
 _LN_BWD_BLOCK = 64          # cells per program of the LayerNorm backward (fixed)
 _LN_TILE_MAX_C = 512        # widest C served by the one-tile LayerNorm kernels
@@ -445,22 +447,29 @@ _LN_TILE_MAX_C = 512        # widest C served by the one-tile LayerNorm kernels
 def _ew_configs():
     if _INTERPRET:
         return [triton.Config({"BLOCK": 1024}, num_warps=4)]
-    return [triton.Config({"BLOCK": b}, num_warps=w)
-            for b in (1024, 2048, 4096) for w in (4, 8)]
+    if _FULL_TUNE:
+        return [triton.Config({"BLOCK": b}, num_warps=w)
+                for b in (1024, 2048, 4096) for w in (4, 8)]
+    return [triton.Config({"BLOCK": 1024}, num_warps=4),
+            triton.Config({"BLOCK": 4096}, num_warps=8)]
 
 
 def _warp_configs(extra=None):
     extra = extra or {}
     if _INTERPRET:
         return [triton.Config(dict(extra), num_warps=4)]
-    return [triton.Config(dict(extra), num_warps=w) for w in (2, 4, 8)]
+    return [triton.Config(dict(extra), num_warps=w)
+            for w in ((2, 4, 8) if _FULL_TUNE else (4, 8))]
 
 
 def _ln_fwd_configs():
     if _INTERPRET:
         return [triton.Config({"BLOCK_N": 32}, num_warps=4)]
-    return [triton.Config({"BLOCK_N": bn}, num_warps=w)
-            for bn in (16, 32, 64, 128) for w in (4, 8)]
+    if _FULL_TUNE:
+        return [triton.Config({"BLOCK_N": bn}, num_warps=w)
+                for bn in (16, 32, 64, 128) for w in (4, 8)]
+    return [triton.Config({"BLOCK_N": 32}, num_warps=4),
+            triton.Config({"BLOCK_N": 64}, num_warps=8)]
 
 
 def _prune_ln(configs, named_args, **kw):

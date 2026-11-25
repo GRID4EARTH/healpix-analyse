@@ -66,6 +66,13 @@ CONFIGS = {
         dict(name="L10 regional(1/12) B4 C64", level=10, m=1, B=4, C=64),
         dict(name="L8 full B16 C256", level=8, m=None, B=16, C=256),
     ],
+    # reduced A100 set: levels 8 and 10, full sphere and one regional domain
+    "gpu-reduced": [
+        dict(name="L8 full B4 C128", level=8, m=None, B=4, C=128),
+        dict(name="L8 regional(1/12) B16 C128", level=8, m=1, B=16, C=128),
+        dict(name="L10 full B1 C64", level=10, m=None, B=1, C=64),
+        dict(name="L10 regional(1/12) B4 C64", level=10, m=1, B=4, C=64),
+    ],
 }
 
 
@@ -259,7 +266,7 @@ def bench_profile(args):
 
     device = torch.device("cuda")
     dtype = getattr(torch, args.dtype)
-    cfg = [c for c in CONFIGS["gpu"] if c["name"] == args.config][0]
+    cfg = [c for c in CONFIGS["gpu"] + CONFIGS["gpu-reduced"] if c["name"] == args.config][0]
     ids, x, xn, mask = _data(cfg, device, dtype)
     B, C, N = x.shape
     T = x.numel() * x.element_size()
