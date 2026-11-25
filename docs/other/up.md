@@ -178,9 +178,8 @@ from healpix_geo import nested
 from healpix_analyse.up import HealPixUp
 
 level_coarse = 5                # nside = 2**5
-patch_coarse = nested.cone_coverage((0.0, 0.0), 20.0, level_coarse)
-patch_coarse = np.asarray(getattr(patch_coarse, "data", patch_coarse),
-                          dtype=np.int64).reshape(-1)
+# with one centre, cone_coverage returns (cell_ids, depths, fully_covered)
+patch_coarse, _, _ = nested.cone_coverage((0.0, 0.0), 20.0, level_coarse)
 
 up = HealPixUp(level=level_coarse, cell_ids=patch_coarse)
 

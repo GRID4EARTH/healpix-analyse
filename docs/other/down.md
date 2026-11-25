@@ -29,7 +29,7 @@ Four strategies are available:
   to the largest child.
 
 All modes work on the whole sphere or on a regional set of cells defined by
-`cell_ids` (but see the partial-domain issue of `"maxpool"` below).
+`cell_ids`.
 
 Input shapes `[N]` and `[B, N]` only (a `[B, C, N]` tensor raises
 `ValueError`: reshape it to `[B·C, N]`). NumPy arrays and torch tensors are
@@ -103,8 +103,12 @@ $$M_{p_{\text{out}}, p_{\text{in}}} \propto \exp\!\left(-\frac{\gamma^2}{2\sigma
 and `γ` is the haversine angular distance between the centers of the
 fine and coarse pixels.
 
-The sparse matrix `M` is built once at construction and stored as a
-buffer — `forward` only applies it.
+The sparse matrix `M` is built once at construction and stored, with its
+transpose, as CSR buffers (they follow `.to()`, `.double()`, `.cuda()`).
+`forward` only applies it, and the gradient with respect to the input applies
+the stored transpose: no sparse tensor is assembled or transposed per call.
+The matrix is not written to the `state_dict`, since the constructor
+arguments define it.
 
 **`weight_norm` options:**
 
@@ -167,7 +171,7 @@ to level 0, float64, `ellipsoid="sphere"`, one CPU thread
 | Coarse cells reached by a fine cell (level 5 → 4; min / median / max over all fine cells) | 5 / 7 / 9 | 5 / 7 / 9 | 1 |
 | Regional domain | yes | yes (coverage-weighted mean) | yes |
 | Build the level-8 operator | 1.5 s | 1.6 s | 0.003 s |
-| Apply, level 8 → 7 | 56 ms | 54 ms | a reshape and a mean |
+| Apply, level 8 → 7 | 10 ms | 17 ms | a reshape and a mean |
 
 The extra work in `forward` is two sums over the input and the output.
 Real data were not tested.
@@ -182,14 +186,9 @@ $$y_{p_{\text{out}}} = \max(x_{4p},\; x_{4p+1},\; x_{4p+2},\; x_{4p+3})$$
 The gradient goes to the largest child (differentiable almost everywhere).
 NaN propagates.
 
-```{warning}
-**Known issue on regional domains.** When a parent has fewer than four
-children in `cell_ids`, the missing children are replaced by the value of the
-first input cell (`cell_ids[0]`), which may not be a child of that parent at
-all. Measured: cells `[100, 4, 5, 6]` at level 2 with values `[50, 1, 2, 3]`
-give 50 for parent 1 instead of 3. Until this is fixed, use `maxpool` only
-when every parent has its four children, or pad the domain to whole parents.
-```
+On a regional domain, a parent with fewer than four children in `cell_ids`
+takes the maximum of the children present (cells `[100, 4, 5, 6]` at level 2
+with values `[50, 1, 2, 3]` give `[3, 50]` for parents `[1, 25]`).
 
 ---
 
@@ -240,9 +239,9 @@ from healpix_geo import nested
 from healpix_analyse.down import HealPixDown
 
 level = 6                       # nside = 2**6
-# the NESTED cells within 20 degrees of (lon, lat) = (0, 0)
-patch = nested.cone_coverage((0.0, 0.0), 20.0, level)
-patch = np.asarray(getattr(patch, "data", patch), dtype=np.int64).reshape(-1)
+# the NESTED cells within 20 degrees of (lon, lat) = (0, 0); with one centre,
+# cone_coverage returns (cell_ids, depths, fully_covered)
+patch, _, _ = nested.cone_coverage((0.0, 0.0), 20.0, level)
 
 down = HealPixDown(level=level, cell_ids=patch)
 

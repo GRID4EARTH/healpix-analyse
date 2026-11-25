@@ -53,6 +53,34 @@
   `import healpix_analyse` on a laptop) off the package import; the first
   call of `direct_spherical_convolution` pays it instead.
 
+### Fixed
+- `HealPixDown(mode="maxpool")` on a regional domain: a child absent from
+  `cell_ids` was replaced by the first input cell, which can belong to
+  another parent (cells `[100, 4, 5, 6]` at level 2 with values
+  `[50, 1, 2, 3]` gave `[50, 50]`); it is now replaced by a present child of
+  the same parent, so a parent is the max of its children present (#93).
+- `docs/other/down.md`, `docs/other/up.md`: the regional-domain examples
+  read a single-centre `cone_coverage` result as one array; with
+  healpix-geo 0.5 it is a tuple `(cell_ids, depths, fully_covered)`, and the
+  old recipe gave repeated ids.
+
+### Performance
+- `HealPixDown` (`"smooth"`, `"smooth_conservative"`) and `HealPixUp` keep
+  their matrix and its transpose as CSR buffers (int32 indices) built once in
+  the constructor; they follow `.to()`. `forward` no longer assembles a COO
+  tensor at each call, and the gradient applies the stored transpose (twice
+  differentiable). Level 8 → 7, one CPU thread, one map: `HealPixDown`
+  forward 167 → 12 ms, forward + backward 370 → 15 ms with a per-call peak
+  of 151 → 6 MiB; `HealPixUp` forward 153 → 10 ms, forward + backward
+  575 → 36 ms (157 → 9 MiB) (#59). The matrix is no longer in the
+  `state_dict`; older `state_dict`s with `_M_indices` / `_M_values` still
+  load.
+
+### Removed
+- `down.py`: the old `_build_smooth_matrix` kept in a string, the unused
+  `_normalize_weights_vec`, and the unused `pyproj` import; the `down.py` /
+  `up.py` docstrings use healpix-geo instead of healpy (#61, #96).
+
 ## 2026.11.1 (2026-11-23)
 
 ### Added
