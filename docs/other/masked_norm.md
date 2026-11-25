@@ -106,16 +106,27 @@ output and the gradients of its `torch.nn` equivalent; the tests check it to
 `backend="auto"` (default) picks:
 
 - **`"triton"`** on CUDA for float32, float16 and bfloat16, when the
-  optional `triton` package is installed. Fused kernels: the mask is read
-  through broadcast strides (an `[N]` mask is never expanded to `[B, C, N]`),
-  the statistics are reduced in partial sums of a fixed order and merged with
-  Chan's formula (no atomics, so the forward and backward are deterministic),
-  16-bit data accumulate in float32. The backward is written by hand from the
-  saved mean and 1/std of each row.
+  optional `triton` package is installed. Fused kernels, forward and
+  backward; 16-bit data accumulate in float32.
 - **`"torch"`** everywhere else (CPU, float64, CUDA without Triton): a few
   PyTorch passes (validity, row sums, one fused sum of squares, the output)
   and the same hand-written backward. Nothing of size `[B, C, N]` is saved
   beyond the input.
+
+The Triton kernels and their memory traffic (T = one pass over `x`):
+
+| Layer | Forward | Backward |
+|---|---|---|
+| GroupNorm, BatchNorm (training) | statistics in **one read** (a weighted Welford update per lane, partial sums of a fixed chunking merged with Chan's formula), then normalisation, affine step and `fill` in one pass: 3 T | sums of `dy` and `dy·x̂` per chunk, then `dx`: 5 T |
+| LayerNorm, C ≤ 512 | one `[C, BLOCK_N]` tile per program, held in registers: **2 T** | one tile of `x` and `dy`: **3 T** |
+| LayerNorm, C > 512 | loop over the channels: 4 T | 5 T |
+| BatchNorm (evaluation) | one element-wise pass: 2 T | 3 T (sums only for `γ`, `β`) |
+
+`torch.nn.GroupNorm` and `BatchNorm` also read `x` twice in the forward.
+The mask is read through broadcast strides: an `[N]` or `[B, N]` mask is
+never expanded to `[B, C, N]`. No kernel uses atomics; the reductions keep
+a fixed tile and a fixed chunking (only the element-wise kernels autotune
+their tile), so outputs and gradients are bitwise reproducible.
 
 The backward formula, for the cells of weight w > 0 and `g = ∂L/∂y · γ`:
 
@@ -148,12 +159,21 @@ cells of weight > 0). A sample, channel or region without any valid cell
 gets `fill="zero"` (default) or `"nan"`.
 
 `region_pool` takes any integer labels (`-1` leaves a cell out): basins,
-countries, land-cover classes. The cells of each region are gathered once
-into a padded `[B, C, R, L]` tensor (L = size of the largest region) and
-reduced, so there are no atomics and the result is deterministic. Regions of
-very different sizes waste memory in the padding. When the regions are
-contiguous, sorted and of equal size (`from_cell_ids` on the full sphere or
-on a complete sorted domain) the gather is a free view.
+countries, land-cover classes. Neither backend uses atomics, so the
+results are deterministic.
+
+- **Triton** (CUDA): `global_pool` reads `x` once (partial sums per chunk,
+  as the normalisations); its backward is one element-wise pass. Regions are
+  stored in CSR form (int32 cell positions sorted by region, int32
+  offsets); one program per (region, block of rows) gathers the cells of its
+  region, and the backward gathers the `[B, C, R]` gradient by the label of
+  each cell. `"max"` stores the index of the maximum (the first one on ties)
+  and its backward writes one value per (b, c, region).
+- **PyTorch**: the cells of each region are gathered into a padded
+  `[B, C, R, L]` tensor (L = size of the largest region) and reduced;
+  regions of very different sizes waste memory in the padding. When the
+  regions are contiguous, sorted and of equal size (`from_cell_ids` on the
+  full sphere or on a complete sorted domain) the gather is a free view.
 
 For one level coarser on every cell, keeping a HEALPix grid, use
 {doc}`HealPixDown <down>` instead.

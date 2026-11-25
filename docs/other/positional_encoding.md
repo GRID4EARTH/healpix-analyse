@@ -75,7 +75,13 @@ CPU) is cached in memory, keyed by a SHA-256 hash of the `cell_ids` (their
 order included), the level, the ellipsoid and the gauge. The cache keeps the
 8 most recently used domains. The features themselves are a few
 element-wise operations on the requested device.
-`positional_encoding_cache_info()` reports hits and misses;
+On CUDA (float32, float16, bfloat16) one Triton kernel writes every
+feature of a block of cells (one read of the float64 geometry, one write of
+the result); elsewhere PyTorch computes them in float64. Both reduce the
+Fourier argument `f · v` modulo 2 in float64 before the sine, so high
+frequencies keep full float32 accuracy. The geometry is copied once to each
+device it is used on. The gauge angle is computed in closed form (no
+rotation matrices). `positional_encoding_cache_info()` reports hits and misses;
 `clear_positional_encoding_cache()` empties it.
 
 Memory: the encoding holds F × N values on the device, e.g. 57 × 786 432

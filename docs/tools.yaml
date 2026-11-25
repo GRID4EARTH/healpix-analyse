@@ -1277,9 +1277,10 @@ tools:
   gpu: yes; fused Triton kernels (float32, float16, bfloat16, fp32 accumulation, deterministic) with the optional triton package
   nan: NaN and inf are invalid cells; they never reach the output (except fill="passthrough") or the gradients
   cost: >-
-    Triton: one read of x for the statistics, one read and one write for the
-    output; the backward the same. benchmarks/benchmark_layers.py measures
-    them against torch.nn (see the page).
+    Triton forward 3 passes over x for GroupNorm / BatchNorm (one-pass
+    statistics, then normalisation and affine step), 2 for LayerNorm with
+    C <= 512; backward 5 and 3. benchmarks/benchmark_layers.py measures them
+    against torch.nn (see the page).
   pros:
     - Same parameters and state_dict as torch.nn.GroupNorm / LayerNorm / BatchNorm1d; with an all-valid mask the outputs are the same.
     - Coverage weights (cells have equal area); deterministic Triton kernels with a PyTorch reference.
@@ -1312,7 +1313,7 @@ tools:
   ordering: any; HealPixRegionPool.from_cell_ids builds regions from NESTED ids
   io: "x [B, C, N] -> [B, C] (global) or [B, C, R] (regions)"
   differentiable: yes, in x
-  gpu: yes (PyTorch operations, deterministic)
+  gpu: yes; Triton kernels (one read of x, CSR int32 regions, no atomics) with the optional triton package
   nan: NaN cells are invalid; a region without valid cells gets 0 or NaN (fill=)
   cost: >-
     One reduction; region_pool gathers the cells into a padded [B, C, R, L]
@@ -1325,7 +1326,7 @@ tools:
     - when: one level coarser on every cell, keeping the grid
       use: HealPixDown
       page: other/down
-  optional_deps: none
+  optional_deps: triton (triton extra), only for the CUDA kernels
 
 - id: positional_encoding
   title: Positional encodings of HEALPix cells (HealPixPositionalEncoding)
@@ -1348,7 +1349,7 @@ tools:
   ellipsoid: '"WGS84" (geodetic latitude of the cell centres from healpix-geo)'
   io: "-> [F, N] tensor; the module also concatenates it to x [B, C, N]"
   differentiable: no (a constant input)
-  gpu: yes; the module buffer follows .to()
+  gpu: yes; one Triton kernel writes all the features (optional triton package); the module buffer follows .to()
   cost: >-
     healpix-geo cell centres at the first call for a domain, then an
     in-memory cache (8 domains) keyed by a hash of the cell ids; F x N
