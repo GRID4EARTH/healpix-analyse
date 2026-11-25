@@ -26,7 +26,7 @@ from healpix_geo._healpix_geo_python import resolve_ellipsoid
 __all__ = ["canonicalize_ellipsoid"]
 
 
-def canonicalize_ellipsoid(ellipsoid: str) -> str:
+def canonicalize_ellipsoid(ellipsoid):
     """Return ``ellipsoid`` re-cased to whatever spelling ``healpix_geo``'s
     own registry accepts, trying the string as given, then upper case,
     lower case, and title case, in that order.
@@ -38,8 +38,13 @@ def canonicalize_ellipsoid(ellipsoid: str) -> str:
     a genuinely unknown name still fails with ``healpix_geo``'s own, more
     informative error at the point of use, rather than a confusing one
     raised from here.
+
+    Anything that is not a string (for instance a ``dict`` of ellipsoid
+    parameters, which ``healpix_geo`` also accepts) is returned unchanged.
     """
-    s = str(ellipsoid)
+    if not isinstance(ellipsoid, str):
+        return ellipsoid
+    s = ellipsoid
     for candidate in (s, s.upper(), s.lower(), s.title()):
         try:
             resolve_ellipsoid(candidate)

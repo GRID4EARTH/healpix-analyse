@@ -412,6 +412,8 @@ class HealPixWideConv:
         cell_ids : array-like of int, shape ``[N]``
             HEALPix NESTED cell ids at ``self.level``, in any order: they
             are sorted internally and ``y`` comes back in the order given.
+            Unsorted ids cost two ``argsort`` of ``N`` on every call; pass
+            them sorted to avoid it.
 
         Returns
         -------

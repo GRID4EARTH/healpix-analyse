@@ -91,3 +91,26 @@ def test_set_ellipsoid_accepts_title_case():
             dino.set_ellipsoid("not-an-ellipsoid")
     finally:
         dino.set_ellipsoid(previous)
+
+
+WGS84_DICT = {"semimajor_axis": 6378137.0, "inverse_flattening": 298.257223563}
+
+
+def test_canonicalize_passes_non_strings_through():
+    d = dict(WGS84_DICT)
+    assert canonicalize_ellipsoid(d) is d
+
+
+def test_interp_weights_accept_a_dict_ellipsoid():
+    lon, lat = np.array([2.0]), np.array([45.0])
+    pix_d, w_d = get_interp_weights(lon, lat, DEPTH, ellipsoid=dict(WGS84_DICT))
+    pix_n, w_n = get_interp_weights(lon, lat, DEPTH, ellipsoid="WGS84")
+    np.testing.assert_array_equal(pix_d, pix_n)
+    np.testing.assert_allclose(w_d, w_n, rtol=0, atol=1e-12)
+
+
+def test_constructor_keeps_a_dict_ellipsoid():
+    from healpix_analyse import HealPixDown
+
+    down = HealPixDown(level=4, ellipsoid=dict(WGS84_DICT), device="cpu")
+    assert down.ellipsoid == WGS84_DICT
