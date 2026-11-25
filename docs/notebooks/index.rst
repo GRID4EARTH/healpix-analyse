@@ -19,3 +19,7 @@ Interactive Jupyter notebooks demonstrating the main features of **healpix-analy
    FFT large-kernel convolution <../external_notebooks/fft_conv_test>
    Masked multiscale decomposition <../external_notebooks/decomp_test>
    Multiscale divergence and curl <../external_notebooks/divcurl_test>
+   Pyramidal convolution, single test <../external_notebooks/pyramid_conv_single_test>
+   Pyramidal convolution on Sentinel-2 <../external_notebooks/pyramid_conv_sentinel2_test>
+   Wide-kernel recipes <../external_notebooks/wide_conv_kernel_recipes>
+   DINOv3 tuning on one date <../external_notebooks/dino_tuning_single_date>

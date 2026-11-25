@@ -4,6 +4,8 @@ import shutil
 import sys
 
 sys.path.insert(0, os.path.abspath(".."))
+# local extensions (docs/_ext): the tool catalogue generator
+sys.path.insert(0, os.path.abspath("_ext"))
 
 # ---------------------------------------------------------------------------
 # Notebooks live in ``<repo root>/Notebooks`` so they can be run/edited
@@ -92,6 +94,15 @@ autoapi_options = [
     "show-module-summary",
 ]
 autoapi_keep_files = True
+# Legacy modules that cannot be imported with the declared dependencies
+# (they import ``foscat`` or ``cdshealpix``) or that are scripts, not API.
+# They stay in the source tree for now; see the open questions of issue #89.
+autoapi_ignore = [
+    "*/LocalizedFlatSkyAlm.py",
+    "*/LocalizedAlm_optimized_v13_fixed.py",
+    "*/demo_ps.py",
+    "*/make_rectangle.py",
+]
 autoapi_python_use_implicit_namespaces = True
 
 # ---------------------------------------------------------------------------
@@ -110,9 +121,6 @@ suppress_warnings = [
     "ref.class",
     "ref.func",
     "ref.obj",
-    # Supplementary/dev notebooks in Notebooks/ that are intentionally not
-    # linked from any toctree.
-    "toc.not_included",
     # Notebooks (.ipynb) don't always start with a Markdown H1 cell, so
     # myst-nb can't derive a page title from them; we always give them an
     # explicit title in the toctree entry itself.
@@ -154,6 +162,8 @@ intersphinx_mapping = {
 # ---------------------------------------------------------------------------
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
+# llms.txt and llms-full.txt (generated from tools.yaml) go to the site root
+html_baseurl = "https://grid4earth.eu/healpix-analyse/"
 html_title = "healpix-analyse"
 html_theme_options = {
     "navigation_depth": 4,
@@ -169,6 +179,10 @@ html_theme_options = {
 # myst_nb (in extensions) registers .md and .ipynb automatically.
 # Listing .md first avoids Sphinx resolving root_doc to index.rst.
 # ---------------------------------------------------------------------------
+# Generated fragments (docs/_generated) are included by other pages, never
+# built on their own.
+exclude_patterns = ["_build", "_generated"]
+
 source_suffix = {
     ".md": "myst-nb",
     ".ipynb": "myst-nb",
