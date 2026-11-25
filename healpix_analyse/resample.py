@@ -531,7 +531,13 @@ def resample_healpix(
 def resample_to_latlon_grid(lat, lon, data, method="linear"):
     """Resample HEALPix data onto a regular latitude/longitude grid."""
     # SciPy is optional for the HEALPix-to-HEALPix operators above.
-    from scipy.interpolate import griddata
+    try:
+        from scipy.interpolate import griddata
+    except ImportError as exc:
+        raise ImportError(
+            "resample_to_latlon_grid requires SciPy.\n"
+            "Install the 'scipy' extra:  pip install 'healpix-analyse[scipy]'"
+        ) from exc
 
     lon_grid, lat_grid = np.meshgrid(
         np.linspace(lon.min(), lon.max(), data.shape[1]),

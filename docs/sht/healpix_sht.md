@@ -17,7 +17,7 @@ Spin-0 needs only `torch`, `numpy` and `healpix-geo`. Spin ≥ 1 additionally
 needs `quaternionic` and `spherical`:
 
 ```bash
-pip install quaternionic spherical      # only for spin > 0
+pip install "healpix-analyse[sht]"      # quaternionic + spherical, only for spin > 0
 ```
 
 For a grid that is *not* a whole-sphere HEALPix map — ERA5, a regular lat/lon grid, a
@@ -230,10 +230,9 @@ div, curl = sht.uv_to_curl_div(u_ssh, v_ssh)
 
 `sht.anafast` below is the production-ready angular power spectrum for a
 whole-sphere HEALPix map, validated against `healpy`. The separate
-`powerspectra`/`powerspectra_lonlat` functions in `powerspectra.py` compute a
-different, flat-sky-style spectrum through `AlmTransform` and are still under
-development — see {doc}`/sht/powerspectra` for their current status before using
-them instead of `anafast`.
+`powerspectra` function in `powerspectra.py` computes a different, flat
+spectrum through `AlmTransform` and is deprecated — see
+{doc}`/sht/powerspectra`.
 
 ### Scalar auto-spectrum
 

@@ -448,9 +448,8 @@ B08 and NDVI.
 
 `LocalFFT.ps()` (also exposed as `local_ps`) is the production-ready 1D
 isotropic power spectrum for a local patch, described above. The separate
-`powerspectra`/`powerspectra_lonlat` functions (built on `AlmTransform` in
-`alm.py`) offer a similar-looking API but are still under development — see
-{doc}`/sht/powerspectra` before reaching for them.
+`powerspectra` function (built on `AlmTransform` in `alm.py`) offers a
+similar-looking API but is deprecated — see {doc}`/sht/powerspectra`.
 
 ## Errors and limitations
 

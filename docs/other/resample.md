@@ -187,9 +187,7 @@ with SciPy's `griddata`. It is not tied to HEALPix cell ids: `lat`, `lon` and
 `data` are 2-D arrays of the same shape, and the output grid has the shape of
 `data`. Points outside the convex hull get the mean of `data`. It needs SciPy
 (`pip install "healpix-analyse[scipy]"`), is NumPy only (not
-differentiable), and is **not exported** from `healpix_analyse`; the notebooks
-`Test_resampling_powerspectra` use it. Whether to keep it in the public API is
-an open question.
+differentiable), and is exported from `healpix_analyse`.
 
 ## Performance considerations
 

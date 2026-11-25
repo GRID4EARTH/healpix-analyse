@@ -66,6 +66,25 @@
   installed, this also takes its import (about 0.7 s of the 5 to 7 s of
   `import healpix_analyse` on a laptop) off the package import; the first
   call of `direct_spherical_convolution` pays it instead.
+- `AlmTransform` no longer prints in its constructor; the diagnostics are
+  printed only with `debug=True`. `AlmTransform(method="alm")` now raises
+  `NotImplementedError` instead of silently running the FFT path.
+- `AlmCoeffs` is no longer exported from `healpix_analyse` (no function
+  returns it); import it from `healpix_analyse.alm`.
+- Packaging: `termcolor`, `umap-learn` and `healpix-plot` are no longer core
+  dependencies (the package does not import them). `termcolor` stays in the
+  `dino` and `examples` extras and `umap-learn` in the `examples` extra;
+  `healpix-plot` is not on PyPI, so it is in no pyproject extra, only in the
+  pixi `examples` feature (git source). New extra `sht` (`quaternionic`,
+  `spherical`) for the spin ≠ 0 transforms of `HEALPixSHT`, whose
+  `ImportError` now names it. `healpy`, used only by the tests, is added to
+  the `test` extra and moved from the pixi core dependencies to the pixi
+  `test` feature. `resample_to_latlon_grid` raises an `ImportError` naming
+  the `scipy` extra when SciPy is missing.
+- `HealPixConv`, `HEALPixSHT`, `binary_dilation`, `binary_erosion`,
+  `get_interp_val`, `get_interp_weights` and `resample_to_latlon_grid` are
+  now exported from `healpix_analyse`. `quaternionic` and `spherical` are
+  imported on first spin ≠ 0 use, not when `healpix_sht` is imported.
 - `alm2map_latlon`: `lmax` now defaults to `None` and is deduced from the
   length of `alm`; a value that does not match raises `ValueError`.
   `grid_summary` defaults to `lmax=64`, like `map2alm_latlon` and
@@ -120,6 +139,15 @@
 - `down.py`: the old `_build_smooth_matrix` kept in a string, the unused
   `_normalize_weights_vec`, and the unused `pyproj` import; the `down.py` /
   `up.py` docstrings use healpix-geo instead of healpy (#61, #96).
+- `healpix_analyse.powerspectra_lonlat`: it could not run (1-D cell ids
+  passed to `AlmTransform`, `lon`/`lat`/`weights` ignored). For lon/lat
+  iso-latitude grids, use `build_rings_from_latlon` + `anafast_latlon`.
+- `healpix_analyse.ps` (a plain 2-D FFT of a NumPy array, not HEALPix).
+- The legacy modules `LocalizedFlatSkyAlm`, `LocalizedAlm_optimized_v13_fixed`
+  and the script `demo_ps` (they import `foscat`, which is not a dependency),
+  and `make_rectangle` (it imports `cdshealpix`; no module of the package used
+  it). The notebooks `Test_rectangle`, `Test_resampling_powerspectra` and
+  `Test_resampling_powerspectra-s2-l2a` still import `make_rectangle` and `ps`.
 
 ### Fixed
 - Ellipsoid names in any casing (`"wgs84"`, `"Wgs84"`, `"Sphere"`,
@@ -142,6 +170,12 @@
   `compact_weighted_neighbourhood_reduce`); `nested_to_tiles` documents
   that repeated ids follow `duplicates`, and `GetDINOV3SAT` lists the
   `"percell"` projection (#96).
+
+### Deprecated
+- `healpix_analyse.powerspectra.powerspectra` emits a `DeprecationWarning`
+  and will be removed. Use `HEALPixSHT.anafast` on the full sphere,
+  `HealPixWaveletSpectrum` on a regional domain or with missing data, and
+  `build_rings_from_latlon` + `anafast_latlon` on lon/lat grids.
 
 ## 2026.11.1 (2026-11-23)
 

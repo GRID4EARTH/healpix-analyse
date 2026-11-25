@@ -1,101 +1,69 @@
-# Flat power spectra (experimental): `powerspectra`, `powerspectra_lonlat`, `ps`
+# Flat power spectrum (deprecated): `powerspectra`
 
-Three helpers compute an isotropic 1D power spectrum by binning a 2D FFT
-radially. They are not spherical-harmonic transforms and should not be
-confused with `sht.anafast` ({doc}`/sht/healpix_sht`) or `LocalFFT.ps`
-({doc}`/sht/fft_local`), which are the production-ready spectra for, respectively,
-a whole-sphere HEALPix map and a local gnomonic patch.
+`powerspectra` computes an isotropic 1-D power spectrum by binning a 2-D FFT
+of a rectangular block of HEALPix cells radially. It is not a
+spherical-harmonic transform and should not be confused with
+`HEALPixSHT.anafast` ({doc}`/sht/healpix_sht`), `anafast_latlon`
+({doc}`/sht/alm_latlon`), the wavelet spectrum ({doc}`/sht/wavelet_spectrum`)
+or `LocalFFT.ps` ({doc}`/sht/fft_local`).
 
 ```{include} ../_generated/glance/flat_spectra.md
 ```
 
 ```{warning}
-**Experimental.** None of these three functions is exported from
-`healpix_analyse`, none is differentiable (they bin in NumPy), and
-`powerspectra_lonlat` cannot run as written (see below). Whether to keep
-them in the public API is an open question of the documentation overhaul.
+**Deprecated.** `powerspectra` emits a `DeprecationWarning` and will be
+removed in a future release. It is not exported from `healpix_analyse`, it
+is not differentiable (it bins in NumPy), and the harmonic path of the
+`AlmTransform` it is built on is not implemented. Use instead:
+
+- the full sphere → `HEALPixSHT.anafast` ({doc}`/sht/healpix_sht`);
+- a regional domain, or a map with missing data → `HealPixWaveletSpectrum` /
+  `HealPixIsotropicWaveletSpectrum` ({doc}`/sht/wavelet_spectrum`), or
+  `local_ps` for one gap-free patch ({doc}`/sht/fft_local`);
+- a lon/lat or Gaussian grid → `build_rings_from_latlon` + `anafast_latlon`
+  ({doc}`/sht/alm_latlon`).
 ```
-
-What each one returns:
-
-| Function | Input | Output | Normalisation |
-|---|---|---|---|
-| `ps` | a regular 2-D NumPy array | 1-D radial spectrum, frequencies in cycles per array index, `min(nx, ny) // 2` linear bins; the cross-spectrum takes `abs(F1 · conj F2)` | `/(nx · ny)` |
-| `powerspectra` | a **2-D** array of RING cell ids (`AlmTransform`) | 1-D radial spectrum in cycles per `dx` | `/(nx · ny)` |
-| `powerspectra_lonlat` | lon/lat rings | — (fails, see below) | `/(nx · ny)²` in the code |
 
 ```python
-from healpix_analyse.powerspectra import powerspectra
-from healpix_analyse.powerspectra_lonlat import powerspectra_lonlat
-from healpix_analyse.ps import ps
+from healpix_analyse.powerspectra import powerspectra   # DeprecationWarning
+
+f, pk = powerspectra(cell_ids, level, data, dx=1.0)
 ```
 
-## `ps(data, data_cross=None, plot_2D_fft=False)`
+`cell_ids` is a **2-D** array of RING cell ids (`ny, nx`), one row per
+iso-latitude ring, and `data` has the same shape. The function returns the
+bin centres in cycles per `dx` and the spectrum averaged over
+`min(nx, ny) // 2` linear radial bins, normalised by `nx · ny`.
 
-A plain 2D-FFT radial power spectrum on an already-regular 2D array (`ny,
-nx`). It has no notion of HEALPix, the sphere, or physical units — frequency
-axes are in cycles per array index. Use it on data you have already gridded
-yourself, for example the output of `LocalFFT.project`. This function is
-self-contained and has no dependency on `AlmTransform`.
+## Limits
 
-## `powerspectra(cell_ids, level, data, ...)` and `powerspectra_lonlat(lon, lat, data, ...)`
+`powerspectra` builds an `AlmTransform` (`healpix_analyse/alm.py`) and calls
+its `.fft()` method, so it inherits its limits:
 
-These compute a similar radial spectrum starting from HEALPix cells
-(`powerspectra`) or from arbitrary `(lon, lat)` samples on iso-latitude rings
-(`powerspectra_lonlat`). Both build an `AlmTransform` (`healpix_analyse/alm.py`)
-internally and call its `.fft()` method.
+- **The second stage is a plain FFT along latitude, not a Legendre sum.**
+  `AlmTransform.fft()` does one FFT along each ring, then a second FFT across
+  the rings. That is a spherical-harmonic projection only when the rings are
+  uniformly spaced in colatitude. Treat the result as a flat spectrum, not a
+  calibrated angular power spectrum.
+- **`AlmTransform(method="alm")` raises `NotImplementedError`**, and so does
+  `AlmTransform.ifft()`: only the FFT stage exists. `indexing_scheme` only
+  accepts `"2D_array"`.
+- **Only periodic boundary conditions** (`fft(..., pbc=False)` raises
+  `NotImplementedError`), which is an approximation on a regional domain.
+- **No handling of the 0/360° longitude wrap** in the pixel-shift
+  correction.
+- **Not differentiable**: the 2-D spectrum is detached and binned in NumPy.
 
-### Current status: under development
+`AlmTransform` prints diagnostics and shows debug plots (matplotlib) only
+when it is built with `debug=True`.
 
-`AlmTransform` is explicitly a work in progress, and `powerspectra` /
-`powerspectra_lonlat` inherit its limitations:
+## Removed: `powerspectra_lonlat` and `ps`
 
-- **`AlmTransform.ifft()` is not implemented.** It raises `NotImplementedError`
-  rather than silently returning a wrong result — the Legendre-projection
-  stage it needs, and the ring bookkeeping it depends on, are not built yet.
-  `powerspectra`/`powerspectra_lonlat` only ever call `.fft()`, so this does
-  not affect them directly, but any code trying to reconstruct a map from
-  their intermediate `AlmTransform` will hit it.
-- **The second transform stage is a plain FFT along latitude, not a Legendre
-  sum.** `AlmTransform.fft()` does one FFT along each ring's longitude, then
-  a second FFT along the ring (latitude) axis. That second step is only
-  mathematically equivalent to a spherical-harmonic projection when rings are
-  uniformly spaced in colatitude, which is not guaranteed in general — see the
-  module's own `TODO: NUFFT or direct Legendre analysis for the second stage,
-  currently only FFT stage implemented`. Treat the result as a flat-sky-style
-  spectrum, not a calibrated angular power spectrum.
-- **Only periodic boundary conditions are supported.** `fft(..., pbc=False)`
-  raises `NotImplementedError`; `pbc=True` (the default) assumes the domain
-  wraps, which is an approximation for a regional patch.
-- **No handling of the 0/360° longitude wrap** in the pixel-shift correction
-  (noted as a `TODO` in the source) — patches crossing the date line are not
-  validated.
-- **`method="alm"` is not implemented** — it silently runs the same FFT path
-  as `method="fft"` (the code does not branch on `method`); `indexing_scheme` only accepts `"2D_array"` despite the
-  docstring mentioning `"ring"` as a default.
-- **Debug plotting is now gated, not removed.** Earlier versions of
-  `AlmTransform.fft()` (and the constructor, through `compute_phase_shift`)
-  called `matplotlib.pyplot.show()` unconditionally on every call, which
-  opened blocking plot windows even in batch/headless use. These diagnostic
-  plots are now only shown when the transform is constructed with
-  `debug=True`; with the default `debug=False` (used internally by
-  `powerspectra`/`powerspectra_lonlat`), no plot window opens. The
-  constructor still prints diagnostic lines unconditionally.
-- **`powerspectra_lonlat` cannot run as written.** It passes a 1-D array of
-  dummy cell ids to `AlmTransform`, which unpacks a 2-D shape; the `lon`,
-  `lat` and `weights` it forwards are ignored; and it deletes its transform
-  before using it for the cross-spectrum (static reading of the code).
-- **Not differentiable.** `powerspectra` detaches the 2-D spectrum and bins it
-  in NumPy.
-
-### Recommendation
-
-For a spectrum you can rely on today:
-
-- whole-sphere HEALPix map → `sht.anafast` ({doc}`/sht/healpix_sht`);
-- local HEALPix patch → `LocalFFT.ps` / `local_ps` ({doc}`/sht/fft_local`);
-- an array you already gridded yourself → `ps` (above).
-
-Use `powerspectra` / `powerspectra_lonlat` only where their specific
-`AlmTransform`-based code path is what you are testing or extending, and keep
-the limitations above in mind when interpreting the result.
+`powerspectra_lonlat` could not run (it passed 1-D cell ids to
+`AlmTransform` and ignored its `lon`, `lat` and `weights`), and `ps`, a
+plain 2-D FFT of a NumPy array, did not use HEALPix at all. Both were
+removed. For lon/lat iso-latitude grids, build the rings with
+`build_rings_from_latlon` and compute the angular power spectrum with
+`anafast_latlon` ({doc}`/sht/alm_latlon`). For an array you have already
+gridded yourself, `numpy.fft.fft2` followed by a radial average does what
+`ps` did.

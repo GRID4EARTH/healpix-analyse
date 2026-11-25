@@ -146,7 +146,7 @@ through `torch.autograd` (geometry, weights and kernel shapes are constants).
 - **Not differentiable:** `HealPixWideConv` (it detaches its input), the
   operator builders (NumPy), `neighbour_reduce` with `count`, `mode`, `any`,
   `all`, morphology, components, `get_interp_*`, DINO (inference mode),
-  `powerspectra`, `ps`.
+  `powerspectra` (deprecated).
 - **Not differentiable with respect to the width:** no tool gives a gradient
   with respect to `sigma_m`, `radius_m` or the parameters of a kernel callable.
 
