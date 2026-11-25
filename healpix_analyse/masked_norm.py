@@ -49,6 +49,7 @@ The pooling functions are plain PyTorch (one reduction each, deterministic).
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Sequence
 
 import numpy as np
@@ -415,16 +416,65 @@ def _batch_norm_eval(x, m, rm, rv, weight, bias, eps, fill):
 # ===========================================================================
 # Triton kernels
 # ===========================================================================
+#
+# Memory traffic (the kernels are bandwidth-bound; T = one pass over x):
+#
+#   group / batch, forward   stats: read x (one-pass Welford)   normalise: read x, write y   = 3 T
+#   group / batch, backward  sums:  read x, dy                  dx: read x, dy, write dx     = 5 T
+#   layer (C <= 512), fwd    one tile [C, BLOCK_N] in registers: read x, write y            = 2 T
+#   layer (C <= 512), bwd    read x, dy, write dx                                           = 3 T
+#
+# torch.nn.GroupNorm / BatchNorm also make two passes (3 T forward).  The
+# mask is read through broadcast strides, so an [N] or [B, N] mask adds
+# almost nothing.  Reductions use a fixed tile (_RED_BLOCK) and a fixed
+# chunking, so their summation order, hence the result, does not depend on
+# the autotuned configuration: the outputs and gradients are bitwise
+# reproducible.  Only the element-wise kernels autotune their tile.
 
 def triton_available() -> bool:
     """True when Triton is installed and a CUDA device is visible."""
     return _HAS_TRITON and torch.cuda.is_available()
 
 
+_INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
+_RED_BLOCK = 1024           # tile of the reductions (fixed: sets the summation order)
+_LN_BWD_BLOCK = 64          # cells per program of the LayerNorm backward (fixed)
+_LN_TILE_MAX_C = 512        # widest C served by the one-tile LayerNorm kernels
+
+
+def _ew_configs():
+    if _INTERPRET:
+        return [triton.Config({"BLOCK": 1024}, num_warps=4)]
+    return [triton.Config({"BLOCK": b}, num_warps=w)
+            for b in (1024, 2048, 4096) for w in (4, 8)]
+
+
+def _warp_configs(extra=None):
+    extra = extra or {}
+    if _INTERPRET:
+        return [triton.Config(dict(extra), num_warps=4)]
+    return [triton.Config(dict(extra), num_warps=w) for w in (2, 4, 8)]
+
+
+def _ln_fwd_configs():
+    if _INTERPRET:
+        return [triton.Config({"BLOCK_N": 32}, num_warps=4)]
+    return [triton.Config({"BLOCK_N": bn}, num_warps=w)
+            for bn in (16, 32, 64, 128) for w in (4, 8)]
+
+
+def _prune_ln(configs, named_args, **kw):
+    """Keep the tiles of at most 16 K elements of the one-tile LayerNorm."""
+    bc = kw.get("BLOCK_C", named_args.get("BLOCK_C", 64))
+    ok = [c for c in configs if c.kwargs["BLOCK_N"] * bc <= 16384]
+    return ok or configs[:1]
+
+
 if _HAS_TRITON:
 
     @triton.jit
     def _load_w(x, m_ptr, b, c, offs, inb, smb, smc, HAS_M: tl.constexpr):
+        """Cell weight: the clamped mask (1 without mask) where x is finite."""
         finite = (x == x) & (tl.abs(x) < float("inf"))
         if HAS_M:
             w = tl.load(m_ptr + b * smb + c * smc + offs, mask=inb, other=0).to(tl.float32)
@@ -432,16 +482,29 @@ if _HAS_TRITON:
             w = tl.minimum(tl.maximum(w, 0.0), 1.0)
         else:
             w = tl.full(x.shape, 1.0, tl.float32)
-        w = tl.where(finite & inb, w, 0.0)
-        return w
+        return tl.where(finite & inb, w, 0.0)
 
+    @triton.jit
+    def _fill_out(y, x, w, FILL: tl.constexpr):
+        if FILL == 0:
+            y = tl.where(w > 0, y, 0.0)
+        elif FILL == 1:
+            y = tl.where(w > 0, y, float("nan"))
+        else:
+            y = tl.where(w > 0, y, x)
+        return y
+
+    # ---------------------------------------------------------------- group / batch
+
+    @triton.autotune(configs=_warp_configs(), key=["N", "CHUNK"])
     @triton.jit
     def _rows_stats_kernel(
         x_ptr, m_ptr, part_ptr,
         C, N, CHUNK, NCH, smb, smc,
         HAS_M: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        """Partial (S0, mean, M2) of a chunk of one (b, c) row."""
+        """Partial (S0, mean, M2) of a chunk of one (b, c) row, in ONE read:
+        a weighted Welford update per lane, the lanes merged by Chan's rule."""
         bc = tl.program_id(0).to(tl.int64)
         j = tl.program_id(1)
         b = bc // C
@@ -449,31 +512,30 @@ if _HAS_TRITON:
         start = j * CHUNK
         row = x_ptr + bc * N
         ar = tl.arange(0, BLOCK)
-        s0v = tl.zeros([BLOCK], tl.float32)
-        s1v = tl.zeros([BLOCK], tl.float32)
+        n = tl.zeros([BLOCK], tl.float32)
+        mean = tl.zeros([BLOCK], tl.float32)
+        m2 = tl.zeros([BLOCK], tl.float32)
         for k in range(0, CHUNK, BLOCK):
             offs = start + k + ar
             inb = (offs < N) & (k + ar < CHUNK)
             x = tl.load(row + offs, mask=inb, other=0.0).to(tl.float32)
             w = _load_w(x, m_ptr, b, c, offs, inb, smb, smc, HAS_M)
             x = tl.where(w > 0, x, 0.0)
-            s0v += w
-            s1v += w * x
-        s0 = tl.sum(s0v, 0)
-        mu = tl.sum(s1v, 0) / tl.maximum(s0, 1e-30)
-        m2v = tl.zeros([BLOCK], tl.float32)
-        for k in range(0, CHUNK, BLOCK):
-            offs = start + k + ar
-            inb = (offs < N) & (k + ar < CHUNK)
-            x = tl.load(row + offs, mask=inb, other=0.0).to(tl.float32)
-            w = _load_w(x, m_ptr, b, c, offs, inb, smb, smc, HAS_M)
-            d = tl.where(w > 0, x - mu, 0.0)
-            m2v += w * d * d
+            nn_ = n + w
+            delta = x - mean
+            mean = mean + tl.where(nn_ > 0, w * delta / tl.maximum(nn_, 1e-30), 0.0)
+            m2 = m2 + w * delta * (x - mean)
+            n = nn_
+        s0 = tl.sum(n, 0)
+        mu = tl.sum(n * mean, 0) / tl.maximum(s0, 1e-30)
+        d = mean - mu
+        m2t = tl.sum(m2, 0) + tl.sum(n * d * d, 0)
         out = part_ptr + (bc * NCH + j) * 3
         tl.store(out, s0)
         tl.store(out + 1, mu)
-        tl.store(out + 2, tl.sum(m2v, 0))
+        tl.store(out + 2, m2t)
 
+    @triton.autotune(configs=_ew_configs(), key=["N", "C"])
     @triton.jit
     def _rows_norm_fwd_kernel(
         x_ptr, m_ptr, y_ptr, mean_ptr, rstd_ptr, g_ptr, b_ptr,
@@ -481,6 +543,8 @@ if _HAS_TRITON:
         HAS_M: tl.constexpr, AFFINE: tl.constexpr, FILL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
+        """y = (x - mean) * rstd * gamma + beta at the valid cells, fill
+        elsewhere: normalisation, affine step and fill in one pass."""
         bc = tl.program_id(0).to(tl.int64)
         b = bc // C
         c = bc % C
@@ -488,22 +552,18 @@ if _HAS_TRITON:
         offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         inb = offs < N
         base = bc * N
-        xr = tl.load(x_ptr + base + offs, mask=inb, other=0.0)
-        x = xr.to(tl.float32)
+        x = tl.load(x_ptr + base + offs, mask=inb, other=0.0).to(tl.float32)
         w = _load_w(x, m_ptr, b, c, offs, inb, smb, smc, HAS_M)
-        mu = tl.load(mean_ptr + s)
-        r = tl.load(rstd_ptr + s)
-        y = (x - mu) * r
+        scale = tl.load(rstd_ptr + s)
+        shift = -tl.load(mean_ptr + s) * scale
         if AFFINE:
-            y = y * tl.load(g_ptr + c).to(tl.float32) + tl.load(b_ptr + c).to(tl.float32)
-        if FILL == 0:
-            y = tl.where(w > 0, y, 0.0)
-        elif FILL == 1:
-            y = tl.where(w > 0, y, float("nan"))
-        else:
-            y = tl.where(w > 0, y, x)
+            gam = tl.load(g_ptr + c).to(tl.float32)
+            scale = scale * gam
+            shift = shift * gam + tl.load(b_ptr + c).to(tl.float32)
+        y = _fill_out(x * scale + shift, x, w, FILL)
         tl.store(y_ptr + base + offs, y.to(y_ptr.dtype.element_ty), mask=inb)
 
+    @triton.autotune(configs=_warp_configs(), key=["N", "CHUNK"])
     @triton.jit
     def _rows_bwd_part_kernel(
         x_ptr, m_ptr, dy_ptr, mean_ptr, rstd_ptr, part_ptr,
@@ -530,13 +590,13 @@ if _HAS_TRITON:
             w = _load_w(x, m_ptr, b, c, offs, inb, smb, smc, HAS_M)
             dy = tl.load(dy_ptr + base + offs, mask=inb, other=0.0).to(tl.float32)
             dy = tl.where(w > 0, dy, 0.0)
-            xh = tl.where(w > 0, (x - mu) * r, 0.0)
             p1 += dy
-            p2 += dy * xh
+            p2 += dy * tl.where(w > 0, (x - mu) * r, 0.0)
         out = part_ptr + (bc * NCH + j) * 2
         tl.store(out, tl.sum(p1, 0))
         tl.store(out + 1, tl.sum(p2, 0))
 
+    @triton.autotune(configs=_ew_configs(), key=["N", "C"])
     @triton.jit
     def _rows_bwd_dx_kernel(
         x_ptr, m_ptr, dy_ptr, dx_ptr, mean_ptr, rstd_ptr, a_ptr, bb_ptr, g_ptr,
@@ -544,6 +604,7 @@ if _HAS_TRITON:
         HAS_M: tl.constexpr, AFFINE: tl.constexpr, FILL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
+        """dx = rstd * (gamma * dy - w * (A + xhat * B)) at the valid cells."""
         bc = tl.program_id(0).to(tl.int64)
         b = bc // C
         c = bc % C
@@ -569,6 +630,90 @@ if _HAS_TRITON:
             dx = tl.where(w > 0, dx, 0.0)
         tl.store(dx_ptr + base + offs, dx.to(dx_ptr.dtype.element_ty), mask=inb)
 
+    # ---------------------------------------------------------------- layer, one tile
+
+    @triton.autotune(configs=_ln_fwd_configs(), key=["C", "N"],
+                     prune_configs_by={"early_config_prune": _prune_ln})
+    @triton.jit
+    def _ln_tile_fwd_kernel(
+        x_ptr, m_ptr, y_ptr, g_ptr, b_ptr, mean_ptr, rstd_ptr,
+        C, N, smb, smc, eps,
+        HAS_M: tl.constexpr, AFFINE: tl.constexpr, FILL: tl.constexpr,
+        BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        """LayerNorm of BLOCK_N cells: the [C, BLOCK_N] tile is read once,
+        reduced over C in registers, and written once."""
+        b = tl.program_id(0).to(tl.int64)
+        offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        cc = tl.arange(0, BLOCK_C)
+        inb = (cc[:, None] < C) & (offs[None, :] < N)
+        base = b * C * N
+        ptr = base + cc[:, None] * N + offs[None, :]
+        x = tl.load(x_ptr + ptr, mask=inb, other=0.0).to(tl.float32)
+        w = _load_w(x, m_ptr, b, cc[:, None], offs[None, :], inb, smb, smc, HAS_M)
+        xz = tl.where(w > 0, x, 0.0)
+        s0 = tl.sum(w, 0)
+        s0c = tl.maximum(s0, 1e-30)
+        mu = tl.sum(w * xz, 0) / s0c
+        d = tl.where(w > 0, xz - mu[None, :], 0.0)
+        r = 1.0 / tl.sqrt(tl.sum(w * d * d, 0) / s0c + eps)
+        y = d * r[None, :]
+        if AFFINE:
+            gam = tl.load(g_ptr + cc, mask=cc < C, other=0.0).to(tl.float32)
+            bet = tl.load(b_ptr + cc, mask=cc < C, other=0.0).to(tl.float32)
+            y = y * gam[:, None] + bet[:, None]
+        y = _fill_out(y, x, w, FILL)
+        tl.store(y_ptr + ptr, y.to(y_ptr.dtype.element_ty), mask=inb)
+        nm = offs < N
+        tl.store(mean_ptr + b * N + offs, mu, mask=nm)
+        tl.store(rstd_ptr + b * N + offs, r, mask=nm)
+
+    @triton.autotune(configs=_warp_configs(), key=["C", "N"])
+    @triton.jit
+    def _ln_tile_bwd_kernel(
+        x_ptr, m_ptr, dy_ptr, dx_ptr, g_ptr, mean_ptr, rstd_ptr, pg_ptr, pb_ptr,
+        C, N, NBLK, smb, smc,
+        HAS_M: tl.constexpr, AFFINE: tl.constexpr, FILL: tl.constexpr,
+        BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        """dx of BLOCK_N cells from one read of the x and dy tiles; partial
+        dgamma / dbeta of the program (fixed BLOCK_N: deterministic)."""
+        b = tl.program_id(0).to(tl.int64)
+        pb = tl.program_id(1)
+        offs = pb * BLOCK_N + tl.arange(0, BLOCK_N)
+        cc = tl.arange(0, BLOCK_C)
+        cm = cc < C
+        inb = cm[:, None] & (offs[None, :] < N)
+        base = b * C * N
+        ptr = base + cc[:, None] * N + offs[None, :]
+        x = tl.load(x_ptr + ptr, mask=inb, other=0.0).to(tl.float32)
+        w = _load_w(x, m_ptr, b, cc[:, None], offs[None, :], inb, smb, smc, HAS_M)
+        dyr = tl.load(dy_ptr + ptr, mask=inb, other=0.0).to(tl.float32)
+        nm = offs < N
+        mu = tl.load(mean_ptr + b * N + offs, mask=nm, other=0.0)
+        r = tl.load(rstd_ptr + b * N + offs, mask=nm, other=0.0)
+        xh = tl.where(w > 0, (x - mu[None, :]) * r[None, :], 0.0)
+        dy = tl.where(w > 0, dyr, 0.0)
+        if AFFINE:
+            gam = tl.load(g_ptr + cc, mask=cm, other=0.0).to(tl.float32)
+            prow = (b * NBLK + pb) * C
+            tl.store(pg_ptr + prow + cc, tl.sum(dy * xh, 1), mask=cm)
+            tl.store(pb_ptr + prow + cc, tl.sum(dy, 1), mask=cm)
+            g = dy * gam[:, None]
+        else:
+            g = dy
+        s0c = tl.maximum(tl.sum(w, 0), 1e-30)
+        A = tl.sum(g, 0) / s0c
+        Bv = tl.sum(g * xh, 0) / s0c
+        dx = r[None, :] * (g - w * (A[None, :] + xh * Bv[None, :]))
+        if FILL == 2:
+            dx = tl.where(w > 0, dx, dyr)
+        else:
+            dx = tl.where(w > 0, dx, 0.0)
+        tl.store(dx_ptr + ptr, dx.to(dx_ptr.dtype.element_ty), mask=inb)
+
+    # ---------------------------------------------------------------- layer, channel loop (C > 512)
+
     @triton.jit
     def _ln_fwd_kernel(
         x_ptr, m_ptr, y_ptr, g_ptr, b_ptr, mean_ptr, rstd_ptr,
@@ -576,8 +721,7 @@ if _HAS_TRITON:
         HAS_M: tl.constexpr, AFFINE: tl.constexpr, FILL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        """LayerNorm over the channels of each cell: one program per
-        (sample, block of cells), loops over the channels."""
+        """LayerNorm for wide C: loops over the channels (3 reads of x)."""
         b = tl.program_id(0).to(tl.int64)
         offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         inb = offs < N
@@ -605,12 +749,7 @@ if _HAS_TRITON:
             y = (x - mu) * r
             if AFFINE:
                 y = y * tl.load(g_ptr + c).to(tl.float32) + tl.load(b_ptr + c).to(tl.float32)
-            if FILL == 0:
-                y = tl.where(w > 0, y, 0.0)
-            elif FILL == 1:
-                y = tl.where(w > 0, y, float("nan"))
-            else:
-                y = tl.where(w > 0, y, x)
+            y = _fill_out(y, x, w, FILL)
             tl.store(y_ptr + base + c * N + offs, y.to(y_ptr.dtype.element_ty), mask=inb)
 
     @triton.jit
@@ -620,8 +759,6 @@ if _HAS_TRITON:
         HAS_M: tl.constexpr, AFFINE: tl.constexpr, FILL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        """dx of the per-cell LayerNorm, and partial sums of dgamma / dbeta
-        per (program, channel) (no atomics)."""
         b = tl.program_id(0).to(tl.int64)
         pb = tl.program_id(1)
         offs = pb * BLOCK + tl.arange(0, BLOCK)
@@ -665,9 +802,123 @@ if _HAS_TRITON:
                 dx = tl.where(w > 0, dx, 0.0)
             tl.store(dx_ptr + base + c * N + offs, dx.to(dx_ptr.dtype.element_ty), mask=inb)
 
+    # ---------------------------------------------------------------- pooling
 
-_BLOCK = 1024
-_LN_BLOCK = 128
+    @triton.autotune(configs=_warp_configs(), key=["N", "CHUNK"])
+    @triton.jit
+    def _pool_part_kernel(
+        x_ptr, m_ptr, part_ptr, arg_ptr,
+        C, N, CHUNK, NCH, smb, smc,
+        HAS_M: tl.constexpr, IS_MAX: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """Partial (S0, sum w x) or (S0, max, first argmax) of a chunk."""
+        bc = tl.program_id(0).to(tl.int64)
+        j = tl.program_id(1)
+        b = bc // C
+        c = bc % C
+        start = j * CHUNK
+        row = x_ptr + bc * N
+        ar = tl.arange(0, BLOCK)
+        s0 = tl.zeros([BLOCK], tl.float32)
+        acc = tl.zeros([BLOCK], tl.float32)
+        best = tl.full([BLOCK], -float("inf"), tl.float32)
+        bidx = tl.zeros([BLOCK], tl.int32)
+        for k in range(0, CHUNK, BLOCK):
+            offs = start + k + ar
+            inb = (offs < N) & (k + ar < CHUNK)
+            x = tl.load(row + offs, mask=inb, other=0.0).to(tl.float32)
+            w = _load_w(x, m_ptr, b, c, offs, inb, smb, smc, HAS_M)
+            s0 += w
+            if IS_MAX:
+                xv = tl.where(w > 0, x, -float("inf"))
+                upd = xv > best
+                best = tl.where(upd, xv, best)
+                bidx = tl.where(upd, offs, bidx)
+            else:
+                acc += w * tl.where(w > 0, x, 0.0)
+        out = part_ptr + (bc * NCH + j) * 2
+        tl.store(out, tl.sum(s0, 0))
+        if IS_MAX:
+            mx = tl.max(best, 0)
+            first = tl.min(tl.where(best == mx, bidx, 2147483647), 0)
+            tl.store(out + 1, mx)
+            tl.store(arg_ptr + bc * NCH + j, first)
+        else:
+            tl.store(out + 1, tl.sum(acc, 0))
+
+    @triton.autotune(configs=_ew_configs(), key=["N", "C"])
+    @triton.jit
+    def _pool_bwd_kernel(
+        x_ptr, m_ptr, lab_ptr, g_ptr, dx_ptr,
+        C, N, R, smb, smc,
+        HAS_M: tl.constexpr, HAS_LAB: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """dx = w * G[bc, region(n)] at the valid cells (G = dy / S0 for a
+        mean, dy for a sum): a gather from the [B*C, R] gradient, no atomics."""
+        bc = tl.program_id(0).to(tl.int64)
+        b = bc // C
+        c = bc % C
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        inb = offs < N
+        x = tl.load(x_ptr + bc * N + offs, mask=inb, other=0.0).to(tl.float32)
+        w = _load_w(x, m_ptr, b, c, offs, inb, smb, smc, HAS_M)
+        if HAS_LAB:
+            lab = tl.load(lab_ptr + offs, mask=inb, other=-1)
+            ok = lab >= 0
+            g = tl.load(g_ptr + bc * R + tl.maximum(lab, 0), mask=inb & ok, other=0.0)
+            w = tl.where(ok, w, 0.0)
+        else:
+            g = tl.load(g_ptr + bc)
+        dx = w * g
+        tl.store(dx_ptr + bc * N + offs, dx.to(dx_ptr.dtype.element_ty), mask=inb)
+
+    @triton.autotune(configs=_warp_configs(), key=["R", "BC"])
+    @triton.jit
+    def _region_part_kernel(
+        x_ptr, m_ptr, perm_ptr, offs_ptr, s0_ptr, y_ptr, arg_ptr,
+        C, N, R, BC, smb, smc,
+        HAS_M: tl.constexpr, IS_MAX: tl.constexpr,
+        BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        """One region, BLOCK_R (b, c) rows: gather the region's cells (CSR,
+        int32) and reduce them in a fixed order."""
+        reg = tl.program_id(0)
+        rows = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+        rm = rows < BC
+        rows64 = rows.to(tl.int64)
+        b = rows64 // C
+        c = rows64 % C
+        k0 = tl.load(offs_ptr + reg)
+        k1 = tl.load(offs_ptr + reg + 1)
+        ar = tl.arange(0, BLOCK_K)
+        s0 = tl.zeros([BLOCK_R, BLOCK_K], tl.float32)
+        acc = tl.zeros([BLOCK_R, BLOCK_K], tl.float32)
+        best = tl.full([BLOCK_R, BLOCK_K], -float("inf"), tl.float32)
+        bidx = tl.zeros([BLOCK_R, BLOCK_K], tl.int32)
+        for k in range(k0, k1, BLOCK_K):
+            km = (k + ar) < k1
+            cell = tl.load(perm_ptr + k + ar, mask=km, other=0)
+            inb = rm[:, None] & km[None, :]
+            x = tl.load(x_ptr + rows64[:, None] * N + cell[None, :], mask=inb,
+                        other=0.0).to(tl.float32)
+            w = _load_w(x, m_ptr, b[:, None], c[:, None], cell[None, :], inb, smb, smc, HAS_M)
+            s0 += w
+            if IS_MAX:
+                xv = tl.where(w > 0, x, -float("inf"))
+                upd = xv > best
+                best = tl.where(upd, xv, best)
+                bidx = tl.where(upd, cell[None, :] + tl.zeros([BLOCK_R, BLOCK_K], tl.int32), bidx)
+            else:
+                acc += w * tl.where(w > 0, x, 0.0)
+        out = rows64 * R + reg
+        tl.store(s0_ptr + out, tl.sum(s0, 1), mask=rm)
+        if IS_MAX:
+            mx = tl.max(best, 1)
+            first = tl.min(tl.where(best == mx[:, None], bidx, 2147483647), 1)
+            tl.store(y_ptr + out, mx, mask=rm)
+            tl.store(arg_ptr + out, first, mask=rm)
+        else:
+            tl.store(y_ptr + out, tl.sum(acc, 1), mask=rm)
 
 
 def _mask_args(m, x):
@@ -684,24 +935,29 @@ def _mask_args(m, x):
 
 
 def _chunks(rows: int, N: int, device) -> tuple[int, int]:
-    """(CHUNK, NCH): enough programs to fill the GPU, fixed for a shape."""
+    """(CHUNK, NCH): enough programs to fill the GPU.  Depends only on the
+    shape and the device, never on the autotuned configuration."""
     try:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
-    except Exception:  # pragma: no cover
+    except Exception:  # pragma: no cover - CPU under the interpreter
         sms = 108
     target = 8 * sms
-    nch = max(1, min(-(-target // max(rows, 1)), -(-N // _BLOCK)))
+    nch = max(1, min(-(-target // max(rows, 1)), -(-N // _RED_BLOCK)))
     chunk = -(-N // nch)
-    chunk = -(-chunk // _BLOCK) * _BLOCK
+    chunk = -(-chunk // _RED_BLOCK) * _RED_BLOCK
     nch = -(-N // chunk)
     return chunk, nch
 
 
+def _ew_grid(rows, N):
+    return lambda meta: (rows, triton.cdiv(N, meta["BLOCK"]))
+
+
 def _rows_layout(kind, B, C, G):
-    """(SB, CG, number of stat rows) of the (b, c) -> stat-row map."""
+    """(SB, CG) of the (b, c) -> statistics-row map: row = b * SB + c // CG."""
     if kind == "group":
-        return G, C // G, B * G
-    return 0, 1, C  # batch
+        return G, C // G
+    return 0, 1  # batch
 
 
 def _combine_parts(parts, kind, B, C, G):
@@ -720,57 +976,22 @@ def _combine_parts(parts, kind, B, C, G):
     return s0, mu, m2 / s0c
 
 
-class _RowsNormFunction(torch.autograd.Function):
-    """Triton group / batch normalisation (training statistics)."""
-
-    @staticmethod
-    def forward(ctx, x, m, weight, bias, kind, G, eps, fill):
-        B, C, N = x.shape
-        x_in = x
-        x = x.contiguous()
-        mt, smb, smc, has_m = _mask_args(m, x)
-        SB, CG, R = _rows_layout(kind, B, C, G)
-        chunk, nch = _chunks(B * C, N, x.device)
-        parts = torch.empty(B * C, nch, 3, device=x.device, dtype=torch.float32)
-        _rows_stats_kernel[(B * C, nch)](
-            x, mt, parts, C, N, chunk, nch, smb, smc,
-            HAS_M=has_m, BLOCK=_BLOCK, num_warps=4)
-        s0, mu, var = _combine_parts(parts, kind, B, C, G)
-        rstd = torch.rsqrt(var + eps)
-        affine = weight is not None
-        y = torch.empty_like(x)
-        _rows_norm_fwd_kernel[(B * C, triton.cdiv(N, _BLOCK))](
-            x, mt, y, mu, rstd,
-            weight if affine else x, bias if affine else x,
-            C, N, smb, smc, SB, CG,
-            HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
-            BLOCK=_BLOCK, num_warps=4)
-        ctx.save_for_backward(x_in, m if m is not None else torch.empty(0), weight
-                              if affine else torch.empty(0), mu, rstd, s0)
-        ctx.meta = (kind, G, eps, fill, has_m, affine, bias is not None)
-        ctx.mark_non_differentiable(mu, var, s0)
-        return y, mu, var, s0
-
-    @staticmethod
-    def backward(ctx, dy, _dmu, _dvar, _ds0):
-        x, m, weight, mu, rstd, s0 = ctx.saved_tensors
-        kind, G, eps, fill, has_m, affine, has_bias = ctx.meta
-        m = m if has_m else None
-        w_in = weight if affine else None
-        if torch.is_grad_enabled():  # double backward: reference with autograd
-            return _reference_backward(ctx, x, m, w_in, dy, kind, G, eps, fill)
-        B, C, N = x.shape
-        x = x.contiguous()
-        dy = dy.contiguous()
-        mt, smb, smc, _ = _mask_args(m, x)
-        SB, CG, R = _rows_layout(kind, B, C, G)
+def _rows_backward_kernels(x, mt, smb, smc, has_m, dy, mu, rstd, s0, weight, affine,
+                           kind, G, fill, with_stats):
+    """dx (and the per-channel sums of dy, dy * xhat) of the group / batch
+    normalisation; ``with_stats=False`` for given statistics (evaluation)."""
+    B, C, N = x.shape
+    SB, CG = _rows_layout(kind, B, C, G)
+    P1 = P2 = None
+    if with_stats or affine:
         chunk, nch = _chunks(B * C, N, x.device)
         parts = torch.empty(B * C, nch, 2, device=x.device, dtype=torch.float32)
         _rows_bwd_part_kernel[(B * C, nch)](
             x, mt, dy, mu, rstd, parts, C, N, chunk, nch, smb, smc, SB, CG,
-            HAS_M=has_m, BLOCK=_BLOCK, num_warps=4)
+            HAS_M=has_m, BLOCK=_RED_BLOCK)
         P = parts.sum(1).view(B, C, 2)
         P1, P2 = P[..., 0], P[..., 1]
+    if with_stats:
         gam = weight.float().view(1, C) if affine else torch.ones(1, C, device=x.device)
         g1, g2 = gam * P1, gam * P2
         if kind == "group":
@@ -781,15 +1002,98 @@ class _RowsNormFunction(torch.autograd.Function):
         s0c = s0.clamp_min(1e-30)
         A = (sg / s0c).contiguous()
         Bv = (sgx / s0c).contiguous()
-        dx = torch.empty_like(x)
-        _rows_bwd_dx_kernel[(B * C, triton.cdiv(N, _BLOCK))](
-            x, mt, dy, dx, mu, rstd, A, Bv, weight if affine else x,
+    else:
+        A = Bv = torch.zeros_like(mu)
+    dx = torch.empty_like(x)
+    _rows_bwd_dx_kernel[_ew_grid(B * C, N)](
+        x, mt, dy, dx, mu, rstd, A, Bv, weight if affine else x,
+        C, N, smb, smc, SB, CG,
+        HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill])
+    return dx, P1, P2
+
+
+class _RowsNormFunction(torch.autograd.Function):
+    """Triton group / batch normalisation.  With ``stats=(mean, var)`` given
+    ([C], batch kind) the statistics are not computed (evaluation)."""
+
+    @staticmethod
+    def forward(ctx, x, m, weight, bias, kind, G, eps, fill, stats=None):
+        B, C, N = x.shape
+        x_in = x
+        x = x.contiguous()
+        mt, smb, smc, has_m = _mask_args(m, x)
+        SB, CG = _rows_layout(kind, B, C, G)
+        if stats is None:
+            chunk, nch = _chunks(B * C, N, x.device)
+            parts = torch.empty(B * C, nch, 3, device=x.device, dtype=torch.float32)
+            _rows_stats_kernel[(B * C, nch)](
+                x, mt, parts, C, N, chunk, nch, smb, smc,
+                HAS_M=has_m, BLOCK=_RED_BLOCK)
+            s0, mu, var = _combine_parts(parts, kind, B, C, G)
+        else:
+            mu = stats[0].float().contiguous()
+            var = stats[1].float().contiguous()
+            s0 = torch.zeros_like(mu)
+        rstd = torch.rsqrt(var + eps)
+        affine = weight is not None
+        y = torch.empty_like(x)
+        _rows_norm_fwd_kernel[_ew_grid(B * C, N)](
+            x, mt, y, mu, rstd,
+            weight if affine else x, bias if affine else x,
             C, N, smb, smc, SB, CG,
-            HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
-            BLOCK=_BLOCK, num_warps=4)
+            HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill])
+        ctx.save_for_backward(x_in, m if m is not None else torch.empty(0),
+                              weight if affine else torch.empty(0), mu, rstd, s0)
+        ctx.meta = (kind, G, eps, fill, has_m, affine, stats is None)
+        ctx.mark_non_differentiable(mu, var, s0)
+        return y, mu, var, s0
+
+    @staticmethod
+    def backward(ctx, dy, _dmu, _dvar, _ds0):
+        x, m, weight, mu, rstd, s0 = ctx.saved_tensors
+        kind, G, eps, fill, has_m, affine, with_stats = ctx.meta
+        m = m if has_m else None
+        w_in = weight if affine else None
+        if torch.is_grad_enabled():  # double backward: reference with autograd
+            if not with_stats:
+                return _eval_reference_backward(ctx, x, m, w_in, mu, rstd, dy, fill)
+            return _reference_backward(ctx, x, m, w_in, dy, kind, G, eps, fill) + (None,)
+        x = x.contiguous()
+        dy = dy.contiguous()
+        mt, smb, smc, _ = _mask_args(m, x)
+        dx, P1, P2 = _rows_backward_kernels(
+            x, mt, smb, smc, has_m, dy, mu, rstd, s0, weight, affine, kind, G, fill,
+            with_stats)
         dw = P2.sum(0).to(weight.dtype) if affine and ctx.needs_input_grad[2] else None
-        db = P1.sum(0).to(weight.dtype) if has_bias and ctx.needs_input_grad[3] else None
-        return dx, None, dw, db, None, None, None, None
+        db = P1.sum(0).to(weight.dtype) if affine and ctx.needs_input_grad[3] else None
+        return dx, None, dw, db, None, None, None, None, None
+
+
+def _eval_reference_backward(ctx, x, m, weight, mu, rstd, dy, fill):
+    """Graph-keeping backward of the evaluation-mode batch normalisation."""
+    C = x.shape[1]
+    cdt = _compute_dtype(x.dtype)
+    with torch.enable_grad():
+        br = None
+        if weight is not None and ctx.needs_input_grad[3]:
+            br = torch.zeros_like(weight).requires_grad_(True)
+        valid, _ = _validity(x, m)
+        scale = rstd.to(cdt)
+        if weight is not None:
+            scale = scale * weight.to(cdt)
+        shift = -mu.to(cdt) * scale
+        if br is not None:
+            shift = shift + br.to(cdt)
+        y = torch.addcmul(shift.view(1, C, 1), x.to(cdt), scale.view(1, C, 1))
+        y = _apply_fill(y, x, valid, fill).to(x.dtype)
+        ins = [(i, t) for i, t in ((0, x), (2, weight), (3, br))
+               if t is not None and ctx.needs_input_grad[i] and t.requires_grad]
+        grads = torch.autograd.grad(y, [t for _, t in ins], dy,
+                                    create_graph=True, allow_unused=True)
+    out = [None] * 9
+    for (i, _), g in zip(ins, grads):
+        out[i] = g
+    return tuple(out)
 
 
 class _LayerNormFunction(torch.autograd.Function):
@@ -805,45 +1109,176 @@ class _LayerNormFunction(torch.autograd.Function):
         y = torch.empty_like(x)
         mu = torch.empty(B, N, device=x.device, dtype=torch.float32)
         rstd = torch.empty_like(mu)
-        _ln_fwd_kernel[(B, triton.cdiv(N, _LN_BLOCK))](
-            x, mt, y, weight if affine else x, bias if affine else x, mu, rstd,
-            C, N, smb, smc, eps,
-            HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
-            BLOCK=_LN_BLOCK, num_warps=4)
+        args = (x, mt, y, weight if affine else x, bias if affine else x, mu, rstd,
+                C, N, smb, smc, eps)
+        if C <= _LN_TILE_MAX_C:
+            bc = max(16, triton.next_power_of_2(C))
+            _ln_tile_fwd_kernel[lambda meta: (B, triton.cdiv(N, meta["BLOCK_N"]))](
+                *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill], BLOCK_C=bc)
+        else:
+            _ln_fwd_kernel[(B, triton.cdiv(N, 128))](
+                *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
+                BLOCK=128, num_warps=4)
         ctx.save_for_backward(x_in, m if m is not None else torch.empty(0),
                               weight if affine else torch.empty(0), mu, rstd)
-        ctx.meta = (eps, fill, has_m, affine, bias is not None)
+        ctx.meta = (eps, fill, has_m, affine)
         return y
 
     @staticmethod
     def backward(ctx, dy):
         x, m, weight, mu, rstd = ctx.saved_tensors
-        eps, fill, has_m, affine, has_bias = ctx.meta
+        eps, fill, has_m, affine = ctx.meta
         m = m if has_m else None
         w_in = weight if affine else None
         if torch.is_grad_enabled():
-            dx, _, dw, db, *_ = _reference_backward(
-                ctx, x, m, w_in, dy, "layer", 1, eps, fill)
+            dx, _, dw, db, *_ = _reference_backward(ctx, x, m, w_in, dy, "layer", 1, eps, fill)
             return dx, None, dw, db, None, None
         B, C, N = x.shape
         x = x.contiguous()
         dy = dy.contiguous()
         mt, smb, smc, _ = _mask_args(m, x)
-        nblk = triton.cdiv(N, _LN_BLOCK)
+        tile = C <= _LN_TILE_MAX_C
+        if tile:
+            bc = max(16, triton.next_power_of_2(C))
+            bn = max(8, min(_LN_BWD_BLOCK, 16384 // bc))
+        else:
+            bn = 128
+        nblk = triton.cdiv(N, bn)
         dx = torch.empty_like(x)
         if affine:
             pg = torch.empty(B * nblk, C, device=x.device, dtype=torch.float32)
             pb = torch.empty_like(pg)
         else:
             pg = pb = mu
-        _ln_bwd_kernel[(B, nblk)](
-            x, mt, dy, dx, weight if affine else x, mu, rstd, pg, pb,
-            C, N, nblk, smb, smc,
-            HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
-            BLOCK=_LN_BLOCK, num_warps=4)
+        args = (x, mt, dy, dx, weight if affine else x, mu, rstd, pg, pb, C, N, nblk, smb, smc)
+        if tile:
+            _ln_tile_bwd_kernel[(B, nblk)](
+                *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
+                BLOCK_C=bc, BLOCK_N=bn)
+        else:
+            _ln_bwd_kernel[(B, nblk)](
+                *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
+                BLOCK=bn, num_warps=4)
         dw = pg.sum(0).to(weight.dtype) if affine and ctx.needs_input_grad[2] else None
-        db = pb.sum(0).to(weight.dtype) if has_bias and ctx.needs_input_grad[3] else None
+        db = pb.sum(0).to(weight.dtype) if affine and ctx.needs_input_grad[3] else None
         return dx, None, dw, db, None, None
+
+
+# ---------------------------------------------------------------------------
+# Pooling on Triton
+# ---------------------------------------------------------------------------
+
+class _GlobalPoolFunction(torch.autograd.Function):
+    """Masked global pooling: one read of x (partial sums per chunk, fixed
+    order), backward one gather-free element-wise pass (max: a scatter of
+    the B*C gradients to their argmax, unique positions)."""
+
+    @staticmethod
+    def forward(ctx, x, m, mode):
+        B, C, N = x.shape
+        x_in = x
+        x = x.contiguous()
+        mt, smb, smc, has_m = _mask_args(m, x)
+        chunk, nch = _chunks(B * C, N, x.device)
+        parts = torch.empty(B * C, nch, 2, device=x.device, dtype=torch.float32)
+        is_max = mode == "max"
+        arg = torch.empty(B * C, nch, device=x.device, dtype=torch.int32) if is_max else parts
+        _pool_part_kernel[(B * C, nch)](
+            x, mt, parts, arg, C, N, chunk, nch, smb, smc,
+            HAS_M=has_m, IS_MAX=is_max, BLOCK=_RED_BLOCK)
+        s0 = parts[..., 0].sum(1)
+        if is_max:
+            y, j = parts[..., 1].max(1)
+            idx = arg.gather(1, j[:, None]).squeeze(1).long()
+        else:
+            y = parts[..., 1].sum(1)
+            idx = None
+        ctx.save_for_backward(x_in, m if m is not None else torch.empty(0), s0,
+                              idx if idx is not None else torch.empty(0))
+        ctx.meta = (mode, has_m)
+        ctx.mark_non_differentiable(s0)
+        return y.view(B, C), s0.view(B, C)
+
+    @staticmethod
+    def backward(ctx, dy, _ds0):
+        x, m, s0, idx = ctx.saved_tensors
+        mode, has_m = ctx.meta
+        m = m if has_m else None
+        B, C, N = x.shape
+        if torch.is_grad_enabled():
+            with torch.enable_grad():
+                y = _torch_global_pool(x, m, mode)[0]
+                (dx,) = torch.autograd.grad(y, x, dy, create_graph=True)
+            return dx, None, None
+        x = x.contiguous()
+        dyf = dy.reshape(-1).float()
+        if mode == "max":
+            dx = torch.zeros(B * C, N, device=x.device, dtype=torch.float32)
+            ok = s0 > 0
+            rows = torch.arange(B * C, device=x.device)
+            dx[rows[ok], idx[ok]] = dyf[ok]
+            return dx.view(B, C, N).to(x.dtype), None, None
+        g = torch.where(s0 > 0, dyf, torch.zeros_like(dyf)).contiguous()
+        mt, smb, smc, _ = _mask_args(m, x)
+        dx = torch.empty_like(x)
+        _pool_bwd_kernel[_ew_grid(B * C, N)](
+            x, mt, x, g, dx, C, N, 1, smb, smc, HAS_M=has_m, HAS_LAB=False)
+        return dx, None, None
+
+
+class _RegionPoolFunction(torch.autograd.Function):
+    """Masked pooling over CSR regions: one program per (region, block of
+    rows) gathers the region's cells (int32 indices) in a fixed order;
+    backward: a gather of the [B*C, R] gradient by the region label of each
+    cell (no atomics)."""
+
+    @staticmethod
+    def forward(ctx, x, m, mode, perm, offs, labels):
+        B, C, N = x.shape
+        R = offs.numel() - 1
+        x_in = x
+        x = x.contiguous()
+        mt, smb, smc, has_m = _mask_args(m, x)
+        BC = B * C
+        is_max = mode == "max"
+        s0 = torch.empty(BC, R, device=x.device, dtype=torch.float32)
+        y = torch.empty_like(s0)
+        arg = torch.empty(BC, R, device=x.device, dtype=torch.int32) if is_max else s0
+        block_r = 16 if BC >= 16 else max(1, triton.next_power_of_2(BC))
+        _region_part_kernel[(R, triton.cdiv(BC, block_r))](
+            x, mt, perm, offs, s0, y, arg, C, N, R, BC, smb, smc,
+            HAS_M=has_m, IS_MAX=is_max, BLOCK_R=block_r, BLOCK_K=64)
+        ctx.save_for_backward(x_in, m if m is not None else torch.empty(0), s0, labels,
+                              arg if is_max else torch.empty(0))
+        ctx.meta = (mode, has_m, R)
+        ctx.mark_non_differentiable(s0)
+        return y.view(B, C, R), s0.view(B, C, R)
+
+    @staticmethod
+    def backward(ctx, dy, _ds0):
+        x, m, s0, labels, arg = ctx.saved_tensors
+        mode, has_m, R = ctx.meta
+        m = m if has_m else None
+        B, C, N = x.shape
+        dyf = dy.reshape(B * C, R).float()
+        if torch.is_grad_enabled():
+            with torch.enable_grad():
+                y = _torch_region_pool(x, m, mode, labels.long(), R)[0]
+                (dx,) = torch.autograd.grad(y, x, dy, create_graph=True)
+            return dx, None, None, None, None, None
+        if mode == "max":
+            dx = torch.zeros(B * C, N, device=x.device, dtype=torch.float32)
+            ok = s0 > 0
+            rows = torch.arange(B * C, device=x.device)[:, None].expand(B * C, R)
+            dx[rows[ok], arg.long()[ok]] = dyf[ok]
+            return dx.view(B, C, N).to(x.dtype), None, None, None, None, None
+        g = torch.where(s0 > 0, dyf, torch.zeros_like(dyf)).contiguous()
+        x = x.contiguous()
+        mt, smb, smc, _ = _mask_args(m, x)
+        dx = torch.empty_like(x)
+        _pool_bwd_kernel[_ew_grid(B * C, N)](
+            x, mt, labels, g, dx, C, N, R, smb, smc, HAS_M=has_m, HAS_LAB=True)
+        return dx, None, None, None, None, None
 
 
 def _reference_backward(ctx, x, m, weight, dy, kind, G, eps, fill):
@@ -869,7 +1304,8 @@ def _reference_backward(ctx, x, m, weight, dy, kind, G, eps, fill):
 def _use_triton(x: torch.Tensor, backend: str) -> bool:
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}; got {backend!r}.")
-    ok = _HAS_TRITON and x.is_cuda and x.dtype in _TRITON_DTYPES
+    ok = (_HAS_TRITON and (x.is_cuda or (_INTERPRET and backend == "triton"))
+          and x.dtype in _TRITON_DTYPES)
     if backend == "triton" and not ok:
         raise RuntimeError(
             "backend='triton' needs the triton package, a CUDA tensor and a "
@@ -1047,6 +1483,11 @@ class HealPixBatchNorm(_MaskedNormMixin, nn.BatchNorm1d):
         use_batch = self.training or (self.running_mean is None and self.running_var is None)
 
         if not use_batch:
+            if _use_triton(x, self.backend):
+                y, *_ = _RowsNormFunction.apply(
+                    x, m, self.weight, self.bias, "batch", 1, self.eps, self.fill,
+                    (self.running_mean, self.running_var))
+                return y
             return _batch_norm_eval(x, m, self.running_mean, self.running_var,
                                     self.weight, self.bias, self.eps, self.fill)
 
@@ -1090,7 +1531,7 @@ def _empty_value(fill: str) -> float:
 
 
 def global_pool(x, mask=None, mode: str = "mean", fill: str = "zero",
-                return_weight: bool = False):
+                return_weight: bool = False, backend: str = "auto"):
     """Masked global pooling of ``[B, C, N]`` HEALPix data over the cells.
 
     Parameters
@@ -1109,20 +1550,56 @@ def global_pool(x, mask=None, mode: str = "mean", fill: str = "zero",
         Result for a (sample, channel) without any valid cell.
     return_weight : bool, default False
         Also return ``sum w`` (``[B, C]``), the covered number of cells.
+    backend : {"auto", "triton", "torch"}, default "auto"
+        ``"auto"``: a Triton kernel on CUDA (one read of ``x``) when Triton
+        is installed.
 
     Returns
     -------
     y : torch.Tensor, shape [B, C] (and the weight sum if requested)
+
+    Notes
+    -----
+    The gradient of ``"max"`` goes to the maximum; with ties, the PyTorch
+    backend shares it equally (as ``torch.amax``) and the Triton backend
+    gives it to the first cell.
     """
     _check_x(x)
     if mode not in POOL_MODES:
         raise ValueError(f"mode must be one of {POOL_MODES}; got {mode!r}.")
     empty = _empty_value(fill)
-    src, wt = _pool_sources(x, _mask_3d(mask, x), mode)
-    cdt = src.dtype
-    s0 = wt.sum(-1, dtype=cdt).expand(x.shape[0], x.shape[1])
-    y = src.amax(-1) if mode == "max" else src.sum(-1)
+    m = _mask_3d(mask, x)
+    if _use_triton(x, backend):
+        y, s0 = _GlobalPoolFunction.apply(x, m, "max" if mode == "max" else "sum")
+    else:
+        y, s0 = _torch_global_pool(x, m, mode)
     return _pool_finish(y, s0, mode, empty, x.dtype, return_weight)
+
+
+def _torch_global_pool(x, m, mode):
+    """PyTorch global pooling: (sum or max, S0), shape [B, C]."""
+    src, wt = _pool_sources(x, m, mode)
+    s0 = wt.sum(-1, dtype=src.dtype).expand(x.shape[0], x.shape[1])
+    y = src.amax(-1) if mode == "max" else src.sum(-1)
+    return y, s0
+
+
+def _torch_region_pool(x, m, mode, lab, R):
+    """PyTorch region pooling by scatter (reference for double backward)."""
+    B, C, N = x.shape
+    src, wt = _pool_sources(x, m, mode)
+    keep = lab >= 0
+    pos = torch.nonzero(keep).reshape(-1)
+    li = lab[keep]
+    sv = src.index_select(-1, pos)
+    if mode == "max":
+        y = torch.full((B, C, R), -float("inf"), dtype=src.dtype, device=x.device)
+        y = y.scatter_reduce(-1, li.view(1, 1, -1).expand(B, C, -1), sv, "amax")
+    else:
+        y = torch.zeros(B, C, R, dtype=src.dtype, device=x.device).index_add(-1, li, sv)
+    wv = wt.index_select(-1, pos).to(src.dtype)
+    s0 = torch.zeros(*wv.shape[:2], R, dtype=src.dtype, device=x.device).index_add(-1, li, wv)
+    return y, s0.expand(B, C, R)
 
 
 def _pool_sources(x, m, mode):
@@ -1153,24 +1630,31 @@ def _pool_finish(y, s0, mode, empty, dtype, return_weight):
 class HealPixGlobalPool(nn.Module):
     """Module form of :func:`global_pool`: ``[B, C, N]`` -> ``[B, C]``."""
 
-    def __init__(self, mode: str = "mean", fill: str = "zero"):
+    def __init__(self, mode: str = "mean", fill: str = "zero", backend: str = "auto"):
         super().__init__()
         if mode not in POOL_MODES:
             raise ValueError(f"mode must be one of {POOL_MODES}; got {mode!r}.")
         _empty_value(fill)
         self.mode = mode
         self.fill = fill
+        self.backend = backend
 
     def extra_repr(self) -> str:  # pragma: no cover
         return f"mode={self.mode!r}, fill={self.fill!r}"
 
-    def forward(self, x, mask=None):
-        return global_pool(x, mask, self.mode, self.fill)
+    def forward(self, x, mask=None, return_weight: bool = False):
+        return global_pool(x, mask, self.mode, self.fill, return_weight, self.backend)
 
 
 def _region_layout(regions, n_regions=None):
-    """ELL layout of the regions: indices ``[R, L]`` (padded with 0) and the
-    padding mask ``[R, L]``, L being the size of the largest region."""
+    """Layouts of the regions, as a dict of CPU tensors and flags:
+
+    * ELL (PyTorch backend): ``idx [R, L]`` (padded with 0) and ``pad
+      [R, L]``, L being the size of the largest region; ``ident`` when the
+      layout is the identity (a free view), ``full`` without padding;
+    * CSR (Triton backend): ``perm`` (int32 cell positions sorted by region),
+      ``offs`` (int32 ``[R + 1]``) and ``labels`` (int32 ``[N]``, -1 = none).
+    """
     if isinstance(regions, torch.Tensor):
         r = regions.detach().to("cpu", torch.int64).reshape(-1)
     else:
@@ -1195,7 +1679,11 @@ def _region_layout(regions, n_regions=None):
     n = r.numel()
     full = bool(pad.all())
     ident = full and idx.numel() == n and bool(torch.equal(idx.reshape(-1), torch.arange(n)))
-    return idx, pad, counts, n, ident, full
+    offs = torch.zeros(R + 1, dtype=torch.int32)
+    offs[1:] = torch.cumsum(counts, 0).to(torch.int32)
+    labels = torch.where(keep, r, torch.full_like(r, -1)).to(torch.int32)
+    return dict(idx=idx, pad=pad, counts=counts, n=n, ident=ident, full=full,
+                perm=pos.to(torch.int32), offs=offs, labels=labels)
 
 
 def _region_reduce(t, idx, pad, ident, full, op, dtype):
@@ -1214,21 +1702,34 @@ def _region_reduce(t, idx, pad, ident, full, op, dtype):
     return g.sum(-1, dtype=dtype)
 
 
-def _region_pool_layout(x, idx, pad, ident, full, mask, mode, fill, return_weight):
+def _region_pool_run(x, lay, mask, mode, fill, return_weight, backend):
     _check_x(x)
     if mode not in POOL_MODES:
         raise ValueError(f"mode must be one of {POOL_MODES}; got {mode!r}.")
     empty = _empty_value(fill)
     B, C, N = x.shape
-    src, wt = _pool_sources(x, _mask_3d(mask, x), mode)
-    cdt = src.dtype
-    y = _region_reduce(src, idx, pad, ident, full, "max" if mode == "max" else "sum", cdt)
-    s0 = _region_reduce(wt, idx, pad, ident, full, "sum", cdt).expand(B, C, idx.shape[0])
+    m = _mask_3d(mask, x)
+    R = lay["idx"].shape[0]
+    if _use_triton(x, backend) and R > 0:
+        y, s0 = _RegionPoolFunction.apply(x, m, "max" if mode == "max" else "sum",
+                                          lay["perm"], lay["offs"], lay["labels"])
+    else:
+        src, wt = _pool_sources(x, m, mode)
+        cdt = src.dtype
+        y = _region_reduce(src, lay["idx"], lay["pad"], lay["ident"], lay["full"],
+                           "max" if mode == "max" else "sum", cdt)
+        s0 = _region_reduce(wt, lay["idx"], lay["pad"], lay["ident"], lay["full"],
+                            "sum", cdt).expand(B, C, R)
     return _pool_finish(y, s0, mode, empty, x.dtype, return_weight)
 
 
+def _layout_to(lay, device):
+    return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in lay.items()}
+
+
 def region_pool(x, regions, mask=None, mode: str = "mean", fill: str = "zero",
-                n_regions: Optional[int] = None, return_weight: bool = False):
+                n_regions: Optional[int] = None, return_weight: bool = False,
+                backend: str = "auto"):
     """Masked pooling of ``[B, C, N]`` HEALPix data over labelled regions.
 
     Parameters
@@ -1238,7 +1739,7 @@ def region_pool(x, regions, mask=None, mode: str = "mean", fill: str = "zero",
         Region label of each cell (in the order of ``x``), in
         ``[0, n_regions)``; ``-1`` excludes the cell.  Labels of coarser
         parents: :meth:`HealPixRegionPool.from_cell_ids`.
-    mask, mode, fill, return_weight
+    mask, mode, fill, return_weight, backend
         As :func:`global_pool`; a region without any valid cell gets
         ``fill``.
     n_regions : int, optional
@@ -1250,25 +1751,28 @@ def region_pool(x, regions, mask=None, mode: str = "mean", fill: str = "zero",
 
     Notes
     -----
-    The cells of each region are gathered into a padded ``[B, C, R, L]``
-    tensor, L being the size of the largest region, then reduced: no
-    atomics, deterministic forward and backward.  When the regions are
-    contiguous, sorted and of equal size (``from_cell_ids`` on the full
-    sphere or on a complete sorted domain) the gather is a free view.  For many calls with the
-    same regions, build a :class:`HealPixRegionPool` once.
+    No atomics, deterministic forward and backward.  Triton backend: one
+    program per (region, block of rows) gathers the cells of the region
+    from a CSR layout (int32), and the backward is a gather of the
+    ``[B, C, R]`` gradient by the label of each cell.  PyTorch backend: the
+    cells are gathered into a padded ``[B, C, R, L]`` tensor (L = size of
+    the largest region; a free view when the regions are contiguous, sorted
+    and of equal size, as ``from_cell_ids`` gives on the full sphere).  For
+    many calls with the same regions, build a :class:`HealPixRegionPool`
+    once.
     """
-    idx, pad, _, n, ident, full = _region_layout(regions, n_regions)
-    if n != x.shape[-1]:
-        raise ValueError(f"regions has {n} labels for {x.shape[-1]} cells.")
-    return _region_pool_layout(x, idx.to(x.device), pad.to(x.device), ident, full, mask,
-                               mode, fill, return_weight)
+    lay = _region_layout(regions, n_regions)
+    if lay["n"] != x.shape[-1]:
+        raise ValueError(f"regions has {lay['n']} labels for {x.shape[-1]} cells.")
+    return _region_pool_run(x, _layout_to(lay, x.device), mask, mode, fill,
+                            return_weight, backend)
 
 
 class HealPixRegionPool(nn.Module):
     """Masked pooling over fixed regions: ``[B, C, N]`` -> ``[B, C, R]``.
 
-    The layout of the regions is built once and stored as non-persistent
-    buffers, so it follows ``.to()``.  See :func:`region_pool`.
+    The layouts of the regions are built once and stored as non-persistent
+    buffers, so they follow ``.to()``.  See :func:`region_pool`.
 
     Parameters
     ----------
@@ -1277,6 +1781,7 @@ class HealPixRegionPool(nn.Module):
     mode : {"mean", "max", "sum"}, default "mean"
     fill : {"zero", "nan"}, default "zero"
     n_regions : int, optional
+    backend : {"auto", "triton", "torch"}, default "auto"
 
     Attributes
     ----------
@@ -1287,21 +1792,26 @@ class HealPixRegionPool(nn.Module):
         With :meth:`from_cell_ids`, the parent cell id of each region.
     """
 
+    _LAYOUT_TENSORS = ("idx", "pad", "perm", "offs", "labels")
+
     def __init__(self, regions, mode: str = "mean", fill: str = "zero",
-                 n_regions: Optional[int] = None):
+                 n_regions: Optional[int] = None, backend: str = "auto"):
         super().__init__()
         if mode not in POOL_MODES:
             raise ValueError(f"mode must be one of {POOL_MODES}; got {mode!r}.")
         _empty_value(fill)
-        idx, pad, counts, n, self._ident, self._full = _region_layout(regions, n_regions)
+        lay = _region_layout(regions, n_regions)
         self.mode = mode
         self.fill = fill
-        self.n_regions = idx.shape[0]
-        self.n_cells = n
+        self.backend = backend
+        self.n_regions = lay["idx"].shape[0]
+        self.n_cells = lay["n"]
+        self._ident = lay["ident"]
+        self._full = lay["full"]
         self.region_ids = None
-        self.register_buffer("_idx", idx, persistent=False)
-        self.register_buffer("_pad", pad, persistent=False)
-        self.register_buffer("counts", counts, persistent=False)
+        for k in self._LAYOUT_TENSORS:
+            self.register_buffer("_" + k, lay[k], persistent=False)
+        self.register_buffer("counts", lay["counts"], persistent=False)
 
     @classmethod
     def from_cell_ids(cls, cell_ids, level: int, region_level: int, **kwargs):
@@ -1324,5 +1834,7 @@ class HealPixRegionPool(nn.Module):
     def forward(self, x, mask=None, return_weight: bool = False):
         if x.shape[-1] != self.n_cells:
             raise ValueError(f"Expected {self.n_cells} cells, got {x.shape[-1]}.")
-        return _region_pool_layout(x, self._idx, self._pad, self._ident, self._full, mask,
-                                   self.mode, self.fill, return_weight)
+        lay = {k: getattr(self, "_" + k) for k in self._LAYOUT_TENSORS}
+        lay.update(ident=self._ident, full=self._full)
+        return _region_pool_run(x, lay, mask, self.mode, self.fill, return_weight,
+                                self.backend)

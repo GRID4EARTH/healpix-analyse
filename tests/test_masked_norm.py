@@ -516,3 +516,96 @@ def test_torch_backend_matches_reference(kind, mask_kind, fill, affine):
     ins1 = (xt,) + ((w, b) if affine else ())
     for a, c in zip(torch.autograd.grad(y1, ins1, g), torch.autograd.grad(y0, ins0, g)):
         torch.testing.assert_close(a, c, atol=1e-11, rtol=1e-11, equal_nan=True)
+
+
+@needs_triton
+@pytest.mark.parametrize("C", [8, 600])
+def test_triton_layer_norm_tile_and_loop_kernels(C):
+    """C <= 512 runs the one-tile kernels, wider C the channel loop."""
+    dev = TRITON_DEVICE
+    N = 300
+    x = _rand(2, C, N, torch.float32, device=dev)
+    m = torch.rand(2, C, N, device=dev) > 0.2
+    w = torch.randn(C, device=dev, requires_grad=True)
+    b = torch.randn(C, device=dev, requires_grad=True)
+    xr, xt = x.clone().requires_grad_(), x.clone().requires_grad_()
+    y0, *_ = mn.masked_norm_reference(xr, m, "layer", 1, w, b, 1e-5, "zero")
+    y1 = mn._LayerNormFunction.apply(xt, mn._mask_3d(m, xt), w, b, 1e-5, "zero")
+    torch.testing.assert_close(y1, y0, atol=1e-4, rtol=1e-4)
+    g = torch.randn_like(y0)
+    for a, c in zip(torch.autograd.grad(y1, (xt, w, b), g), torch.autograd.grad(y0, (xr, w, b), g)):
+        torch.testing.assert_close(a, c, atol=2e-3, rtol=1e-3)
+
+
+@needs_triton
+@pytest.mark.parametrize("fill", ["zero", "passthrough"])
+def test_triton_batch_norm_eval(fill):
+    dev = TRITON_DEVICE
+    C = 6
+    ref = HealPixBatchNorm(C, fill=fill, backend="torch").to(dev)
+    tri = HealPixBatchNorm(C, fill=fill, backend="triton").to(dev)
+    with torch.no_grad():
+        for layer in (ref, tri):
+            layer.running_mean.copy_(torch.linspace(-1, 1, C))
+            layer.running_var.copy_(torch.linspace(0.5, 2, C))
+            layer.weight.copy_(torch.linspace(1, 2, C))
+            layer.bias.copy_(torch.linspace(-0.5, 0.5, C))
+    ref.eval()
+    tri.eval()
+    x = _rand(2, C, 500, torch.float32, device=dev)
+    m = torch.rand(500, device=dev) > 0.3
+    xr, xt = x.clone().requires_grad_(), x.clone().requires_grad_()
+    y0, y1 = ref(xr, m), tri(xt, m)
+    torch.testing.assert_close(y1, y0, atol=1e-5, rtol=1e-5)
+    g = torch.randn_like(y0)
+    a = torch.autograd.grad(y1, (xt, tri.weight, tri.bias), g)
+    c = torch.autograd.grad(y0, (xr, ref.weight, ref.bias), g)
+    for u, v in zip(a, c):
+        torch.testing.assert_close(u, v, atol=1e-3, rtol=1e-4)
+
+
+@needs_triton
+@pytest.mark.parametrize("mode", ["mean", "sum", "max"])
+@pytest.mark.parametrize("mask_kind", ["none", "N", "BCN_float"])
+def test_triton_pooling_matches_torch(mode, mask_kind):
+    dev = TRITON_DEVICE
+    torch.manual_seed(0)
+    B, C, N = 2, 3, 2000
+    x = _rand(B, C, N, torch.float32, device=dev)
+    x[0, 0, 3] = float("nan")
+    mask = {"none": None, "N": torch.rand(N, device=dev) > 0.3,
+            "BCN_float": torch.rand(B, C, N, device=dev)}[mask_kind]
+    regions = torch.randint(-1, 7, (N,))
+    regions[:5] = 8                      # region 8, region 7 empty
+    for fn in (lambda xx, be: global_pool(xx, mask, mode, return_weight=True, backend=be),
+               lambda xx, be: region_pool(xx, regions, mask, mode, n_regions=9,
+                                          return_weight=True, backend=be)):
+        xr, xt = x.clone().requires_grad_(), x.clone().requires_grad_()
+        y0, s0 = fn(xr, "torch")
+        y1, s1 = fn(xt, "triton")
+        torch.testing.assert_close(s1.float(), s0.float(), atol=1e-3, rtol=1e-5)
+        torch.testing.assert_close(y1, y0, atol=1e-4, rtol=1e-4)
+        g = torch.randn_like(y0)
+        (a,) = torch.autograd.grad(y1, xt, g)
+        (c,) = torch.autograd.grad(y0, xr, g)
+        torch.testing.assert_close(a, c, atol=1e-5, rtol=1e-4)
+
+
+@needs_triton
+def test_triton_region_pool_module_and_determinism():
+    dev = TRITON_DEVICE
+    level = 4
+    rng = np.random.default_rng(0)
+    ids = rng.permutation(np.arange(256 * 3, 256 * 5))
+    pool_t = HealPixRegionPool.from_cell_ids(ids, level, 2, backend="triton").to(dev)
+    pool_r = HealPixRegionPool.from_cell_ids(ids, level, 2, backend="torch").to(dev)
+    x = _rand(3, 4, ids.size, torch.float32, device=dev)
+    m = torch.rand(3, ids.size, device=dev) > 0.2
+    torch.testing.assert_close(pool_t(x, m), pool_r(x, m), atol=1e-5, rtol=1e-5)
+    outs = []
+    for _ in range(2):
+        xt = x.clone().requires_grad_()
+        y = pool_t(xt, m)
+        (gx,) = torch.autograd.grad(y.square().sum(), xt)
+        outs.append((y, gx))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])

@@ -134,3 +134,28 @@ def test_input_checks():
         healpix_positional_encoding(1, gauge_type="bad")
     with pytest.raises(ValueError):
         healpix_positional_encoding(30)
+
+
+def _triton_device():
+    import os
+    from healpix_analyse import positional_encoding as pe
+    if not pe._HAS_TRITON:
+        return None
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else None
+
+
+@pytest.mark.skipif(_triton_device() is None, reason="needs Triton on CUDA or TRITON_INTERPRET=1")
+@pytest.mark.parametrize("gauge_type", [None, "projected_ref"])
+def test_triton_kernel_matches_torch(gauge_type):
+    dev = _triton_device()
+    ids = np.random.default_rng(0).permutation(np.arange(3000))
+    kw = dict(gauge_type=gauge_type, include_level=True, device=dev)
+    a = healpix_positional_encoding(7, ids, backend="triton", **kw)
+    b = healpix_positional_encoding(7, ids, backend="torch", **kw)
+    assert a.dtype == torch.float32 and a.shape == b.shape
+    torch.testing.assert_close(a, b, atol=2e-6, rtol=0)
+    h = healpix_positional_encoding(7, ids, backend="triton", dtype=torch.bfloat16,
+                                    gauge_type=gauge_type, device=dev)
+    assert h.dtype == torch.bfloat16

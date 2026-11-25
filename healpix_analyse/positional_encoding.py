@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from collections import OrderedDict
 from typing import Optional, Sequence
 
@@ -44,6 +45,60 @@ import torch.nn as nn
 import healpix_geo
 
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
+
+try:  # Triton is an optional extra
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover - depends on the environment
+    triton = None
+    tl = None
+    _HAS_TRITON = False
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _fourier_axis(v, f, out_ptr, row, N, offs, m):
+        # sin / cos(pi f v): the argument is reduced modulo 2 in float64
+        # (f v is exact for octave frequencies), then evaluated in float32.
+        t = f * v
+        r = t - 2.0 * tl.floor(t * 0.5)
+        a = (r * 3.141592653589793).to(tl.float32)
+        tl.store(out_ptr + row * N + offs, tl.sin(a).to(out_ptr.dtype.element_ty), mask=m)
+        tl.store(out_ptr + (row + 3) * N + offs, tl.cos(a).to(out_ptr.dtype.element_ty), mask=m)
+
+    @triton.jit
+    def _posenc_kernel(xyz_ptr, alpha_ptr, f_ptr, out_ptr, N, NF, ROW0, GROW, LROW, level_val,
+                       HAS_XYZ: tl.constexpr, HAS_GAUGE: tl.constexpr,
+                       HAS_LEVEL: tl.constexpr, BLOCK: tl.constexpr):
+        """All the features of BLOCK cells in one pass: reads 3 float64 (+1),
+        writes F values per cell."""
+        offs = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+        m = offs < N
+        x = tl.load(xyz_ptr + offs, mask=m, other=0.0)
+        y = tl.load(xyz_ptr + N + offs, mask=m, other=0.0)
+        z = tl.load(xyz_ptr + 2 * N + offs, mask=m, other=0.0)
+        ty = out_ptr.dtype.element_ty
+        if HAS_XYZ:
+            tl.store(out_ptr + offs, x.to(ty), mask=m)
+            tl.store(out_ptr + N + offs, y.to(ty), mask=m)
+            tl.store(out_ptr + 2 * N + offs, z.to(ty), mask=m)
+        for k in range(0, NF):
+            f = tl.load(f_ptr + k)
+            row = ROW0 + 6 * k
+            _fourier_axis(x, f, out_ptr, row, N, offs, m)
+            _fourier_axis(y, f, out_ptr, row + 1, N, offs, m)
+            _fourier_axis(z, f, out_ptr, row + 2, N, offs, m)
+        if HAS_GAUGE:
+            al = tl.load(alpha_ptr + offs, mask=m, other=0.0)
+            tl.store(out_ptr + GROW * N + offs, tl.cos(al).to(ty), mask=m)
+            tl.store(out_ptr + (GROW + 1) * N + offs, tl.sin(al).to(ty), mask=m)
+        if HAS_LEVEL:
+            tl.store(out_ptr + LROW * N + offs,
+                     (tl.zeros([BLOCK], tl.float32) + level_val).to(ty), mask=m)
+
+
 
 __all__ = [
     "HealPixPositionalEncoding",
@@ -76,22 +131,37 @@ def _domain_key(ids: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(ids, dtype=np.int64).tobytes()).hexdigest()
 
 
-def _gauge_angle(th, ph, gauge_type, ref_direction, chunk=1 << 20):
-    """Angle from e_theta to the first gauge axis, in [-pi, pi]."""
-    from healpix_analyse.convol import _build_rotation_matrices
+def _gauge_angle(th, ph, gauge_type, ref_direction):
+    """Angle from e_theta to the first gauge axis of ``HealPixConv``.
 
-    out = np.empty(th.shape[0], dtype=np.float64)
-    for s in range(0, th.shape[0], chunk):
-        t = th[s:s + chunk]
-        p = ph[s:s + chunk]
-        R = _build_rotation_matrices(t, p, 1, gauge_type, "cpu", torch.float64,
-                                     ref_direction=ref_direction)[:, 0]   # [k, 3, 3]
-        v = R[:, :, 0].numpy()                     # image of the north-pole x axis
-        ct, st, cp, sp = np.cos(t), np.sin(t), np.cos(p), np.sin(p)
-        e_th = np.stack([ct * cp, ct * sp, -st], axis=1)
-        e_ph = np.stack([-sp, cp, np.zeros_like(sp)], axis=1)
-        out[s:s + chunk] = np.arctan2((v * e_ph).sum(1), (v * e_th).sum(1))
-    return out
+    ``HealPixConv`` rotates its frame about the normal n by ``alpha_base``,
+    and ``n x e_theta = e_phi``, so the first axis is
+    ``cos(alpha) e_theta + sin(alpha) e_phi`` with ``alpha = alpha_base``:
+    the closed forms of ``convol._build_rotation_matrices`` (checked against
+    its rotation matrices in the tests), without building them.
+    """
+    if gauge_type == "phi":
+        return np.zeros_like(th)
+    if gauge_type == "cosmo":
+        return np.where(th > np.pi / 2, ph, -ph)
+    ct, st, cp, sp = np.cos(th), np.sin(th), np.cos(ph), np.sin(ph)
+
+    def tangent(r):
+        r = np.asarray(r, dtype=np.float64).reshape(3)
+        r = r / max(np.linalg.norm(r), 1e-12)
+        r_eth = r[0] * ct * cp + r[1] * ct * sp - r[2] * st
+        r_eph = -r[0] * sp + r[1] * cp
+        return r_eth, r_eph
+
+    if gauge_type == "projected_ref":
+        eth, eph = tangent([1.0, 0.0, 0.0] if ref_direction is None else ref_direction)
+        return np.arctan2(eph, eth)
+    if ref_direction is None or np.asarray(ref_direction).size != 6:
+        raise ValueError("gauge_type='two_ref' needs ref_direction of shape (2, 3).")
+    ref = np.asarray(ref_direction, dtype=np.float64).reshape(2, 3)
+    e1, p1 = tangent(ref[0])
+    e2, p2 = tangent(ref[1])
+    return np.arctan2(e1 * p2 + p1 * e2, e1 * e2 - p1 * p2)
 
 
 def _geometry(level, ids, ellipsoid, gauge_type, ref_direction):
@@ -173,6 +243,7 @@ def healpix_positional_encoding(
     ellipsoid: str = "WGS84",
     device=None,
     dtype: torch.dtype = torch.float32,
+    backend: str = "auto",
 ) -> torch.Tensor:
     """Positional encoding of HEALPix cells, shape ``[F, N]``.
 
@@ -199,14 +270,19 @@ def healpix_positional_encoding(
         Ellipsoid of the cell centres (``healpix_geo`` name).
     device, dtype
         Of the result (float32 by default).
+    backend : {"auto", "triton", "torch"}, default "auto"
+        ``"auto"``: on CUDA (float32 / 16-bit), one Triton kernel writes all
+        the features (one read of the float64 geometry, one write of the
+        ``[F, N]`` result); elsewhere PyTorch element-wise operations in
+        float64.  Both reduce the Fourier arguments modulo 2 in float64.
 
     Returns
     -------
     torch.Tensor, shape [F, N]
         Row k of the encoding is cell ``cell_ids[k]``.  The geometry (unit
         vectors and gauge angle, float64 on the CPU) is cached per domain,
-        keyed by a hash of ``cell_ids``; the features themselves are computed
-        on ``device`` (a few element-wise operations).
+        keyed by a hash of ``cell_ids``, with one copy per device it was
+        used on; the features themselves are computed on ``device``.
     """
     if gauge_type is not None and gauge_type not in GAUGE_TYPES:
         raise ValueError(f"gauge_type must be one of {GAUGE_TYPES} or None.")
@@ -217,21 +293,56 @@ def healpix_positional_encoding(
     geom = _geometry(level, ids, ellipsoid, gauge_type, ref_direction)
     freqs = _frequencies(level, n_frequencies, frequencies)
 
-    xyz = geom["xyz"].to(device=device)                       # [3, N] float64
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    interp = os.environ.get("TRITON_INTERPRET") == "1" and backend == "triton"
+    use_triton = (_HAS_TRITON and (dev.type == "cuda" or interp)
+                  and backend in ("auto", "triton")
+                  and dtype in (torch.float32, torch.float16, torch.bfloat16))
+    if backend == "triton" and not use_triton:
+        raise RuntimeError("backend='triton' needs triton, a CUDA device and a 16/32-bit dtype.")
+    xyz = _on_device(geom, "xyz", dev)                          # [3, N] float64
+    N = xyz.shape[1]
+    F = (3 if include_xyz else 0) + 6 * len(freqs) + (2 if gauge_type else 0) + int(include_level)
+    if use_triton:
+        out = torch.empty(F, N, dtype=dtype, device=dev)
+        if F == 0 or N == 0:
+            return out
+        fr = torch.tensor(freqs or [0.0], dtype=torch.float64, device=dev)
+        alpha = _on_device(geom, "alpha", dev) if gauge_type is not None else xyz
+        row0 = 3 if include_xyz else 0
+        grow = row0 + 6 * len(freqs)
+        lrow = grow + (2 if gauge_type else 0)
+        BLOCK = 512
+        _posenc_kernel[(triton.cdiv(N, BLOCK),)](
+            xyz, alpha, fr, out, N, len(freqs), row0, grow, lrow, float(level) / _MAX_LEVEL,
+            HAS_XYZ=include_xyz, HAS_GAUGE=gauge_type is not None,
+            HAS_LEVEL=include_level, BLOCK=BLOCK, num_warps=4)
+        return out
     feats = [xyz] if include_xyz else []
     if freqs:
-        f = torch.tensor(freqs, dtype=torch.float64, device=xyz.device) * math.pi
-        arg = f.view(-1, 1, 1) * xyz.unsqueeze(0)               # [nf, 3, N]
-        feats.append(torch.cat([arg.sin(), arg.cos()], dim=1).reshape(-1, xyz.shape[1]))
+        f = torch.tensor(freqs, dtype=torch.float64, device=xyz.device)
+        t = f.view(-1, 1, 1) * xyz.unsqueeze(0)                  # [nf, 3, N]
+        arg = (t - 2.0 * torch.floor(0.5 * t)) * math.pi         # reduced modulo 2 pi
+        feats.append(torch.cat([arg.sin(), arg.cos()], dim=1).reshape(-1, N))
     if gauge_type is not None:
-        a = geom["alpha"].to(device=xyz.device)
+        a = _on_device(geom, "alpha", dev)
         feats.append(torch.stack([a.cos(), a.sin()]))
     if include_level:
-        feats.append(torch.full((1, xyz.shape[1]), level / _MAX_LEVEL,
-                                dtype=torch.float64, device=xyz.device))
+        feats.append(torch.full((1, N), level / _MAX_LEVEL, dtype=torch.float64, device=dev))
     if not feats:
-        return torch.empty(0, xyz.shape[1], dtype=dtype, device=xyz.device)
+        return torch.empty(0, N, dtype=dtype, device=dev)
     return torch.cat(feats, dim=0).to(dtype)
+
+
+def _on_device(geom, name, dev):
+    """The cached geometry tensor on ``dev`` (copied once per device)."""
+    if dev.type == "cpu":
+        return geom[name]
+    per = geom.setdefault("device", {})
+    key = (name, str(dev))
+    if key not in per:
+        per[key] = geom[name].to(dev)
+    return per[key]
 
 
 class HealPixPositionalEncoding(nn.Module):
@@ -259,7 +370,7 @@ class HealPixPositionalEncoding(nn.Module):
                  frequencies: Optional[Sequence[float]] = None, include_xyz: bool = True,
                  gauge_type: Optional[str] = None, ref_direction=None,
                  include_level: bool = False, ellipsoid: str = "WGS84",
-                 device=None, dtype: torch.dtype = torch.float32):
+                 device=None, dtype: torch.dtype = torch.float32, backend: str = "auto"):
         super().__init__()
         self.level = int(level)
         self.cell_ids = _cell_ids_array(level, cell_ids)
@@ -272,7 +383,8 @@ class HealPixPositionalEncoding(nn.Module):
             level, self.cell_ids, frequencies=self.frequencies or None,
             n_frequencies=0 if not self.frequencies else None,
             include_xyz=include_xyz, gauge_type=gauge_type, ref_direction=ref_direction,
-            include_level=include_level, ellipsoid=self.ellipsoid, device=device, dtype=dtype)
+            include_level=include_level, ellipsoid=self.ellipsoid, device=device, dtype=dtype,
+            backend=backend)
         self.register_buffer("encoding", enc, persistent=False)
         self.feature_names = _feature_names(self.frequencies, include_xyz, gauge_type,
                                             include_level)
