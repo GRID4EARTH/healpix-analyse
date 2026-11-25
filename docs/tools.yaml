@@ -324,7 +324,9 @@ tools:
     Geometry built once (about 0.8 s at nside 64, G = 4, per the code
     comments) and cached on disk (HEALPIXCONV_CACHE or ~/.cache/healpixconv).
     The two geometry buffers [P, 4, G, K] take 629 MB at nside 128, G = 4,
-    kernel 5. The forward and backward passes never store the
+    kernel 5. On CUDA, the default deterministic=True backward adds a
+    transposed map of about the same size, built at the first backward
+    pass; deterministic=False (fp32 atomics) avoids it. The forward and backward passes never store the
     B*C_in*G*K*P gathered values; benchmarks/benchmark_healpix_conv.py
     measures them.
   pros:

@@ -17,7 +17,7 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
-- `HealPixConv(backend="auto" | "triton" | "torch", deterministic=False)`
+- `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is
   installed (new extra `triton`; the Linux CUDA wheels of PyTorch usually
@@ -27,10 +27,14 @@
   hand-written backward. Neither backend materialises the gathered
   `[B, C_in, G, K, P]` tensor, so training needs a fraction of the memory
   and configurations that ran out of memory on an 80 GB GPU now fit.
-  `deterministic=True` (or `torch.use_deterministic_algorithms(True)`)
-  computes the input gradient of the Triton backend without atomics, by a
-  gather on the transposed stencil map (built at the first backward pass),
-  and gives the same bits at every run. `missing="local_mean"` keeps the
+  By default (`deterministic=True`), the Triton backend computes the input
+  gradient without atomics, by a gather on the transposed stencil map: the
+  same bits at every run, and a training step 1.6–2.2× shorter than with
+  atomics on an A100. Its cost is GPU memory: the map is built at the first
+  backward pass and kept, at about the size of the stencil buffers again
+  (0.2–2.6 GiB in the benchmark configurations). `deterministic=False`
+  scatters the gradient with fp32 atomics instead, with no extra memory and
+  last bits that vary between runs. `missing="local_mean"` keeps the
   PyTorch reference path (gathered tensor and matrix product) on every
   device.
 - `benchmarks/benchmark_healpix_conv.py`: forward, forward + backward, peak

@@ -342,7 +342,7 @@ HealPixConv(
     missing            = "centre",
     local_mean_weights = None,
     backend            = "auto",
-    deterministic      = False,
+    deterministic      = True,
 )
 ```
 
@@ -363,7 +363,7 @@ HealPixConv(
 | `ellipsoid` | `str` | `"WGS84"` | Reference ellipsoid for healpix_geo coordinate conversions. |
 | `dtype` | `torch.dtype` | `torch.float32` | Floating-point precision for all buffers and parameters. `module.to(...)` moves and casts the layer afterwards. |
 | `backend` | `str` | `"auto"` | `"auto"`, `"triton"` or `"torch"`; see *Backends* below. |
-| `deterministic` | `bool` | `False` | Triton only: input gradient without atomics, identical at every run. |
+| `deterministic` | `bool` | `True` | Triton only: input gradient by a gather on the transposed stencil map, without atomics, identical at every run. `False`: fp32 atomics, no extra memory. |
 | `missing` | `str` | `"centre"` | `"centre"`: today's behaviour (points outside the domain take the centre value; NaN propagates). `"local_mean"`: NaN and points outside the domain are completed by the renormalised interpolation of the valid neighbours, or the local mean of the valid stencil values. |
 | `local_mean_weights` | `array (P,)` or `None` | `None` | Non-negative weights of the stencil points in the local mean of `"local_mean"`; `None` = uniform. |
 
@@ -387,12 +387,19 @@ package is installed (16-bit data accumulate in fp32; under `torch.autocast`
 the kernels compute in the autocast dtype). Everything else (CPU, float64, no
 Triton) runs a PyTorch loop over the P taps with a hand-written backward.
 
-The input gradient of the Triton backend is scattered with fp32 atomics, so
-its last bits vary between runs. `deterministic=True`, or
-`torch.use_deterministic_algorithms(True)`, gathers it on the transposed
-stencil map instead: no atomics, the same bits at every run, and one more
-geometry buffer of about the size of the stencil, built at the first
-backward pass.
+By default (`deterministic=True`), the Triton backend computes the input
+gradient by a gather on the transposed stencil map: no atomics, the same bits
+at every run, and, on an A100, a training step 1.6–2.2× shorter than with
+atomics. The cost is memory. The map is built at the first backward pass
+(0.02–0.2 s on an A100) and stays on the GPU, at about the size of the stencil
+buffers again: 0.2–2.6 GiB for the configurations of
+`benchmarks/benchmark_healpix_conv.py`. `module.to(...)` drops it, and the next
+backward pass rebuilds it.
+
+`deterministic=False` scatters the gradient with fp32 atomics instead. It
+needs no extra memory, but the summation order, and so the last bits, vary
+between runs. `torch.use_deterministic_algorithms(True)` selects the gather in
+either case.
 
 ---
 
@@ -532,8 +539,9 @@ _tap_w   : 78 643 200 × 4 bytes ≈ 315 MB
 total                           ≈ 629 MB   (944 MB for a float64 layer)
 ```
 
-`deterministic=True` adds the transposed map, about the same size again. For
-very large nside, consider reducing G or kernel_sz.
+On CUDA, the backward pass of the default `deterministic=True` adds the
+transposed map, about the same size again; `deterministic=False` avoids it.
+For very large nside, consider reducing G or kernel_sz.
 
 #### Geometry cache on disk
 

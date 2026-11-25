@@ -645,13 +645,18 @@ class HealPixConv(nn.Module):
         construction (``conv.backend = "torch"``).  ``missing="local_mean"``
         always runs the PyTorch reference path (gathered stencil + matrix
         product) and ignores this setting.
-    deterministic : bool, default False
+    deterministic : bool, default True
         Triton backend only.  ``True`` computes the gradient with respect to
         the input by a gather on the transposed stencil map: no atomics, the
-        same bits at every run, at the cost of a second geometry buffer
-        built at the first backward pass.  ``False`` scatters it with fp32
-        atomics, whose summation order varies between runs.  Also selected
-        when ``torch.use_deterministic_algorithms(True)`` is set.
+        same bits at every run, and a training step 1.6-2.2x shorter than
+        with atomics on an A100.  The cost is memory: the map is built at the
+        first backward pass (0.02-0.2 s on an A100) and kept on the GPU,
+        about the size of the geometry buffers again (0.2-2.6 GiB in the
+        configurations of ``benchmarks/benchmark_healpix_conv.py``).
+        ``False`` scatters the gradient with fp32 atomics instead: no extra
+        memory, but the summation order, so the last bits, vary between
+        runs.  ``torch.use_deterministic_algorithms(True)`` selects the
+        gather even with ``False``.
     missing : {"centre", "local_mean"}, default "centre"
         How a stencil value is formed when its pixels are missing.  Each
         stencil value is a bilinear interpolation of 4 pixels.
@@ -700,7 +705,7 @@ class HealPixConv(nn.Module):
     # existed still runs forward() and repr() after unpickling.
     missing = "centre"
     backend = "auto"
-    deterministic = False
+    deterministic = True
     _tmap = None
 
     def __init__(
@@ -723,7 +728,7 @@ class HealPixConv(nn.Module):
         missing: str = "centre",
         local_mean_weights=None,
         backend: str = "auto",
-        deterministic: bool = False,
+        deterministic: bool = True,
     ):
         super().__init__()
 

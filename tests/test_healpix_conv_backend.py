@@ -237,6 +237,7 @@ def test_legacy_whole_module_pickle():
     old.__setstate__(state)
     old = pickle.loads(pickle.dumps(old))
     assert torch.equal(old(x), y)
+    assert old.backend == "auto" and old.deterministic is True
 
 
 def test_gradcheck_level2():
@@ -381,6 +382,17 @@ def test_backend_argument():
             conv(torch.randn(1, 1, conv.K))
 
 
+def test_deterministic_is_the_default():
+    """deterministic=True by default (#90, open question 3); False is the opt-in."""
+    import inspect
+
+    assert HealPixConv(1, 1, 1, device="cpu", cache_dir=None).deterministic is True
+    assert HealPixConv.deterministic is True
+    assert inspect.signature(cb.gauge_conv).parameters["deterministic"].default is True
+    conv = HealPixConv(1, 1, 1, device="cpu", cache_dir=None, deterministic=False)
+    assert conv.deterministic is False
+
+
 def test_transposed_map_is_the_transpose():
     conv = make_conv(CASES["regional"], torch.float64, "cpu")
     ptr, base, tk, tw = cb.build_transposed_map(conv._tap_idx, conv._tap_w, conv.K)
@@ -441,25 +453,30 @@ def test_triton_channel_tiles(C, Co):
 def test_triton_deterministic_is_bitwise_reproducible():
     cs = CASES["full"]
     dev = torch.device("cuda")
-    conv = make_conv(dict(cs, C=16, Co=16, B=4), torch.float32, dev, backend="triton",
-                     deterministic=True)
+    conv = make_conv(dict(cs, C=16, Co=16, B=4), torch.float32, dev, backend="triton")
+    assert conv.deterministic                       # the default
     x0 = torch.randn(4, 16, conv.K, device=dev)
     a = run(conv, x0, conv)
     b = run(conv, x0, conv)
-    for u, v in zip(a, b):
-        assert torch.equal(u, v)
+    # without a cached map, gauge_conv builds it at the backward pass: same bits
+    c = run(conv, x0, lambda x: cb.gauge_conv(x, conv.weight, conv.bias, conv._tap_idx,
+                                              conv._tap_w, backend="triton"))
+    for u, v, t in zip(a, b, c):
+        assert torch.equal(u, v) and torch.equal(u, t)
 
 
 @needs_triton
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_triton_16bit(dtype):
+def test_triton_16bit(dtype, deterministic):
     cs = CASES["regional"]
     dev = torch.device("cuda")
-    conv = make_conv(dict(cs, C=16, Co=16), torch.float32, dev)
+    conv = make_conv(dict(cs, C=16, Co=16), torch.float32, dev, deterministic=deterministic)
     geom = reference_geometry(conv, cs["cell_ids"], torch.float32, dev)
     x0 = torch.randn(cs["B"], 16, conv.K, device=dev)
     ref = run(conv, x0, lambda x: reference_forward(conv, geom, x))
-    half = make_conv(dict(cs, C=16, Co=16), torch.float32, dev).to(dtype)
+    half = make_conv(dict(cs, C=16, Co=16), torch.float32, dev,
+                     deterministic=deterministic).to(dtype)
     with torch.no_grad():
         half.weight.copy_(conv.weight)
         half.bias.copy_(conv.bias)

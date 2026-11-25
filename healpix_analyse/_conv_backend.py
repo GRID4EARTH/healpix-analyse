@@ -25,11 +25,11 @@ Neither backend ever materialises the gathered tensor ``[B, C, G, K, P]``
     in registers and multiplied by ``W[g, p]``.  grad W: the same gather,
     reduced over the rows; each program sums a contiguous chunk of rows for a
     block of taps, contracted by one product over (tap, channel), and writes
-    its partial sum (no atomics, deterministic).  grad x: either a
-    GEMM-scatter with fp32 atomics, or, with ``deterministic=True``, a gather
-    on the transposed map of the stencil (for each source cell, its incoming
-    (target cell, weight) entries, in CSR form per gauge and tap): no atomics,
-    and the same result at every run.
+    its partial sum (no atomics, deterministic).  grad x: by default
+    (``deterministic=True``), a gather on the transposed map of the stencil
+    (for each source cell, its incoming (target cell, weight) entries, in CSR
+    form per gauge and tap): no atomics, and the same result at every run.
+    With ``deterministic=False``, a GEMM-scatter with fp32 atomics.
 
 Extension points
 ----------------
@@ -557,8 +557,9 @@ def _triton_backward(x, weight, idx, w, gy, need_x, need_w, deterministic, trans
             gW = part.sum(0).permute(0, 2, 3, 1).to(weight.dtype)   # [G, C, CO, P]
             del part
         if need_x:
-            tmap = transposed() if (deterministic and transposed is not None) else None
-            if tmap is not None:
+            if deterministic:
+                tmap = (transposed() if transposed is not None
+                        else build_transposed_map(idx, w, K))
                 tptr, tbase, tk, tw = tmap
                 gyt = gy.view(B, G, CO, K).transpose(2, 3).contiguous()   # [B, G, K, CO]
                 gx = torch.empty(B, C, K, device=x.device, dtype=x.dtype)
@@ -680,7 +681,7 @@ def _use_triton(x, backend):
     return ok
 
 
-def gauge_conv(x, weight, bias, idx, w, *, backend="auto", deterministic=False,
+def gauge_conv(x, weight, bias, idx, w, *, backend="auto", deterministic=True,
                transposed=None):
     """Gauge-equivariant convolution on precomputed tap geometry.
 
@@ -694,13 +695,16 @@ def gauge_conv(x, weight, bias, idx, w, *, backend="auto", deterministic=False,
     backend : {"auto", "triton", "torch"}
         ``"auto"`` runs Triton on CUDA for float32/float16/bfloat16 when Triton
         is installed, and PyTorch otherwise (CPU, float64).
-    deterministic : bool
+    deterministic : bool, default True
         Triton only: compute grad x by a gather on the transposed map (no
-        atomics, identical results at every run) instead of fp32 atomics.
-        Also selected when ``torch.are_deterministic_algorithms_enabled()``.
+        atomics, identical results at every run); ``False`` uses fp32
+        atomics.  ``torch.are_deterministic_algorithms_enabled()`` selects
+        the gather even with ``False``.
     transposed : callable or None
         Returns the transposed map (:func:`build_transposed_map`) of
-        ``idx, w``; called only by a deterministic Triton backward.
+        ``idx, w``, so that the caller can cache it; called only by a
+        deterministic Triton backward.  None builds the map at every
+        backward pass.
 
     Returns
     -------

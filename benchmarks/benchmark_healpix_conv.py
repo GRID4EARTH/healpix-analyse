@@ -6,7 +6,7 @@ checkout to measure first on ``PYTHONPATH`` and label the run, e.g.::
 
     PYTHONPATH=/path/to/main   python benchmarks/benchmark_healpix_conv.py conv --device cuda --configs gpu --label main
     PYTHONPATH=/path/to/branch python benchmarks/benchmark_healpix_conv.py conv --device cuda --configs gpu --label branch \\
-        --variants layer layer_det
+        --variants layer layer_atomic
     python benchmarks/benchmark_healpix_conv.py table main.jsonl branch.jsonl     # Markdown gain table
 
 Subcommands
@@ -32,7 +32,10 @@ table
 Variants (``--variants``)
 -------------------------
 layer        ``conv(x)`` with the defaults of the installed version
+             (``deterministic=True`` since #90)
 layer_det    ``deterministic=True`` (versions with a Triton backend)
+layer_atomic ``deterministic=False``: fp32 atomics in the input gradient
+             (versions with a Triton backend)
 torch        ``backend="torch"``: the PyTorch tap loop (versions with backends)
 """
 from __future__ import annotations
@@ -170,6 +173,8 @@ def _set_variant(conv, variant):
     if not hasattr(conv, "backend"):
         return variant == "layer"
     if variant == "layer":
+        conv.backend = "auto"     # deterministic keeps its default
+    elif variant == "layer_atomic":
         conv.backend, conv.deterministic = "auto", False
     elif variant == "layer_det":
         conv.backend, conv.deterministic = "auto", True
@@ -352,7 +357,7 @@ def main():
     c.add_argument("--device", default="cpu")
     c.add_argument("--configs", default="cpu", choices=sorted(CONFIGS))
     c.add_argument("--only", nargs="*", help="substrings of the configuration names to run")
-    c.add_argument("--variants", nargs="+", default=["layer"], choices=["layer", "layer_det", "torch"])
+    c.add_argument("--variants", nargs="+", default=["layer"], choices=["layer", "layer_det", "layer_atomic", "torch"])
     c.add_argument("--dtype", default="float32")
     c.add_argument("--reps", type=int, default=5)
     c.add_argument("--threads", type=int, default=0)
