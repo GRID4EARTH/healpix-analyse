@@ -357,10 +357,10 @@ tools:
   symbols: [HealPixWindowAttention, WINDOW_SHIFTS, DEFAULT_WINDOW_SHIFT]
   also: [shift, shifted, halo]
   summary: >-
-    A torch nn.Module for Swin-like transformers: full multi-head attention
-    inside each NESTED block of 4**window_level cells, by a reshape followed
-    by scaled_dot_product_attention; `shift` selects the replacement of
-    Swin's shifted windows.
+    A torch nn.Module for Swin-like transformers: multi-head attention of
+    the cells of each NESTED block of 4**window_level cells over their
+    window; by default the windows are centred on the cells of a coarser
+    level and overlap across the block borders (`shift`).
   tasks:
     - build a Swin-like transformer layer on the sphere or on a regional domain
     - attend over all the cells of a NESTED block (local self-attention)
@@ -370,23 +370,23 @@ tools:
   ellipsoid: '"WGS84" for the cell centres of shift="coarse_centred"'
   io: "[B, C, N] -> [B, C, N]"
   differentiable: yes, in the input and the projections
-  gpu: yes; PyTorch's flash or memory-efficient SDPA kernels on the reshape path
+  gpu: yes; fused flash-style Triton kernels (float32, float16, bfloat16, autocast) with the optional triton package, deterministic backward
   nan: not handled (NaN propagates)
   cost: >-
-    N * 4**w scores per head; memory linear in N with the fused SDPA kernels.
-    shift="coarse_centred" gathers about 2.5 times more keys (halo=0.25).
+    N * 4**w scores per head with shift="none", about 2.3 times more with the
+    default shift="coarse_centred" (halo=0.25); memory linear in N.
     benchmarks/benchmark_attention.py measures it against dense attention.
   pros:
-    - Plain SDPA on a reshape on the full sphere and on sorted domains of complete blocks.
-    - Both candidate replacements of shifted windows, behind one option whose default is a module constant.
+    - Fused Triton kernels on every kind of window (padded, unsorted, overlapping), with a deterministic backward.
+    - The receptive field grows at every layer by default; the default is a module constant.
   cons:
     - Windows follow the NESTED base-cell axes, not the gauge.
-    - The gathered backward of padded domains and of overlapping windows uses index_put_ (deterministic on CUDA only under torch.use_deterministic_algorithms).
+    - Without Triton (or on CPU), the backward of the gathered windows uses index_put_ (deterministic on CUDA only under torch.use_deterministic_algorithms).
   use_instead:
     - when: each cell should attend to a small gauge-oriented neighbourhood
       use: HealPixNeighbourhoodAttention
       page: conv/attention
-  optional_deps: none
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
 
 - id: neighbourhood_attention
   title: Neighbourhood attention on the gauge stencil (HealPixNeighbourhoodAttention)

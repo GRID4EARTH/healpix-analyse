@@ -34,11 +34,16 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import healpix_geo
 
-from healpix_analyse._attention_backend import BACKENDS, neighbourhood_attention
+from healpix_analyse._attention_backend import (
+    BACKENDS,
+    WindowPlan,
+    neighbourhood_attention,
+    neighbourhood_attention_qkv,
+    window_attention,
+)
 from healpix_analyse._conv_backend import build_transposed_map
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 from healpix_analyse._topology import nested_neighbours
@@ -54,9 +59,10 @@ __all__ = [
 #: Replacements of Swin's shifted windows (``HealPixWindowAttention(shift=...)``).
 WINDOW_SHIFTS = ("none", "alternate_level", "coarse_centred")
 
-#: Default of ``HealPixWindowAttention(shift=None)``.  The choice between the
-#: two candidates is an open question of issue #109: change it here.
-DEFAULT_WINDOW_SHIFT = "alternate_level"
+#: Default of ``HealPixWindowAttention(shift=None)``: windows centred on the
+#: cells of a coarser level, overlapping across the block borders (decision of
+#: the maintainer on the open question of issue #109).  Change it here.
+DEFAULT_WINDOW_SHIFT = "coarse_centred"
 
 _PAD = 8        # window lengths are padded to a multiple of 8 (SDPA alignment)
 
@@ -171,16 +177,20 @@ def _centred_keys(ids, level, wl, blocks, halo, ellipsoid, chunk_cells=1 << 22):
 class HealPixWindowAttention(nn.Module):
     """Multi-head self-attention inside NESTED windows (Swin-like).
 
-    A window is a NESTED block of ``4**window_level`` cells, the descendants
-    of one cell of level ``level - window_level``.  Each cell attends to the
-    cells of its window with standard scaled dot-product attention
-    (:func:`torch.nn.functional.scaled_dot_product_attention`).
+    The queries of a window are a NESTED block of ``4**window_level`` cells,
+    the descendants of one cell of level ``level - window_level``; each cell
+    attends to the keys of its window with standard scaled dot-product
+    attention.
 
-    On the full sphere and on regional domains whose ``cell_ids`` are sorted
-    and made of complete blocks, the windows are a reshape of the input (no
-    index, no mask: PyTorch's flash or memory-efficient kernels run).  Other
-    domains (unsorted, or with incomplete blocks) gather their windows with
-    padding and a key mask.
+    On CUDA (float32, float16, bfloat16, autocast) fused Triton kernels in
+    the style of flash attention run on every kind of window: they read the
+    packed projection in place, gather the rows of padded or overlapping
+    windows in registers and mask the padding there, and their backward is
+    deterministic (no atomics).  On the full sphere and on regional domains
+    whose ``cell_ids`` are sorted and made of complete blocks, the query
+    windows are consecutive cells (no index at all).  Elsewhere (CPU,
+    float64, attention dropout) the windows are gathered and passed to
+    :func:`torch.nn.functional.scaled_dot_product_attention`.
 
     Swin's shifted windows have no direct equivalent on HEALPix.  ``shift``
     selects the replacement:
@@ -203,7 +213,10 @@ class HealPixWindowAttention(nn.Module):
         ``1.6 (1 + halo)**2`` times more keys and a key mask.  ``shifted`` is
         ignored.
 
-    ``shift=None`` takes :data:`DEFAULT_WINDOW_SHIFT`.
+    ``shift=None`` takes :data:`DEFAULT_WINDOW_SHIFT`, ``"coarse_centred"``:
+    the maintainer chose the overlapping windows centred on the cells of a
+    coarser level as the replacement of Swin's shifted windows (issue #109).
+    ``"alternate_level"`` and ``"none"`` stay available.
 
     Parameters
     ----------
@@ -228,18 +241,20 @@ class HealPixWindowAttention(nn.Module):
         ``[0, 1]``.
     qkv_bias : bool, default True
     attn_drop : float, default 0.0
-        Dropout on the attention weights, in training mode.
+        Dropout on the attention weights, in training mode (runs the PyTorch
+        path).
+    backend : {"auto", "triton", "torch"}, default "auto"
     ellipsoid : str, default "WGS84"
         Ellipsoid of the cell centres (``shift="coarse_centred"`` only).
     device, dtype : torch device and dtype of the parameters.
 
     Notes
     -----
-    The backward of the gathers of a padded domain, and of the overlapping
-    keys of ``"coarse_centred"``, accumulates with ``index_put_``: on CUDA
-    its summation order is fixed only under
-    ``torch.use_deterministic_algorithms(True)``.  The reshape path has no
-    such accumulation.
+    The Triton backward is deterministic: the key and value gradients of
+    overlapping windows are summed per cell in a fixed order.  On the
+    PyTorch path, the backward of the gathers accumulates with
+    ``index_put_``, whose order on CUDA is fixed only under
+    ``torch.use_deterministic_algorithms(True)``.
 
     Examples
     --------
@@ -263,6 +278,7 @@ class HealPixWindowAttention(nn.Module):
         halo: float = 0.25,
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
+        backend: str = "auto",
         ellipsoid: str = "WGS84",
         device=None,
         dtype: torch.dtype = torch.float32,
@@ -290,6 +306,9 @@ class HealPixWindowAttention(nn.Module):
         if not 0.0 <= self.halo <= 1.0:
             raise ValueError("halo must be in [0, 1].")
         self.attn_drop = float(attn_drop)
+        if backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
+        self.backend = backend
         self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
 
         ids, self.partial = _domain_ids(self.level, cell_ids)
@@ -304,18 +323,28 @@ class HealPixWindowAttention(nn.Module):
         self.window_len = 4 ** wl if q_index is None else q_index.shape[1]
         self.key_len = self.window_len if kv_index is None else kv_index.shape[1]
 
-        def buf(name, a):
-            t = None if a is None else torch.as_tensor(a, dtype=torch.long, device=device)
+        def buf(name, a, dt=torch.int32):
+            t = None if a is None else torch.as_tensor(a, dtype=dt, device=device)
             self.register_buffer(name, t, persistent=False)
 
+        kptr = kent = None
+        if kv_index is not None and kv_index is not q_index:
+            # overlapping windows: for each cell, its key slots (CSR, fixed order)
+            flat = kv_index.ravel()
+            slots = np.nonzero(flat < self.N)[0]
+            order = np.argsort(flat[slots], kind="stable")
+            kent = slots[order]
+            kptr = np.searchsorted(flat[slots][order], np.arange(self.N + 1))
         buf("_q_index", q_index)
-        buf("_q_inv", q_inv)
+        buf("_q_inv", q_inv, torch.long)
         buf("_kv_index", kv_index)
+        buf("_kptr", kptr)
+        buf("_kent", kent)
         self.register_buffer(
             "_kv_mask",
-            None if kv_index is None else torch.as_tensor(kv_index < self.N, device=device),
+            None if kv_index is None or not bool((kv_index >= self.N).any())
+            else torch.as_tensor(kv_index < self.N, device=device),
             persistent=False)
-        self._needs_mask = kv_index is not None and bool((kv_index >= self.N).any())
         self.register_buffer("_blocks", torch.as_tensor(blocks, device=device), persistent=False)
 
         C = self.embed_dim
@@ -327,11 +356,11 @@ class HealPixWindowAttention(nn.Module):
         """Identifiers of the window centres: cells of level ``level - effective_window_level``."""
         return self._blocks
 
-    @staticmethod
-    def _gather(t, index):
-        """t [B, N, F] -> [B, nW, T, F] at the positions ``index`` (N = zero padding)."""
-        pad = torch.cat([t, t.new_zeros(t.shape[0], 1, t.shape[2])], dim=1)
-        return pad[:, index]
+    def plan(self) -> WindowPlan:
+        """The windows as a :class:`~healpix_analyse._attention_backend.WindowPlan`."""
+        return WindowPlan(self.N, self.n_windows, self.window_len, self.key_len,
+                          self._q_index, self._kv_index, self._q_inv, self._kv_mask,
+                          self._kptr, self._kent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``x [B, C, N] -> [B, C, N]``."""
@@ -339,32 +368,12 @@ class HealPixWindowAttention(nn.Module):
             raise ValueError(
                 f"expected input [B, {self.embed_dim}, {self.N}], got {tuple(x.shape)}.")
         B, C, N = x.shape
-        H, D = self.num_heads, self.head_dim
-        nB = self.n_windows
         qkv = self.qkv(x.transpose(1, 2).to(self.qkv.weight.dtype))       # [B, N, 3C]
-        if self.fast:
-            q = qkv[..., :C].reshape(B, nB, self.window_len, H, D)
-        else:
-            q = self._gather(qkv[..., :C], self._q_index).view(B, nB, -1, H, D)
-        if self._kv_index is None:
-            kv = qkv[..., C:].reshape(B, nB, q.shape[2], 2, H, D)
-        else:
-            kv = self._gather(qkv[..., C:], self._kv_index).view(B, nB, -1, 2, H, D)
-        Tq, Tk = q.shape[2], kv.shape[2]
-        q = q.permute(0, 1, 3, 2, 4).reshape(B * nB, H, Tq, D)
-        k = kv[:, :, :, 0].permute(0, 1, 3, 2, 4).reshape(B * nB, H, Tk, D)
-        v = kv[:, :, :, 1].permute(0, 1, 3, 2, 4).reshape(B * nB, H, Tk, D)
-        mask = None
-        if self._needs_mask:
-            mask = self._kv_mask.view(1, nB, 1, 1, Tk).expand(B, nB, 1, 1, Tk)
-            mask = mask.reshape(B * nB, 1, 1, Tk)
-        o = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask,
-            dropout_p=self.attn_drop if self.training else 0.0)          # [B*nB, H, Tq, D]
-        o = o.view(B, nB, H, Tq, D).permute(0, 1, 3, 2, 4).reshape(B, nB * Tq, C)
-        if not self.fast:
-            o = o[:, self._q_inv]
-        return self.proj(o).transpose(1, 2)
+        o = window_attention(
+            qkv.view(B, N, 3, self.num_heads, self.head_dim), self.plan(),
+            backend=self.backend, dropout_p=self.attn_drop if self.training else 0.0)
+        o = self.proj(o.reshape(B, N, C).to(self.proj.weight.dtype))
+        return o.transpose(1, 2)
 
     def extra_repr(self):
         return (f"level={self.level}, embed_dim={self.embed_dim}, num_heads={self.num_heads}, "
@@ -540,9 +549,13 @@ class HealPixNeighbourhoodAttention(nn.Module):
         B, C, N = x.shape
         H, D, G = self.num_heads, self.head_dim, self.G
         qkv = self.qkv(x.transpose(1, 2).to(self.qkv.weight.dtype))       # [B, N, 3C]
-        qkv = qkv.view(B, N, 3, H, D).permute(2, 0, 3, 1, 4)             # [3, B, H, N, D]
-        o = self.attend(qkv[0], qkv[1], qkv[2])                         # [B, G, H, N, D]
-        o = o.permute(0, 1, 3, 2, 4).reshape(B, G, N, C)
+        w = self._tap_w
+        if w.dtype != qkv.dtype and qkv.dtype == torch.float64:
+            w = w.to(qkv.dtype)
+        o = neighbourhood_attention_qkv(
+            qkv.view(B, N, 3, H, D), self.pos_bias, self._tap_idx, w, self._valid,
+            backend=self.backend, transposed=self._transposed_map)        # [B, G, N, H, D]
+        o = o.reshape(B, G, N, C)
         o = self.proj(o.to(self.proj.weight.dtype))                       # [B, G, N, C]
         return o.permute(0, 1, 3, 2).reshape(B, G * C, N)
 

@@ -356,3 +356,72 @@ def test_window_sorted_complete_domain_takes_the_reshape():
 def test_window_default_is_a_module_constant(monkeypatch):
     monkeypatch.setattr(att, "DEFAULT_WINDOW_SHIFT", "coarse_centred")
     assert HealPixWindowAttention(3, 8, 2, 1, device="cpu").shift == "coarse_centred"
+
+
+# ---------------------------------------------------------------------------
+# Window attention: Triton (CUDA)
+# ---------------------------------------------------------------------------
+
+def _window(shift, domain, shifted=False, device="cpu", dtype=F64, level=4, wl=2):
+    ids = None if domain == "full" else _regional_ids(level)
+    return HealPixWindowAttention(level, 32, 2, wl, cell_ids=ids, shift=shift, shifted=shifted,
+                                  device=device, dtype=dtype)
+
+
+@needs_triton
+@pytest.mark.parametrize("shift,shifted", [("none", False), ("alternate_level", True),
+                                           ("coarse_centred", False)])
+@pytest.mark.parametrize("domain", ["full", "regional"])
+def test_window_triton_matches_torch(shift, shifted, domain):
+    from healpix_analyse._attention_backend import window_attention
+    m = _window(shift, domain, shifted, device="cuda", dtype=torch.float32)
+    plan = m.plan()
+    qkv = torch.randn(2, m.N, 3, 2, 16, device="cuda", requires_grad=True)
+    out = window_attention(qkv, plan, backend="triton")
+    q64 = qkv.detach().double().requires_grad_()
+    ref = window_attention(q64, plan, backend="torch")
+    torch.testing.assert_close(out.double(), ref, rtol=0, atol=1e-5)
+    g = torch.randn_like(out)
+    (ga,) = torch.autograd.grad(out, qkv, g)
+    (gr,) = torch.autograd.grad(ref, q64, g.double())
+    torch.testing.assert_close(ga.double(), gr, rtol=0, atol=2e-5 * max(1.0, gr.abs().max().item()))
+
+
+@needs_triton
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_window_triton_16bit(dtype):
+    m = _window("coarse_centred", "regional", device="cuda", dtype=torch.float32)
+    x = torch.randn(2, 32, m.N, device="cuda", requires_grad=True)
+    with torch.autocast("cuda", dtype=dtype):
+        y = m(x)
+    ref = m.to(F64)(x.double())
+    torch.testing.assert_close(y.double(), ref, rtol=0, atol=5e-2)
+    y.float().square().mean().backward()
+    assert torch.isfinite(x.grad).all()
+
+
+@needs_triton
+def test_window_triton_backward_is_bitwise_reproducible():
+    m = _window("coarse_centred", "full", device="cuda", dtype=torch.float32)
+    x = torch.randn(2, 32, m.N, device="cuda", requires_grad=True)
+    grads = []
+    for _ in range(2):
+        m.zero_grad()
+        x.grad = None
+        m(x).square().sum().backward()
+        grads.append([x.grad.clone()] + [p.grad.clone() for p in m.parameters()])
+    for a, r in zip(*grads):
+        assert torch.equal(a, r)
+
+
+@needs_triton
+def test_window_triton_double_backward():
+    m = _window("coarse_centred", "regional", device="cuda", dtype=torch.float32)
+    x = torch.randn(1, 32, m.N, device="cuda", requires_grad=True)
+    pens = []
+    for backend in ("triton", "torch"):
+        m.backend = backend
+        (gx,) = torch.autograd.grad(m(x).square().sum(), x, create_graph=True)
+        (ggx,) = torch.autograd.grad(gx.square().sum(), x)
+        pens.append(ggx)
+    torch.testing.assert_close(pens[0], pens[1], rtol=1e-3, atol=1e-4)

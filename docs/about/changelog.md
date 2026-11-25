@@ -32,13 +32,16 @@
   reshape and `scaled_dot_product_attention` on the full sphere and on sorted
   domains of complete blocks, with padded and masked windows otherwise. The
   replacement of Swin's shifted windows is the option
-  `shift="none" | "alternate_level" | "coarse_centred"`; its default is the
-  module constant `DEFAULT_WINDOW_SHIFT` (`"alternate_level"`), an open
-  question of #109. Neighbourhood attention lets each cell attend to the taps
-  of the gauge-oriented `HealPixConv` stencil, with one relative position
-  bias per head and tap; on CUDA it runs fused Triton kernels (online softmax
-  over the taps, deterministic backward without atomics), and a PyTorch loop
-  over the taps elsewhere. `benchmarks/benchmark_attention.py` compares them
+  `shift="coarse_centred" | "alternate_level" | "none"`: the default,
+  chosen in #109, is `"coarse_centred"` (windows centred on the cells of a
+  coarser level, overlapping across block borders), set by the module
+  constant `DEFAULT_WINDOW_SHIFT`. Neighbourhood attention lets each cell
+  attend to the taps of the gauge-oriented `HealPixConv` stencil, with one
+  relative position bias per head and tap. On CUDA both layers run fused
+  Triton kernels (flash-style online softmax, 16-bit data with fp32
+  accumulation, autotuned tiles, deterministic backward without atomics,
+  the packed projection read and its gradient written in place); a
+  PyTorch path runs elsewhere and serves as the reference. `benchmarks/benchmark_attention.py` compares them
   with dense attention and with a naive gather.
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward

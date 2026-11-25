@@ -109,57 +109,58 @@ def _qkv(B, H, N, D, dev, dtype, seed=0):
 # ---------------------------------------------------------------------------
 
 WINDOW_CONFIGS = {
-    "cpu": [dict(level=5, w=2, B=2, H=4, D=32), dict(level=5, w=3, B=2, H=4, D=32),
-            dict(level=6, w=3, B=1, H=4, D=32)],
-    "gpu": [dict(level=6, w=3, B=4, H=4, D=32), dict(level=7, w=3, B=4, H=4, D=32),
-            dict(level=8, w=4, B=2, H=8, D=32), dict(level=9, w=4, B=1, H=8, D=32)],
+    "cpu": [dict(level=5, w=2, B=2, H=4, D=32, region=None),
+            dict(level=5, w=3, B=2, H=4, D=32, region=None),
+            dict(level=6, w=3, B=1, H=4, D=32, region=None),
+            dict(level=7, w=3, B=1, H=4, D=32, region=20.0)],
+    "gpu": [dict(level=6, w=3, B=4, H=4, D=32, region=None),
+            dict(level=7, w=3, B=4, H=4, D=32, region=None),
+            dict(level=8, w=4, B=2, H=8, D=32, region=None),
+            dict(level=9, w=4, B=1, H=8, D=32, region=None),
+            dict(level=9, w=3, B=2, H=4, D=64, region=None),
+            dict(level=10, w=4, B=1, H=4, D=32, region=25.0)],
 }
 
 
 def bench_window(args):
     from healpix_analyse.attention import HealPixWindowAttention
+    from healpix_analyse._attention_backend import window_attention
     dev = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
     for cfg in WINDOW_CONFIGS[args.configs]:
         L, w, B, H, D = cfg["level"], cfg["w"], cfg["B"], cfg["H"], cfg["D"]
-        N = 12 * 4 ** L
-        name = f"L{L} w{w} B{B} H{H} D{D}"
-        mods = {
-            "window_none": HealPixWindowAttention(L, H * D, H, w, shift="none", device=dev),
-            "window_centred": HealPixWindowAttention(L, H * D, H, w, shift="coarse_centred",
-                                                     device=dev),
-        }
+        ids = None if cfg["region"] is None else _region_ids(L, cfg["region"])
+        mods = {sh: HealPixWindowAttention(L, H * D, H, w, cell_ids=ids, shift=sh, device=dev)
+                for sh in ("none", "coarse_centred")}
+        N = mods["none"].N
+        name = f"L{L} {'full' if ids is None else 'regional'} N={N} w{w} B{B} H{H} D{D}"
 
-        def core(m):
-            nB = m.n_windows
+        def make():
+            g = torch.Generator(device="cpu").manual_seed(0)
+            return (torch.randn(B, N, 3, H, D, generator=g).to(dev, dtype).requires_grad_(),)
 
-            def run(q, k, v):
-                # the attention core of HealPixWindowAttention.forward, q/k/v [B, H, N, D]
-                if m._kv_index is None:
-                    T = m.window_len
-                    f = lambda t: t.view(B, H, nB, T, D).transpose(1, 2).reshape(B * nB, H, T, D)
-                    o = F.scaled_dot_product_attention(f(q), f(k), f(v))
-                    return o
-                T = m.window_len
-                qq = q.view(B, H, nB, T, D).transpose(1, 2).reshape(B * nB, H, T, D)
-                kv = m._kv_index
-                Tk = kv.shape[1]
-                pad = lambda t: torch.cat([t, t.new_zeros(B, H, 1, D)], 2)[:, :, kv] \
-                    .permute(0, 2, 1, 3, 4).reshape(B * nB, H, Tk, D)
-                mask = m._kv_mask.view(1, nB, 1, 1, Tk).expand(B, nB, 1, 1, Tk).reshape(B * nB, 1, 1, Tk)
-                return F.scaled_dot_product_attention(qq, pad(k), pad(v), attn_mask=mask)
-            return run
+        variants = {}
+        for sh, m in mods.items():
+            tag = "none" if sh == "none" else "centred"
+            plan = m.plan()
+            for be in (("triton", "torch") if dev.type == "cuda" else ("torch",)):
+                variants[f"{tag}_{'sdpa' if be == 'torch' else be}"] = (
+                    (lambda plan, be: lambda qkv: window_attention(qkv, plan, backend=be))(plan, be),
+                    m)
 
-        variants = {k: core(m) for k, m in mods.items()}
-        variants["dense"] = lambda q, k, v: F.scaled_dot_product_attention(q, k, v)
+        def split(qkv):
+            return [qkv[:, :, i].transpose(1, 2) for i in range(3)]
+
         T = 4 ** w
+        if ids is None:
+            variants["dense"] = (lambda qkv: F.scaled_dot_product_attention(*split(qkv)), None)
 
-        def dense_masked(q, k, v):
-            blk = torch.arange(N, device=dev) // T
-            return F.scaled_dot_product_attention(q, k, v, attn_mask=blk[:, None] == blk[None, :])
-
-        variants["dense_masked"] = dense_masked
-        for vname, run in variants.items():
+            def dense_masked(qkv):
+                blk = torch.arange(N, device=dev) // T
+                return F.scaled_dot_product_attention(*split(qkv),
+                                                      attn_mask=blk[:, None] == blk[None, :])
+            variants["dense_masked"] = (dense_masked, None)
+        for vname, (run, m) in variants.items():
             if args.variants and vname not in args.variants:
                 continue
             rec = dict(bench="window", config=name, variant=vname, device=dev.type,
@@ -169,11 +170,14 @@ def bench_window(args):
                 _emit(rec)
                 continue
             try:
-                rec.update(_measure(lambda: _qkv(B, H, N, D, dev, dtype), run, dev, args.reps))
+                rec.update(_measure(make, run, dev, args.reps))
             except OOM:
                 rec["oom"] = True
-            if vname == "window_centred":
-                rec["keys_per_window"] = mods[vname].key_len
+            if m is not None and "fwd_ms" in rec:
+                # FLOPs of q k^T and p v on the (padded) windows
+                flops = 4.0 * B * H * m.n_windows * m.window_len * m.key_len * D
+                rec["keys_per_window"] = m.key_len
+                rec["fwd_TFLOPs"] = flops / (rec["fwd_ms"] * 1e-3) / 1e12
             _emit(rec)
             if dev.type == "cuda":
                 torch.cuda.empty_cache()
@@ -221,16 +225,19 @@ def bench_neighbourhood(args):
         w = na._tap_w
 
         def make():
-            q, k, v = _qkv(B, H, N, D, dev, dtype)
+            g = torch.Generator(device="cpu").manual_seed(0)
+            qkv = torch.randn(B, N, 3, H, D, generator=g).to(dev, dtype).requires_grad_()
             b = na.pos_bias.detach().clone().to(dtype).requires_grad_()
-            return q, k, v, b
+            return qkv, b
 
-        def fused(q, k, v, b):
-            from healpix_analyse._attention_backend import neighbourhood_attention
-            return neighbourhood_attention(q, k, v, b, na._tap_idx, w, na._valid,
-                                           backend=args.backend, transposed=na._transposed_map)
+        def fused(qkv, b):
+            from healpix_analyse._attention_backend import neighbourhood_attention_qkv
+            return neighbourhood_attention_qkv(qkv, b, na._tap_idx, w, na._valid,
+                                               backend=args.backend,
+                                               transposed=na._transposed_map)
 
-        def naive(q, k, v, b):
+        def naive(qkv, b):
+            q, k, v = (qkv[:, :, i].transpose(1, 2) for i in range(3))
             return neighbourhood_attention_naive(q, k, v, b, na._tap_idx, w, na._valid)
 
         for vname, run in (("fused", fused), ("naive", naive)):
@@ -242,6 +249,11 @@ def bench_neighbourhood(args):
                 rec.update(_measure(make, run, dev, args.reps))
             except OOM:
                 rec["oom"] = True
+            if "fwd_ms" in rec:
+                # compulsory traffic of the forward: read q, k, v, write the output
+                esz = torch.finfo(dtype).bits // 8
+                nbytes = (3 + G) * B * N * H * D * esz
+                rec["fwd_GBs"] = nbytes / (rec["fwd_ms"] * 1e-3) / 1e9
             _emit(rec)
             if dev.type == "cuda":
                 torch.cuda.empty_cache()
@@ -313,15 +325,16 @@ def table(args):
     for path in args.files:
         with open(path) as f:
             recs += [json.loads(line) for line in f if line.startswith("{")]
-    for bench, ref in (("window", "dense_masked"), ("neighbourhood", "naive")):
+    for bench, ref in (("window", "centred_sdpa"), ("neighbourhood", "naive")):
         rs = [r for r in recs if r["bench"] == bench]
         if not rs:
             continue
         configs = list(dict.fromkeys((r["device"], r["dtype"], r["config"]) for r in rs))
         variants = list(dict.fromkeys(r["variant"] for r in rs))
         print(f"\n### {bench}\n")
-        print("| device | config | variant | fwd ms | step ms | peak GiB | step vs " + ref + " |")
-        print("|---|---|---|---|---|---|---|")
+        print("| device | config | variant | fwd ms | step ms | step/fwd | peak GiB | fwd rate "
+              "| step vs " + ref + " |")
+        print("|---|---|---|---|---|---|---|---|---|")
         for devc, dt, cfg in configs:
             by = {r["variant"]: r for r in rs if (r["device"], r["dtype"], r["config"]) == (devc, dt, cfg)}
             devc = devc if dt == "float32" else f"{devc} {dt}"
@@ -332,12 +345,14 @@ def table(args):
                     continue
                 if "skipped" in r or r.get("oom"):
                     note = "OOM" if r.get("oom") else "skipped"
-                    print(f"| {devc} | {cfg} | {v} | {note} | | | |")
+                    print(f"| {devc} | {cfg} | {v} | {note} | | | | | |")
                     continue
                 gain = f"{refstep / r['step_ms']:.1f}x" if refstep else ""
                 peak = f"{r['peak_GiB']:.2f}" if "peak_GiB" in r else ""
+                rate = (f"{r['fwd_TFLOPs']:.1f} TFLOP/s" if "fwd_TFLOPs" in r else
+                        f"{r['fwd_GBs']:.0f} GB/s" if "fwd_GBs" in r else "")
                 print(f"| {devc} | {cfg} | {v} | {r['fwd_ms']:.2f} | {r['step_ms']:.2f} | "
-                      f"{peak} | {gain} |")
+                      f"{r['step_ms'] / r['fwd_ms']:.1f} | {peak} | {rate} | {gain} |")
 
 
 def main(argv=None):

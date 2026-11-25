@@ -22,14 +22,29 @@ channels.
 ```{include} ../_generated/glance/window_attention.md
 ```
 
-A window is the set of `4**w` descendants of one cell of level `level - w`.
-In NESTED order they are contiguous, so on the full sphere, and on a regional
-domain whose `cell_ids` are sorted and made of complete blocks, the windows
-are a reshape of the input followed by
-`torch.nn.functional.scaled_dot_product_attention`: no index, no mask, and
-PyTorch's flash or memory-efficient kernels run. Any other domain (unsorted,
-or with incomplete blocks) gathers its windows, pads them to a common length
-and masks the padding.
+The queries of a window are the `4**w` descendants of one cell of level
+`level - w`. In NESTED order they are contiguous: on the full sphere, and on
+a regional domain whose `cell_ids` are sorted and made of complete blocks,
+the query windows need no index. Any other domain (unsorted, or with
+incomplete blocks) pads its windows to a common length and masks the
+padding.
+
+On CUDA (float32, float16, bfloat16, and under `torch.autocast`) fused
+Triton kernels in the style of flash attention run every kind of window:
+
+- they read the packed output of the `qkv` projection in place and write
+  its gradient in place, so no permuted copy of q, k, v is made;
+- the rows of padded or overlapping windows are gathered in registers and
+  the padding is masked there, with no gathered copy and no mask tensor;
+- q kᵀ and p v run on tensor cores (`tl.dot`), with fp32 accumulation and
+  an online softmax; the tile sizes are autotuned;
+- the backward is deterministic: one kernel for the query gradient, one for
+  the key and value gradients of each block of keys. When windows overlap
+  (`"coarse_centred"`), each window slot writes a partial sum, and a third
+  kernel sums the slots of each cell in a fixed order. No atomics.
+
+Elsewhere (CPU, float64, attention dropout, `backend="torch"`), the windows
+are gathered and passed to `torch.nn.functional.scaled_dot_product_attention`.
 
 ```python
 import torch
@@ -47,19 +62,31 @@ y = layers(torch.randn(2, 128, 12 * 4**8))      # [2, 128, N]
 
 Swin alternates its window grid with one shifted by half a window, so that
 information crosses the window borders. HEALPix blocks have no such shift.
-The option `shift` selects one of two replacements (the choice is still open
-in issue #109):
+The option `shift` selects the replacement. The maintainer chose the windows
+centred on the cells of a coarser level, which overlap across block borders
+(issue #109): `"coarse_centred"` is the default, and the two other options
+stay available.
 
 | `shift` | windows | cost | receptive field |
 |---|---|---|---|
-| `"none"` | blocks of `4**w` cells at every layer | one reshape + SDPA | one block, whatever the depth |
+| `"coarse_centred"` (default) | queries: a block of `4**w` cells; keys: the cells within `(1 + halo) r_c` of the block centre, `r_c` the radius of the block | about 2.3× more keys than `"none"` at `halo=0.25` | grows at every layer, across block borders |
+| `"none"` | blocks of `4**w` cells at every layer | the cheapest | one block, whatever the depth |
 | `"alternate_level"` | `shifted=False`: blocks of `4**w`; `shifted=True`: blocks of `4**(w+1)` | the shifted layers attend over 4× longer windows (4× the cost) | one block of `4**(w+1)` cells after 2 layers; it grows further only through Down/Up, as in the hierarchical stages of Swin |
-| `"coarse_centred"` | queries: a block of `4**w` cells; keys: the cells within `(1 + halo) r_c` of the block centre, `r_c` the radius of the block | keys gathered and masked: about 2.5× more keys than `"none"` at `halo=0.25` | grows at every layer, across block borders |
 
 `shift=None` takes the module constant `DEFAULT_WINDOW_SHIFT`
-(`"alternate_level"`), so the default can be changed in one place.
+(`"coarse_centred"`), so the default can be changed in one place.
 `benchmarks/benchmark_attention.py receptive` prints the receptive field of
-one cell after 1 to 6 layers for each option.
+one cell after 1 to 6 layers for each option. At level 8 with windows of 64
+cells (cell size 0.23°), as cells / radius in cell sizes:
+
+| `shift` | 1 layer | 2 layers | 3 layers | 4 layers | 6 layers |
+|---|---|---|---|---|---|
+| `"coarse_centred"` | 150 / 7.3 | 680 / 16.8 | 1594 / 26.8 | 2904 / 36.9 | 6723 / 57.2 |
+| `"alternate_level"` | 64 / 6.3 | 256 / 17.8 | 256 / 17.8 | 256 / 17.8 | 256 / 17.8 |
+| `"none"` | 64 / 6.3 | 64 / 6.3 | 64 / 6.3 | 64 / 6.3 | 64 / 6.3 |
+
+(for a cell next to the centre of its block; layers alternate `shifted=False`
+and `True`).
 
 ## Neighbourhood attention
 
@@ -123,11 +150,12 @@ and the baseline of the benchmark.
 
 ## Cost
 
-- Window attention: `N * 4**w` scores per head (`"none"`), memory linear in
-  `N` with the flash and memory-efficient kernels. The gathered path of a
-  padded domain, and the overlapping keys of `"coarse_centred"`, accumulate
-  their backward with `index_put_`, whose order on CUDA is fixed only under
-  `torch.use_deterministic_algorithms(True)`.
+- Window attention: `N * 4**w` scores per head (`"none"`; about 2.3 times
+  more with `"coarse_centred"`), memory linear in `N`. The Triton backward
+  of overlapping windows keeps one fp32 partial sum per key slot (twice the
+  size of k and v per slot). On the PyTorch path, the backward of the
+  gathers accumulates with `index_put_`, whose order on CUDA is fixed only
+  under `torch.use_deterministic_algorithms(True)`.
 - Neighbourhood attention: `N * P` scores per head and gauge, linear in `N`;
   each score reads 4 rows of keys and 4 of values. The geometry is the one of
   a `HealPixConv` with the same arguments.
