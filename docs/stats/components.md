@@ -3,6 +3,9 @@
 `healpix-analyse` provides connected-component analysis for binary fields
 defined on NESTED HEALPix cells.
 
+```{include} ../_generated/glance/components.md
+```
+
 ## Basic usage
 
 ```python

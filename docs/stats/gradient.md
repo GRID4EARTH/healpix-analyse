@@ -3,6 +3,9 @@
 `healpix-analyse` provides local scalar-field gradients for NESTED HEALPix
 data using the real geographic geometry of neighbouring cell centres.
 
+```{include} ../_generated/glance/gradient.md
+```
+
 The gradient is expressed in a local tangent basis:
 
 - `grad_east`: derivative toward geographic East
@@ -291,8 +294,8 @@ The relative geometry contains:
 - East offset;
 - North offset.
 
-This geometry can be reused across variables or bands defined on the same
-HEALPix cells.
+There is no public API to keep this geometry between calls: `gradient`
+rebuilds it at every call, and takes one 1-D field at a time.
 
 The same generic relative-geometry primitive can also support other local
 operators such as radial and directional filters.

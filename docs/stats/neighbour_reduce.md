@@ -2,6 +2,9 @@
 
 `neighbour_reduce` applies an unweighted reduction to values in a physical neighbourhood around each HEALPix cell.
 
+```{include} ../_generated/glance/neighbour_reduce.md
+```
+
 Unlike Cartesian image filters, neighbourhoods are specified using a physical radius rather than a fixed pixel window such as `3x3` or `5x5`. This makes the operation independent of HEALPix refinement level and avoids assumptions about Cartesian x/y directions.
 
 ## Basic usage
@@ -198,6 +201,56 @@ result = neighbour_reduce(
 Only cells belonging to `domain` may contribute to each output reduction.
 
 The output contains exactly two values, corresponding to cells `10` and `11`.
+
+## Reductions, aliases and the reusable reducer
+
+`reduction` is one of `"mean"`, `"sum"`, `"min"`, `"max"`, `"median"`,
+`"count"`, `"std"`, `"any"`, `"all"`, `"mode"`.
+
+- `std` is the population standard deviation (no correction).
+- `median` averages the two middle values for an even count.
+- `mode` needs integer or boolean values; ties go to the smallest value.
+- `any` and `all` need boolean values.
+- Output dtype: `mean`, `median` and `std` are floating point (integer input
+  becomes float64); `sum` of integers is int64; `count` is int64; `any` and
+  `all` are boolean; `min`, `max` and `mode` keep the input dtype.
+- An empty neighbourhood gives 0 for `sum` and `count`, `False` for `any`,
+  `True` for `all`, and raises `ValueError` for the other reductions.
+
+Four aliases fix the reduction and take the same other arguments:
+`median_filter`, `mean_filter`, `min_filter`, `max_filter`.
+
+To apply several reductions, or the same one to many fields, on the same cells,
+build the neighbourhoods once with `HealPixNeighbourReducer` (`neighbour_reduce`
+builds a new one at every call):
+
+```python
+from healpix_analyse import HealPixNeighbourReducer
+
+reducer = HealPixNeighbourReducer(
+    cell_ids, refinement_level=17, radius_m=240.0,
+)
+med = reducer(values, reduction="median")
+p_max = reducer(values, reduction="max")
+reducer.output_cell_ids          # the domain, in output order
+```
+
+## Differentiability, missing values and cost
+
+- **Differentiable** (Torch input) for `mean`, `sum`, `min`, `max`, `median`
+  and `std`; `count` and `mode` return integers and `any` / `all` booleans,
+  which carry no gradient.
+- **NaN propagates**: a NaN inside a neighbourhood makes the `mean`, `std`,
+  `min`, `max` and `median` of that cell NaN. If you need NaN-aware
+  averaging, use `radial_filter` with a top-hat kernel
+  ({doc}`compare_neighbourhood`).
+- **Cost**: the neighbourhoods are built once per call on the CPU (healpix-geo
+  and pyproj); the reduction is then a Python loop over the output cells, on
+  the device of the input tensor. It is therefore not the cheapest local
+  operator: in one CPU measurement (20 000 cells at level 12, 3 km radius),
+  `mean_filter` took about 0.5 s per call, against 0.15 s for the first call
+  of `radial_filter` with a top-hat kernel and 0.012 s once its geometry is
+  cached. To be confirmed by a benchmark in `benchmarks/`.
 
 ## Spatial semantics
 

@@ -5,6 +5,9 @@ curl from eastward/northward velocity components on a NESTED HEALPix domain.
 `HealPixMultiScaleDivCurl` applies the same physical operator to every native
 band returned by `HealPixDecomp`.
 
+```{include} ../_generated/glance/divcurl.md
+```
+
 The implementation is local, differentiable, GPU-aware, compatible with
 partial masks, and built directly on `HealPixConv`.
 
@@ -228,15 +231,22 @@ derivative, preventing accidental mixing of masks or resolutions.
 
 ## Masks and limitations
 
-`HealPixConv` only uses available input cells, so the operator remains local
-on ocean or coastline masks. Derivatives close to a mask boundary are less
-accurate because the stencil becomes incomplete. Scientific validation should
+The operator stays on the cells of the domain, but it does not drop the
+missing ones: a stencil tap whose neighbours are outside the domain takes the
+value of the centre cell (the padding rule of `HealPixConv`). Derivatives
+close to a mask boundary are therefore one-sided and less accurate. NaN
+values are not handled and propagate. Scientific validation should
 either exclude a narrow boundary region, retain gauge-to-gauge dispersion as
 an uncertainty indicator, or compare multiple kernel sizes.
 
-The final level-zero band contains only twelve full-sky HEALPix cells and
+When the decomposition goes down to level 0 (`Jmax=-1`, the default, or
+`Jmax=level`), the last band contains at most the twelve base cells and
 cannot provide a precise local derivative. It is returned for completeness,
 but should normally be interpreted only as a very coarse diagnostic.
+
+Default ellipsoids differ: `HealPixDivCurl` uses `"sphere"`, while
+`HealPixMultiScaleDivCurl` inherits the ellipsoid of its `HealPixDecomp`
+(`"WGS84"` by default). Pass the same value when you compare them.
 
 This module computes diagnostic divergence and curl. Reconstructing velocity
 from them is a separate Helmholtz-Hodge inversion and requires boundary

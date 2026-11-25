@@ -3,6 +3,9 @@
 `healpix-analyse` provides binary mathematical morphology for masks
 represented by active nested HEALPix cell IDs.
 
+```{include} ../_generated/glance/morphology.md
+```
+
 The initial API consists of:
 
 ```python
@@ -11,6 +14,14 @@ from healpix_analyse.morphology import (
     binary_erosion,
 )
 ```
+
+Both functions are **not exported** from `healpix_analyse`: import them from
+`healpix_analyse.morphology`. They take a list of active cell ids and return a
+sorted array of cell ids (NumPy only, so not differentiable). The structuring
+element is a **metric radius** in metres (`radius`), with the cell-centre or
+cone-coverage neighbourhoods described below — the same neighbourhoods as
+`neighbour_reduce` — not the immediate-neighbour graph of the NESTED scheme.
+Without `domain`, a dilation can grow anywhere on the sphere.
 
 ## Structuring neighbourhoods
 
@@ -119,7 +130,7 @@ for the same target cell and radius.
 ## Sentinel-2 MSI Mask S2 example
 
 [The Sentinel-2 MSI Mask S2 processing uses disk-shaped structuring
-elements on a 60 m processing grid.](https://s2.pages.eopf.copernicus.eu/msi/s2msi/1.3.0/dpm/sensor_geometry/transition_geometry/pu_mask_s2.html?utm_source=chatgpt.com#structural-element-selection)
+elements on a 60 m processing grid.](https://s2.pages.eopf.copernicus.eu/msi/s2msi/1.3.0/dpm/sensor_geometry/transition_geometry/pu_mask_s2.html#structural-element-selection)
 
 The original raster parameters are:
 

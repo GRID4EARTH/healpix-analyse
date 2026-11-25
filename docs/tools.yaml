@@ -727,3 +727,213 @@ tools:
       use: HEALPixSHT.map2alm or map2alm_latlon (plain tensors, healpy layout)
       page: sht/healpix_sht
   optional_deps: none
+
+# ===========================================================================
+# B. Statistics & local analysis
+# ===========================================================================
+- id: neighbour_reduce
+  title: Neighbourhood statistics within a radius (neighbour_reduce)
+  family: B
+  page: stats/neighbour_reduce
+  symbols: [neighbour_reduce, median_filter, mean_filter, min_filter, max_filter, HealPixNeighbourReducer]
+  summary: >-
+    Unweighted statistic (mean, median, min, max, std, count, mode, any, all,
+    sum) over the cells within a physical radius in metres of each cell.
+  tasks:
+    - do: take the median, minimum or maximum of a field within a radius in metres
+      use: [neighbour_reduce, median_filter, max_filter]
+    - do: count valid cells or take the most frequent class (mode) around each cell
+      use: [neighbour_reduce]
+    - do: apply several reductions on the same cells without rebuilding the neighbourhoods
+      use: [HealPixNeighbourReducer]
+  keywords: [median filter, max filter, min filter, mode filter, local statistics, despeckle, classification smoothing, radius in metres]
+  domain: whole sphere or regional set of cell ids; `domain` selects the output cells
+  ordering: NESTED
+  ellipsoid: '"WGS84" (the only accepted value with the cell-centre neighbourhood)'
+  io: "values [..., N] -> [..., len(domain)]; NumPy in -> NumPy out; dtype depends on the reduction"
+  differentiable: for mean, sum, min, max, median, std (Torch); not for count, mode, any, all
+  gpu: the reduction runs on the input device; neighbourhoods built on CPU
+  nan: propagates (mean, std, min, max, median)
+  cost: >-
+    A Python loop over the output cells; in one CPU test (20 000 cells,
+    level 12, 3 km) mean_filter took about 0.5 s per call, slower than
+    radial_filter with a top-hat kernel. HealPixNeighbourReducer keeps the
+    neighbourhoods between calls.
+  pros:
+    - Ten reductions, including categorical ones (mode, any, all, count).
+    - Radius in metres, the same meaning at every level.
+  cons:
+    - NaN propagates; no weights.
+    - Not the cheapest operator (per-cell Python loop).
+  use_instead:
+    - when: a weighted or NaN-aware mean
+      use: radial_filter / gaussian_filter
+      page: stats/compare_neighbourhood
+    - when: growing or shrinking a mask given as a list of cells
+      use: binary_dilation / binary_erosion
+      page: stats/morphology
+  optional_deps: none
+
+- id: gradient
+  title: East/North gradient of a scalar field (gradient)
+  family: B
+  page: stats/gradient
+  symbols: [gradient, gradient_magnitude, directional_derivative]
+  summary: >-
+    Least-squares East and North derivatives of a scalar field from the
+    immediate neighbours of each cell, in units per metre on WGS84; its
+    magnitude; and the derivative along any azimuth.
+  tasks:
+    - compute the slope, gradient or gradient magnitude of a field (e.g. a DEM, SST fronts)
+    - do: compute the derivative of a field along a direction (azimuth from North)
+      use: [directional_derivative]
+  keywords: [gradient, slope, aspect, DEM, fronts, derivative, east, north, azimuth]
+  domain: whole sphere or regional set of cell ids; `domain` selects the output cells
+  ordering: NESTED
+  ellipsoid: hard-coded "WGS84" (no argument)
+  io: "1-D values only -> (grad_east, grad_north) in units per metre; NumPy in -> NumPy out"
+  differentiable: yes (Torch)
+  gpu: the fit runs on the input device; geometry on CPU at every call
+  nan: NaN neighbours are dropped; a cell gets NaN when its value is not finite or fewer than 2 valid neighbours remain or the fit is degenerate
+  cost: the geometry is rebuilt at every call (no cache); to be measured
+  pros:
+    - True East/North directions and metric distances, no Cartesian assumption.
+    - Works on regional domains and across base-cell boundaries.
+  cons:
+    - One 1-D field per call; no radius, no weights (immediate neighbours only).
+    - WGS84 hard-coded.
+  use_instead:
+    - when: a smoother gradient over a larger scale
+      use: gaussian_filter first, then gradient
+      page: conv/radial_filter
+    - when: divergence and curl of a vector field
+      use: HealPixDivCurl
+      page: stats/divcurl
+  optional_deps: none
+
+- id: divcurl
+  title: Divergence and curl of a flow, at one or every scale (HealPixDivCurl)
+  family: B
+  page: stats/divcurl
+  symbols: [HealPixDivCurl, HealPixMultiScaleDivCurl, HealPixDivCurlPyramid]
+  summary: >-
+    Divergence and curl of a horizontal flow (u east, v north) with fixed
+    derivative-of-Gaussian kernels on the cells, at one scale
+    (HealPixDivCurl) or on every band of a HealPixDecomp pyramid
+    (HealPixMultiScaleDivCurl, which returns a HealPixDivCurlPyramid).
+  tasks:
+    - compute the divergence and vorticity (curl) of wind or currents on a regional domain
+    - do: get divergence and curl at every scale of a multiscale decomposition
+      use: [HealPixMultiScaleDivCurl]
+  keywords: [divergence, curl, vorticity, wind, currents, convergence, eddies, multiscale]
+  domain: whole sphere or regional set of cell ids (cell_ids at construction)
+  ordering: NESTED
+  ellipsoid: '"sphere" (HealPixDivCurl); inherited from the HealPixDecomp ("WGS84" by default) for HealPixMultiScaleDivCurl'
+  io: "[..., 2, N] (u, v) -> [..., 2, N] (div, curl) in 1/s for m/s input; NumPy in -> NumPy out"
+  differentiable: yes, in the input
+  gpu: yes (CUDA by default when available)
+  nan: not handled; NaN propagates
+  cost: one HealPixConv per scale; geometry cached on disk by HealPixConv
+  pros:
+    - Local, works on coastlines and regional domains; one band per physical scale.
+  cons:
+    - Near a mask edge the missing taps take the centre value, so the derivatives are one-sided.
+    - The coarsest band (level 0) holds at most twelve cells.
+    - Different default ellipsoids for the two classes.
+  use_instead:
+    - when: the field covers the whole sphere and spectral accuracy matters
+      use: HEALPixSHT.uv_to_curl_div with the sqrt(l(l+1))/R factor
+      page: stats/compare_divcurl
+  optional_deps: none
+
+- id: morphology
+  title: Binary dilation and erosion by a radius (morphology)
+  family: B
+  page: stats/morphology
+  not_exported: [healpix_analyse.morphology.binary_dilation, healpix_analyse.morphology.binary_erosion]
+  summary: >-
+    Grow or shrink a mask, given as a list of active cell ids, by a radius in
+    metres, optionally restricted to a domain.
+  tasks:
+    - grow (dilate) or shrink (erode) a cloud, water or land mask by a distance in metres
+  keywords: [morphology, dilation, erosion, buffer, mask, cloud mask, opening, closing]
+  domain: whole sphere, or restricted to `domain`
+  ordering: NESTED
+  ellipsoid: '"WGS84"'
+  io: a list of active cell ids -> sorted unique cell ids (NumPy)
+  differentiable: no
+  cost: the same neighbourhood search as neighbour_reduce
+  pros:
+    - Metric radius with cell-centre or cone-coverage structuring neighbourhoods; domain-aware.
+  cons:
+    - Not exported; NumPy only; without `domain` a dilation is unbounded.
+  use_instead:
+    - when: the mask is a boolean value per cell
+      use: max_filter / min_filter
+      page: stats/compare_neighbourhood
+  optional_deps: none
+
+- id: components
+  title: Connected components and their areas (components)
+  family: B
+  page: stats/components
+  symbols: [connected_components, component_size, component_area, remove_small_components, healpix_cell_area]
+  summary: >-
+    Label the connected regions of a boolean mask with edge or
+    edge-and-vertex connectivity of the NESTED scheme, count their cells,
+    measure their areas in square metres and remove small ones.
+  tasks:
+    - label connected regions of a mask (clouds, burned areas, water bodies) and measure their areas
+    - remove regions smaller than a number of cells or an area in square metres
+    - do: get the area of a HEALPix cell in square metres on an ellipsoid
+      use: [healpix_cell_area]
+  keywords: [connected components, labelling, objects, blobs, area, segmentation, cell area]
+  domain: whole sphere or regional set of cell ids; `domain` restricts the labelling
+  ordering: NESTED only
+  ellipsoid: '"WGS84" for areas'
+  io: "1-D boolean mask -> (labels int64, n_components); label 0 is the background"
+  differentiable: no (discrete)
+  gpu: Torch input is processed on the CPU and returned on its device
+  cost: union-find; the topology comes from healpix-geo
+  pros:
+    - Edge (4-like) or edge-or-vertex (8-like) connectivity; deterministic labels.
+    - Exact ellipsoidal cell area.
+  cons:
+    - NESTED only; not differentiable.
+  use_instead:
+    - when: a smooth, differentiable measure of the shape of a field
+      use: minkowski_functionals_healpix
+      page: stats/minkowski
+  optional_deps: none
+
+- id: minkowski
+  title: Minkowski functionals, planar and HEALPix (minkowski)
+  family: B
+  page: stats/minkowski
+  symbols: [minkowski_functionals, minkowski_curves, build_healpix_adjacency, minkowski_functionals_healpix, minkowski_curves_healpix]
+  summary: >-
+    Soft, differentiable area, perimeter and Euler characteristic (W0, W1,
+    W2) of a field above a threshold, for batches of planar images or for
+    HEALPix maps after a one-time adjacency setup.
+  tasks:
+    - do: measure area, perimeter and Euler characteristic of a field above thresholds, differentiably (as a loss or a feature)
+      use: [minkowski_functionals_healpix, minkowski_curves_healpix]
+  keywords: [Minkowski functionals, morphology statistics, topology, Euler characteristic, perimeter, loss term]
+  domain: planar [B, N, N] images, or a HEALPix map (whole sphere or cell_ids) for the _healpix variants
+  ordering: NESTED or RING (`nest` of build_healpix_adjacency)
+  ellipsoid: not applicable
+  io: "Torch tensors only; planar: [B, N, N] -> [B]; HEALPix: [..., Npix] -> [...] (curves add a threshold axis)"
+  differentiable: yes after setup (sigmoid thresholds; gradients also flow to a tensor threshold)
+  gpu: yes (Torch)
+  nan: not handled
+  cost: build_healpix_adjacency runs a Python loop over the cells (once)
+  pros:
+    - Differentiable, usable as a loss term; several thresholds at once.
+  cons:
+    - "`build_healpix_adjacency` needs `healpy`, which is not a dependency, and is slow on large maps."
+    - "`minkowski_functionals` and `minkowski_curves` work on planar images, not on HEALPix."
+  use_instead:
+    - when: discrete objects and their areas
+      use: connected_components / component_area
+      page: stats/components
+  optional_deps: healpy for build_healpix_adjacency

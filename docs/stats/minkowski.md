@@ -3,6 +3,9 @@
 **Module** `healpix_analyse.minkowski`  
 **Functions** `minkowski_functionals`, `minkowski_curves`
 
+```{include} ../_generated/glance/minkowski.md
+```
+
 ---
 
 ## Overview
@@ -251,9 +254,17 @@ and then reused across all differentiable forward passes.
 
 ### `build_healpix_adjacency`
 
+```{note}
+`build_healpix_adjacency` imports **`healpy`**, which is not a dependency of
+the package: install it yourself (`pip install healpy`). It builds the edges
+with a Python loop over the cells (one `healpy.get_all_neighbours` call per
+cell) and the triangles with a loop over the edges, so the setup is slow on
+large maps; it is done once.
+```
+
 ```python
 healpix_analyse.minkowski.build_healpix_adjacency(
-    nside,
+    level,
     cell_ids  = None,
     nest      = True,
     device    = None,
@@ -262,8 +273,8 @@ healpix_analyse.minkowski.build_healpix_adjacency(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `nside` | `int` | — | HEALPix resolution parameter. |
-| `cell_ids` | array-like or `None` | `None` | Global pixel indices of the map. `None` = full sky. |
+| `level` | `int` | — | HEALPix level (`nside = 2**level`). |
+| `cell_ids` | array-like or `None` | `None` | Global pixel indices of the map. `None` = whole sphere. |
 | `nest` | `bool` | `True` | Pixel ordering (`True` = NESTED, `False` = RING). |
 | `device` | device or `None` | `None` | Target device for the returned tensors. |
 
