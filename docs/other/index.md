@@ -38,5 +38,7 @@ decomp
 resample
 interpolation
 dino
+masked_norm
+positional_encoding
 validation
 ```
