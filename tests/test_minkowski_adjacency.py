@@ -74,14 +74,14 @@ def test_regional_domain_matches_reference_loop(level):
     np.testing.assert_array_equal(triangles.numpy(), ref_t)
 
 
-def test_duplicated_cells_match_reference_loop():
-    level = 2
-    cells = np.array([5, 6, 7, 4, 6, 13, 5, 100])
-    edges, triangles = build_healpix_adjacency(level, cells)
-    ref_e, ref_t = _reference_loop(level, cells, _geo_neighbours(level))
-
-    np.testing.assert_array_equal(edges.numpy(), ref_e)
-    np.testing.assert_array_equal(triangles.numpy(), ref_t)
+@pytest.mark.parametrize("nest", [True, False])
+@pytest.mark.parametrize(
+    "cells",
+    [[4, 6, 5, 5], [5, 6, 7, 4, 6, 13, 5, 100]],
+)
+def test_duplicated_cells_raise(cells, nest):
+    with pytest.raises(ValueError, match="duplicated"):
+        build_healpix_adjacency(2, np.array(cells), nest=nest)
 
 
 @pytest.mark.parametrize("level", [1, 3])

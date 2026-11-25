@@ -258,8 +258,8 @@ def build_healpix_adjacency(
     For the full sphere with all pixels active this recovers
     :math:`\\chi(\\mathbb{S}^2) = 2` (Euler characteristic of the sphere).
 
-    If ``cell_ids`` contains the same cell twice, neighbours that point to
-    that cell use its last local index.
+    ``cell_ids`` must not contain the same cell twice: duplicated cells
+    raise ``ValueError``.
     """
     import numpy as np
 
@@ -297,10 +297,14 @@ def build_healpix_adjacency(
             nested_ids, level, connectivity="edge_or_vertex",
         )
 
-        # Global -> local index.  With a stable sort, the last match of a
-        # duplicated id is its last local index.
+        # Global -> local index (cell ids are unique, checked below).
         order = np.argsort(nested_ids, kind="stable")
         sorted_ids = nested_ids[order]
+        if np.any(sorted_ids[1:] == sorted_ids[:-1]):
+            raise ValueError(
+                "cell_ids contains duplicated cells; each cell must appear "
+                "once (the adjacency graph of repeated cells is undefined)"
+            )
         pos = np.searchsorted(sorted_ids, nbr_global, side="right") - 1
         pos_c = np.clip(pos, 0, n_cells - 1)
         found = (nbr_global >= 0) & (pos >= 0) & (sorted_ids[pos_c] == nbr_global)
