@@ -51,9 +51,12 @@ sst_smooth = gaussian_filter(sst, cell_ids, level, sigma_m=15_000.0)
 # Geographic gradient, east and north components, in degC per metre.
 d_east, d_north = gradient(sst_smooth, cell_ids, level)
 
-# Coarsen the regional field to level 8 (about 25 km).
+# Coarsen the regional field to level 8 (about 25 km): the output cells are
+# the parents of the domain (in NESTED ordering, cell >> 2 per level).
+cell_ids_l8 = np.unique(cell_ids >> np.uint64(2 * (level - 8)))
 sst_l8, cell_ids_l8 = resample_healpix(
-    sst_smooth, in_level=level, out_level=8, in_cell_ids=cell_ids
+    sst_smooth, in_level=level, out_level=8,
+    in_cell_ids=cell_ids, out_cell_ids=cell_ids_l8,
 )
 
 print(len(cell_ids), "cells at level", level, "->", len(cell_ids_l8), "at level 8")
