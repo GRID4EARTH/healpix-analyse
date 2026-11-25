@@ -25,6 +25,10 @@ healpix-geo = ">=0.5"
 [feature.affine.dependencies]
 affine = "*"
 
+# --- non-uniform FFT (healpix_analyse.nufft) --------------------------------
+[feature.nufft.dependencies]
+finufft = "*"
+
 # --- DINOv3 embeddings (healpix_analyse.dino) -------------------------------
 # The backbone is fetched at run time from Meta's distribution and is governed
 # by the DINOv3 License; the SAT-493M weights are gated (see docs/dino.md).
@@ -85,7 +89,7 @@ isort = "*"
 
 
 [environments]
-default = ["test", "dev", "affine", "dino", "examples"]
+default = ["test", "dev", "affine", "dino", "examples", "nufft"]
 docs = ["docs"]
 # a lighter environment when only the embeddings are needed
 dino = ["dino", "examples"]

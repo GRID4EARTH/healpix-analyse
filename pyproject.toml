@@ -46,6 +46,11 @@ benchmark = [
   "scipy>=1.11",
 ]
 
+# Non-uniform FFT -- healpix_analyse.nufft
+nufft = [
+  "finufft",
+]
+
 # DINOv3 embeddings -- healpix_analyse.dino
 #
 # The backbone is neither vendored nor redistributed here: it is fetched at run
