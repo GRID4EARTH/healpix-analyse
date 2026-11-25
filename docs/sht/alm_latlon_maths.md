@@ -55,7 +55,8 @@ $a_{\ell,-m} = (-1)^m a_{\ell m}^*$, so only $m \geq 0$ needs to be stored.
 
 ### Synthesis: alm → map
 
-The inverse transform reconstructs the map:
+The inverse transform reconstructs the map (the factor 2 stands for the pair
+$\pm m$, since $a_{\ell,-m} Y_{\ell,-m} = (a_{\ell m} Y_{\ell m})^*$):
 
 $$
 f(\theta, \phi) = \sum_{\ell=0}^{L_{\max}} \left[
@@ -63,6 +64,16 @@ a_{\ell 0} \, Y_{\ell 0}(\theta) +
 2 \, \text{Re} \sum_{m=1}^{\ell} a_{\ell m} \, Y_{\ell m}(\theta, \phi)
 \right]
 $$
+
+`alm2map_latlon` computes it ring by ring as
+$f(\theta_r, \phi_j) = \text{Re} \sum_{m=0}^{\ell_{\max}} c_m \, \tilde{G}_r(m) \, e^{im\phi_j}$
+with $\tilde{G}_r(m) = \sum_{\ell=m}^{\ell_{\max}} a_{\ell m} Y_{\ell m}(\theta_r, 0)$,
+$c_0 = 1$ and $c_m = 2$ for $m > 0$. For a field band-limited to
+$\ell \leq \ell_{\max}$ and an exact quadrature (for example Gauss-Legendre
+rings, $R \geq \ell_{\max} + 1$, with uniform rings of $N_r \geq 2\ell_{\max} + 1$
+points), `alm2map_latlon(map2alm_latlon(f))` returns `f` to rounding error.
+It is the inverse of the analysis, not its adjoint: the adjoint would carry
+the quadrature weights.
 
 ### Angular power spectrum
 
@@ -225,7 +236,10 @@ In code this is implemented as:
 
 1. Sort the $N_r$ pixel values by ascending longitude.
 2. Compute `torch.fft.rfft` on the sorted values (exploiting real symmetry).
-3. Reconstruct the full complex spectrum with `_rfft2fft`.
+3. Reconstruct the full complex spectrum with `_rfft2fft`: the frequencies
+   $N_r - k$ are the conjugates of $k = 1, \ldots, \lfloor (N_r - 1)/2 \rfloor$
+   (for an even $N_r$ the Nyquist bin $N_r/2$ is not mirrored; for an odd $N_r$
+   there is none), so the result has exactly $N_r$ values for any $N_r$.
 4. **Tile** the spectrum if $N_r < \ell_{\max} + 1$ (aliasing by periodicity):
    the DFT at frequency $m$ equals the DFT at $m \bmod N_r$, so repeating the
    spectrum in blocks of $N_r$ gives the correct aliased value at every $m$.
@@ -365,12 +379,6 @@ respectively.
 ### Current limitations
 
 - Only **scalar (spin-0)** fields.  Spin-weighted harmonics are not yet implemented.
-- Known issue: `alm2map_latlon` omits the factor 2 of the $m > 0$ terms, so
-  they come back at half amplitude (measured; see the guide).
-- Uniform rings with an **odd** number of points: the internal real-to-full
-  FFT helper returns one value too few, which corrupts the aliased modes when
-  `lmax >= (N_r + 1) / 2` (static reading of the code; HEALPix rings have an
-  even number of points and are not affected).
 - The Legendre tables are recomputed at every call (no cache).
 - `alm2map_latlon` uses a direct DFT in longitude ($O(N_r \cdot \ell_{\max})$ per ring);
   an IFFT optimisation for uniform rings is not yet implemented.

@@ -52,6 +52,20 @@
   installed, this also takes its import (about 0.7 s of the 5 to 7 s of
   `import healpix_analyse` on a laptop) off the package import; the first
   call of `direct_spherical_convolution` pays it instead.
+- `alm2map_latlon`: `lmax` now defaults to `None` and is deduced from the
+  length of `alm`; a value that does not match raises `ValueError`.
+  `grid_summary` defaults to `lmax=64`, like `map2alm_latlon` and
+  `anafast_latlon` (it was 24).
+
+### Fixed
+- `alm2map_latlon` returned the m > 0 terms at half amplitude: the synthesis
+  of a real field now carries the factor 2 of the pair ±m, and
+  `alm2map_latlon(map2alm_latlon(f))` returns a band-limited `f` to rounding
+  error with an exact quadrature (#92).
+- `alm_latlon`: uniform rings with an odd number of points lost one
+  frequency in the analysis, which corrupted the aliased modes when
+  `lmax >= (N_r + 1) / 2`; irregular rings failed on CUDA input (kernel
+  built on the CPU). New tests in `tests/test_alm_latlon.py`.
 
 ### Fixed
 - `HealPixDown(mode="maxpool")` on a regional domain: a child absent from
