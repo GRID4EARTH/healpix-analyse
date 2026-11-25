@@ -43,7 +43,6 @@ from healpix_analyse._patches_backend import (
     PatchFoldFunction,
     PatchGeometry,
     _Options,
-    fold_scale,
     use_triton,
 )
 
@@ -378,8 +377,10 @@ class HealPixPatches(nn.Module):
             sel = sel.unsqueeze(0)
         if sel.dim() != 2 or sel.shape[0] not in (1, B):
             raise ValueError(f"index must have shape [Ms] or [B={B}, Ms]; got {tuple(sel.shape)}.")
-        if sel.numel() and (int(sel.min()) < 0 or int(sel.max()) >= self.M):
-            raise ValueError(f"index must lie in [0, {self.M}).")
+        if sel.numel():
+            lo, hi = torch.aminmax(sel)
+            if int(lo) < 0 or int(hi) >= self.M:      # one device sync
+                raise ValueError(f"index must lie in [0, {self.M}).")
         return sel.to(torch.int32).contiguous()
 
     def _opts(self, t):
@@ -474,20 +475,19 @@ class HealPixPatches(nn.Module):
         if sel is not None and sel.shape[1] != Ms:
             raise ValueError("index and y disagree on the number of patches.")
         t5 = t.reshape(B, Ms, G, C, self.P)
+        if sel is not None and norm != "none" and sel.shape[1] > 1:
+            srt = torch.sort(sel, dim=1).values
+            if bool((srt[:, 1:] == srt[:, :-1]).any()):
+                raise ValueError("a normalised fold needs distinct centres in each row of "
+                                 "index; use norm='none' to sum repeated patches.")
         if self.mode == "nested" and self.contiguous and sel is None:
             # every cell is read once, with weight 1: the three norms agree
             out = (t5.view(B, self.M, C, self.P).permute(0, 2, 1, 3)
                    .index_select(3, self._iperm)).reshape(B, C, self.K)
         else:
-            opts = self._opts(t5)
-            geom = self._geometry()
-            scale = fold_scale(geom, norm, sel, B, t5.device,
-                               torch.float32 if opts.use_triton else
-                               (t5.dtype if t5.is_floating_point() else geom.w.dtype),
-                               opts.use_triton)
-            if scale is not None and not opts.use_triton:
-                scale = scale.to(t5.dtype)
-            out = PatchFoldFunction.apply(t5, geom, sel, scale, opts)
+            if not t5.is_floating_point():
+                t5 = t5.to(self._w.dtype)
+            out = PatchFoldFunction.apply(t5, self._geometry(), sel, norm, self._opts(t5))
         if squeeze:
             out = out[0]
         return out.detach().cpu().numpy() if is_numpy else out

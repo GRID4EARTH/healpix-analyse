@@ -250,16 +250,24 @@ if _HAS_TRITON:
 
     _FOLD_CONFIGS = [
         triton.Config({"BLOCK_S": bs}, num_warps=nw)
-        for bs, nw in ((64, 4), (128, 4), (256, 8))
+        for bs, nw in ((32, 2), (64, 4), (128, 4), (256, 8))
     ]
 
-    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "SIZE"])
+    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "SIZE"])
     @triton.jit
-    def _fold_kernel(y_ptr, ptr_ptr, rows_ptr, tw_ptr, scale_ptr, x_ptr,
-                     C, K, MG, P, SCALE_SB, SIZE,
-                     HAS_SCALE: tl.constexpr, ONES: tl.constexpr,
+    def _fold_kernel(y_ptr, inv_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr,
+                     C, K, NY, G, P, INV_SB, SIZE,
+                     HAS_INV: tl.constexpr, NORM: tl.constexpr, WRITE_SCALE: tl.constexpr,
                      BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr):
-        """x[b, c, s] = scale[b, s] sum_e tw[e] y[b, mg(e), c, p(e)], no atomics."""
+        """x[b, c, s] = sum_e tw[e] y[b, i(e), g(e), c, p(e)] / norm[b, s], no atomics.
+
+        ``y`` is ``[B, NY, G, C, P]``.  Without ``HAS_INV`` row ``r = (m*G + g)*P + p``
+        of the map reads patch ``i = m``; with it, ``i = inv[b, m]`` (the position of
+        centre ``m`` in the selection of sample ``b``, -1 when not selected: the
+        entry is skipped).  ``NORM``: 0 none, 1 sum of the weights read, 2 their
+        number; computed on the fly from the same entries (written to ``scale``
+        with ``WRITE_SCALE``, for the backward pass).
+        """
         pid_s = tl.program_id(0)
         b = tl.program_id(1).to(tl.int64)
         pid_c = tl.program_id(2)
@@ -270,24 +278,36 @@ if _HAS_TRITON:
         start = tl.load(ptr_ptr + s, mask=s_ok, other=0)
         n = tl.load(ptr_ptr + s + 1, mask=s_ok, other=0) - start
         n_max = tl.max(n, axis=0)
-        y_base = y_ptr + b * MG * C * P
+        y_base = y_ptr + b * NY * G * C * P
         acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+        nacc = tl.zeros((BLOCK_S,), dtype=tl.float32)
         for jj in range(0, n_max):
             e_ok = s_ok & (jj < n)
             e = start + jj
             r = tl.load(rows_ptr + e, mask=e_ok, other=0).to(tl.int64)
-            if ONES:
-                wv = tl.where(e_ok, 1.0, 0.0)
-            else:
-                wv = tl.load(tw_ptr + e, mask=e_ok, other=0.0).to(tl.float32)
             mg = r // P
             p = r - mg * P
-            off = (mg * C)[:, None] * P + c[None, :] * P + p[:, None]
-            v = tl.load(y_base + off, mask=e_ok[:, None] & c_ok[None, :], other=0.0)
+            if HAS_INV:
+                m = mg // G
+                i = tl.load(inv_ptr + b * INV_SB + m, mask=e_ok, other=-1).to(tl.int64)
+                ok = e_ok & (i >= 0)
+                yrow = i * G + (mg - m * G)
+            else:
+                ok = e_ok
+                yrow = mg
+            wv = tl.load(tw_ptr + e, mask=ok, other=0.0).to(tl.float32)
+            if NORM == 1:
+                nacc += wv
+            if NORM == 2:
+                nacc += tl.where(ok, 1.0, 0.0)
+            off = (yrow * C)[:, None] * P + c[None, :] * P + p[:, None]
+            v = tl.load(y_base + off, mask=ok[:, None] & c_ok[None, :], other=0.0)
             acc += wv[:, None] * v.to(tl.float32)
-        if HAS_SCALE:
-            sc = tl.load(scale_ptr + b * SCALE_SB + s, mask=s_ok, other=0.0).to(tl.float32)
+        if NORM != 0:
+            sc = tl.where(nacc > 0, 1.0 / tl.where(nacc > 0, nacc, 1.0), 0.0)
             acc = acc * sc[:, None]
+            if WRITE_SCALE:
+                tl.store(scale_ptr + b * K + s, sc, mask=s_ok & (pid_c == 0))
         tl.store(x_ptr + (b * C + c.to(tl.int64))[None, :] * K + s[:, None],
                  acc.to(x_ptr.dtype.element_ty), mask=s_ok[:, None] & c_ok[None, :])
 
@@ -329,17 +349,23 @@ def _triton_extract(x, geom, sel):
     return y
 
 
-def _triton_fold(y, geom, scale=None, ones=False):
-    """y [B, M, G, C, P] -> x [B, C, K]; ``scale`` [K] or [B, K] multiplies the result."""
-    B, M, G, C, P = y.shape
+def _triton_fold(y, geom, inv=None, norm="none", want_scale=False):
+    """y [B, NY, G, C, P] -> (x [B, C, K], scale [B, K] or None).
+
+    ``inv`` [Bs, M] int32: position of each centre in the selection (-1: not
+    selected); None when ``y`` holds all ``M`` centres.  The normalisation is
+    computed in the kernel, from the entries it reads.
+    """
+    B, NY, G, C, P = y.shape
     K = geom.K
     ptr, rows, tw = geom.transposed()
     x = torch.empty(B, C, K, device=y.device, dtype=y.dtype)
+    mode = {"none": 0, "weight": 1, "count": 2}[norm]
+    scale = (torch.empty(B, K, device=y.device, dtype=torch.float32)
+             if (want_scale and mode) else None)
     if x.numel() == 0:
-        return x
-    if scale is not None:
-        scale = scale.to(torch.float32).contiguous()
-        scale_sb = K if (scale.dim() == 2 and scale.shape[0] > 1) else 0
+        return x, scale
+    inv_sb = inv.stride(0) if (inv is not None and inv.shape[0] > 1) else 0
     BLOCK_C = _block_c(C)
 
     def grid(meta):
@@ -347,11 +373,13 @@ def _triton_fold(y, geom, scale=None, ones=False):
 
     with _device_ctx(y):
         _fold_kernel[grid](
-            y, ptr, rows, tw, scale if scale is not None else tw, x,
-            C, K, M * G, P, scale_sb if scale is not None else 0, _size_class(K),
-            HAS_SCALE=scale is not None, ONES=ones, BLOCK_C=BLOCK_C,
+            y, inv if inv is not None else ptr, ptr, rows, tw, x,
+            scale if scale is not None else tw,
+            C, K, NY, G, P, inv_sb, _size_class(K),
+            HAS_INV=inv is not None, NORM=mode, WRITE_SCALE=scale is not None,
+            BLOCK_C=BLOCK_C,
         )
-    return x
+    return x, scale
 
 
 # ===========================================================================
@@ -382,21 +410,42 @@ def _expand_selected(y, sel, M):
     return full
 
 
-def _raw_fold(y, geom, sel, use_tri, scale=None, ones=False):
-    if sel is not None:
-        y = _expand_selected(y, sel, geom.M)
-    if use_tri:
-        return _triton_fold(y.contiguous(), geom, scale=scale, ones=ones)
-    out = _torch_fold(y, geom, ones=ones)
-    if scale is not None:
-        out = out * scale.to(out.dtype).view(-1, 1, geom.K)
-    return out
+def inverse_selection(sel, M):
+    """``[Bs, M]`` int32: position of centre m in row b of ``sel``, -1 if absent.
+
+    None when a row repeats a centre (the fold then sums the copies through
+    a full tensor instead)."""
+    srt = torch.sort(sel, dim=1).values
+    if srt.shape[1] > 1 and bool((srt[:, 1:] == srt[:, :-1]).any()):
+        return None
+    inv = torch.full((sel.shape[0], M), -1, dtype=torch.int32, device=sel.device)
+    pos = torch.arange(sel.shape[1], dtype=torch.int32, device=sel.device)
+    inv.scatter_(1, sel.long(), pos.expand_as(sel).contiguous())
+    return inv
 
 
 def _extract(x, geom, sel, use_tri):
     if use_tri:
         return _triton_extract(x.contiguous(), geom, sel)
     return _torch_extract(x, geom, sel)
+
+
+def _fold(y, geom, sel, norm, use_tri, want_scale):
+    """Normalised fold; returns (x, scale) with scale [K] or [B, K] or None."""
+    if use_tri:
+        y = y.contiguous()
+        inv = None
+        if sel is not None:
+            inv = inverse_selection(sel, geom.M)
+            if inv is None:
+                y = _expand_selected(y, sel, geom.M)
+        return _triton_fold(y, geom, inv=inv, norm=norm, want_scale=want_scale)
+    scale = fold_scale(geom, norm, sel, y.shape[0], y.device, y.dtype)
+    yy = _expand_selected(y, sel, geom.M) if sel is not None else y
+    out = _torch_fold(yy, geom)
+    if scale is not None:
+        out = out * scale.view(-1, 1, geom.K)
+    return out, scale
 
 
 @dataclass(frozen=True)
@@ -419,7 +468,7 @@ class PatchExtractFunction(torch.autograd.Function):
         sel = ctx.saved_tensors[0] if ctx.has_sel else None
         gx = None
         if ctx.needs_input_grad[0]:
-            gx = PatchFoldFunction.apply(gy, ctx.geom, sel, None, ctx.opts)
+            gx = PatchFoldFunction.apply(gy, ctx.geom, sel, "none", ctx.opts)
         return gx, None, None, None
 
 
@@ -428,12 +477,13 @@ class PatchFoldFunction(torch.autograd.Function):
     an extraction of ``scale * gx``."""
 
     @staticmethod
-    def forward(ctx, y, geom, sel, scale, opts):
+    def forward(ctx, y, geom, sel, norm, opts):
         ctx.geom, ctx.opts = geom, opts
+        x, scale = _fold(y, geom, sel, norm, opts.use_triton, ctx.needs_input_grad[0])
         ctx.has_sel = sel is not None
         ctx.has_scale = scale is not None
         ctx.save_for_backward(*[t for t in (sel, scale) if t is not None])
-        return _raw_fold(y, geom, sel, opts.use_triton, scale=scale)
+        return x
 
     @staticmethod
     def backward(ctx, gx):
@@ -447,13 +497,15 @@ class PatchFoldFunction(torch.autograd.Function):
         return gy, None, None, None, None
 
 
-def fold_scale(geom, norm, sel, B, device, dtype, use_tri):
-    """``1 / norm`` of the fold (0 where no patch reads a cell), [K] or [B, K]."""
+def fold_scale(geom, norm, sel, B, device, dtype):
+    """PyTorch backend: ``1 / norm`` of the fold (0 where no patch reads a
+    cell), [K] or [B, K]."""
     if norm == "none":
         return None
     if sel is None:
         n = geom.norm(norm).to(device=device, dtype=dtype)
     else:
         ones = torch.ones((B, sel.shape[1], geom.G, 1, geom.P), device=device, dtype=dtype)
-        n = _raw_fold(ones, geom, sel, use_tri, ones=(norm == "count")).view(B, geom.K)
+        n = _torch_fold(_expand_selected(ones, sel, geom.M), geom,
+                        ones=(norm == "count")).view(B, geom.K)
     return torch.where(n > 0, 1.0 / n.clamp_min(torch.finfo(n.dtype).tiny), torch.zeros_like(n))
