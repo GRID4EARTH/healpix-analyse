@@ -51,6 +51,7 @@ Triton is optional: without it (or without CUDA) everything runs on the
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -577,6 +578,23 @@ def _autocast_dtype(device_type):
     return None
 
 
+_WARNED_NO_TRITON = False
+
+
+def _warn_no_triton():
+    global _WARNED_NO_TRITON
+    if not _WARNED_NO_TRITON:
+        _WARNED_NO_TRITON = True
+        warnings.warn(
+            "HealPixConv runs on CUDA without Triton: the PyTorch backend keeps "
+            "the memory low but its backward pass is slow on GPUs. Install the "
+            "optional 'triton' package (pip install healpix-analyse[triton]) "
+            "for the fused kernels.",
+            RuntimeWarning,
+            stacklevel=5,       # the caller of HealPixConv.forward
+        )
+
+
 def _compute_dtype(x):
     """dtype the Triton kernels run in: the autocast dtype for float32 data."""
     dt = _autocast_dtype("cuda") if x.is_cuda else None
@@ -588,6 +606,8 @@ def _use_triton(x, backend):
         raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
     if backend == "torch":
         return False
+    if x.is_cuda and not _HAS_TRITON and _compute_dtype(x) in _TRITON_DTYPES:
+        _warn_no_triton()
     ok = _HAS_TRITON and x.is_cuda and _compute_dtype(x) in _TRITON_DTYPES
     if backend == "triton" and not ok:
         raise RuntimeError(
