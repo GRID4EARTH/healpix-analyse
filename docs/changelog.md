@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+- `healpix_analyse.nufft`: two-dimensional non-uniform FFT of scattered
+  samples (for instance HEALPix cell centres of a regional domain), a thin
+  wrapper around `finufft.nufft2d1`, with the sign of `numpy.fft` and a phase
+  reference at the smallest coordinates. The period defaults to the extent plus
+  the median sample spacing (`n * dx` on a regular grid, where the result equals
+  `np.fft.fftshift(np.fft.fft2(...))`) and can be set with `period=`. Batched
+  data `(K, M)` gives `(K, Ny, Nx)`. `windowing_weights_polygon` and
+  `windowing_weights_bbox` give Tukey tapers inside a polygon (concave allowed,
+  either orientation) or a box. New optional extra `nufft` (`finufft`).
+
 ### Changed
 - `LocalFFT.blur_floor_px` (called by `HealPixFFTConv.set_gaussian` and
   `LocalFFT.check_width` since 2026.11.1) no longer uses SciPy: the moments of

@@ -110,6 +110,7 @@ hidden: true
 ---
 fft_local
 fft_conv
+nufft
 geo_fft
 ```
 
