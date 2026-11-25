@@ -58,6 +58,13 @@ CONFIGS = {
              mode="nested", keep=0.25),
         dict(name="L10 regional 262144 N8 coarse gauge B16 C16", level=10, N=8, B=16, C=16, m=9),
     ],
+    "gpu_short": [  # reduced A100 run: levels 8 and 10, full sphere and one regional domain
+        dict(name="L8 full N4 coarse gauge G1 B8 C16", level=8, N=4, B=8, C=16),
+        dict(name="L10 full N16 coarse gauge G1 B4 C3", level=10, N=16, B=4, C=3),
+        dict(name="L10 full N16 coarse nested B4 C3", level=10, N=16, B=4, C=3, mode="nested"),
+        dict(name="L10 full N16 gauge B4 C3 keep 25%", level=10, N=16, B=4, C=3, keep=0.25),
+        dict(name="L10 regional 262144 N8 coarse gauge B16 C16", level=10, N=8, B=16, C=16, m=9),
+    ],
     "tiny": [
         dict(name="L3 full N2 coarse gauge B2 C2", level=3, N=2, B=2, C=2),
         dict(name="L4 regional 256 N4 nested keep 25%", level=4, N=4, B=2, C=2, m=4,

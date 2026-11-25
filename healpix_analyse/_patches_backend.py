@@ -219,7 +219,7 @@ if _HAS_TRITON:
 
     _GATHER_CONFIGS = [
         triton.Config({"BLOCK_R": br}, num_warps=nw)
-        for br, nw in ((64, 4), (128, 4), (256, 8))
+        for br, nw in ((128, 4), (256, 8))
     ]
 
     @triton.autotune(configs=_GATHER_CONFIGS, key=["C", "J", "P", "CL", "SIZE"])
@@ -265,7 +265,7 @@ if _HAS_TRITON:
 
     _FOLD_CONFIGS = [
         triton.Config({"BLOCK_S": bs}, num_warps=nw)
-        for bs, nw in ((32, 2), (64, 4), (128, 4), (256, 8))
+        for bs, nw in ((64, 4), (128, 4))
     ]
 
     @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "CL", "SIZE"])
