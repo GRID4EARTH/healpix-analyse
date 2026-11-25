@@ -188,17 +188,14 @@ if _HAS_TRITON:
         _ELL_CONFIGS = [triton.Config({"BLOCK_I": 64, "BLOCK_B": 2}, num_warps=4)]
         _EW_CONFIGS = [triton.Config({"BLOCK": 128}, num_warps=4)]
     else:
+        # a small space of likely winners (gather-bound kernels: wide row
+        # tiles, a few batch rows per program to reuse the operator entries)
         _ELL_CONFIGS = [
             triton.Config({"BLOCK_I": bi, "BLOCK_B": bb}, num_warps=nw)
-            for bi, bb, nw in (
-                (128, 1, 4), (256, 1, 4), (512, 1, 4), (1024, 1, 8),
-                (256, 2, 4), (512, 2, 8), (256, 4, 4), (512, 4, 8),
-                (128, 8, 4), (256, 8, 8),
-            )
+            for bi, bb, nw in ((256, 1, 4), (512, 2, 4), (256, 4, 4), (512, 4, 8))
         ]
         _EW_CONFIGS = [
-            triton.Config({"BLOCK": bl}, num_warps=nw)
-            for bl, nw in ((256, 4), (512, 4), (1024, 4), (1024, 8), (2048, 8))
+            triton.Config({"BLOCK": bl}, num_warps=nw) for bl, nw in ((1024, 4), (2048, 8))
         ]
 
     @triton.jit
