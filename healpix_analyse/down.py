@@ -20,12 +20,26 @@ Works on the full sphere or on a regional domain (``cell_ids``).
 Resolution is exposed through the Grid4Earth ``level`` convention, with
 ``nside = 2**level``.
 
-Accepts numpy arrays or torch tensors of shape ``[N]`` or ``[B, N]`` and
-returns an output of the same type and number of dimensions.
+Accepts numpy arrays or torch tensors of shape ``[N]``, ``[B, N]`` or
+``[..., N]`` (``[B, C, N]`` for a network layer) and returns an output of the
+same type and leading dimensions.  The leading dimensions are flattened into
+one row axis by a view, so a contiguous ``[B*C, N]`` tensor goes through
+Down/Up without any permute or copy.
 
-The linear modes keep their sparse matrix, and its transpose for the
-gradient, as CSR buffers built once in the constructor: they follow
-``.to()`` and no sparse tensor is assembled in ``forward``.
+Compute backends (``backend=``, see :mod:`healpix_analyse._updown_backend`):
+
+* ``mean`` / ``maxpool`` on contiguous NESTED data (the full sphere, or a
+  regional domain with sorted ``cell_ids`` and complete parents) reduce a
+  ``[B, N/4, 4]`` view of the input: no index array, bit-identical to the
+  gather of the reference;
+* the linear modes keep their sparse matrix, and its transpose for the
+  gradient, in ELL form (fixed fan-in, int32 indices), applied by a Triton
+  gather-reduce kernel on CUDA and a PyTorch gather elsewhere;
+* ``backend="csr"`` is the reference implementation: CSR buffers with
+  ``torch.sparse.mm`` and the child gather everywhere.
+
+The buffers are built once in the constructor: they follow ``.to()`` and no
+sparse tensor is assembled in ``forward``.
 
 Dependencies: numpy, torch, healpix_geo.
 """
@@ -39,6 +53,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import healpix_geo
+from healpix_analyse import _updown_backend as _ub
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 # ---------------------------------------------------------------------------
@@ -51,48 +66,57 @@ ArrayLike = Union[np.ndarray, torch.Tensor]
 # Internal I/O helpers
 # ---------------------------------------------------------------------------
 
+def _torch_dtype(x: ArrayLike) -> torch.dtype:
+    """torch dtype of a tensor or of a numpy array."""
+    if isinstance(x, torch.Tensor):
+        return x.dtype
+    return torch.from_numpy(np.empty(0, dtype=np.asarray(x).dtype)).dtype
+
+
 def _prepare_input(
     x: ArrayLike,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[torch.Tensor, bool, bool]:
+    keep: Tuple[torch.dtype, ...] = (),
+) -> Tuple[torch.Tensor, bool, Tuple[int, ...]]:
     """
-    Convert an input array / tensor into a 2-D torch.Tensor [B, N].
+    Convert an input array / tensor into a 2-D torch.Tensor [rows, N].
+
+    Leading dimensions are flattened by a view when the input is
+    contiguous (no copy).  An input whose dtype is in ``keep`` keeps it;
+    any other is cast to ``dtype``.
 
     Returns
     -------
-    t       : torch.Tensor  [B, N]
+    t       : torch.Tensor  [rows, N]
     is_numpy: bool   -- True if the input was a numpy array
-    was_1d  : bool   -- True if the input had shape [N] (no batch dim)
+    lead    : tuple  -- the leading dimensions (``()`` for an input [N])
     """
     is_numpy = isinstance(x, np.ndarray)
+    target = None if _torch_dtype(x) in keep else dtype
 
     if is_numpy:
-        t = torch.as_tensor(x, dtype=dtype, device=device)
+        t = torch.as_tensor(x, dtype=target, device=device)
     else:
-        t = x.to(device=device, dtype=dtype)
+        t = x.to(device=device, dtype=target if target is not None else x.dtype)
 
-    was_1d = (t.ndim == 1)
-    if was_1d:
-        t = t.unsqueeze(0)  # [1, N]
-
-    if t.ndim != 2:
+    if t.ndim < 1:
         raise ValueError(
-            f"Input must have shape [N] or [B, N], got {tuple(t.shape)}"
+            f"Input must have shape [N], [B, N] or [..., N], got {tuple(t.shape)}"
         )
-    return t, is_numpy, was_1d
+    lead = tuple(t.shape[:-1])
+    return t.reshape(-1, t.shape[-1]), is_numpy, lead
 
 
 def _restore_output(
     t: torch.Tensor,
     is_numpy: bool,
-    was_1d: bool,
+    lead: Tuple[int, ...],
 ) -> ArrayLike:
     """
-    Convert a 2-D torch.Tensor [B, N] back to the original format.
+    Convert a 2-D torch.Tensor [rows, N_out] back to the original format.
     """
-    if was_1d:
-        t = t.squeeze(0)   # [N]
+    t = t.reshape(tuple(lead) + (t.shape[-1],))
     if is_numpy:
         if t.dtype == torch.bfloat16:      # numpy has no bfloat16
             t = t.float()
@@ -109,7 +133,8 @@ _HALF_DTYPES = (torch.float16, torch.bfloat16)
 # Buffers that keep at least float32 when the module is cast to a 16-bit
 # dtype: the sparse matrix (CPU sparse kernels have no 16-bit version) and the
 # normalisation / coverage vectors.
-_KEEP_PRECISION = ("_M_val", "_MT_val", "_coverage", "_col_sum", "_col_l2")
+_KEEP_PRECISION = ("_M_val", "_MT_val", "_ell_w", "_ellT_w", "_fast_v", "_fast_d",
+                   "_coverage", "_col_sum", "_col_l2")
 
 
 def _storage_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -138,11 +163,12 @@ class _CsrMatmul(torch.autograd.Function):
 
 class _SparseOperatorMixin:
     """
-    Store a sparse ``[R, C]`` matrix and its transpose as CSR buffers.
+    Store a sparse ``[R, C]`` matrix and its transpose, in ELL form (the
+    default) or as CSR buffers (``backend="csr"``, the reference).
 
     The components (``crow_indices``, ``col_indices``, ``values``) are plain
     dense buffers, so they follow ``.to()``, ``.double()``, ``.cuda()``...
-    ``forward`` wraps them in CSR tensors without copying.  The buffers are
+    ``forward`` uses them without copying.  The buffers are
     not persistent: the matrix is entirely determined by the constructor
     arguments, so it is not written to the ``state_dict``.  The
     ``_M_indices`` / ``_M_values`` keys written by older versions are
@@ -171,10 +197,37 @@ class _SparseOperatorMixin:
 
     def _compute_dtype(self) -> torch.dtype:
         """dtype in which the sparse product is computed."""
-        return self._M_val.dtype if self.dtype in _HALF_DTYPES else self.dtype
+        if self.dtype not in _HALF_DTYPES:
+            return self.dtype
+        for name in ("_M_val", "_ell_w", "_fast_v"):    # the stored precision
+            b = self._buffers.get(name)
+            if b is not None:
+                return b.dtype
+        return torch.float32
 
-    def _register_sparse(self, M: torch.Tensor) -> None:
+    def _register_sparse(
+        self, M: torch.Tensor, div: Optional[torch.Tensor] = None
+    ) -> None:
+        """
+        Store ``M`` (a sparse ``[R, C]`` matrix) and the operator of the
+        backward pass.  ``div`` (``[R]``, ELL only) is the row normalisation
+        that ``forward`` applies after the product (``y = M x / div``); it is
+        folded into the stored transpose, ``M^T diag(1/div)``.
+        """
         M = M.coalesce().to(_storage_dtype(M.dtype))
+        self._M_size = tuple(M.size())
+        if self.backend != "csr":
+            R, C = self._M_size
+            rows, cols = M.indices()
+            vals = M.values()
+            idx, w = _ub.build_ell(rows, cols, vals, R, C)
+            if div is not None:
+                vals = (vals.double() / div.double()[rows]).to(vals.dtype)
+            idx_t, w_t = _ub.build_ell(cols, rows, vals, C, R)
+            for name, b in (("_ell_idx", idx), ("_ell_w", w),
+                            ("_ellT_idx", idx_t), ("_ellT_w", w_t)):
+                self.register_buffer(name, b, persistent=False)
+            return
         with warnings.catch_warnings():
             # torch warns once per process that CSR support is "beta"
             warnings.filterwarnings("ignore", message=".*Sparse CSR tensor support")
@@ -187,7 +240,12 @@ class _SparseOperatorMixin:
             self.register_buffer(f"{name}_crow", T.crow_indices().to(itype), persistent=False)
             self.register_buffer(f"{name}_col", T.col_indices().to(itype), persistent=False)
             self.register_buffer(f"{name}_val", T.values().clone(), persistent=False)
-        self._M_size = tuple(M.size())
+
+    def _ell_ops(self):
+        """The stored operator and its backward as :class:`_ub.Ell`."""
+        R, C = self._M_size
+        return (_ub.Ell(self._ell_idx, self._ell_w, C),
+                _ub.Ell(self._ellT_idx, self._ellT_w, R))
 
     def _csr(self, transpose: bool = False) -> torch.Tensor:
         """The stored matrix (or its transpose) as a CSR tensor, no copy."""
@@ -200,12 +258,29 @@ class _SparseOperatorMixin:
             size=(C, R) if transpose else (R, C),
         )
 
-    def _apply_sparse(self, t: torch.Tensor) -> torch.Tensor:
-        """``M @ t`` for a batch ``t`` of shape ``[B, C]``; returns ``[B, R]``."""
-        return _CsrMatmul.apply(t.T, self._csr(), self._csr(transpose=True)).T
+    def _apply_sparse(
+        self,
+        t: torch.Tensor,
+        div: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """
+        ``M @ t`` for a batch ``t`` of shape ``[B, C]``; returns ``[B, R]``.
+
+        ELL backends only: ``div`` divides the output (it must be the ``div``
+        given to :meth:`_register_sparse`), and the output has ``out_dtype``
+        (``t.dtype`` by default), with at least float32 accumulation.
+        """
+        if self.backend == "csr":
+            return _CsrMatmul.apply(t.T, self._csr(), self._csr(transpose=True)).T
+        fwd, bwd = self._ell_ops()
+        return _ub.ell_matmul(t, fwd, bwd, div=div, out_dtype=out_dtype,
+                              backend=self.backend)
 
     def _sparse_coo(self) -> torch.Tensor:
         """The stored matrix as a coalesced COO tensor."""
+        if self.backend != "csr":
+            return _ub.ell_to_coo(self._ell_idx, self._ell_w, self._M_size[1])
         return self._csr().to_sparse().coalesce()
 
     # Read-only views of the former COO buffers (kept for existing callers).
@@ -312,6 +387,21 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         Defaults to CUDA if available, else CPU.
     dtype : torch.dtype, default torch.float32
         Floating-point dtype for the sparse matrix values.
+    backend : {"auto", "triton", "torch", "csr"}, default "auto"
+        How ``forward`` computes.  *auto*: ``mean`` and ``maxpool`` on
+        contiguous NESTED data (the full sphere, or sorted ``cell_ids``
+        whose parents are complete) reduce a view of the input, with no
+        index array; otherwise they gather the children.  The Gaussian
+        modes apply their matrix in ELL form, with a Triton kernel on CUDA
+        (float32, float16, bfloat16; fp32 accumulation, so 16-bit data is
+        not copied to float32) when Triton is installed and a PyTorch
+        gather otherwise.  The backward is a gather with the stored
+        transpose: deterministic, no atomics.  *triton* / *torch* force
+        that kernel for the Gaussian modes (*triton* raises if it cannot
+        run).  *csr*: the reference implementation (CSR matrix and
+        ``torch.sparse.mm``, child gather in every case).  All backends give
+        the same result: bit-identical for ``mean`` / ``maxpool``, equal to
+        rounding for the Gaussian modes.
 
     Examples
     --------
@@ -347,8 +437,10 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
         skipna: bool = False,
+        backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.backend = _ub.check_backend(backend)
 
         # ---- resolve device ----
         if device is None:
@@ -431,6 +523,13 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
                     torch.as_tensor(present.sum(axis=1) / 4.0,
                                     dtype=torch.float64, device=self.device),
                 )
+        # contiguous NESTED blocks: mean / maxpool reduce a view, no index array
+        self._blocks = (
+            self.backend != "csr" and self.mode in ("mean", "maxpool")
+            and _ub.nested_blocks(self._cell_ids_in)
+        )
+        if self.mode in ("smooth", "smooth_conservative") or self._blocks:
+            pass
         elif self.mode == "mean":
             self._build_mean_children()
         else:
@@ -748,6 +847,21 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         delta = torch.where(torch.isfinite(delta), delta, torch.zeros_like(delta))
         return y + delta.to(y.dtype)[:, None]
 
+    def _children(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        ``(idx, valid)``, both ``[N_out, 4]``: positions of the 4 children
+        of every output cell in the input, and whether each is present.
+        Built on the fly for contiguous NESTED blocks (no stored index).
+        """
+        if self._blocks:
+            idx = torch.arange(self.N_in, device=self.device).view(self.N_out, 4)
+            return idx, torch.ones(idx.shape, dtype=torch.bool, device=self.device)
+        valid = getattr(self, "_children_valid", None)
+        if valid is None:   # maxpool: absent children were replaced
+            valid = torch.ones(self._children_idx.shape, dtype=torch.bool,
+                               device=self._children_idx.device)
+        return self._children_idx, valid
+
     def _gather_children(
         self, t: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -759,6 +873,18 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         ``cell_ids`` and, with ``skipna``, finite.  It is ``None`` when every
         child takes part (full sphere, ``skipna=False``).
         """
+        if self._blocks:
+            # contiguous NESTED blocks: a view, the same values in the same
+            # layout as the gather below (so the same result, bit for bit)
+            gathered = t.reshape(t.shape[0], self.N_out, 4)       # [B, N_out, 4]
+            valid = None
+            if self.partial:
+                valid = torch.ones((), dtype=torch.bool,
+                                   device=t.device).expand_as(gathered)
+            if self.skipna:
+                finite = torch.isfinite(gathered)
+                valid = finite if valid is None else valid & finite
+            return gathered, valid
         idx = self._children_idx.to(device=t.device)            # [N_out, 4]
         gathered = t[:, idx]                                     # [B, N_out, 4]
         valid = None
@@ -792,17 +918,21 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         """
         if self.mode != "mean":
             raise ValueError("valid_fraction is only defined for mode='mean'.")
-        t, is_numpy, was_1d = _prepare_input(x, self.device, self.dtype)
+        t, is_numpy, lead = _prepare_input(x, self.device, self.dtype)
         if t.shape[1] != self.N_in:
             raise ValueError(
                 f"Expected input with {self.N_in} pixels, got {t.shape[1]}."
             )
-        gathered = t[:, self._children_idx.to(device=t.device)]
+        idx, present = self._children()
+        if self._blocks:
+            gathered = t.reshape(t.shape[0], self.N_out, 4)
+        else:
+            gathered = t[:, idx.to(device=t.device)]
         valid = torch.isfinite(gathered)
         if self.partial:
-            valid = valid & self._children_valid.to(device=t.device)
+            valid = valid & present.to(device=t.device)
         frac = valid.sum(dim=-1).to(t.dtype) / 4.0
-        return _restore_output(frac, is_numpy, was_1d)
+        return _restore_output(frac, is_numpy, lead)
 
     def sparse_matrix(self) -> torch.Tensor:
         """
@@ -819,8 +949,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
             return self._sparse_coo()
         if self.mode != "mean":
             raise ValueError("maxpool is not linear; it has no sparse matrix.")
-        idx = self._children_idx
-        valid = self._children_valid
+        idx, valid = self._children()
         rows = torch.arange(self.N_out, device=idx.device)[:, None].expand_as(idx)
         vdtype = _storage_dtype(self.dtype)
         n = valid.sum(dim=-1, keepdim=True).to(vdtype).expand(idx.shape)
@@ -850,7 +979,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
                 "coverage is only defined for mode='mean' or "
                 "'smooth_conservative'."
             )
-        return self._children_valid.sum(dim=-1).cpu().numpy() / 4.0
+        return self._children()[1].sum(dim=-1).cpu().numpy() / 4.0
 
     @property
     def cell_ids_out(self) -> np.ndarray:
@@ -865,23 +994,28 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
 
         Parameters
         ----------
-        x : numpy.ndarray or torch.Tensor, shape [N] or [B, N]
+        x : numpy.ndarray or torch.Tensor, shape [N], [B, N] or [..., N]
             Input map(s) at fine resolution ``nside_in``.
             When ``cell_ids`` was given at construction, ``N`` must equal
             ``len(cell_ids)``.  Otherwise ``N = 12 * nside_in**2``.
 
         Returns
         -------
-        y : same type as x, shape [N_out] or [B, N_out]
+        y : same type as x, shape [N_out], [B, N_out] or [..., N_out]
             Downsampled map(s) at coarse resolution ``nside_out``.
         cell_ids_out : np.ndarray
             NESTED pixel indices of the output pixels at ``nside_out``.
         """
-        # self.device / self.dtype follow .to(); the sparse product of a
-        # 16-bit module is computed in the stored precision (float32)
+        # self.device / self.dtype follow .to().  The sparse product of a
+        # 16-bit module is computed in the stored precision (float32): the
+        # CSR reference casts the input to it, the ELL kernels read 16-bit
+        # data as it is and accumulate in float32.
         linear = self.mode in ("smooth", "smooth_conservative")
         dtype = self._compute_dtype() if linear else self.dtype
-        t, is_numpy, was_1d = _prepare_input(x, self.device, dtype)
+        keep = ()
+        if linear and self.backend != "csr" and self.dtype in _HALF_DTYPES:
+            keep = (self.dtype,)
+        t, is_numpy, lead = _prepare_input(x, self.device, dtype, keep)
         B, N = t.shape
 
         if N != self.N_in:
@@ -889,12 +1023,19 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
                 f"Expected input with {self.N_in} pixels, got {N}."
             )
 
-        if self.mode in ("smooth", "smooth_conservative"):
+        if linear and self.backend == "csr":
             # M: [N_out, N_in] CSR, built once;  t: [B, N_in]
             y = self._apply_sparse(t)       # [B, N_out]
             if self.mode == "smooth_conservative":
                 y = self._conserve_mean(t, y)
             y = y.to(self.dtype)
+
+        elif self.mode == "smooth":
+            y = self._apply_sparse(t, out_dtype=self.dtype)
+
+        elif self.mode == "smooth_conservative":
+            y = self._apply_sparse(t, out_dtype=self._compute_dtype())
+            y = self._conserve_mean(t, y).to(self.dtype)
 
         elif self.mode == "mean":
             gathered, valid = self._gather_children(t)          # [B, N_out, 4]
@@ -906,9 +1047,12 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
                 )
                 y = gathered.sum(dim=-1) / valid.sum(dim=-1).to(t.dtype)
 
+        elif self._blocks:  # maxpool on contiguous NESTED blocks: a view
+            y = t.reshape(B, self.N_out, 4).max(dim=-1).values   # [B, N_out]
+
         else:  # maxpool
             idx = self._children_idx.to(device=t.device)   # [N_out, 4]
             gathered = t[:, idx]                            # [B, N_out, 4]
             y = gathered.max(dim=-1).values                 # [B, N_out]
 
-        return _restore_output(y, is_numpy, was_1d), self._cell_ids_out
+        return _restore_output(y, is_numpy, lead), self._cell_ids_out

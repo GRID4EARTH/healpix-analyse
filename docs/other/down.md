@@ -53,6 +53,7 @@ HealPixDown(
     device      = None,
     dtype       = torch.float32,
     skipna      = False,
+    backend     = "auto",
 )
 ```
 
@@ -68,6 +69,7 @@ HealPixDown(
 | `device` | device or `None` | auto | Torch device. Defaults to CUDA if available, else CPU. |
 | `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values; the input is cast to it. |
 | `skipna` | `bool` | `False` | Only with `mode="mean"`: average the finite children only (otherwise `ValueError`). |
+| `backend` | `str` | `"auto"` | `"auto"`, `"triton"`, `"torch"` or `"csr"` (the reference); see [Compute backends](#compute-backends). |
 
 ---
 
@@ -79,12 +81,50 @@ y, cell_ids_out = down(x)
 
 | Argument | Type | Shape | Description |
 |---|---|---|---|
-| `x` | numpy or torch | `[N]` or `[B, N]` | Input map(s) at fine resolution `nside_in`. `N` must equal `len(cell_ids)` on a regional domain, or `12 * nside_in²` otherwise. |
+| `x` | numpy or torch | `[N]`, `[B, N]` or `[..., N]` | Input map(s) at fine resolution `nside_in`. `N` must equal `len(cell_ids)` on a regional domain, or `12 * nside_in²` otherwise. |
 
 | Return | Type | Shape | Description |
 |---|---|---|---|
-| `y` | same as `x` | `[N_out]` or `[B, N_out]` | Downsampled map(s) at coarse resolution `nside_out = nside_in // 2`. |
+| `y` | same as `x` | `[N_out]`, `[B, N_out]` or `[..., N_out]` | Downsampled map(s) at coarse resolution `nside_out = nside_in // 2`. |
 | `cell_ids_out` | `np.ndarray` | `[N_out]` | NESTED pixel indices of the output pixels at `nside_out`. |
+
+---
+
+## Compute backends
+
+`backend=` chooses how `forward` computes; every backend gives the same
+result (bit for bit for `"mean"` and `"maxpool"`, to rounding for the
+Gaussian modes).
+
+| `backend` | `"mean"` / `"maxpool"` | `"smooth"` / `"smooth_conservative"` |
+|---|---|---|
+| `"auto"` *(default)* | Contiguous NESTED data: a reduction over a `[B, N/4, 4]` view of the input, with no index array. Otherwise, a gather of the 4 children. | The matrix in ELL form (fixed fan-in, int32 indices): a Triton gather-reduce kernel on CUDA when the optional `triton` package is installed (float32, float16, bfloat16), `torch.nn.functional.embedding_bag` otherwise (CPU, float64). |
+| `"triton"` | as `"auto"` | the Triton kernel; raises if it cannot run |
+| `"torch"` | as `"auto"` | the PyTorch gather |
+| `"csr"` | the gather of the 4 children | the reference: CSR matrix and `torch.sparse.mm` |
+
+**Contiguous NESTED data.** On the full sphere, the 4 children of parent `p`
+are cells `4p … 4p+3`, next to each other in memory. The same holds on a
+regional domain whose `cell_ids` are sorted and whose parents are complete
+(all 4 children present); the constructor detects it. `"mean"` is then
+`x.view(B, N/4, 4).mean(-1)` and `"maxpool"` its `max(-1)`: no index array
+is stored, and the backward is the standard one of a view and a reduction.
+An unsorted or incomplete domain keeps the gather.
+
+**ELL form.** The rows of the Gaussian matrix have a nearly constant number
+of non-zeros at a given level, so the matrix is stored as two `[N_out, R]`
+arrays (column indices and weights, padded), and its transpose likewise for
+the backward pass. The Triton kernel reads 16-bit data directly and
+accumulates in float32, so no float32 copy of a float16 or bfloat16 input is
+made; the output is cast to the module dtype. The backward is the same
+gather with the stored transpose: no atomics, the same result at every run,
+and twice differentiable. On the CPU, `embedding_bag` works on a transposed
+float32 (or float64) copy of the input.
+
+**Layout.** `forward` accepts `[..., N]`: the leading dimensions are
+flattened by a view, so a contiguous `[B, C, N]` feature map (or `[B·C, N]`)
+goes through without a permute or a copy, and the output `[..., N_out]` is
+contiguous.
 
 ---
 
@@ -104,7 +144,8 @@ and `γ` is the haversine angular distance between the centers of the
 fine and coarse pixels.
 
 The sparse matrix `M` is built once at construction and stored, with its
-transpose, as CSR buffers (they follow `.to()`, `.double()`, `.cuda()`).
+transpose, as buffers (ELL arrays, or CSR with `backend="csr"`; they follow
+`.to()`, `.double()`, `.cuda()`).
 `forward` only applies it, and the gradient with respect to the input applies
 the stored transpose: no sparse tensor is assembled or transposed per call.
 The matrix is not written to the `state_dict`, since the constructor
@@ -306,17 +347,11 @@ down1 = HealPixDown(level,     mode="smooth")
 conv2 = HealPixConv(level - 1, in_channels=32, out_channels=64, use_norm=True)
 down2 = HealPixDown(level - 1, mode="smooth")
 
-def down_channels(down, f):
-    # HealPixDown takes [N] or [B, N]: fold the channels into the batch
-    B, C, N = f.shape
-    y, _ = down(f.reshape(B * C, N))
-    return y.reshape(B, C, -1)
-
 x = torch.randn(4, 1, 12 * nside**2)        # [B, 1, N]
 f1 = conv1(x)                               # [B, 32, N]
-f1_down = down_channels(down1, f1)          # [B, 32, N/4]
+f1_down, _ = down1(f1)                      # [B, 32, N/4], no copy of f1
 f2 = conv2(f1_down)                         # [B, 64, N/4]
-f2_down = down_channels(down2, f2)          # [B, 64, N/16]
+f2_down, _ = down2(f2)                      # [B, 64, N/16]
 ```
 
 ---

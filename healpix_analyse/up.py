@@ -15,12 +15,17 @@ Works on the full sphere or on a regional domain (``cell_ids``).
 Resolution is exposed through the Grid4Earth ``level`` convention, with
 ``nside = 2**level``.
 
-Accepts numpy arrays or torch tensors of shape ``[N]`` or ``[B, N]`` and
-returns an output of the same type and number of dimensions.
+Accepts numpy arrays or torch tensors of shape ``[N]``, ``[B, N]`` or
+``[..., N]`` and returns an output of the same type and leading dimensions
+(flattened by a view: a contiguous ``[B*C, N]`` tensor is not copied).
 
-The matrix and its transpose are kept as CSR buffers built once in the
-constructor: they follow ``.to()`` and no sparse tensor is assembled in
-``forward``.
+The matrix and its transpose are kept in ELL form (``backend="csr"``: as
+CSR buffers, the reference), built once in the constructor: they follow
+``.to()`` and no sparse tensor is assembled in ``forward``.  When every fine
+cell takes the value of its parent (``paired_down`` a ``mean`` Down on
+contiguous NESTED data), no matrix is stored at all: the forward is an
+``expand`` of the scaled coarse values, bit-identical to the reference.  See
+:mod:`healpix_analyse._updown_backend`.
 
 Dependencies: numpy, torch, healpix_geo.
 """
@@ -34,8 +39,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from healpix_analyse import _updown_backend as _ub
 from healpix_analyse.down import (
     HealPixDown,
+    _HALF_DTYPES,
     _SparseOperatorMixin,
     _storage_dtype,
     _prepare_input,
@@ -106,6 +113,14 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
         ``parent / n`` and ``"diag_l2"`` gives ``n * parent``, where ``n``
         is the number of children of that parent present in the fine
         domain (4 on the full sphere).
+    backend : {"auto", "triton", "torch", "csr"}, default "auto"
+        As for :class:`~healpix_analyse.down.HealPixDown`.  *auto*: when
+        every fine cell takes its parent's value (``paired_down`` a ``mean``
+        Down on the full sphere, or on sorted ``cell_ids`` with complete
+        parents), an ``expand`` of the coarse values with no stored index;
+        otherwise the transpose matrix in ELL form, with the Triton kernel
+        on CUDA and a PyTorch gather elsewhere.  *csr*: the reference (CSR
+        matrix and ``torch.sparse.mm``).
 
     Examples
     --------
@@ -142,8 +157,10 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
         paired_down: Optional[HealPixDown] = None,
+        backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.backend = _ub.check_backend(backend)
 
         # ---- resolve device ----
         if device is None:
@@ -246,6 +263,7 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
                 cell_ids    = cell_ids_out if self.partial else None,
                 device      = self.device,
                 dtype       = self.dtype,
+                backend     = "csr",       # only its matrix is used
             )
         else:
             down = paired_down
@@ -254,10 +272,8 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
         vdtype = _storage_dtype(self.dtype)
         M_down = down.sparse_matrix().to(device=self.device, dtype=vdtype).coalesce()
 
-        # Transpose → M_up: [N_out_fine, N_in_coarse]
-        self._register_sparse(self._transpose_sparse(M_down))
-
         # Diagonal normalisation vectors (computed from M_down once)
+        denom = None
         if self.up_norm in ("col_l1", "diag_l2"):
             idx  = M_down.indices()
             vals = M_down.values()
@@ -270,13 +286,68 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
 
             self.register_buffer("_col_sum", col_sum)
             self.register_buffer("_col_l2",  col_l2)
+            denom = col_sum if self.up_norm == "col_l1" else col_l2
         else:
             self._col_sum = None
             self._col_l2  = None
 
+        # Every fine cell takes (a multiple of) its parent's value, the same
+        # for the 4 children: the forward is an expand, no matrix is stored.
+        self._expand = (
+            self.backend != "csr" and self._expand_scales(M_down, denom)
+        )
+        if not self._expand:
+            # Transpose → M_up: [N_out_fine, N_in_coarse]; the normalisation
+            # is folded into the stored transpose used by the backward
+            self._register_sparse(
+                self._transpose_sparse(M_down),
+                div=None if denom is None else denom.clamp_min(self.eps),
+            )
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _expand_scales(self, M_down: torch.Tensor, denom) -> bool:
+        """
+        Detect an Up that copies each parent to its 4 contiguous children.
+
+        True when fine cell ``j`` reads coarse cell ``j // 4`` only, with a
+        weight and a normalisation that are the same for the 4 children.
+        Registers ``_fast_v`` (the weight) and ``_fast_d`` (the raw
+        normalisation, or None), one value per coarse cell.
+        """
+        n_f, n_c = self.N_out, self.N_in
+        if n_f != 4 * n_c or M_down._nnz() != n_f:
+            return False
+        rows, cols = M_down.indices()
+        j = torch.arange(n_f, device=rows.device)
+        if not (torch.equal(cols, j) and torch.equal(rows, j // 4)):
+            return False
+        v = M_down.values().view(n_c, 4)
+        if not bool((v == v[:, :1]).all()):
+            return False
+        if denom is not None:
+            d = denom.view(n_c, 4)
+            if not bool((d == d[:, :1]).all()):
+                return False
+            self.register_buffer("_fast_d", d[:, 0].clone(), persistent=False)
+        else:
+            self._fast_d = None
+        self.register_buffer("_fast_v", v[:, 0].clone(), persistent=False)
+        self._M_size = (n_f, n_c)
+        return True
+
+    def _sparse_coo(self) -> torch.Tensor:
+        """The stored matrix ``M^T`` (without normalisation) as COO."""
+        if not self._expand:
+            return super()._sparse_coo()
+        n_f, n_c = self._M_size
+        j = torch.arange(n_f, device=self._fast_v.device)
+        return torch.sparse_coo_tensor(
+            torch.stack([j, j // 4]), self._fast_v.repeat_interleave(4),
+            size=(n_f, n_c), device=j.device, dtype=self._fast_v.dtype,
+        ).coalesce()
 
     @staticmethod
     def _transpose_sparse(M: torch.Tensor) -> torch.Tensor:
@@ -307,23 +378,26 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
 
         Parameters
         ----------
-        x : numpy.ndarray or torch.Tensor, shape [N] or [B, N]
+        x : numpy.ndarray or torch.Tensor, shape [N], [B, N] or [..., N]
             Input map(s) at coarse resolution ``nside_in``.
             When ``cell_ids`` was given at construction, ``N`` must equal
             ``len(cell_ids)``.  Otherwise ``N = 12 * nside_in**2``.
 
         Returns
         -------
-        y : same type as x, shape [N_out] or [B, N_out]
+        y : same type as x, shape [N_out], [B, N_out] or [..., N_out]
             Upsampled map(s) at fine resolution ``nside_out = nside_in * 2``.
         cell_ids_out : np.ndarray
             NESTED pixel indices of the output pixels at ``nside_out``.
         """
         # self.device / self.dtype follow .to(); a 16-bit module computes in
-        # the stored precision (float32) and casts the output
-        t, is_numpy, was_1d = _prepare_input(
-            x, self.device, self._compute_dtype()
-        )
+        # the stored precision (float32) and casts the output.  The ELL
+        # kernels read 16-bit data as it is (fp32 accumulation).
+        comp = self._compute_dtype()
+        keep = ()
+        if self.backend != "csr" and not self._expand and self.dtype in _HALF_DTYPES:
+            keep = (self.dtype,)
+        t, is_numpy, lead = _prepare_input(x, self.device, comp, keep)
         B, N = t.shape
 
         if N != self.N_in:
@@ -331,19 +405,35 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
                 f"Expected input with {self.N_in} pixels, got {N}."
             )
 
-        # M^T: [N_out, N_in] CSR, built once;  t: [B, N_in]
-        y = self._apply_sparse(t)         # [B, N_out]
-
-        # Optional diagonal normalisation
+        denom = None
         if self.up_norm == "col_l1" and self._col_sum is not None:
-            denom = self._col_sum.to(device=t.device, dtype=t.dtype).clamp_min(self.eps)
-            y = y / denom.unsqueeze(0)
-
+            denom = self._col_sum
         elif self.up_norm == "diag_l2" and self._col_l2 is not None:
-            denom = self._col_l2.to(device=t.device, dtype=t.dtype).clamp_min(self.eps)
-            y = y / denom.unsqueeze(0)
-
+            denom = self._col_l2
         # up_norm == "adjoint" → no correction
 
-        y = y.to(self.dtype)
-        return _restore_output(y, is_numpy, was_1d), self._cell_ids_out
+        if self._expand:
+            # the operations of the reference on the coarse values (product by
+            # the matrix entry, division by the normalisation), then a copy
+            # to the 4 children: bit-identical to the CSR product
+            y = t * self._fast_v.to(device=t.device)
+            if self._fast_d is not None:
+                y = y / self._fast_d.to(device=t.device, dtype=t.dtype).clamp_min(self.eps)
+            y = y.to(self.dtype)
+            y = y.unsqueeze(-1).expand(B, N, 4).reshape(B, 4 * N)
+
+        elif self.backend != "csr":
+            div = None
+            if denom is not None:
+                div = denom.to(device=t.device, dtype=comp).clamp_min(self.eps)
+            y = self._apply_sparse(t, div=div, out_dtype=self.dtype)
+
+        else:
+            # M^T: [N_out, N_in] CSR, built once;  t: [B, N_in]
+            y = self._apply_sparse(t)         # [B, N_out]
+            if denom is not None:
+                d = denom.to(device=t.device, dtype=t.dtype).clamp_min(self.eps)
+                y = y / d.unsqueeze(0)
+            y = y.to(self.dtype)
+
+        return _restore_output(y, is_numpy, lead), self._cell_ids_out

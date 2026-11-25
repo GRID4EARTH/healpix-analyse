@@ -26,6 +26,23 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `HealPixDown` / `HealPixUp(backend="auto" | "triton" | "torch" | "csr")`
+  (#109, section 1). `"mean"` and `"maxpool"` Down on contiguous NESTED data
+  (the full sphere, or sorted `cell_ids` whose parents are complete, detected
+  at construction) reduce a `[B, N/4, 4]` view of the input, with no index
+  array; an Up paired with such a `"mean"` Down is an `expand` of the
+  coarse values, with no matrix. Both are bit-identical to the previous
+  implementation. The Gaussian modes, and every other Up, store their matrix
+  and its transpose in ELL form (fixed fan-in, int32 indices) and apply it
+  with a Triton gather-reduce kernel on CUDA (float32, float16, bfloat16;
+  float32 accumulation, so 16-bit data is no longer copied to float32) or
+  with `embedding_bag` elsewhere (on a transposed float32 or float64 copy of
+  the input). The backward is a gather with the stored
+  transpose: no atomics, deterministic, twice differentiable.
+  `backend="csr"` keeps the previous CSR / `torch.sparse.mm` implementation
+  as the reference. `forward` now accepts `[..., N]` inputs (a `[B, C, N]`
+  feature map is flattened by a view, without a copy) and returns a
+  contiguous `[..., N_out]`. New benchmark `benchmarks/benchmark_updown.py`.
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is
