@@ -1552,7 +1552,7 @@ def radial_filter(
            processing-domain filter
                     |
                     v
-    build_metric_neighbourhood_geometry
+        build_metric_neighbourhood_geometry
                     |
                     v
             WGS84 distance_m
@@ -1561,7 +1561,7 @@ def radial_filter(
            user radial kernel
                     |
                     v
-   compact_weighted_neighbourhood_reduce
+        compact_weighted_neighbourhood_reduce
                     |
                     v
                   output
