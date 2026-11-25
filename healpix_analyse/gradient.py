@@ -823,16 +823,15 @@ class HealPixGradient:
     A call accepts values of shape ``[..., N]`` (NumPy or torch) and returns
     ``(grad_east, grad_north)`` of shape ``[..., N_domain]``.
 
-    Torch tensors of float32 / float64 run a fused kernel: Triton on CUDA
-    when it is installed, a loop over the neighbours otherwise.  On CUDA with
-    Triton, float16 / bfloat16 data run the same kernels with fp32
-    accumulation (the reference would compute the normal equations in the
-    16-bit dtype, where squared offsets in metres overflow).  Neither
-    materialises the ``[..., N, K]`` gathered tensor, and the backward pass
-    is written by hand (on CUDA, a gather on the transposed neighbourhoods:
-    no atomics, deterministic).  Other dtypes and NumPy arrays use the
-    reference implementation.  The values agree with the reference to
-    rounding (about 1e-12 relative in float64).
+    On CUDA with Triton installed, torch tensors run fused kernels (float16 /
+    bfloat16 with fp32 accumulation; the reference would compute the normal
+    equations in the 16-bit dtype, where squared offsets in metres
+    overflow).  Elsewhere, and with ``backend="torch"``, the materialised
+    reference implementation runs (on CPU it is faster than a loop over the
+    neighbours).  The kernels do not materialise the ``[..., N, K]``
+    gathered tensor, and their backward pass is written by hand (a gather on
+    the transposed neighbourhoods: no atomics, deterministic).  Their values
+    agree with the reference to rounding (about 1e-12 relative in float64).
     """
 
     def __init__(
@@ -911,8 +910,9 @@ class HealPixGradient:
     ]:
         """Return ``(grad_east, grad_north)`` of ``values [..., N]``.
 
-        ``backend`` is ``"auto"``, ``"triton"`` or ``"torch"`` (fused
-        kernels only; ``"auto"`` uses Triton on CUDA when available).
+        ``backend`` is ``"auto"``, ``"triton"`` or ``"torch"``: ``"auto"``
+        uses the Triton kernels on CUDA when available, ``"torch"`` the
+        reference implementation.
         """
 
         if backend not in BACKENDS:
@@ -934,19 +934,22 @@ class HealPixGradient:
                     "'values' must contain numerical scalar values, not bool."
                 )
 
-            fused = values.dtype in (
-                torch.float32,
-                torch.float64,
-            ) or (
-                # 16-bit data: fp32 accumulation in the Triton kernels; the
-                # reference computes in the 16-bit dtype itself.
-                values.dtype in (torch.float16, torch.bfloat16)
+            # The fused kernels run on CUDA with Triton (float16 / bfloat16
+            # with fp32 accumulation).  Elsewhere the materialised reference
+            # is used: on CPU it is faster than a loop over the neighbours.
+            fused = (
+                values.dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                )
                 and values.is_cuda
                 and backend != "torch"
                 and triton_available()
             )
 
-            if not fused or self.domain.size == 0:
+            if (not fused and backend != "triton") or self.domain.size == 0:
                 return _torch_gradient_from_geometry(
                     values,
                     self._geometry,

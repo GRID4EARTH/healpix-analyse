@@ -910,8 +910,9 @@ tools:
   nan: NaN neighbours are dropped; a cell gets NaN when its value is not finite or fewer than 2 valid neighbours remain or the fit is degenerate
   cost: >-
     gradient() rebuilds the WGS84 geometry at every call (most of its time);
-    HealPixGradient builds it once, then a call is one gather over the 8
-    neighbours, with no [N, K] tensor. Timings in benchmarks/benchmark_reductions.py.
+    HealPixGradient builds it once; a call is then the vectorised fit on CPU,
+    and one fused kernel (no [N, K] tensor) on CUDA with Triton. Timings in
+    benchmarks/benchmark_reductions.py.
   pros:
     - True East/North directions and metric distances, no Cartesian assumption.
     - Works on regional domains and across base-cell boundaries.

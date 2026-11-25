@@ -42,12 +42,11 @@
   `any`, `all`; to rounding for the sums).
 - `HealPixGradient`: the least-squares East/North gradient as a reusable
   operator. The WGS84 geometry is built once, a call takes values
-  `[..., N]`, and float32 / float64 tensors run a fused kernel (Triton on
-  CUDA, a loop over the 8 neighbours otherwise) with a deterministic
-  hand-written backward, without building the `[..., N, 8]` gathered tensor.
-  `gradient()` delegates to it (same values to about 1e-12 relative in
-  float64). On CUDA with Triton, float16 / bfloat16 data run the same
-  kernels with fp32 accumulation.
+  `[..., N]`. On CUDA with Triton, tensors run fused kernels with a
+  deterministic hand-written backward, without building the `[..., N, 8]`
+  gathered tensor (float16 / bfloat16 with fp32 accumulation); elsewhere the
+  reference implementation runs. `gradient()` delegates to it (same values
+  to about 1e-12 relative in float64).
 - `HealPixDivCurl` (and `HealPixMultiScaleDivCurl`): on CUDA with Triton,
   the embedding of (u, v) in a Cartesian tangent vector and the contraction
   of the `HealPixConv` derivatives to divergence and curl (with the gauge

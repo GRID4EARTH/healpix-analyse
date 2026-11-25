@@ -284,7 +284,7 @@ def test_lsq_gradient_matches_reference(gradient_ops, name, dtype):
         return e.detach(), n.detach(), t.grad
 
     ref = run(lambda t: _reference_gradient(op, t))
-    new = run(lambda t: op(t, backend="torch"))
+    new = run(lambda t: sb.lsq_gradient(t, op._gradient_stencil(), backend="torch"))
     tol = dict(rtol=1e-12, atol=1e-15) if dtype == torch.float64 else dict(rtol=2e-4, atol=1e-6)
     for a, e in zip(new[:2], ref[:2]):
         assert torch.equal(torch.isnan(a), torch.isnan(e))
@@ -310,8 +310,9 @@ def test_lsq_gradcheck_and_double_backward():
     op = HealPixGradient(np.arange(12 * 4**level), level)
     x = torch.as_tensor(np.random.default_rng(14).normal(size=(2, 12 * 4**level)))
     x.requires_grad_(True)
-    assert torch.autograd.gradcheck(lambda t: op(t, backend="torch"), (x,))
-    assert torch.autograd.gradgradcheck(lambda t: op(t, backend="torch"), (x,))
+    st = op._gradient_stencil()
+    assert torch.autograd.gradcheck(lambda t: sb.lsq_gradient(t, st, backend="torch"), (x,))
+    assert torch.autograd.gradgradcheck(lambda t: sb.lsq_gradient(t, st, backend="torch"), (x,))
 
 
 def test_lsq_numpy_batched(gradient_ops):

@@ -308,14 +308,13 @@ d_north = grad.directional_derivative(values, azimuth_rad=0.0)
 ```
 
 A call returns arrays of shape `[..., len(domain)]` with the same semantics
-as `gradient`. Torch tensors of float32 or float64 run a fused kernel: a
-Triton kernel on CUDA when the optional `triton` package is installed, a loop
-over the neighbours otherwise. Neither builds the `[..., N, K]` gathered
-tensor, and the backward pass is written by hand (on CUDA, a gather on the
-transposed neighbourhoods, without atomics, so the result is the same at
-every run). The values agree with the reference implementation to rounding
-(about 1e-12 relative in float64). Other dtypes and NumPy arrays use the
-reference implementation; `backend="torch"` forces the PyTorch loop.
+as `gradient`. On CUDA, when the optional `triton` package is installed,
+torch tensors run fused Triton kernels: they do not build the `[..., N, K]`
+gathered tensor, float16 / bfloat16 data accumulate in fp32, and the backward
+pass is written by hand (a gather on the transposed neighbourhoods, without
+atomics, so the result is the same at every run). The values agree with the
+reference implementation to rounding (about 1e-12 relative in float64).
+Elsewhere (CPU, NumPy, `backend="torch"`) the reference implementation runs.
 
 The same generic relative-geometry primitive can also support other local
 operators such as radial and directional filters.
