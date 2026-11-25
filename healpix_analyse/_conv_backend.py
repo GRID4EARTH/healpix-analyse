@@ -21,14 +21,16 @@ Neither backend ever materialises the gathered tensor ``[B, C, G, K, P]``
 
 ``"triton"`` (CUDA, float32 / float16 / bfloat16, fp32 accumulation)
     Fused kernels.  Forward: a gather-GEMM, one program per (batch, gauge,
-    block of cells, block of output channels), the tap tile ``A_p`` is built
-    in registers and multiplied by ``W[g, p]``.  grad W: the same gather,
-    reduced over the rows; each program sums a contiguous chunk of rows and
-    writes its partial sum (no atomics, deterministic).  grad x: either a
-    GEMM-scatter with fp32 atomics, or, with ``deterministic=True``, a gather
-    on the transposed map of the stencil (for each source cell, its incoming
-    (target cell, weight) entries, in CSR form per gauge and tap): no atomics,
-    and the same result at every run.
+    block of cells, block of output channels); the tiles ``A_p`` of a block
+    of TP taps are built in registers and contracted with ``W[g, p]`` by one
+    product over (tap, channel), so that the products are not 16 wide.
+    grad W: the same gather, reduced over the rows; each program sums a
+    contiguous chunk of rows for a block of taps and writes its partial sum
+    (no atomics, deterministic).  grad x: either a GEMM-scatter with fp32
+    atomics, or, with ``deterministic=True``, a gather on the transposed map
+    of the stencil (for each source cell, its incoming (target cell, weight)
+    entries, in CSR form per gauge and tap), contracted by blocks of taps
+    like the forward: no atomics, and the same result at every run.
 
 Extension points
 ----------------
@@ -37,12 +39,11 @@ The kernels are written so that the two variants needed by
 in without a rewrite:
 
 * a **masked gather** (value and validity in one pass, renormalisation and the
-  local-mean fallback in registers) replaces :func:`_gather_tile`, the only
-  place that reads the input through the stencil;
+  local-mean fallback in registers) replaces ``_gather_taps``, the only place
+  that reads the input through the stencil;
 * a **contraction with arbitrary taps** (complex taps, several voices, the
-  coverage contraction) replaces the ``tl.dot`` with ``W[g, p]``: the weight
-  tile is read from a ``[G, P, C, Co]`` array whose meaning the kernel does not
-  assume.
+  coverage contraction) replaces ``_weight_taps``: the weight tile is read
+  from a ``[G, P, C, Co]`` array whose meaning the kernels do not assume.
 
 Triton is optional: without it (or without CUDA) everything runs on the
 ``"torch"`` backend.
@@ -237,9 +238,31 @@ def _precision(dtype):
     return "tf32"   # TF32 for float32 when allowed; ignored for 16-bit inputs
 
 
+# programs of the grad-W kernel per streaming multiprocessor (row chunks)
+_SPLIT_PROGRAMS_PER_SM = 32
+
+
 def _size_class(n):
     """Coarse size bucket, part of the autotune key."""
     return int(math.log2(max(int(n), 1))) // 2
+
+
+def _taps_per_block(P, width):
+    """Taps contracted together by one ``tl.dot`` (TP, a power of two).
+
+    The reduction dimension of the products is ``TP * width`` (``width`` is the
+    channel tile): one tap alone gives 16-wide products, which leave the GPU
+    idle.  TP is the largest power of two with ``TP * width <= 128`` whose
+    padding of the last block of taps stays within a quarter.
+    """
+    tp = 1
+    while tp * 2 * width <= 128 and tp * 2 <= P:
+        cand = tp * 2
+        slots = -(-P // cand) * cand
+        if (slots - P) > slots // 4:
+            break
+        tp = cand
+    return tp
 
 
 if _HAS_TRITON:
@@ -247,38 +270,59 @@ if _HAS_TRITON:
     def _configs(spec):
         return [triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=ns) for bm, nw, ns in spec]
 
-    _FWD_CONFIGS = _configs(((32, 2, 1), (64, 2, 1), (64, 4, 1), (64, 4, 2), (128, 4, 1), (128, 8, 2)))
-    _BWD_W_CONFIGS = _configs(((32, 2, 1), (64, 4, 1), (64, 4, 2), (128, 4, 1), (128, 8, 1)))
+    _FWD_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
+    _BWD_W_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
     _BWD_X_CONFIGS = _configs(((32, 2, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1)))
-    _BWD_X_CSR_CONFIGS = _configs(((32, 2, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
+    _BWD_X_CSR_CONFIGS = _configs(((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
 
     @triton.jit
-    def _gather_tile(xt_ptr, idx_ptr, w_ptr, p, g, b, k, c, k_ok, c_ok, K, C, G,
-                     BLOCK_M: tl.constexpr, BLOCK_C: tl.constexpr):
-        """A[m, c] = sum_j w[p, j, g, k_m] * xt[b, idx[p, j, g, k_m], c], in fp32.
+    def _gather_taps(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok, K, C, G, P,
+                     BLOCK_M: tl.constexpr, TP: tl.constexpr, BLOCK_C: tl.constexpr):
+        """A[m, t, c] = sum_j w[p0+t, j, g, k_m] * xt[b, idx[p0+t, j, g, k_m], c], in fp32.
 
-        ``xt`` is ``[B, K, C]``, ``idx`` and ``w`` are ``[P, 4, G, K]``.  This is
-        the only place that reads the input through the stencil: a masked
-        variant (value and validity in one pass) replaces it.
+        ``xt`` is ``[B, K, C]``, ``idx`` and ``w`` are ``[P, 4, G, K]``; taps
+        beyond P read nothing and give 0.  This is the only place that reads
+        the input through the stencil: a masked variant (value and validity in
+        one pass) replaces it.
         """
-        a = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
+        p = p0 + tl.arange(0, TP)
+        m2 = k_ok[:, None] & (p < P)[None, :]                          # [BM, TP]
+        a = tl.zeros((BLOCK_M, TP, BLOCK_C), dtype=tl.float32)
         x_base = xt_ptr + b.to(tl.int64) * K * C
         for j in tl.static_range(4):
-            off = ((p * 4 + j) * G + g).to(tl.int64) * K + k
-            src = tl.load(idx_ptr + off, mask=k_ok, other=0).to(tl.int64)
-            ww = tl.load(w_ptr + off, mask=k_ok, other=0.0).to(tl.float32)
-            xv = tl.load(x_base + src[:, None] * C + c[None, :],
-                         mask=k_ok[:, None] & c_ok[None, :], other=0.0)
-            a += ww[:, None] * xv.to(tl.float32)
+            off = ((p * 4 + j) * G + g).to(tl.int64)[None, :] * K + k[:, None]
+            src = tl.load(idx_ptr + off, mask=m2, other=0).to(tl.int64)
+            ww = tl.load(w_ptr + off, mask=m2, other=0.0).to(tl.float32)
+            xv = tl.load(x_base + src[:, :, None] * C + c[None, None, :],
+                         mask=m2[:, :, None] & c_ok[None, None, :], other=0.0)
+            a += ww[:, :, None] * xv.to(tl.float32)
         return a
+
+    @triton.jit
+    def _weight_taps(wt_ptr, p0, g, c, o, c_ok, o_ok, C, CO, P,
+                     TP: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr):
+        """W2[(t, c), o] = W[g, p0+t, c, o] as a [TP*BLOCK_C, BLOCK_N] tile.
+
+        ``wt`` is ``[G, P, C, CO]``.  The kernels do not assume what these taps
+        are: a contraction with other taps (complex, several voices, the
+        coverage) reads its own array here.
+        """
+        p = p0 + tl.arange(0, TP)
+        rows = ((g * P + p)[:, None] * C + c[None, :]).to(tl.int64)     # [TP, BC]
+        m = ((p < P)[:, None] & c_ok[None, :])[:, :, None] & o_ok[None, None, :]
+        w3 = tl.load(wt_ptr + rows[:, :, None] * CO + o[None, None, :], mask=m, other=0.0)
+        return tl.reshape(w3, (TP * BLOCK_C, BLOCK_N))
 
     @triton.autotune(configs=_FWD_CONFIGS, key=["C", "CO", "P", "SIZE"])
     @triton.jit
     def _fwd_kernel(xt_ptr, idx_ptr, w_ptr, wt_ptr, bias_ptr, y_ptr,
                     K, C, CO, G, P, B, SIZE,
-                    HAS_BIAS: tl.constexpr, PRECISION: tl.constexpr,
+                    HAS_BIAS: tl.constexpr, PRECISION: tl.constexpr, TP: tl.constexpr,
                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr):
-        """y[b, g*CO + o, k] = bias + sum_p A_p[g, b, k, :] @ W[g, p]; y is [B, G*CO, K]."""
+        """y[b, g*CO + o, k] = bias + sum_p A_p[g, b, k, :] @ W[g, p]; y is [B, G*CO, K].
+
+        TP taps are contracted by one ``tl.dot`` (reduction over (tap, channel)).
+        """
         pid = tl.program_id(0)
         pid_n = tl.program_id(1)
         b = pid % B                      # batch fastest: the same idx / w tiles
@@ -291,15 +335,16 @@ if _HAS_TRITON:
         n_ok = offs_n < CO
         offs_c = tl.arange(0, BLOCK_C)
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for p in range(0, P):
+        for p0 in range(0, P, TP):
             for c0 in range(0, C, BLOCK_C):
                 c = c0 + offs_c
                 c_ok = c < C
-                a = _gather_tile(xt_ptr, idx_ptr, w_ptr, p, g, b, k, c, k_ok, c_ok, K, C, G,
-                                 BLOCK_M, BLOCK_C)
-                wt = tl.load(wt_ptr + ((g * P + p) * C + c)[:, None] * CO + offs_n[None, :],
-                             mask=c_ok[:, None] & n_ok[None, :], other=0.0)
-                acc = tl.dot(a.to(wt.dtype), wt, acc, input_precision=PRECISION)
+                a = _gather_taps(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok, K, C, G, P,
+                                 BLOCK_M, TP, BLOCK_C)
+                w2 = _weight_taps(wt_ptr, p0, g, c, offs_n, c_ok, n_ok, C, CO, P,
+                                  TP, BLOCK_C, BLOCK_N)
+                a2 = tl.reshape(a, (BLOCK_M, TP * BLOCK_C))
+                acc = tl.dot(a2.to(w2.dtype), w2, acc, input_precision=PRECISION)
         if HAS_BIAS:
             bv = tl.load(bias_ptr + g * CO + offs_n, mask=n_ok, other=0.0).to(tl.float32)
             acc += bv[None, :]
@@ -311,38 +356,49 @@ if _HAS_TRITON:
     @triton.jit
     def _bwd_w_kernel(xt_ptr, idx_ptr, w_ptr, gy_ptr, part_ptr,
                       K, C, CO, G, P, B, N_SPLIT, SIZE,
-                      PRECISION: tl.constexpr,
+                      PRECISION: tl.constexpr, TP: tl.constexpr,
                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr):
-        """part[s, g, p, c, o] = sum over the rows of chunk s of A_p[g, r, c] * gy[g, r, o]."""
-        p = tl.program_id(0)             # tap fastest: the programs of one row chunk
-        pid_cn = tl.program_id(1)        # run together and share gy in L2
-        pid_gs = tl.program_id(2)
-        g = pid_gs % G
-        s = pid_gs // G
+        """part[s, g, p, c, o] = sum over the rows of chunk s of A_p[g, r, c] * gy[g, r, o].
+
+        One program: TP taps x one channel tile x one output tile, for gauge g
+        and row chunk s; the product is [TP*BLOCK_C, BLOCK_M] @ [BLOCK_M, BLOCK_N].
+        """
+        pid0 = tl.program_id(0)          # tap block fastest: the programs of one
+        pid1 = tl.program_id(1)          # row chunk run together and share gy in L2
+        n_tb = tl.cdiv(P, TP)
+        tb = pid0 % n_tb
+        cn = pid0 // n_tb
+        g = pid1 % G
+        s = pid1 // G
         n_bn = tl.cdiv(CO, BLOCK_N)
-        c = (pid_cn // n_bn) * BLOCK_C + tl.arange(0, BLOCK_C)
+        c = (cn // n_bn) * BLOCK_C + tl.arange(0, BLOCK_C)
         c_ok = c < C
-        o = (pid_cn % n_bn) * BLOCK_N + tl.arange(0, BLOCK_N)
+        o = (cn % n_bn) * BLOCK_N + tl.arange(0, BLOCK_N)
         o_ok = o < CO
+        p0 = tb * TP
         n_kb = tl.cdiv(K, BLOCK_M)
         n_tiles = B * n_kb
         tps = tl.cdiv(n_tiles, N_SPLIT)
         t_lo = s * tps
         t_hi = tl.minimum(t_lo + tps, n_tiles)
-        acc = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
+        acc = tl.zeros((TP * BLOCK_C, BLOCK_N), dtype=tl.float32)
         for t in range(t_lo, t_hi):
             b = t % B
             kb = t // B
             k = kb * BLOCK_M + tl.arange(0, BLOCK_M)
             k_ok = k < K
-            a = _gather_tile(xt_ptr, idx_ptr, w_ptr, p, g, b, k, c, k_ok, c_ok, K, C, G,
-                             BLOCK_M, BLOCK_C)
+            a = _gather_taps(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok, K, C, G, P,
+                             BLOCK_M, TP, BLOCK_C)
+            a2 = tl.reshape(a, (BLOCK_M, TP * BLOCK_C))
             ch = (b.to(tl.int64) * G + g) * CO + o
             gy = tl.load(gy_ptr + ch[None, :] * K + k[:, None],
                          mask=k_ok[:, None] & o_ok[None, :], other=0.0)
-            acc = tl.dot(tl.trans(a.to(gy.dtype)), gy, acc, input_precision=PRECISION)
-        off = (((s * G + g) * P + p).to(tl.int64) * C + c)[:, None] * CO + o[None, :]
-        tl.store(part_ptr + off, acc, mask=c_ok[:, None] & o_ok[None, :])
+            acc = tl.dot(tl.trans(a2.to(gy.dtype)), gy, acc, input_precision=PRECISION)
+        acc3 = tl.reshape(acc, (TP, BLOCK_C, BLOCK_N))
+        p = p0 + tl.arange(0, TP)
+        rows = (((s * G + g) * P + p).to(tl.int64)[:, None] * C + c[None, :])    # [TP, BC]
+        m = ((p < P)[:, None] & c_ok[None, :])[:, :, None] & o_ok[None, None, :]
+        tl.store(part_ptr + rows[:, :, None] * CO + o[None, None, :], acc3, mask=m)
 
     @triton.autotune(configs=_BWD_X_CONFIGS, key=["C", "CO", "P", "SIZE"],
                      reset_to_zero=["gx_ptr"])
@@ -386,11 +442,12 @@ if _HAS_TRITON:
     @triton.jit
     def _bwd_x_csr_kernel(gyt_ptr, tptr_ptr, tbase_ptr, tk_ptr, tw_ptr, wt_ptr, gx_ptr,
                           K, C, CO, G, P, B, SIZE,
-                          PRECISION: tl.constexpr,
+                          PRECISION: tl.constexpr, TP: tl.constexpr,
                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr):
         """gx[b, c, s] = sum_{g,p} (sum_e tw_e gy[b, g, tk_e, :]) @ W[g, p]^T, no atomics.
 
-        ``gyt`` is ``[B, G, K, CO]``; gx is written as ``[B, C, K]``.
+        ``gyt`` is ``[B, G, K, CO]``; gx is written as ``[B, C, K]``.  TP taps
+        are contracted by one ``tl.dot`` (reduction over (tap, output channel)).
         """
         pid = tl.program_id(0)
         pid_c = tl.program_id(1)
@@ -406,27 +463,35 @@ if _HAS_TRITON:
         acc = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
         for g in range(0, G):
             gy_base = gyt_ptr + (b.to(tl.int64) * G + g) * K * CO
-            for p in range(0, P):
-                base = tl.load(tbase_ptr + p)
-                row = s64 + g * K + p * GK1
-                start = tl.load(tptr_ptr + row, mask=s_ok, other=0)
-                n = tl.load(tptr_ptr + row + 1, mask=s_ok, other=0) - start
-                n_max = tl.max(n, axis=0)
+            for p0 in range(0, P, TP):
+                p = p0 + tl.arange(0, TP)
+                p_ok = p < P
+                m2 = s_ok[:, None] & p_ok[None, :]                          # [BM, TP]
+                base = tl.load(tbase_ptr + p, mask=p_ok, other=0)           # [TP]
+                row = s64[:, None] + g * K + p.to(tl.int64)[None, :] * GK1
+                start = tl.load(tptr_ptr + row, mask=m2, other=0)
+                n = tl.load(tptr_ptr + row + 1, mask=m2, other=0) - start
+                n_max = tl.max(tl.max(n, axis=1), axis=0)
+                first = base[None, :] + start.to(tl.int64)
                 for n0 in range(0, CO, BLOCK_N):
                     o = n0 + offs_n
                     o_ok = o < CO
-                    at = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                    at = tl.zeros((BLOCK_M, TP, BLOCK_N), dtype=tl.float32)
                     for jj in range(0, n_max):
-                        m = s_ok & (jj < n)
-                        e = base + start.to(tl.int64) + jj
+                        m = m2 & (jj < n)
+                        e = first + jj
                         kk = tl.load(tk_ptr + e, mask=m, other=0).to(tl.int64)
                         ww = tl.load(tw_ptr + e, mask=m, other=0.0).to(tl.float32)
-                        v = tl.load(gy_base + kk[:, None] * CO + o[None, :],
-                                    mask=m[:, None] & o_ok[None, :], other=0.0)
-                        at += ww[:, None] * v.to(tl.float32)
-                    wT = tl.load(wt_ptr + ((g * P + p) * C + c)[None, :] * CO + o[:, None],
-                                 mask=o_ok[:, None] & c_ok[None, :], other=0.0)
-                    acc = tl.dot(at.to(wT.dtype), wT, acc, input_precision=PRECISION)
+                        v = tl.load(gy_base + kk[:, :, None] * CO + o[None, None, :],
+                                    mask=m[:, :, None] & o_ok[None, None, :], other=0.0)
+                        at += ww[:, :, None] * v.to(tl.float32)
+                    # W2T[(t, o), c] = W[g, p0+t, c, o]
+                    rows = ((g * P + p)[:, None, None] * C + c[None, None, :]).to(tl.int64)
+                    wm = (p_ok[:, None, None] & o_ok[None, :, None]) & c_ok[None, None, :]
+                    w3 = tl.load(wt_ptr + rows * CO + o[None, :, None], mask=wm, other=0.0)
+                    w2 = tl.reshape(w3, (TP * BLOCK_N, BLOCK_C))
+                    at2 = tl.reshape(at, (BLOCK_M, TP * BLOCK_N))
+                    acc = tl.dot(at2.to(w2.dtype), w2, acc, input_precision=PRECISION)
         tl.store(gx_ptr + (b.to(tl.int64) * C + c)[None, :] * K + s[:, None],
                  acc.to(gx_ptr.dtype.element_ty), mask=s_ok[:, None] & c_ok[None, :])
 
@@ -456,15 +521,17 @@ def _triton_forward(x, weight, bias, idx, w):
             xt, idx, w, wt, bias if bias is not None else wt, y,
             K, C, CO, G, P, B, _size_class(B * K),
             HAS_BIAS=bias is not None, PRECISION=_precision(x.dtype),
-            BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
+            TP=_taps_per_block(P, BLOCK_C), BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
         )
     return y
 
 
 def _n_split(x, n_rows, G, P, n_cn, C, CO):
-    """Number of row chunks of the grad-W kernel: enough programs to fill the GPU."""
+    """Number of row chunks of the grad-W kernel: enough programs to fill the GPU.
+
+    ``P`` is the number of tap blocks of the kernel."""
     sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-    n = triton.cdiv(16 * sms, max(1, G * P * n_cn))
+    n = triton.cdiv(_SPLIT_PROGRAMS_PER_SM * sms, max(1, G * P * n_cn))
     n = max(1, min(n, triton.cdiv(n_rows, 8 * 128)))      # >= ~8 row tiles each
     # bound the buffer of partial sums to ~256 MB
     n = max(1, min(n, (2**26) // max(1, G * P * C * CO)))
@@ -484,11 +551,13 @@ def _triton_backward(x, weight, idx, w, gy, need_x, need_w, deterministic, trans
         if need_w:
             xt = x.transpose(1, 2).contiguous()
             n_cn = triton.cdiv(C, BLOCK_C) * triton.cdiv(CO, BLOCK_N)
-            n_split = _n_split(x, B * K, G, P, n_cn, C, CO)
+            tp = _taps_per_block(P, BLOCK_C)
+            n_tb = triton.cdiv(P, tp)
+            n_split = _n_split(x, B * K, G, n_tb, n_cn, C, CO)
             part = torch.empty(n_split, G, P, C, CO, device=x.device, dtype=torch.float32)
-            _bwd_w_kernel[(P, n_cn, G * n_split)](
+            _bwd_w_kernel[(n_tb * n_cn, G * n_split)](
                 xt, idx, w, gy, part, K, C, CO, G, P, B, n_split, size,
-                PRECISION=prec, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
+                PRECISION=prec, TP=tp, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
             )
             del xt
             gW = part.sum(0).permute(0, 2, 3, 1).to(weight.dtype)   # [G, C, CO, P]
@@ -505,7 +574,8 @@ def _triton_backward(x, weight, idx, w, gy, need_x, need_w, deterministic, trans
 
                 _bwd_x_csr_kernel[grid](
                     gyt, tptr, tbase, tk, tw, wt, gx, K, C, CO, G, P, B, size,
-                    PRECISION=prec, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
+                    PRECISION=prec, TP=_taps_per_block(P, BLOCK_N),
+                    BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
                 )
             else:
                 gxt = torch.zeros(B, K, C, device=x.device, dtype=torch.float32)
