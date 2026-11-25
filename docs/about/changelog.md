@@ -46,8 +46,16 @@
   CUDA, a loop over the 8 neighbours otherwise) with a deterministic
   hand-written backward, without building the `[..., N, 8]` gathered tensor.
   `gradient()` delegates to it (same values to about 1e-12 relative in
-  float64). `benchmarks/benchmark_reductions.py` measures the reductions,
-  the gradient and `HealPixDivCurl`.
+  float64). On CUDA with Triton, float16 / bfloat16 data run the same
+  kernels with fp32 accumulation.
+- `HealPixDivCurl` (and `HealPixMultiScaleDivCurl`): on CUDA with Triton,
+  the embedding of (u, v) in a Cartesian tangent vector and the contraction
+  of the `HealPixConv` derivatives to divergence and curl (with the gauge
+  mean) are fused kernels, forward and backward, instead of about ten
+  PyTorch operations and their intermediate tensors. Values unchanged to
+  rounding. `benchmarks/benchmark_reductions.py` measures the reductions,
+  the gradient and `HealPixDivCurl` (time, peak memory, and bandwidth against
+  the HBM peak of the GPU).
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is

@@ -318,7 +318,10 @@ tools:
   ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
   io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out"
   differentiable: yes, in the input and in the kernel weights
-  gpu: yes (CUDA by default when available); fused Triton kernels for float32, float16 and bfloat16 with the optional triton package
+  gpu: >-
+    yes (CUDA by default when available); with the optional triton extra the
+    HealPixConv stencil and the embedding / contraction around it run as fused
+    kernels, forward and backward; fused Triton kernels for float32, float16 and bfloat16 with the optional triton package
   nan: not handled by default (NaN propagates); missing="local_mean" completes NaN like pixels outside the domain
   cost: >-
     Geometry built once (about 0.8 s at nside 64, G = 4, per the code
