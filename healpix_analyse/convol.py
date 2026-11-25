@@ -136,6 +136,9 @@ def _load_geometry_cache(
             "w_norm":     data["w_norm"].to(device=device, dtype=dtype),  # [4, G, K*P] float
             "sort_order": data["sort_order"].to(device=device),           # [K] long
             "inv_order":  data["inv_order"].to(device=device),            # [K] long
+            # [G, K*P] float; absent from caches written before missing=
+            "support":    (data["support"].to(device=device, dtype=dtype)
+                           if "support" in data else None),
         }
     except Exception:
         # Corrupt or outdated cache — ignore and recompute
@@ -149,20 +152,21 @@ def _save_geometry_cache(
     w_norm:     torch.Tensor,   # [4, G, K*P]
     sort_order: torch.Tensor,   # [K]
     inv_order:  torch.Tensor,   # [K]
+    support:    "torch.Tensor | None" = None,   # [G, K*P]
 ) -> None:
     """Save geometry buffers to disk as float32/int64 CPU tensors."""
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         tmp = _cache_path(cache_dir, key).with_suffix(".tmp")
-        torch.save(
-            {
-                "pos_safe":   pos_safe.cpu().to(dtype=torch.long),
-                "w_norm":     w_norm.cpu().to(dtype=torch.float32),
-                "sort_order": sort_order.cpu(),
-                "inv_order":  inv_order.cpu(),
-            },
-            tmp,
-        )
+        data = {
+            "pos_safe":   pos_safe.cpu().to(dtype=torch.long),
+            "w_norm":     w_norm.cpu().to(dtype=torch.float32),
+            "sort_order": sort_order.cpu(),
+            "inv_order":  inv_order.cpu(),
+        }
+        if support is not None:
+            data["support"] = support.cpu().to(dtype=torch.float32)
+        torch.save(data, tmp)
         tmp.replace(_cache_path(cache_dir, key))   # atomic rename
     except Exception:
         # Non-fatal: cache write failure just means the next run recomputes
@@ -406,7 +410,8 @@ def _bind_support_batched(
     K:           int,
     P:           int,
     device:      torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_support: bool = False,
+):
     """
     Vectorised binding of stencil neighbours for ALL G gauges at once.
 
@@ -414,6 +419,11 @@ def _bind_support_batched(
     -------
     pos_safe : [G, 4, K*P]   column indices in ids_sorted (0 for absent)
     w_norm   : [G, 4, K*P]   renormalised weights
+    support  : [G, K*P]      only with ``return_support=True``: the fraction
+                             of the bilinear weight of each stencil point
+                             that falls inside the domain, computed before
+                             a fully absent point is bound to the centre
+                             (0 for such a point, 1 inside the domain).
     """
     G = idx_t.shape[0]
     M = K * P
@@ -425,6 +435,7 @@ def _bind_support_batched(
     cmp_vals = torch.full_like(idx_t, -1)
     cmp_vals[in_range] = ids_sorted[pos[in_range]]
     present  = cmp_vals == idx_t          # [G, 4, M]
+    support  = (w_t * present).sum(dim=1) if return_support else None
 
     p_ref  = (kernel_sz // 2) * (kernel_sz + 1)
     empty  = ~present.any(dim=1)          # [G, M]
@@ -465,6 +476,8 @@ def _bind_support_batched(
 
     w_norm   = w / colsum.clamp_min(1e-12)
     pos_safe = torch.where(present, pos, torch.zeros_like(pos))
+    if return_support:
+        return pos_safe, w_norm, support               # [G,4,K*P] x2, [G,K*P]
     return pos_safe, w_norm                             # [G, 4, K*P] each
 
 
@@ -602,6 +615,25 @@ class HealPixConv(nn.Module):
     ellipsoid : str, default "WGS84"
         Reference ellipsoid for healpix_geo coordinate conversions.
     device, dtype : torch device / dtype.
+    missing : {"centre", "local_mean"}, default "centre"
+        How a stencil value is formed when its pixels are missing.  Each
+        stencil value is a bilinear interpolation of 4 pixels.
+
+        ``"centre"`` (the existing behaviour): neighbours outside
+        ``cell_ids`` are dropped and the others renormalised; a stencil
+        point whose 4 neighbours are all outside takes the value of the
+        centre pixel.  NaN values are not handled and propagate.
+
+        ``"local_mean"``: NaN values (and pixels with ``mask == 0``) are
+        missing exactly like pixels outside ``cell_ids``.  A stencil point
+        with at least one valid neighbour takes the renormalised bilinear
+        interpolation of its valid neighbours; a point with none takes the
+        local mean of the valid stencil values of the same output pixel
+        (weighted by ``local_mean_weights``).  Every pixel gets a finite
+        output, and so do the gradients.  Costs a second gather (the mask).
+    local_mean_weights : array-like [P] or None
+        Non-negative weights of the stencil points in the local mean of
+        ``missing="local_mean"``.  None = uniform.
 
     Examples
     --------
@@ -639,8 +671,14 @@ class HealPixConv(nn.Module):
         ellipsoid: str = "WGS84",
         dtype: torch.dtype = torch.float32,
         cache_dir: "Path | str | None" = _DEFAULT_CACHE_DIR,
+        missing: str = "centre",
+        local_mean_weights=None,
     ):
         super().__init__()
+
+        if missing not in ("centre", "local_mean"):
+            raise ValueError("missing must be 'centre' or 'local_mean'.")
+        self.missing = missing
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -810,8 +848,14 @@ class HealPixConv(nn.Module):
             if _cache_dir_resolved is not None else None
         )
 
+        if (_cached is not None and self.missing == "local_mean"
+                and _cached.get("support") is None):
+            _cached = None   # cache written before missing=: recompute once
+
+        _support = None
         if _cached is not None:
             # ---- Fast path: restore buffers from disk ----
+            _support = _cached.get("support")
             self.register_buffer("_sort_order", _cached["sort_order"])
             self.register_buffer("_inv_order",  _cached["inv_order"])
             self.register_buffer("_pos_safe",   _cached["pos_safe"])
@@ -872,10 +916,11 @@ class HealPixConv(nn.Module):
                 inv_order, dtype=torch.long, device=self.device
             )
 
-            pos_all, w_all_norm = _bind_support_batched(
+            pos_all, w_all_norm, _support = _bind_support_batched(
                 idx_all.clone(), w_all.clone(),
                 ids_sorted_t, self.kernel_sz, self.K, self.P, self.device,
-            )  # [G, 4, K*P] each
+                return_support=True,
+            )  # [G, 4, K*P] each, [G, K*P]
 
             # OPT 1 — contiguous layout [4, G, K*P]
             pos_all    = pos_all.permute(1, 0, 2).contiguous()
@@ -891,7 +936,32 @@ class HealPixConv(nn.Module):
                 _save_geometry_cache(
                     _cache_dir_resolved, _cache_key,
                     pos_all, w_all_norm, sort_order_t, inv_order_t,
+                    support=_support,
                 )
+
+        # ---- missing="local_mean": domain fraction and local-mean weights ----
+        # Not persistent, so the state_dict of the default mode is unchanged.
+        if self.missing == "local_mean":
+            self.register_buffer(
+                "_support",
+                _support.to(device=self.device, dtype=self.dtype).contiguous(),
+                persistent=False,
+            )
+            if local_mean_weights is None:
+                lmw = torch.ones(self.P, device=self.device, dtype=self.dtype)
+            else:
+                lmw = torch.as_tensor(
+                    np.asarray(local_mean_weights, dtype=np.float64).ravel(),
+                    device=self.device, dtype=self.dtype,
+                )
+                if lmw.numel() != self.P or bool((lmw < 0).any()) or float(lmw.sum()) <= 0:
+                    raise ValueError(
+                        f"local_mean_weights must hold {self.P} non-negative "
+                        "values with a positive sum."
+                    )
+            self.register_buffer("_local_mean_w", lmw, persistent=False)
+        elif local_mean_weights is not None:
+            raise ValueError("local_mean_weights needs missing='local_mean'.")
 
         # ---- learnable kernel and bias ----
         self.weight = nn.Parameter(
@@ -975,13 +1045,17 @@ class HealPixConv(nn.Module):
     # Forward — optimised gather + bmm  (no Python loop over G)
     # ------------------------------------------------------------------
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """
         Apply gauge-equivariant spherical convolution.
 
         Parameters
         ----------
         x : array-like, shape [N], [B, N] or [B, C_in, N]
+        mask : array-like or None
+            Only with ``missing="local_mean"``: weights in [0, 1] of the
+            pixels (0 = missing), broadcastable to ``x``.  NaN values of
+            ``x`` are always missing.  None = ``isfinite(x)``.
 
         Returns
         -------
@@ -1049,16 +1123,22 @@ class HealPixConv(nn.Module):
         # Each pos[j] is already contiguous ([G, K*P]) thanks to OPT 1,
         # so .reshape(-1) is a free zero-copy view.
         # ------------------------------------------------------------------
-        gathered = t.new_zeros(B, C_in, G, K, P)          # [B, C_in, G, K, P]
+        if self.missing == "local_mean":
+            # NaN / masked pixels completed like pixels outside cell_ids
+            gathered, _ = self._local_mean_stencil(t, mask)
+        else:
+            if mask is not None:
+                raise ValueError("mask= needs missing='local_mean'.")
+            gathered = t.new_zeros(B, C_in, G, K, P)          # [B, C_in, G, K, P]
 
-        for j in range(4):
-            pj  = pos[j].reshape(-1)                      # [G*K*P] — zero-copy
-            wj  = wn[j]                                   # [G, K*P] — contiguous
-            vf  = t_sorted.index_select(2, pj)            # [B, C_in, G*K*P]
-            # in-place accumulate to avoid a second large alloc
-            gathered.add_(
-                vf.view(B, C_in, G, K, P) * wj.view(1, 1, G, K, P)
-            )
+            for j in range(4):
+                pj  = pos[j].reshape(-1)                      # [G*K*P] — zero-copy
+                wj  = wn[j]                                   # [G, K*P] — contiguous
+                vf  = t_sorted.index_select(2, pj)            # [B, C_in, G*K*P]
+                # in-place accumulate to avoid a second large alloc
+                gathered.add_(
+                    vf.view(B, C_in, G, K, P) * wj.view(1, 1, G, K, P)
+                )
 
         # ------------------------------------------------------------------
         # OPT 3 — Replace einsum("bcgkp,gcop->bgok") with torch.bmm.
@@ -1110,6 +1190,85 @@ class HealPixConv(nn.Module):
 
         return _restore_output_conv(y, is_numpy, was_1d)
 
+    def _local_mean_stencil(self, t, mask=None):
+        """Completed stencil values for ``missing="local_mean"``.
+
+        ``t`` is ``[B, C, K]`` (already prepared).  Returns ``(z, cov)``, both
+        ``[B, C, G, K, P]``: the stencil values, and the valid fraction of
+        each stencil point (its bilinear weight on valid pixels inside the
+        domain, in [0, 1]).
+        """
+        if self.missing != "local_mean":
+            raise RuntimeError("needs missing='local_mean'.")
+        B, C, N = t.shape
+        G, P, K = self.G, self.P, self.K
+        so  = self._sort_order.to(device=t.device)
+        pos = self._pos_safe.to(device=t.device)
+        wn  = self._w_norm.to(device=t.device, dtype=t.dtype)
+        sup = self._support.to(device=t.device, dtype=t.dtype).view(1, 1, G, K, P)
+
+        v = torch.isfinite(t).to(t.dtype)
+        if mask is not None:
+            m = torch.as_tensor(mask, device=t.device, dtype=t.dtype)
+            m = torch.where(torch.isfinite(m), m, torch.zeros_like(m)).clamp(0.0, 1.0)
+            if m.dim() == 2 and t.dim() == 3:
+                m = m.unsqueeze(1)          # [B, N] -> [B, 1, N]
+            v = v * m
+        xz = torch.where(v > 0, t, torch.zeros_like(t))
+        vx = (xz * v)[:, :, so]
+        vs = v[:, :, so]
+
+        ivx = t.new_zeros(B, C, G, K, P)
+        iv  = t.new_zeros(B, C, G, K, P)
+        for j in range(4):
+            pj = pos[j].reshape(-1)
+            wj = wn[j].view(1, 1, G, K, P)
+            ivx = ivx + vx.index_select(2, pj).view(B, C, G, K, P) * wj
+            iv  = iv + vs.index_select(2, pj).view(B, C, G, K, P) * wj
+
+        # wn is renormalised over the neighbours inside the domain; sup puts
+        # back the fraction outside it (0 for a point with no neighbour in it)
+        cov = iv * sup
+        eps = 1e-6
+        has = cov > eps
+        one = torch.ones_like(iv)
+        z_direct = ivx / torch.where(has, iv, one)
+
+        a = self._local_mean_w.to(device=t.device, dtype=t.dtype).view(1, 1, 1, 1, P)
+        num = (a * ivx * sup).sum(-1, keepdim=True)
+        den = (a * cov).sum(-1, keepdim=True)
+        has_den = den > eps
+        xbar = torch.where(has_den, num / torch.where(has_den, den, torch.ones_like(den)),
+                           torch.zeros_like(den))
+        z = torch.where(has, z_direct, xbar.expand_as(z_direct))
+        return z, cov
+
+    def completed_stencil(self, x, mask=None):
+        """Stencil values and their valid fraction (``missing="local_mean"``).
+
+        Parameters
+        ----------
+        x : array-like, shape [N], [B, N] or [B, C, N]
+        mask : array-like or None
+            Weights in [0, 1] of the pixels, broadcastable to ``x``; NaN
+            values of ``x`` are always missing.
+
+        Returns
+        -------
+        z : torch.Tensor [B, C, G, N, P]
+            The values the kernel weights multiply: renormalised bilinear
+            interpolation of the valid pixels, or the local mean for a
+            stencil point with no valid neighbour.
+        cov : torch.Tensor [B, C, G, N, P]
+            The valid fraction of each stencil point, in [0, 1].  With tap
+            weights t_p, ``(cov * t).sum(-1) / t.sum()`` is the coverage of
+            the kernel at each pixel.
+        """
+        t, _, _, _ = _prepare_input_conv(x, self.device, self.dtype)
+        if t.shape[-1] != self.K:
+            raise ValueError(f"Expected {self.K} pixels, got {t.shape[-1]}.")
+        return self._local_mean_stencil(t, mask)
+
     def singularity_info(self) -> str:
         """
         Return a human-readable description of the gauge singularities.
@@ -1152,6 +1311,8 @@ class HealPixConv(nn.Module):
             f"kernel_sz={self.kernel_sz}, P={self.P}, G={self.G}, "
             f"gauge={self.gauge_type!r}, partial={self.partial}"
         )
+        if self.missing != "centre":
+            base += f", missing={self.missing!r}"
         if self.gauge_type == "projected_ref":
             s1, s2 = self.singularity_1, self.singularity_2
             base += (
