@@ -4,6 +4,9 @@
 **Class** `HealPixDown`  
 **Inherits** `torch.nn.Module`
 
+```{include} ../_generated/glance/down.md
+```
+
 ---
 
 ## Overview
@@ -22,13 +25,17 @@ Four strategies are available:
 - **`"mean"`** — unweighted mean of the 4 direct NESTED children; conserves
   the global mean exactly, but nothing crosses parent boundaries.
 - **`"maxpool"`** — Non-linear maximum over the 4 direct NESTED children
-  of each coarse pixel.  Faster, no gradient.
+  of each coarse pixel. Differentiable almost everywhere: the gradient goes
+  to the largest child.
 
-All modes work on the full sphere or on a partial-sky subset defined by
-`cell_ids`.
+All modes work on the whole sphere or on a regional set of cells defined by
+`cell_ids` (but see the partial-domain issue of `"maxpool"` below).
 
-Input shapes `[N]` and `[B, N]` are both accepted; numpy arrays and torch
-tensors are both accepted, and the return type mirrors the input type.
+Input shapes `[N]` and `[B, N]` only (a `[B, C, N]` tensor raises
+`ValueError`: reshape it to `[B·C, N]`). NumPy arrays and torch tensors are
+both accepted and the return type mirrors the input type, cast to the
+operator `dtype` (float32 by default). `forward` returns a tuple
+`(y, cell_ids_out)`.
 
 ---
 
@@ -38,12 +45,14 @@ tensors are both accepted, and the return type mirrors the input type.
 HealPixDown(
     level,
     mode        = "smooth",
+    ellipsoid   = "WGS84",       # third positional argument
     radius_deg  = None,
     sigma_deg   = None,
     weight_norm = "l1",
     cell_ids    = None,
     device      = None,
     dtype       = torch.float32,
+    skipna      = False,
 )
 ```
 
@@ -51,12 +60,14 @@ HealPixDown(
 |---|---|---|---|
 | `level` | `int` | — | Input Grid4Earth/HEALPix level, integer ≥ 1. Internally, `nside_in = 2**level`. |
 | `mode` | `str` | `"smooth"` | Downsampling strategy: `"smooth"`, `"smooth_conservative"`, `"maxpool"` or `"mean"`. |
-| `radius_deg` | `float` or `None` | auto | Angular radius of the Gaussian disc (degrees). Default ≈ 3 × pixel size. Used only with `"smooth"`. |
-| `sigma_deg` | `float` or `None` | auto | Gaussian sigma (degrees). Default = `radius_deg / 2`. Used only with `"smooth"`. |
+| `ellipsoid` | `str` | `"WGS84"` | Ellipsoid of the cell centres (third positional argument). |
+| `radius_deg` | `float` or `None` | auto | Angular radius of the Gaussian disc (degrees). Default ≈ 3 × pixel size. Used with `"smooth"` and `"smooth_conservative"`. |
+| `sigma_deg` | `float` or `None` | auto | Gaussian sigma (degrees). Default = `radius_deg / 2`. Used with `"smooth"` and `"smooth_conservative"`. |
 | `weight_norm` | `str` | `"l1"` | Per-output-pixel weight normalisation in `"smooth"` mode: `"l1"` (sum=1, preserves constants), `"l2"` (sum of squares=1, preserves energy), `"none"` (raw Gaussian). |
 | `cell_ids` | array-like or `None` | `None` | Input pixel indices (NESTED ordering) for partial-sky operation. `None` = full sphere. |
 | `device` | device or `None` | auto | Torch device. Defaults to CUDA if available, else CPU. |
-| `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values. |
+| `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values; the input is cast to it. |
+| `skipna` | `bool` | `False` | Only with `mode="mean"`: average the finite children only (otherwise `ValueError`). |
 
 ---
 
@@ -168,8 +179,17 @@ In NESTED ordering, the 4 children of coarse pixel `p` are always
 
 $$y_{p_{\text{out}}} = \max(x_{4p},\; x_{4p+1},\; x_{4p+2},\; x_{4p+3})$$
 
-This is non-differentiable and does not support partial sky smoothly
-(missing children are replaced by the first available child).
+The gradient goes to the largest child (differentiable almost everywhere).
+NaN propagates.
+
+```{warning}
+**Known issue on regional domains.** When a parent has fewer than four
+children in `cell_ids`, the missing children are replaced by the value of the
+first input cell (`cell_ids[0]`), which may not be a child of that parent at
+all. Measured: cells `[100, 4, 5, 6]` at level 2 with values `[50, 1, 2, 3]`
+give 50 for parent 1 instead of 3. Until this is fixed, use `maxpool` only
+when every parent has its four children, or pad the domain to whole parents.
+```
 
 ---
 
@@ -287,11 +307,17 @@ down1 = HealPixDown(level,     mode="smooth")
 conv2 = HealPixConv(level - 1, in_channels=32, out_channels=64, use_norm=True)
 down2 = HealPixDown(level - 1, mode="smooth")
 
+def down_channels(down, f):
+    # HealPixDown takes [N] or [B, N]: fold the channels into the batch
+    B, C, N = f.shape
+    y, _ = down(f.reshape(B * C, N))
+    return y.reshape(B, C, -1)
+
 x = torch.randn(4, 1, 12 * nside**2)        # [B, 1, N]
 f1 = conv1(x)                               # [B, 32, N]
-f1_down, _ = down1(f1)                      # [B, 32, N/4]
+f1_down = down_channels(down1, f1)          # [B, 32, N/4]
 f2 = conv2(f1_down)                         # [B, 64, N/4]
-f2_down, _ = down2(f2)                      # [B, 64, N/16]
+f2_down = down_channels(down2, f2)          # [B, 64, N/16]
 ```
 
 ---
@@ -309,6 +335,10 @@ f2_down, _ = down2(f2)                      # [B, 64, N/16]
 | `mode` | `"smooth"`, `"smooth_conservative"`, `"maxpool"` or `"mean"`. |
 | `partial` | `True` when `cell_ids` was provided. |
 | `cell_ids_out` | Output pixel indices (coarse NESTED ids). |
+| `ellipsoid`, `skipna` | As given to the constructor. |
+| `coverage` | Modes `"mean"` and `"smooth_conservative"`: fraction of each parent covered by the domain. |
+| `valid_fraction(x)` | Mode `"mean"`: fraction of finite children per parent. |
+| `sparse_matrix()` | The sparse matrix of the `"smooth"`, `"smooth_conservative"` (Gaussian part) and `"mean"` modes; `"maxpool"` raises. |
 
 ---
 

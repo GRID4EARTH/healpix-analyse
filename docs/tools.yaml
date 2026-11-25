@@ -937,3 +937,248 @@ tools:
       use: connected_components / component_area
       page: stats/components
   optional_deps: healpy for build_healpix_adjacency
+
+# ===========================================================================
+# D. Other tools
+# ===========================================================================
+- id: down
+  title: One level coarser (HealPixDown)
+  family: D
+  page: other/down
+  symbols: [HealPixDown]
+  summary: >-
+    Go one HEALPix level coarser with a Gaussian-weighted average ("smooth"),
+    a smooth average that keeps the global mean ("smooth_conservative"), the
+    mean of the four children ("mean") or their maximum ("maxpool").
+  tasks:
+    - do: coarsen a map by one level while keeping its mean
+      use: [HealPixDown]
+    - build the pooling layer of a spherical U-Net encoder
+  keywords: [downsample, coarsen, pooling, max pooling, average pooling, U-Net, mean conservation]
+  domain: whole sphere or regional set of cell ids at construction
+  ordering: NESTED
+  ellipsoid: '"WGS84"'
+  io: "[N] or [B, N] only -> tuple (y, cell_ids_out); cast to dtype (float32 by default)"
+  differentiable: yes (maxpool almost everywhere, the gradient goes to the largest child)
+  gpu: yes (CUDA by default when available)
+  nan: '"smooth" spreads NaN; "mean" keeps it to the parent, or ignores it with skipna=True'
+  cost: a sparse matrix built once at construction (about 1.5 s at level 8 for smooth in the documented benchmark), then one sparse product
+  pros:
+    - Four modes, with a table of what each conserves.
+    - Whole sphere or regional domain; NumPy or Torch.
+  cons:
+    - "`\"smooth\"` does not conserve the global mean."
+    - "Known issue: `\"maxpool\"` on a regional domain gives a parent with missing children the value of the first input cell."
+    - Only [N] or [B, N] inputs; returns a tuple.
+  use_instead:
+    - when: several levels at once, or another output domain
+      use: resample_healpix
+      page: other/resample
+    - when: a smoothing at the same level
+      use: gaussian_filter
+      page: conv/compare_gaussian
+  optional_deps: none
+
+- id: up
+  title: One level finer (HealPixUp)
+  family: D
+  page: other/up
+  symbols: [HealPixUp]
+  summary: >-
+    Go one HEALPix level finer with the transpose of the smooth Down matrix
+    and a normalisation (col_l1 by default), optionally paired with an
+    existing HealPixDown.
+  tasks:
+    - build the upsampling layer of a spherical U-Net decoder
+  keywords: [upsample, refine, unpooling, decoder, adjoint, transpose]
+  domain: whole sphere or regional set of coarse cell ids
+  ordering: NESTED
+  ellipsoid: '"WGS84" (or that of paired_down)'
+  io: "[N] or [B, N] only -> tuple (y, cell_ids_out)"
+  differentiable: yes
+  gpu: yes
+  nan: not handled
+  cost: sparse matrix built once, then one sparse product
+  pros:
+    - "`col_l1` with `weight_norm=\"l1\"` preserves constants; `paired_down` reuses the exact Down matrix."
+  cons:
+    - "A Down then Up round trip is far from exact on white noise (RMS 0.97 with col_l1, 3.33 with diag_l2 at nside 64, measured)."
+  use_instead:
+    - when: values at arbitrary points rather than at the next level
+      use: get_interp_val
+      page: other/interpolation
+    - when: several levels at once
+      use: resample_healpix
+      page: other/resample
+  optional_deps: none
+
+- id: decomp
+  title: Exactly invertible multiscale pyramid (HealPixDecomp)
+  family: D
+  page: other/decomp
+  symbols: [HealPixDecomp, HealPixPyramid, HealPixWeightedPyramid]
+  summary: >-
+    Split a map into detail bands and a coarse band (a Laplacian pyramid built
+    on HealPixDown and HealPixUp) whose sum gives the map back exactly, with a
+    NaN- and weight-aware variant.
+  tasks:
+    - split a field into scales (multiscale bands) and put it back together exactly
+    - do: decompose a gappy field into scales, ignoring the gaps
+      use: [HealPixDecomp.compute_weighted]
+  keywords: [multiscale, Laplacian pyramid, wavelet-like, bands, scale separation, masked data]
+  domain: whole sphere or regional set of cell ids
+  ordering: NESTED
+  ellipsoid: '"WGS84"'
+  io: "[..., N] -> HealPixPyramid (bands in sorted cell-id order); invert restores the input order"
+  differentiable: yes
+  gpu: yes
+  nan: plain compute propagates NaN; compute_weighted is NaN- and weight-aware
+  cost: one Down and one Up per level, built at construction
+  pros:
+    - Exact synthesis; works on masked regional domains.
+    - "`down_mode` chooses what the coarse band conserves."
+  cons:
+    - The bands are not orthogonal and are correlated.
+  use_instead:
+    - when: a convolution at every scale
+      use: HealPixPyramidConv
+      page: conv/pyramid_conv
+    - when: divergence and curl at every scale
+      use: HealPixMultiScaleDivCurl
+      page: stats/divcurl
+  optional_deps: none
+
+- id: resample
+  title: Between any levels and domains (resample_healpix)
+  family: D
+  page: other/resample
+  symbols: [HealPixResampler, resample_healpix]
+  not_exported: [healpix_analyse.resample.resample_to_latlon_grid]
+  summary: >-
+    Move data from one HEALPix level and domain to another by chaining
+    HealPixDown or HealPixUp steps, normalised by the coverage so gaps are
+    handled; plus a SciPy helper to a regular lat/lon raster.
+  tasks:
+    - do: move a regional field from one HEALPix level to another (coarser or finer)
+      use: [resample_healpix]
+    - do: put two datasets on the same HEALPix level and domain before comparing them
+      use: [HealPixResampler]
+    - do: produce a regular lat/lon raster from scattered samples
+      use: [resample_to_latlon_grid]
+  keywords: [resample, regrid, change level, change resolution, domain, coverage, lat/lon raster]
+  domain: input and output domains chosen independently (in_cell_ids, out_cell_ids)
+  ordering: NESTED
+  ellipsoid: '"WGS84"'
+  io: "[..., N_in] -> tuple (out_data, out_cell_ids); NumPy in -> NumPy out"
+  differentiable: yes (Torch); resample_to_latlon_grid is NumPy only
+  gpu: yes
+  nan: normalised by the coverage; NaN where there is no support
+  cost: build one HealPixResampler and reuse it for repeated calls
+  pros:
+    - Any level to any level, partial domains in and out, gaps handled.
+  cons:
+    - Chained steps on partial or gappy data give a mean of means.
+    - "`resample_to_latlon_grid` is not exported, needs SciPy and is not tied to HEALPix ids."
+  use_instead:
+    - when: one level, inside a network
+      use: HealPixDown / HealPixUp
+      page: other/compare_resolution
+    - when: values at arbitrary points
+      use: get_interp_val
+      page: other/interpolation
+  optional_deps: SciPy for resample_to_latlon_grid only
+
+- id: interpolation
+  title: Values at arbitrary points (get_interp_val)
+  family: D
+  page: other/interpolation
+  not_exported: [healpix_analyse.healpix_interp.get_interp_val, healpix_analyse.healpix_interp.get_interp_weights]
+  summary: >-
+    Bilinear interpolation of a whole-sphere NESTED map at any lon/lat, or
+    the four cells and weights; identical in algorithm to healpy on the
+    sphere, through healpix-geo on other ellipsoids.
+  tasks:
+    - sample a map at stations, ship tracks or profile positions (lon/lat)
+  keywords: [interpolation, bilinear, points, stations, tracks, colocation, healpy get_interp_val]
+  domain: a whole-sphere NESTED map (no cell_ids)
+  ordering: NESTED
+  ellipsoid: '"sphere" (exact string)'
+  io: "lon/lat in degrees, any shape -> values (NumPy)"
+  differentiable: no (NumPy)
+  nan: NaN if one of the four cells is NaN
+  cost: NumPy, no cache
+  pros:
+    - Same algorithm as healpy for "sphere" (validated outside the test suite on about 130 000 points).
+  cons:
+    - Whole-sphere map only; not exported; the level is called `depth`; the ellipsoid name is compared exactly.
+    - The equivalence with healpy is not covered by a test of the repository.
+  use_instead:
+    - when: a regional field to another level or domain
+      use: resample_healpix
+      page: other/resample
+  optional_deps: none
+
+- id: dino
+  title: DINOv3 embeddings of Sentinel-2 data (GetDINOV3SAT)
+  family: D
+  page: other/dino
+  status: experimental
+  symbols: [GetDINOV3SAT, DINOEmbedding, load_dinov3_sat, nested_to_tiles, tiles_to_nested]
+  summary: >-
+    Run an unmodified DINOv3 SAT-493M backbone on HEALPix data (tangent,
+    per-cell or NESTED images) and map every embedding back to a HEALPix
+    cell; plus the NESTED block <-> square image reshape.
+  tasks:
+    - do: compute foundation-model embeddings of Sentinel-2 data on HEALPix cells (for clustering or classification)
+      use: [GetDINOV3SAT]
+    - do: turn NESTED blocks into square images for a CNN, and back
+      use: [nested_to_tiles, tiles_to_nested]
+  keywords: [DINOv3, foundation model, embeddings, Sentinel-2, self-supervised, UMAP, clustering, tiles]
+  domain: the cells present in the data
+  ordering: NESTED
+  ellipsoid: module setting set_ellipsoid(), "sphere" by default
+  io: "data [N, C] reflectances in [0, 1] -> DINOEmbedding (NumPy)"
+  differentiable: no (inference mode)
+  gpu: yes, bf16 autocast on CUDA
+  nan: missing pixels filled (per-tile mean or zero); min_coverage drops tiles
+  cost: one backbone pass per tile (per cell in "percell" mode); cost grows as over_sample**2 and (context_px / cell)**2
+  pros:
+    - No change to the network; embeddings on a fixed grid, comparable across dates.
+    - "`\"tangent\"` (default) corrects the shape distortion of HEALPix cells."
+  cons:
+    - Experimental; the weights are gated by Meta and never downloaded by the package.
+    - Not differentiable; three bands (R, G, B) per run.
+  use_instead:
+    - when: a learned convolution trained on your own data
+      use: HealPixConv / LargeConv
+      page: conv/compare_wide
+  optional_deps: "termcolor (dino extra, torch-hub route) or transformers (dino-hf extra)"
+
+- id: validation
+  title: Reference convolution for tests (validation)
+  family: D
+  page: other/validation
+  not_exported: [healpix_analyse.validation.direct_spherical_convolution]
+  also: [direct_reference_operator_factory, smooth_test_field]
+  summary: >-
+    A direct, non-pyramidal spherical convolution at the exact great-circle
+    distance, independent of HealPixConv, used to test and calibrate the
+    pyramidal convolutions.
+  tasks:
+    - check a fast convolution against a brute-force reference
+  keywords: [reference, oracle, validation, brute force, test]
+  domain: whole sphere or regional set of cell ids
+  ordering: NESTED
+  ellipsoid: '"sphere"'
+  io: "x [N] -> [N] (NumPy)"
+  differentiable: no
+  cost: Python loop over the cells; slow, for test-size maps
+  pros:
+    - Independent of the code it checks; exact distances.
+  cons:
+    - Isotropic kernels only; slow; needs SciPy.
+  use_instead:
+    - when: production filtering
+      use: the tools of family A
+      page: conv/index
+  optional_deps: SciPy

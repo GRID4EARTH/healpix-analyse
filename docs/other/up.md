@@ -4,6 +4,9 @@
 **Class** `HealPixUp`  
 **Inherits** `torch.nn.Module`
 
+```{include} ../_generated/glance/up.md
+```
+
 ---
 
 ## Overview
@@ -21,11 +24,13 @@ where `M` is the `(N_coarse × N_fine)` Gaussian-weighted downsampling
 matrix.  An optional diagonal normalisation corrects the amplitude after
 the transpose.
 
-Both modes work on the full sphere or on a partial-sky subset defined by
+It works on the whole sphere or on a regional set of coarse cells defined by
 `cell_ids`.
 
-Input shapes `[N]` and `[B, N]` are both accepted; numpy arrays and torch
-tensors are both accepted, and the return type mirrors the input type.
+Input shapes `[N]` and `[B, N]` only (fold channels into the batch, as in
+the U-Net example below). NumPy arrays and torch tensors are both accepted;
+the return type mirrors the input type, cast to `dtype`. `forward` returns a
+tuple `(y, cell_ids_out)`. NaN is not handled and spreads through `Mᵀ`.
 
 ---
 
@@ -39,6 +44,7 @@ HealPixUp(
     weight_norm = "l1",
     up_norm     = "col_l1",
     eps         = 1e-12,
+    ellipsoid   = "WGS84",
     cell_ids    = None,
     device      = None,
     dtype       = torch.float32,
@@ -54,10 +60,11 @@ HealPixUp(
 | `weight_norm` | `str` | `"l1"` | Normalisation used when building `M` (`"l1"`, `"l2"`, `"none"`). **Must match** the paired `HealPixDown`. |
 | `up_norm` | `str` | `"col_l1"` | Diagonal correction applied after the transpose (see table below). |
 | `eps` | `float` | `1e-12` | Floor for the denominator in normalisation, avoids division by zero. |
+| `ellipsoid` | `str` | `"WGS84"` | Ellipsoid of the internal Down matrix (inherited from `paired_down` when given). |
 | `cell_ids` | array-like or `None` | `None` | **Coarse** pixel indices (NESTED) for partial-sky operation. `None` = full sphere. |
 | `device` | device or `None` | auto | Torch device. Defaults to CUDA if available, else CPU. |
 | `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values. |
-| `paired_down` | `HealPixDown` or `None` | `None` | Reuse the exact matrix and fine-cell domain of an existing smooth Down operator. `cell_ids` must be omitted; `level` identifies the coarse output level. |
+| `paired_down` | `HealPixDown` or `None` | `None` | Reuse the exact matrix and fine-cell domain of an existing Down operator in mode `"smooth"`, `"smooth_conservative"` or `"mean"` (not `"maxpool"`); its `ellipsoid` and `weight_norm` are used. With a `"mean"` Down and `col_l1`, every child receives its parent's value. `cell_ids` must be omitted; `level` identifies the coarse output level. |
 
 ---
 
@@ -99,7 +106,7 @@ pixels accumulates multiple counts.  The `up_norm` options correct for this.
 | `up_norm` | Formula | Effect |
 |---|---|---|
 | `"col_l1"` *(default)* | $x_{\text{up}} \mathbin{/} \text{col\_sum}$ where $\text{col\_sum}[i] = \sum_k M_{k,i}$ | Preserves constant fields when `weight_norm="l1"` was used in `HealPixDown`. **Recommended** for U-Net skip connections. |
-| `"diag_l2"` | $x_{\text{up}} \mathbin{/} \text{diag}(M^T M)$ where $\text{diag}[i] = \sum_k M_{k,i}^2$ | Minimises the local L² approximation error. Use when `weight_norm="l2"`. |
+| `"diag_l2"` | $x_{\text{up}} \mathbin{/} \text{diag}(M^T M)$ where $\text{diag}[i] = \sum_k M_{k,i}^2$ | A diagonal least-squares preconditioner. On white noise it gave the largest round-trip residual of the three (see *Round-trip accuracy*). |
 | `"adjoint"` | $x_{\text{up}} = M^T y$ (no correction) | Raw adjoint. Amplitude is not corrected. Useful for debugging or when further processing follows. |
 
 ---
@@ -236,11 +243,17 @@ dec1 = HealPixConv(level, 64 + 32, 32, kernel_sz=3, use_norm=True)
 up2  = HealPixUp(level - 2, up_norm="col_l1")
 dec2 = HealPixConv(level - 1, 128 + 64, 64, kernel_sz=3, use_norm=True)
 
-# s1, s2 are skip connections from the encoder
-xu2, _ = up2(bottleneck)                           # [B, 128, N/4]
-xd2    = dec2(torch.cat([xu2, s2], dim=1))         # [B,  64, N/4]
-xu1, _ = up1(xd2)                                  # [B,  64, N]
-xd1    = dec1(torch.cat([xu1, s1], dim=1))         # [B,  32, N]
+def up_channels(up, f):
+    # HealPixUp takes [N] or [B, N]: fold the channels into the batch
+    B, C, N = f.shape
+    y, _ = up(f.reshape(B * C, N))
+    return y.reshape(B, C, -1)
+
+# bottleneck: [B, 128, N/16] from the encoder; s1, s2: skip connections
+xu2 = up_channels(up2, bottleneck)                 # [B, 128, N/4]
+xd2 = dec2(torch.cat([xu2, s2], dim=1))            # [B,  64, N/4]
+xu1 = up_channels(up1, xd2)                        # [B,  64, N]
+xd1 = dec1(torch.cat([xu1, s1], dim=1))            # [B,  32, N]
 ```
 
 ---
@@ -287,7 +300,18 @@ print(f"Max |residual|: {np.abs(residual).max():.3f}")
 print(f"RMS  residual : {np.std(residual):.3f}")
 ```
 
-For a white-noise input at `nside=64`, typical values are:
-- `col_l1`  → RMS ≈ 0.5–0.7 (constant fields perfectly preserved)
-- `diag_l2` → RMS ≈ 0.4–0.6 (better for smooth signals)
-- `adjoint` → RMS ≈ 0.8–1.2 (no correction)
+Measured on white noise (unit variance) at `nside=64`, float32,
+`numpy.random.default_rng(0)`, Down `"smooth"` then Up:
+
+| Down `weight_norm` | Up `up_norm` | RMS residual | max abs residual |
+|---|---|---|---|
+| `"l1"` | `"col_l1"` | 0.97 | 4.43 |
+| `"l1"` | `"adjoint"` | 0.99 | 4.65 |
+| `"l1"` | `"diag_l2"` | 3.33 | 13.2 |
+| `"l2"` | `"diag_l2"` | 3.33 | 13.2 |
+
+With a Down in mode `"mean"` and the paired Up (`col_l1`), the RMS residual
+is 0.87. White noise is the worst case: most of its power is above the
+resolution of the coarse level. `col_l1` with `weight_norm="l1"` preserves
+constant fields exactly. (An earlier version of this page gave 0.4 to 1.2
+without a source; the table above replaces it.)

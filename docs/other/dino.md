@@ -1,15 +1,18 @@
 # `GetDINOV3SAT` — DINOv3 embeddings of HEALPix data
 
 **Module** `healpix_analyse.dino`  
-**Function** `GetDINOV3SAT`  
+**Functions** `GetDINOV3SAT`, `load_dinov3_sat`, `nested_to_tiles`,
+`tiles_to_nested`; result class `DINOEmbedding`  
 **Status** experimental
 
+```{include} ../_generated/glance/dino.md
+```
+
 All HEALPix geometry — cell centres, vertices, bilinear stencils, neighbours,
-base-cell coordinates — comes from **`healpix-geo`**, the GRID4EARTH library.
-`healpy` is not a dependency of this package and is not used anywhere in it,
-including in the tests and the notebooks. The four primitives the examples
-need are re-exported so that code built on this module does not have to reach
-for another HEALPix library either: `cell_centres_lonlat`, `cells_at_lonlat`,
+base-cell coordinates — comes from **`healpix-geo`**, the GRID4EARTH library;
+this module does not use `healpy`. The four primitives the examples need are
+re-exported so that code built on this module does not have to reach for
+another HEALPix library either: `cell_centres_lonlat`, `cells_at_lonlat`,
 `cell_vectors` and `cell_neighbours`.
 
 ---
@@ -17,25 +20,65 @@ for another HEALPix library either: `cell_centres_lonlat`, `cells_at_lonlat`,
 ## Overview
 
 `GetDINOV3SAT` computes DINOv3 (SAT-493M) embeddings of Sentinel-2-like data
-stored on a NESTED HEALPix grid, **without modifying the network**.
+stored on a NESTED HEALPix grid, **without modifying the network**. Every cell
+of `parent_level` present in the data gives one square image, which is passed
+to the unmodified backbone. How that image is built is set by `projection`:
 
-The trick is purely combinatorial. In the NESTED scheme a cell of
-`parent_level` contains exactly `4**(level - parent_level)` cells of `level`,
-stored contiguously and ordered by a Morton (Z-order) code of their local
-face coordinates `(x, y)`. A NESTED block is therefore an *exact* square image
-of side `S = 2**(level - parent_level)` pixels, with no resampling. The image
-is fed to DINOv3 as is, and every 16 × 16 patch token maps back to one
-HEALPix cell of `level - 4`.
+- **`"tangent"` (default).** The cell is resampled onto a north-up gnomonic
+  plane tangent at its centre, with a constant ground sampling (`gsd_m`,
+  `sqrt(cell area)` at `level` by default). Shapes are then correct: HEALPix
+  cells have equal area but not equal shape — at 52° N the two NESTED axes
+  measure 10.6 m and 16.7 m with a 60.5° angle between them, so a reshaped
+  NESTED block is a parallelogram stretched by a factor 2. The token field is
+  read back at the centres of the cells of the token level, so every cell
+  gets exactly one embedding and the output has no holes. The price is two
+  resamplings.
+- **`"percell"`.** One tangent window of `context_px` pixels **per output
+  cell**, centred on it; the embedding is the patch token holding the centre
+  (`pooling="centre"`; a requested `"cls"` is turned into `"centre"` in this
+  mode). Nothing is interleaved or resampled back; `level - parent_level` may
+  be as small as 1. The cost grows as `(context_px / cell)**2`.
+- **`"nested"`.** The historical mode, described below: the NESTED block is
+  reshaped into an image, exact in index space and free of resampling, but
+  geometrically wrong away from the equator. Kept for comparison.
+
+![Tangent and nested projections of the same cell](../_static/dino_tangent_vs_nested.png)
+
+### The `"nested"` reshape and the tiles
+
+In the NESTED scheme a cell of `parent_level` contains exactly
+`4**(level - parent_level)` cells of `level`, stored contiguously and ordered
+by a Morton (Z-order) code of their local face coordinates `(x, y)`. A NESTED
+block is therefore an *exact* square image of side
+`S = 2**(level - parent_level)` pixels, with no resampling. In `"nested"`
+mode the image is fed to DINOv3 as is, and every 16 × 16 patch token maps
+back to one HEALPix cell of `level - 4`.
 
 ```
 level 19 cells  ──nested_to_tiles──▶  tiles [M, 3, 256, 256]  ──DINOv3──▶  CLS  [M, 1024]           (one per level-11 cell)
                                                                           patches [M·256, 1024]     (one per level-15 cell)
 ```
 
+The reshape is public:
+
+```python
+from healpix_analyse import nested_to_tiles, tiles_to_nested
+
+tiles, parent_ids, valid, coverage = nested_to_tiles(
+    data, cell_id, level, parent_level, fill="mean", duplicates="mean",
+)   # tiles [M, C, S, S] float32, valid [M, S, S], coverage [M]
+data2, cell_id2 = tiles_to_nested(tiles, parent_ids, parent_level, level)
+```
+
+`1 <= level - parent_level <= 15`; `data` is `[N, C]` or `[N]` (Torch input
+is converted to NumPy); duplicated cell ids are averaged by default
+(`duplicates="mean"`). Note the argument order of `tiles_to_nested`:
+`parent_level` before `level`, the reverse of `nested_to_tiles`.
+
 Compared with running DINOv3 on UTM tiles, embeddings live directly on the
-sphere: they are seamless across tiles of the same face, hierarchical
-(`level - 4`, `parent_level`) for free, and comparable across dates and
-orbits because the grid never changes.
+sphere: they are seamless across tiles, hierarchical (`patch_level`,
+`parent_level`) for free, and comparable across dates and orbits because the
+grid never changes.
 
 ---
 
@@ -46,32 +89,56 @@ GetDINOV3SAT(
     data,                     # [N, C] reflectances in [0, 1], NaN = missing
     cell_id,                  # [N] NESTED ids at `level`
     level,                    # resolution of `data`
-    parent_level,             # resolution of the DINO tiles, level - parent_level >= 4
-    model          = None,    # backbone from load_dinov3_sat(); loaded if None
-    weights        = None,    # .pth path (torch-hub) or HF id
+    parent_level,             # resolution of the tiles (level - parent_level >= 4,
+                              #   >= 1 with projection="percell")
+    *,
+    projection     = "tangent",          # "tangent" | "percell" | "nested"
+    over_sample    = 1,                  # sliding window: tokens n times denser, cost n**2
+    context_px     = None,               # window side in "percell" mode (multiple of 16)
+    out_cells      = None,               # restrict "percell" mode to these cells
+    gsd_m          = None,               # tangent ground sampling, metres
+    tile_px        = None,               # image size (rows, cols)
+    interpolation  = "bilinear",         # or "nearest"
+    model          = None,               # backbone from load_dinov3_sat(); loaded if None
+    weights        = None,               # .pth path (torch-hub) or HF id
     model_name     = "dinov3_vitl16",
     bands          = (0, 1, 2),          # (R, G, B) columns of data — S2: B04, B03, B02
     mean           = SAT493M_MEAN,
     std            = SAT493M_STD,
-    pooling        = "cls",              # "cls" | "mean" | "cls+mean"
+    pooling        = "cls",              # "cls" | "mean" | "cls+mean" | "centre"
     return_patches = False,
     min_coverage   = 0.0,
     fill           = "mean",             # missing pixels: per-tile mean | "zero"
+    duplicates     = "mean",             # "mean" | "first" | "error"
     batch_size     = 16,
     device         = None,
     autocast       = True,
 ) -> DINOEmbedding
 ```
 
+The backbone runs under `torch.inference_mode` (no gradients) and returns
+NumPy arrays; on CUDA it uses bf16 autocast. The ellipsoid used to place the
+cells is a module setting, `healpix_analyse.dino.set_ellipsoid(name)`,
+`"sphere"` by default.
+
 | Field of `DINOEmbedding` | Shape | Meaning |
 |---|---|---|
-| `embedding` | `[M, Ndino]` | one vector per tile of `parent_level` present in `cell_id` |
-| `cell_id` | `[M]` | NESTED ids of those tiles |
+| `embedding` | `[M, Ndino]` | one vector per cell of `parent_level` present in `cell_id` |
+| `cell_id` | `[M]` | NESTED ids of those cells |
 | `coverage` | `[M]` | fraction of `level` pixels available in each tile |
 | `patch_embedding` | `[M·P, Ndino]` | patch tokens (`return_patches=True`) |
-| `patch_cell_id` | `[M·P]` | NESTED ids of the patches at `patch_level = level - 4` |
+| `patch_cell_id` | `[M·P]` | NESTED ids of the patches at `patch_level` |
+| `patch_level`, `patch_lon`, `patch_lat` | — | level and centres of the patch cells: `level - 4 + log2(over_sample)` in the tiled modes, `parent_level` in `"percell"` mode |
+| `projection`, `over_sample`, `gsd_m`, `tile_px` | — | the settings used |
 
 `Ndino` is 1024 for ViT-L/16 (`pooling="cls+mean"` doubles it).
+
+`load_dinov3_sat(model_name="dinov3_vitl16", weights=None, *, source="auto",
+repo="facebookresearch/dinov3", device=None)` loads the backbone through
+torch-hub (`weights` is a local `.pth` file) or Hugging Face
+(`source="hf"`, needs the `dino-hf` extra). It raises when `weights` is
+missing outside the Hugging Face route: the weights are gated (see the licence
+section below).
 
 ---
 
@@ -97,8 +164,10 @@ built with `row = S - 1 - y`, `col = x`, so North points to the top-right
 corner. The orientation is the same for all tiles of one face and rotated on
 the polar faces. For a satellite backbone (no gravity direction) this is a
 mild effect; when fine-tuning, use rotation augmentations rather than image
-flips. Pixel-shape distortion of HEALPix cells (equal area, variable shape)
-is negligible at the scale of a 16 px patch.
+flips. This paragraph is about the `"nested"` mode: there, the pixel-shape
+distortion of HEALPix cells (equal area, variable shape) is **not**
+negligible away from the equator (a factor 2 stretch at 52° N, see the
+overview), which is why `"tangent"` is the default.
 
 ---
 

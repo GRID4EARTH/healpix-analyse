@@ -6,6 +6,9 @@ It is the HEALPix equivalent of `scipy.ndimage.map_coordinates` for a regular
 grid: given a point that does not sit exactly on a cell centre, it tells you
 which cells to blend, and by how much.
 
+```{include} ../_generated/glance/interpolation.md
+```
+
 ```python
 from healpix_analyse.healpix_interp import get_interp_val, get_interp_weights
 
@@ -17,8 +20,17 @@ pixels, weights = get_interp_weights(45.03, 30.03, depth=depth)
 # weights: (N, 4) float64, each row sums to 1
 ```
 
-`hpx_map` must be in NESTED order (`12 * 4**depth` values); `lon`/`lat` are in
-degrees and accept scalars, 1D arrays, or arrays of any shape.
+`hpx_map` must be a **whole-sphere** map in NESTED order (`12 * 4**depth`
+values; there is no `cell_ids` argument); `lon`/`lat` are in degrees and
+accept scalars, 1D arrays, or arrays of any shape (`get_interp_weights`
+flattens them; `get_interp_val` returns the input shape). The level is called
+`depth`. Both functions are NumPy only (not differentiable) and are **not
+exported** from `healpix_analyse`: import them from
+`healpix_analyse.healpix_interp`. A NaN in any of the four cells gives NaN.
+
+The `ellipsoid` string is compared exactly: write `"sphere"` (default) or a
+name that healpix-geo accepts as is, such as `"WGS84"` (`"wgs84"` or
+`"Sphere"` raise `ValueError`).
 
 ## Exact equivalence with `healpy`, for `ellipsoid="sphere"`
 
@@ -28,7 +40,7 @@ direct NumPy port of the reference algorithm used by `healpy` itself
 (`T_Healpix_Base::get_interpol`, RING scheme, transcribed from
 [`healpix_base.cc`](https://github.com/healpy/healpixmirror/blob/main/src/cxx/Healpix_cxx/healpix_base.cc)).
 The RING-scheme result is converted to NESTED with `healpix_geo.ring.to_nested`
-(still GRID4EARTH, not `healpy`, see the {doc}`/start/overview` conventions).
+(still GRID4EARTH, not `healpy`, see {doc}`/start/conventions`).
 
 Concretely, for `ellipsoid="sphere"`:
 

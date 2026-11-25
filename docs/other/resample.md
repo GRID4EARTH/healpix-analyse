@@ -4,6 +4,9 @@
 between full or partial cell domains. It is implemented as a sequence of the
 package's local `HealPixDown` or `HealPixUp` operators.
 
+```{include} ../_generated/glance/resample.md
+```
+
 `HealPixResampler` provides the same operation as a reusable PyTorch module.
 Use the class when several maps share the same input and output geometries, so
 the sparse operators are constructed only once.
@@ -58,7 +61,8 @@ When `in_level > out_level`, the operator constructs
 level L -> Down -> level L-1 -> ... -> requested output level
 ```
 
-Every step uses `HealPixDown(mode="smooth")`. For partial maps, the exact
+Every step uses `HealPixDown(mode=down_mode)`, `"smooth"` by default
+(`"smooth_conservative"` and `"mean"` are the alternatives). For partial maps, the exact
 coarse IDs are derived from the available fine cells. The final result is then
 joined to the requested output domain.
 
@@ -144,6 +148,8 @@ The following parameters are forwarded to the underlying operators:
 | `sigma_deg` | level-dependent | Gaussian width |
 | `weight_norm` | `"l1"` | Down normalisation |
 | `up_norm` | `"col_l1"` | Up normalisation |
+| `down_mode` | `"smooth"` | Mode of every Down step: `"smooth"`, `"smooth_conservative"` or `"mean"` |
+| `eps` | `1e-12` | Floor of the coverage denominator; cells with less support are NaN |
 
 Leaving `radius_deg` and `sigma_deg` unset lets every step select a filter
 appropriate to its own native level. Supplying them uses the same angular
@@ -165,11 +171,25 @@ out_data, out_ids = resample_healpix(
     up_norm="col_l1",
     dtype=torch.float32,
     device=None,
+    eps=1e-12,
+    down_mode="smooth",
 )
 ```
 
 The arguments after `in_data` are keyword-only to prevent accidental exchange
 of input/output levels or cell-ID arrays.
+
+## To a lat/lon raster: `resample_to_latlon_grid`
+
+`healpix_analyse.resample.resample_to_latlon_grid(lat, lon, data,
+method="linear")` interpolates scattered samples onto a regular lat/lon grid
+with SciPy's `griddata`. It is not tied to HEALPix cell ids: `lat`, `lon` and
+`data` are 2-D arrays of the same shape, and the output grid has the shape of
+`data`. Points outside the convex hull get the mean of `data`. It needs SciPy
+(`pip install "healpix-analyse[scipy]"`), is NumPy only (not
+differentiable), and is **not exported** from `healpix_analyse`; the notebooks
+`Test_resampling_powerspectra` use it. Whether to keep it in the public API is
+an open question.
 
 ## Performance considerations
 

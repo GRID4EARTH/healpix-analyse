@@ -5,6 +5,9 @@ pyramid for full-sky or masked NESTED HEALPix maps. It is designed for local
 geophysical data such as sea-surface temperature or ocean velocity, where
 land and coastline masks make global Fourier decompositions unsuitable.
 
+```{include} ../_generated/glance/decomp.md
+```
+
 The implementation uses only local sparse operators:
 
 ```text
@@ -219,15 +222,22 @@ HealPixDecomp(
     level,
     cell_ids=None,
     Jmax=-1,
+    *,                       # the rest is keyword-only
     ellipsoid="WGS84",
     radius_deg=None,
     sigma_deg=None,
     weight_norm="l1",
     up_norm="col_l1",
-    dtype=torch.float32,
+    dtype=torch.float32,     # float32 or float64
     device=None,
+    down_mode="smooth",      # or "smooth_conservative", "mean" (not "maxpool")
 )
 ```
+
+The bands returned by `compute` are in sorted cell-id order (the order of
+`pyramid.cell_ids`); `invert` and `expand` restore the input order. Plain
+`compute` does not handle NaN (it propagates); use `compute_weighted` for
+gappy data.
 
 Main methods:
 
