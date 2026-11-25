@@ -13,6 +13,8 @@ embeddings, and the validation helpers.
 2. **Values somewhere else than at cell centres?** → `get_interp_val`.
 3. **Embeddings for clustering or classification?** → `GetDINOV3SAT`
    (experimental, gated weights).
+4. **Random augmentation of training batches?** → `HealPixAugment`
+   ({doc}`augment`).
 
 ## I want to …
 
@@ -37,6 +39,7 @@ up
 decomp
 resample
 interpolation
+augment
 dino
 validation
 ```

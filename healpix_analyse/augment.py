@@ -824,7 +824,7 @@ class HealPixAugment(nn.Module):
         when available, the PyTorch reference otherwise.
     deterministic : bool, default True
         Triton backward without atomics (transposed map); see
-        :mod:`healpix_analyse._augment_backend`.
+        ``healpix_analyse._augment_backend``.
     """
 
     def __init__(

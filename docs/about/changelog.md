@@ -26,6 +26,23 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `healpix_analyse.augment` (#109, section 8): batched data augmentation on
+  the GPU. `HealPixAugment` applies a list of transforms to a whole batch
+  with per-sample random parameters from a seeded `torch.Generator`:
+  `RandomRotation` (any angle about the domain centre), `RandomSO3` (global
+  rotation of a full-sphere field), `RandomShift` (translation on the
+  sphere), `RandomZoom` (any scale, with `antialias="supersample"` or
+  `"pyramid"` for zooms out), `RandomFlip`, `RandomGaugeRotation` (gauge axis
+  of `HealPixConv` outputs), `AdditiveNoise`, `RandomMask` (MAE cell or
+  NESTED-token masking) and `RandomCrop` (NESTED prefixes). Consecutive
+  shift / rotation / zoom / flip transforms compose into one source map and
+  one gather. On CUDA with the optional `triton` package, one fused kernel
+  computes the bilinear weights from the per-sample parameters and gathers in
+  the same pass (float32, float16, bfloat16; fp32 accumulation), and the
+  backward pass recomputes them and scatters into an int64 fixed-point
+  accumulator (deterministic, no map stored). Labels and masks follow with
+  nearest neighbour; cells read outside the domain get NaN and
+  `valid=False`. `benchmarks/benchmark_augment.py` measures the throughput.
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is

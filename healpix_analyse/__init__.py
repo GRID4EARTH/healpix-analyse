@@ -214,6 +214,28 @@ from healpix_analyse.dino import (
     tiles_to_nested,
 )
 
+# ---------------------------------------------------------------------------
+# Batched data augmentation (GPU, per-sample random draws)
+# ---------------------------------------------------------------------------
+
+from healpix_analyse.augment import (
+    HealPixAugment,
+    AugmentPlan,
+    AugmentResult,
+    RandomRotation,
+    RandomSO3,
+    RandomShift,
+    RandomZoom,
+    RandomFlip,
+    Rotation3D,
+    TangentLinear,
+    RandomGaugeRotation,
+    AdditiveNoise,
+    RandomMask,
+    RandomCrop,
+    gauge_rotate,
+)
+
 __all__ = [
     # ------------------------------------------------------------------
     # Multi-resolution operators
@@ -342,4 +364,23 @@ __all__ = [
     "load_dinov3_sat",
     "nested_to_tiles",
     "tiles_to_nested",
+
+    # ------------------------------------------------------------------
+    # Batched data augmentation
+    # ------------------------------------------------------------------
+    "HealPixAugment",
+    "AugmentPlan",
+    "AugmentResult",
+    "RandomRotation",
+    "RandomSO3",
+    "RandomShift",
+    "RandomZoom",
+    "RandomFlip",
+    "Rotation3D",
+    "TangentLinear",
+    "RandomGaugeRotation",
+    "AdditiveNoise",
+    "RandomMask",
+    "RandomCrop",
+    "gauge_rotate",
 ]
