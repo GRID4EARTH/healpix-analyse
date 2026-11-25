@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Added
+- Wavelet power spectrum (`healpix_analyse.wavelet_spectrum`):
+  `HealPixWaveletSpectrum` (complex Morlet, 4 orientations),
+  `HealPixIsotropicWaveletSpectrum` (angle-averaged Morlet, no orientation)
+  and the function `wavelet_power_spectrum`, with the profiles
+  `wavelet_morlet` and `wavelet_morlet_isotropic`. Band powers per HEALPix
+  level (down to level 0, or two per octave with `scales_per_octave=2`), on
+  the full sphere or a regional domain with NaN: the field goes down with
+  `HealPixDown` on the pair (w x, w), missing stencil points are completed
+  with the local mean, and each valid pixel is weighted by the coverage of
+  its kernel. Returns the frequency 0 (mean of the valid pixels), the
+  low-pass variance, `n_eff`, optional S1 and local maps; `cross()` gives
+  co-spectra and coherence of two fields on the same cells; `windows()` and
+  `littlewood_paley()` measure the band responses and fit band constants on
+  the full sphere. Differentiable, batched, CPU or GPU; no SciPy. Agrees
+  with the band-averaged `HEALPixSHT.anafast` within about 4 % per map on
+  the full sphere (bands at levels >= 2, measured at level 4). Page:
+  `docs/sht/wavelet_spectrum.md`.
+- `HealPixConv(missing="local_mean")`: NaN values (and `mask=` zeros) are
+  missing exactly like pixels outside `cell_ids`; a stencil point takes the
+  renormalised bilinear interpolation of its valid neighbours, or the local
+  mean of the valid stencil values when it has none
+  (`local_mean_weights`). Finite outputs and gradients everywhere.
+  `completed_stencil()` returns the stencil values and their valid
+  fraction. The default, `missing="centre"`, is the existing behaviour
+  (identical outputs, same `state_dict`). The geometry cache now also stores
+  the in-domain fraction of each stencil point; older cache files are
+  recomputed once when `missing="local_mean"` needs it.
+
 ### Changed
 - `LocalFFT.blur_floor_px` (called by `HealPixFFTConv.set_gaussian` and
   `LocalFFT.check_width` since 2026.11.1) no longer uses SciPy: the moments of

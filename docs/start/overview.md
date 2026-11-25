@@ -76,6 +76,10 @@ dependencies) with the answer.
 - Whole sphere, HEALPix → `HEALPixSHT` (`anafast`).
 - Whole sphere, ERA5 or another lat/lon grid → `anafast_latlon`.
 - Regional patch → `local_ps` (`LocalFFT`).
+- Gaps (land, clouds, swaths), a regional domain of any size, or a spectrum
+  inside a loss → `HealPixWaveletSpectrum` (band powers per level, NaN-aware,
+  cross-spectra; `HealPixIsotropicWaveletSpectrum` without orientation)
+  ({doc}`/sht/wavelet_spectrum`).
 - All the spectra side by side: {doc}`/sht/compare_power_spectra`.
 
 **I want another resolution, other points or embeddings** (family D,
@@ -93,7 +97,8 @@ dependencies) with the answer.
   {doc}`conventions`: for instance `HealPixDown` uses `level` and degrees on
   WGS84, `gaussian_filter` uses `refinement_level` and metres on WGS84,
   `HealPixFFTConv` defaults to the sphere.
-- **NaN propagates** through the convolutions, `HealPixDown("smooth")`,
+- **NaN propagates** (except with `HealPixConv(missing="local_mean")`)
+  through the convolutions, `HealPixDown("smooth")`,
   `HealPixUp`, the transforms and `neighbour_reduce`.
 - **Tuples.** `HealPixDown`, `HealPixUp` and `resample_healpix` return
   `(values, cell_ids)`.
@@ -129,7 +134,9 @@ Euler characteristic.
 **Spherical harmonics and FFT.** `healpix_sht` (`HEALPixSHT`) is the
 spherical harmonic transform of whole-sphere HEALPix maps (spin 0, 1, 2);
 `alm_latlon` does spin 0 on any iso-latitude grid; `fft_local` (`LocalFFT`)
-takes the FFT and the spectrum of a regional patch; `ps`, `powerspectra` and
+takes the FFT and the spectrum of a regional patch; `wavelet_spectrum`
+(`HealPixWaveletSpectrum`) gives NaN-aware band powers per level, on the full
+sphere or a regional domain; `ps`, `powerspectra` and
 `powerspectra_lonlat` are experimental flat spectra; `alm` holds the
 `AlmCoeffs` container (unused by the other modules) and the experimental
 `AlmTransform`.

@@ -252,6 +252,34 @@ x_patch = torch.randn(4, 1, len(cell_ids))
 y_patch = conv(x_patch)
 ```
 
+### Missing pixels: `missing="local_mean"`
+
+Each stencil value is a bilinear interpolation of 4 pixels. By default
+(`missing="centre"`), neighbours outside `cell_ids` are dropped and the
+others renormalised, and a stencil point with no neighbour in the domain
+takes the value of the centre pixel; NaN values propagate.
+
+With `missing="local_mean"`, a NaN pixel (or a pixel with `mask == 0`) is
+missing exactly like a pixel outside `cell_ids`: a stencil point with at
+least one valid neighbour takes the renormalised interpolation of its valid
+neighbours, and a point with none takes the mean of the valid stencil values
+of the same output pixel (weights `local_mean_weights`, uniform by default).
+Every pixel gets a finite output and finite gradients; the gradient at a NaN
+pixel is 0. It costs a second gather (the mask). Without missing pixels, the
+result is the same as the default.
+
+```python
+conv = HealPixConv(level=6, in_channels=1, out_channels=8, kernel_sz=5,
+                   cell_ids=cell_ids, missing="local_mean")
+y = conv(x_with_nan)                     # NaN completed, finite output
+y = conv(x, mask=valid)                  # or an explicit mask in [0, 1]
+z, cov = conv.completed_stencil(x_with_nan)   # [B, C, G, N, P] values and valid fraction
+```
+
+`completed_stencil` returns the values the kernel multiplies and the valid
+fraction of every stencil point, from which the coverage of any kernel
+follows; the wavelet power spectrum ({doc}`/sht/wavelet_spectrum`) uses it.
+
 ### Fixed (non-learnable) isotropic kernel
 
 ```python
@@ -302,6 +330,8 @@ HealPixConv(
     ellipsoid          = "WGS84",
     dtype              = torch.float32,
     cache_dir          = <default>,   # $HEALPIXCONV_CACHE or ~/.cache/healpixconv
+    missing            = "centre",
+    local_mean_weights = None,
 )
 ```
 
@@ -321,6 +351,8 @@ HealPixConv(
 | `device` | `str` or `torch.device` or `None` | `None` | Target device. Defaults to CUDA if available, else CPU. |
 | `ellipsoid` | `str` | `"WGS84"` | Reference ellipsoid for healpix_geo coordinate conversions. |
 | `dtype` | `torch.dtype` | `torch.float32` | Floating-point precision for all buffers and parameters. |
+| `missing` | `str` | `"centre"` | `"centre"`: today's behaviour (points outside the domain take the centre value; NaN propagates). `"local_mean"`: NaN and points outside the domain are completed by the renormalised interpolation of the valid neighbours, or the local mean of the valid stencil values. |
+| `local_mean_weights` | `array (P,)` or `None` | `None` | Non-negative weights of the stencil points in the local mean of `"local_mean"`; `None` = uniform. |
 
 **Raises:**
 
@@ -335,12 +367,13 @@ HealPixConv(
 
 ---
 
-### `forward(x)`
+### `forward(x, mask=None)`
 
 Apply the gauge-equivariant spherical convolution.
 
 ```python
 y = conv(x)
+y = conv(x, mask=valid)        # missing="local_mean" only
 ```
 
 **Parameters:**
@@ -348,6 +381,7 @@ y = conv(x)
 | Parameter | Type | Shape | Description |
 |---|---|---|---|
 | `x` | `np.ndarray` or `torch.Tensor` | `[N]`, `[B, N]`, or `[B, C_in, N]` | Input map(s) at the HEALPix resolution of this layer. N must equal `len(cell_ids)` for partial-sky, or `12 · nside²` for full sphere. |
+| `mask` | array-like or `None` | broadcastable to `x` | Only with `missing="local_mean"`: pixel weights in [0, 1] (0 = missing). NaN values of `x` are always missing. |
 
 **Returns:**
 
