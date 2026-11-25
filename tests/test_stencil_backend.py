@@ -89,7 +89,8 @@ def _assert_same(actual, expected, reduction, dtype):
         else:
             assert torch.equal(a, e)
     else:
-        tol = {torch.float64: 1e-12, torch.float32: 1e-5}.get(dtype, 2e-3)
+        # 16-bit: one rounding step (the kernels accumulate in fp32 and round once)
+        tol = {torch.float64: 1e-12, torch.float32: 1e-5, torch.bfloat16: 1.6e-2}.get(dtype, 2e-3)
         torch.testing.assert_close(actual, expected, rtol=tol, atol=tol, equal_nan=True)
 
 
