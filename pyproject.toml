@@ -57,7 +57,7 @@ triton = [
 #
 # The backbone is neither vendored nor redistributed here: it is fetched at run
 # time from Meta's own distribution and is governed by the DINOv3 License, and
-# the SAT-493M weights are gated (see docs/dino.md).  What is listed below is
+# the SAT-493M weights are gated (see docs/other/dino.md).  What is listed below is
 # only what that code needs to import on this side.
 dino = [
   "termcolor",              # imported by the facebookresearch/dinov3 hub code
@@ -98,6 +98,7 @@ notebooks = [
 
 docs = [
   "sphinx>=7.0",
+  "pyyaml",               # read by docs/_ext/tool_catalogue.py
   "pydata-sphinx-theme>=0.15",
   "myst-nb>=1.0",
   "sphinx-autoapi>=3.0",
