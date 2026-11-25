@@ -34,8 +34,9 @@ Key design choices:
   as registered buffers. The forward pass is purely index-and-multiply.
 - **Fully vectorised**: no Python loops over pixels or gauges in either the
   constructor or the forward pass.
-- **Differentiable**: every operation in the hot path (gathers, weighted
-  sums, batched matrix products) is supported by PyTorch autograd.
+- **Differentiable**, with a hand-written backward that never stores the
+  interpolated stencil values; fused Triton kernels on CUDA (see *Backends*
+  below). Second-order gradients (`create_graph=True`) are supported.
 
 ---
 
@@ -268,11 +269,16 @@ The geometry of this mode is always built in float64 and then cast to
 `dtype`, because the choice between the two rules depends on the valid
 fraction of each stencil point: a float32 build gives points just outside the
 domain spurious fractions (up to 5e-4 at level 6, near the poles), enough to
-switch a stencil value from the local mean to the value of one neighbour. It
-is cached apart from the default mode.
+switch a stencil value from the local mean to the value of one neighbour. Its
+cache entry is the one of float64 layers.
 Every pixel gets a finite output and finite gradients; the gradient at a NaN
-pixel is 0. It costs a second gather (the mask). Without missing pixels, the
-result is the same as the default.
+pixel is 0. It costs a second gather (the mask), and it runs the PyTorch
+reference path (the gathered `[B, C_in, G, K, P]` tensor and one matrix
+product) on every device, not the fused kernels of *Backends* below. After
+its first forward pass, the layer keeps the stencil in the layout of that
+gather: int64 positions and the weights, `[4, G, K·P]` each, as the buffers of
+earlier versions did. Without missing pixels, the result is the same as the
+default.
 
 ```python
 conv = HealPixConv(level=6, in_channels=1, out_channels=8, kernel_sz=5,
@@ -338,6 +344,8 @@ HealPixConv(
     cache_dir          = <default>,   # $HEALPIXCONV_CACHE or ~/.cache/healpixconv
     missing            = "centre",
     local_mean_weights = None,
+    backend            = "auto",
+    deterministic      = True,
 )
 ```
 
@@ -356,7 +364,9 @@ HealPixConv(
 | `use_norm` | `bool` | `False` | Apply GroupNorm + ReLU after the convolution. |
 | `device` | `str` or `torch.device` or `None` | `None` | Target device. Defaults to CUDA if available, else CPU. |
 | `ellipsoid` | `str` | `"WGS84"` | Reference ellipsoid for healpix_geo coordinate conversions. |
-| `dtype` | `torch.dtype` | `torch.float32` | Floating-point precision for all buffers and parameters. |
+| `dtype` | `torch.dtype` | `torch.float32` | Floating-point precision for all buffers and parameters. `module.to(...)` moves and casts the layer afterwards. |
+| `backend` | `str` | `"auto"` | `"auto"`, `"triton"` or `"torch"`; see *Backends* below. |
+| `deterministic` | `bool` | `True` | Triton only: input gradient by a gather on the transposed stencil map, without atomics, identical at every run. `False`: fp32 atomics, no extra memory. |
 | `missing` | `str` | `"centre"` | `"centre"`: today's behaviour (points outside the domain take the centre value; NaN propagates). `"local_mean"`: NaN and points outside the domain are completed by the renormalised interpolation of the valid neighbours, or the local mean of the valid stencil values. |
 | `local_mean_weights` | `array (P,)` or `None` | `None` | Non-negative weights of the stencil points in the local mean of `"local_mean"`; `None` = uniform. |
 
@@ -370,6 +380,40 @@ HealPixConv(
 - `ValueError` — if `singularity_lonlat` is used with a gauge type that
   does not support it, or if the wrong number of pairs is provided for
   `"two_ref"`.
+
+### Backends
+
+With `missing="centre"` (the default), the forward and backward passes never
+build the gathered `[B, C_in, G, K, P]` tensor. With `backend="auto"`, CUDA tensors in float32,
+float16 or bfloat16 run fused Triton kernels when the optional `triton`
+package is installed (16-bit data accumulate in fp32; under `torch.autocast`
+the kernels compute in the autocast dtype). Everything else (CPU, float64, no
+Triton) runs a PyTorch loop over the P taps with a hand-written backward.
+
+By default (`deterministic=True`), the Triton backend computes the input
+gradient by a gather on the transposed stencil map: no atomics, the same bits
+at every run, and, on an A100, a training step 1.6–2.2× shorter than with
+atomics. The cost is memory. The map is built at the first backward pass
+(0.02–0.2 s on an A100) and stays on the GPU, at about the size of the stencil
+buffers again: 0.2–2.6 GiB for the configurations of
+`benchmarks/benchmark_healpix_conv.py`. `module.to(...)` drops it, and the next
+backward pass rebuilds it.
+
+`deterministic=False` scatters the gradient with fp32 atomics instead. It
+needs no extra memory, but the summation order, and so the last bits, vary
+between runs. `torch.use_deterministic_algorithms(True)` selects the gather in
+either case.
+
+`deterministic` applies to the Triton backend only. The PyTorch backend
+scatters the input gradient with `index_add_`, which is deterministic on CPU.
+On CUDA, where the PyTorch backend runs without Triton, it is
+non-deterministic unless `torch.use_deterministic_algorithms(True)` is set.
+
+A double backward (`create_graph=True`, for example a gradient penalty) runs
+the backward of the PyTorch tap loop on every device, because the Triton
+kernels write their gradients outside the autograd graph. It is correct, and
+as slow on a GPU as the PyTorch backend, and its determinism follows the same
+`index_add_` rule.
 
 ---
 
@@ -464,8 +508,8 @@ gauge_type='two_ref':
 
 | Buffer / tensor | Shape | Description |
 |---|---|---|
-| `_pos_safe` | `[4, G, K·P]` (int64) | Column indices into the sorted input for each bilinear neighbour |
-| `_w_norm` | `[4, G, K·P]` (layer dtype) | Renormalised bilinear weights |
+| `_tap_idx` | `[P, 4, G, K]` (int32) | Position in the input of each bilinear neighbour of each tap (not in the `state_dict`) |
+| `_tap_w` | `[P, 4, G, K]` (layer dtype) | Renormalised bilinear weights (not in the `state_dict`) |
 | `_sort_order` | `[K]` | Index that sorts pixel ids ascending |
 | `_inv_order` | `[K]` | Inverse permutation to restore original order |
 | `weight` | `[G, C_in, C_out, P]` | Learned kernel (nn.Parameter) |
@@ -489,30 +533,29 @@ typical configurations (nside=64, G=4, kernel_sz=3):
 
 #### Forward pass (per batch)
 
-The forward gathers the input at the four bilinear neighbours of every
-stencil point (a loop over the 4 neighbours), forms the weighted sum and
-applies the kernel with a batched matrix product. The gathered tensor has
-`B · C_in · G · K · P` values, and the code comments put the peak at about
-twice that. GPU timings are to be measured (none is published in the
-repository).
+See *Backends* above: one tap at a time, so the memory of a training step
+is about the input and the output plus one tap, never the
+`B · C_in · G · K · P` gathered values. `benchmarks/benchmark_healpix_conv.py`
+measures the forward and backward passes and their peak memory on CPU or
+CUDA.
 
 #### Memory
 
-The dominant buffers are `_pos_safe` (int64) and `_w_norm` (float32 for a
-float32 layer), each of shape `[4, G, K·P]`. For nside=128, G=4,
+The dominant buffers are `_tap_idx` (int32) and `_tap_w` (float32 for a
+float32 layer), each of shape `[P, 4, G, K]`. For nside=128, G=4,
 kernel_sz=5 (P=25):
 
 ```
 K = 12 × 128² = 196 608
-entries per buffer = 4 × 4 × 196 608 × 25 = 78 643 200
-_pos_safe : 78 643 200 × 8 bytes ≈ 629 MB
-_w_norm   : 78 643 200 × 4 bytes ≈ 315 MB
-total                            ≈ 944 MB   (1 258 MB for a float64 layer)
+entries per buffer = 25 × 4 × 4 × 196 608 = 78 643 200
+_tap_idx : 78 643 200 × 4 bytes ≈ 315 MB
+_tap_w   : 78 643 200 × 4 bytes ≈ 315 MB
+total                           ≈ 629 MB   (944 MB for a float64 layer)
 ```
 
-For very large nside, consider reducing G or kernel_sz. The memory of the
-forward pass comes on top: it grows as `B · C_in · G · K · P`. Making this
-layer cheaper for GPU training is tracked in a separate optimisation issue.
+On CUDA, the backward pass of the default `deterministic=True` adds the
+transposed map, about the same size again; `deterministic=False` avoids it.
+For very large nside, consider reducing G or kernel_sz.
 
 #### Geometry cache on disk
 
@@ -521,10 +564,10 @@ construction and reloaded afterwards: about 0.8 s to build at nside 64,
 G = 4, against about 5 ms to reload (figures from the code comments). The
 cache directory is `cache_dir`, by default `$HEALPIXCONV_CACHE` or
 `~/.cache/healpixconv`; `cache_dir=None` disables it. The key holds nside,
-`kernel_sz`, G, the gauge type and reference directions, the ellipsoid and the
-cell ids (in order), but not the dtype: the buffers are stored as int64 and
-float32, so a float64 layer built from the cache gets float32-precision
-weights. `set_kernel` also casts the kernel to float32.
+`kernel_sz`, G, the gauge type and reference directions, the ellipsoid, the
+cell ids (their raw bytes, in order) and the precision of the build: a
+float64 layer caches and reloads float64 weights. `set_kernel` copies the
+kernel in the layer dtype.
 
 #### Edges of a regional domain
 

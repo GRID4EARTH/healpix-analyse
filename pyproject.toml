@@ -50,6 +50,13 @@ benchmark = [
   "scipy>=1.11",
 ]
 
+# Fused GPU kernels of HealPixConv (CUDA only).  Optional: without it the
+# layer runs its PyTorch backend.  The Linux CUDA wheels of PyTorch usually
+# install Triton already.
+triton = [
+  "triton>=3.0",
+]
+
 # DINOv3 embeddings -- healpix_analyse.dino
 #
 # The backbone is neither vendored nor redistributed here: it is fetched at run

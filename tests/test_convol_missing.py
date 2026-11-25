@@ -28,8 +28,8 @@ def test_default_is_centre_and_state_dict_unchanged():
     a, b = _conv(), _conv(missing="centre")
     x = torch.randn(2, len(DOMAIN), dtype=torch.float64)
     assert torch.equal(a(x), b(x))
-    assert set(a.state_dict()) == {"weight", "bias", "_sort_order", "_inv_order",
-                                   "_pos_safe", "_w_norm"}
+    # the stencil geometry is rebuilt at construction, not stored (#90)
+    assert set(a.state_dict()) == {"weight", "bias", "_sort_order", "_inv_order"}
     assert set(_conv(missing="local_mean").state_dict()) == set(a.state_dict())
     with pytest.raises(ValueError):
         a(x, mask=torch.ones(len(DOMAIN)))
@@ -150,14 +150,17 @@ def test_cache_paths(tmp_path):
     x = torch.randn(2, len(DOMAIN), dtype=torch.float64)
     xn = x.clone()
     xn[0, ::7] = float("nan")
-    # the default mode and local_mean (float64 geometry) use separate files
+    # local_mean builds its geometry in float64: it shares the file of the
+    # float64 layers (_conv builds float64 layers), which holds the support;
+    # a float32 layer in the default mode has its own file
     _conv(cache_dir=tmp_path)
-    (centre_file,) = tmp_path.glob("healpixconv_*.pt")
+    (lm_file,) = tmp_path.glob("healpixconv_*.pt")
     _conv(cache_dir=tmp_path, missing="local_mean")
-    files = set(tmp_path.glob("healpixconv_*.pt"))
-    assert len(files) == 2
-    (lm_file,) = files - {centre_file}
+    assert set(tmp_path.glob("healpixconv_*.pt")) == {lm_file}
     assert "support" in load(lm_file)
+    _conv(cache_dir=tmp_path, dtype=torch.float32)
+    _conv(cache_dir=tmp_path, dtype=torch.float32, missing="local_mean")
+    assert len(set(tmp_path.glob("healpixconv_*.pt"))) == 2
     # a local_mean file without the support is recomputed once, and rewritten
     data = load(lm_file)
     del data["support"]
@@ -166,9 +169,9 @@ def test_cache_paths(tmp_path):
     a = _conv(cache_dir=tmp_path, missing="local_mean")
     torch.testing.assert_close(a(xn), ref(xn), rtol=1e-12, atol=1e-12)
     assert "support" in load(lm_file)
-    # then read back (buffers stored in float32)
+    # then read back (the cache keeps the float64 weights)
     b = _conv(cache_dir=tmp_path, missing="local_mean")
-    torch.testing.assert_close(b(xn), ref(xn), rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(b(xn), ref(xn), rtol=1e-12, atol=1e-12)
     # the default mode reads its own file
     torch.testing.assert_close(_conv(cache_dir=tmp_path)(x), _conv()(x), rtol=1e-6, atol=1e-6)
 

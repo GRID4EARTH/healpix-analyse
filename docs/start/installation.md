@@ -55,6 +55,7 @@ SciPy is never a core dependency, and new features do not rely on it.
 | `scipy` | `scipy` | the SciPy features listed above |
 | `sht` | `sht` | `quaternionic` + `spherical`, for the spin ≠ 0 transforms of `HEALPixSHT` |
 | `benchmark` | `benchmark` | SciPy, for the scripts in `benchmarks/` |
+| `triton` | `triton` | the fused CUDA kernels of `HealPixConv` ({doc}`/conv/convol`); the Linux CUDA wheels of PyTorch usually include it already |
 | `dino` | `dino` | DINOv3 embeddings via torch-hub ({doc}`/other/dino`) |
 | `dino-hf` | `dino-hf` | the same, loading the weights from Hugging Face instead |
 | `examples` | `examples` | the Sentinel-2 example scripts: xarray, zarr, obstore, UMAP, scikit-learn, matplotlib, cartopy |

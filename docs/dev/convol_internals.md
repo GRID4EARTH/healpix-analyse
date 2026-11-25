@@ -10,7 +10,8 @@ for anyone modifying the operator or checking its correctness.
 ## The three stages
 
 The layer operates in three stages that are all precomputed at construction
-time. The forward pass reduces to a single gather + einsum.
+time. The forward pass reduces to a gather and one small matrix product per
+stencil tap.
 
 ### Stage A — kernel definition and rotation
 
@@ -61,10 +62,12 @@ idx[4, K·G·P]    — absolute NESTED pixel ids of the 4 neighbours
 w  [4, K·G·P]    — bilinear weights (sum to 1 per stencil point)
 ```
 
-These are reshaped to `[G, 4, K·P]` and stored as persistent buffers
-`_pos_safe` and `_w_norm`. For regional-domain inputs, neighbours outside the
-patch are masked and weights are renormalised; stencil points with no
-available neighbour fall back to the centre pixel.
+For regional-domain inputs, neighbours outside the domain are masked and
+weights are renormalised; stencil points with no available neighbour fall back
+to the centre pixel. The result is stored tap-major, as
+`_tap_idx [P, 4, G, K]` (int32 positions of the neighbours in the order of the
+input: the sort permutation of the domain is folded in) and
+`_tap_w [P, 4, G, K]`.
 
 ### Stage C — forward pass
 
@@ -78,8 +81,7 @@ signal value is obtained by bilinear interpolation of the input map:
 x_interp[b, c, g, k, p] = Σ_{j=0}^{3}  w[g, j, k, p] · x[b, c, nbr[g, j, k, p]]
 ```
 
-The interpolated values are then contracted with the learned kernel via a
-single einsum over all gauges simultaneously:
+The interpolated values are then contracted with the learned kernel:
 
 ```
 y[b, g·C_out + o, k] = Σ_{c, p}  W[g, c, o, p] · x_interp[b, c, g, k, p]
@@ -87,15 +89,17 @@ y[b, g·C_out + o, k] = Σ_{c, p}  W[g, c, o, p] · x_interp[b, c, g, k, p]
 
 In index notation: `"bcgkp, gcop -> bgok"`.
 
-The full forward in code reduces to:
+`x_interp` is never stored whole. The PyTorch backend loops over the taps:
 
 ```python
-pos_flat  = pos.reshape(-1)                        # [G·4·K·P]
-vals_flat = t_sorted.index_select(2, pos_flat)     # [B, C_in, G·4·K·P]
-vals      = vals_flat.view(B, C_in, G, 4, K, P)
-gathered  = (vals * w_shaped).sum(dim=3)           # [B, C_in, G, K, P]
-y         = einsum("bcgkp, gcop -> bgok", gathered, W)  # [B, G, C_out, K]
+for p in range(P):                                 # x: [K, B, C_in]
+    a = sum(w[p, j, :, :, None, None] * x[idx[p, j]] for j in range(4))
+    y += bmm(a.view(G, K * B, C_in), W[..., p])    # [G, K·B, C_out]
 ```
+
+and the Triton backend fuses the same loop into one kernel, building each
+tap's tile of `x_interp` in registers. Both have a hand-written backward that
+recomputes the tile instead of storing it.
 
 ---
 

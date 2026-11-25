@@ -318,23 +318,25 @@ tools:
   ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
   io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out"
   differentiable: yes, in the input and in the kernel weights
-  gpu: yes (CUDA by default when available)
+  gpu: yes (CUDA by default when available); fused Triton kernels for float32, float16 and bfloat16 with the optional triton package
   nan: not handled by default (NaN propagates); missing="local_mean" completes NaN like pixels outside the domain
   cost: >-
     Geometry built once (about 0.8 s at nside 64, G = 4, per the code
     comments) and cached on disk (HEALPIXCONV_CACHE or ~/.cache/healpixconv).
-    The two geometry buffers [4, G, K*P] take 944 MB at nside 128, G = 4,
-    kernel 5; the forward pass gathers B*C_in*G*K*P values. GPU timing: to be
-    measured.
+    The two geometry buffers [P, 4, G, K] take 629 MB at nside 128, G = 4,
+    kernel 5. On CUDA, the default deterministic=True backward adds a
+    transposed map of about the same size, built at the first backward
+    pass; deterministic=False (fp32 atomics) avoids it. The forward and backward passes never store the
+    B*C_in*G*K*P gathered values; benchmarks/benchmark_healpix_conv.py
+    measures them.
   pros:
     - Gauge-equivariant, with four gauge types (`phi`, `cosmo`, `projected_ref`, `two_ref`) and singularities placed where you want them.
     - Whole sphere or regional patch; learned weights; NumPy or Torch.
     - Geometry cached on disk, so a second construction is fast.
   cons:
     - "Reach is `kernel_sz // 2` cells: a wide receptive field needs many layers or another tool."
-    - Outputs G*C_out channels; memory grows as B*C_in*G*K*P.
+    - Outputs G*C_out channels; the geometry grows as G*K*P, and the memory as B*C_in*G*K*P with missing='local_mean', which keeps the reference path.
     - "By default, at the edge of a regional domain, missing stencil points take the value of the centre (silent padding); `missing='local_mean'` uses the local mean instead and also completes NaN."
-    - The disk cache stores float32 buffers, so a float64 layer gets float32 geometry.
   use_instead:
     - when: the receptive field must be wide under a memory budget
       use: LargeConv
@@ -345,7 +347,7 @@ tools:
     - when: no weights are learned and the scale is in metres
       use: gaussian_filter / radial_filter
       page: conv/radial_filter
-  optional_deps: none
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
 
 - id: large_conv
   title: Wide receptive field (LargeConv) and its Gaussian recipe
