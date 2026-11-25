@@ -283,10 +283,12 @@ def bench_receptive(args):
                 for i in range(2)]
         keys = [_keys_of(m) for m in mods]
         for cname, c in cells.items():
-            S = np.array([c])
             sizes, radii = [], []
-            for n in range(layers):
-                S = keys[(layers - 1 - n) % 2](S)       # last layer first: any order works
+            for n in range(1, layers + 1):
+                # a stack of n layers, shifted=False first: walk it from the output
+                S = np.array([c])
+                for i in reversed(range(n)):
+                    S = keys[i % 2](S)
                 sizes.append(S.size)
                 ang = np.degrees(np.arccos(np.clip(vec[S] @ vec[c], -1, 1))).max()
                 radii.append(ang)
@@ -315,13 +317,14 @@ def table(args):
         rs = [r for r in recs if r["bench"] == bench]
         if not rs:
             continue
-        configs = list(dict.fromkeys((r["device"], r["config"]) for r in rs))
+        configs = list(dict.fromkeys((r["device"], r["dtype"], r["config"]) for r in rs))
         variants = list(dict.fromkeys(r["variant"] for r in rs))
         print(f"\n### {bench}\n")
         print("| device | config | variant | fwd ms | step ms | peak GiB | step vs " + ref + " |")
         print("|---|---|---|---|---|---|---|")
-        for devc, cfg in configs:
-            by = {r["variant"]: r for r in rs if (r["device"], r["config"]) == (devc, cfg)}
+        for devc, dt, cfg in configs:
+            by = {r["variant"]: r for r in rs if (r["device"], r["dtype"], r["config"]) == (devc, dt, cfg)}
+            devc = devc if dt == "float32" else f"{devc} {dt}"
             refstep = by.get(ref, {}).get("step_ms")
             for v in variants:
                 r = by.get(v)

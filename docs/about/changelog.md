@@ -26,6 +26,20 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `HealPixWindowAttention` and `HealPixNeighbourhoodAttention` (#109,
+  section 3), new page "Attention layers". Window attention runs full
+  multi-head attention inside NESTED blocks of `4**window_level` cells, by a
+  reshape and `scaled_dot_product_attention` on the full sphere and on sorted
+  domains of complete blocks, with padded and masked windows otherwise. The
+  replacement of Swin's shifted windows is the option
+  `shift="none" | "alternate_level" | "coarse_centred"`; its default is the
+  module constant `DEFAULT_WINDOW_SHIFT` (`"alternate_level"`), an open
+  question of #109. Neighbourhood attention lets each cell attend to the taps
+  of the gauge-oriented `HealPixConv` stencil, with one relative position
+  bias per head and tap; on CUDA it runs fused Triton kernels (online softmax
+  over the taps, deterministic backward without atomics), and a PyTorch loop
+  over the taps elsewhere. `benchmarks/benchmark_attention.py` compares them
+  with dense attention and with a naive gather.
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is

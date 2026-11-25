@@ -315,6 +315,7 @@ class HealPixWindowAttention(nn.Module):
             "_kv_mask",
             None if kv_index is None else torch.as_tensor(kv_index < self.N, device=device),
             persistent=False)
+        self._needs_mask = kv_index is not None and bool((kv_index >= self.N).any())
         self.register_buffer("_blocks", torch.as_tensor(blocks, device=device), persistent=False)
 
         C = self.embed_dim
@@ -326,6 +327,12 @@ class HealPixWindowAttention(nn.Module):
         """Identifiers of the window centres: cells of level ``level - effective_window_level``."""
         return self._blocks
 
+    @staticmethod
+    def _gather(t, index):
+        """t [B, N, F] -> [B, nW, T, F] at the positions ``index`` (N = zero padding)."""
+        pad = torch.cat([t, t.new_zeros(t.shape[0], 1, t.shape[2])], dim=1)
+        return pad[:, index]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``x [B, C, N] -> [B, C, N]``."""
         if x.dim() != 3 or x.shape[1] != self.embed_dim or x.shape[2] != self.N:
@@ -336,25 +343,21 @@ class HealPixWindowAttention(nn.Module):
         nB = self.n_windows
         qkv = self.qkv(x.transpose(1, 2).to(self.qkv.weight.dtype))       # [B, N, 3C]
         if self.fast:
-            win = qkv.view(B, nB, self.window_len, 3, H, D)
-            q = win[:, :, :, 0]
-            kv = win[:, :, :, 1:] if self._kv_index is None else None
+            q = qkv[..., :C].reshape(B, nB, self.window_len, H, D)
         else:
-            q = None
-            kv = None
-        if q is None or kv is None:
-            pad = torch.cat([qkv, qkv.new_zeros(B, 1, 3 * C)], dim=1)       # [B, N+1, 3C]
-            if q is None:
-                q = pad[:, self._q_index].view(B, nB, -1, 3, H, D)[:, :, :, 0]
-            kv = pad[:, self._kv_index].view(B, nB, -1, 3, H, D)[:, :, :, 1:]
+            q = self._gather(qkv[..., :C], self._q_index).view(B, nB, -1, H, D)
+        if self._kv_index is None:
+            kv = qkv[..., C:].reshape(B, nB, q.shape[2], 2, H, D)
+        else:
+            kv = self._gather(qkv[..., C:], self._kv_index).view(B, nB, -1, 2, H, D)
         Tq, Tk = q.shape[2], kv.shape[2]
         q = q.permute(0, 1, 3, 2, 4).reshape(B * nB, H, Tq, D)
         k = kv[:, :, :, 0].permute(0, 1, 3, 2, 4).reshape(B * nB, H, Tk, D)
         v = kv[:, :, :, 1].permute(0, 1, 3, 2, 4).reshape(B * nB, H, Tk, D)
         mask = None
-        if self._kv_mask is not None and not bool(self._kv_mask.all()):
-            mask = self._kv_mask.view(1, nB, 1, 1, Tk).expand(B, nB, 1, 1, Tk) \
-                .reshape(B * nB, 1, 1, Tk)
+        if self._needs_mask:
+            mask = self._kv_mask.view(1, nB, 1, 1, Tk).expand(B, nB, 1, 1, Tk)
+            mask = mask.reshape(B * nB, 1, 1, Tk)
         o = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask,
             dropout_p=self.attn_drop if self.training else 0.0)          # [B*nB, H, Tq, D]

@@ -1,0 +1,135 @@
+# Attention layers — windows and neighbourhoods
+
+Two local self-attention layers for transformer models on HEALPix grids, on
+the full sphere or on a regional domain:
+
+- `HealPixWindowAttention`: full attention inside NESTED blocks of
+  `4**window_level` cells (Swin-like windows);
+- `HealPixNeighbourhoodAttention`: each cell attends to the taps of its
+  gauge-oriented stencil, the stencil of {doc}`convol` (the HEALPix analogue
+  of neighbourhood attention).
+
+Global attention on patch tokens (ViT, MAE) needs no layer of its own: it is
+standard attention applied to the patch tokens.
+
+Both layers take `[B, C, N]` tensors (batch, channels, cells in the order of
+`cell_ids`, NESTED on the full sphere), project them to queries, keys and
+values with `num_heads` heads, and project the attention output back to `C`
+channels.
+
+## Window attention
+
+```{include} ../_generated/glance/window_attention.md
+```
+
+A window is the set of `4**w` descendants of one cell of level `level - w`.
+In NESTED order they are contiguous, so on the full sphere, and on a regional
+domain whose `cell_ids` are sorted and made of complete blocks, the windows
+are a reshape of the input followed by
+`torch.nn.functional.scaled_dot_product_attention`: no index, no mask, and
+PyTorch's flash or memory-efficient kernels run. Any other domain (unsorted,
+or with incomplete blocks) gathers its windows, pads them to a common length
+and masks the padding.
+
+```python
+import torch
+from healpix_analyse import HealPixWindowAttention
+
+layers = torch.nn.Sequential(*[
+    HealPixWindowAttention(level=8, embed_dim=128, num_heads=4, window_level=3,
+                           shifted=bool(i % 2))
+    for i in range(4)
+])
+y = layers(torch.randn(2, 128, 12 * 4**8))      # [2, 128, N]
+```
+
+### Replacing Swin's shifted windows
+
+Swin alternates its window grid with one shifted by half a window, so that
+information crosses the window borders. HEALPix blocks have no such shift.
+The option `shift` selects one of two replacements (the choice is still open
+in issue #109):
+
+| `shift` | windows | cost | receptive field |
+|---|---|---|---|
+| `"none"` | blocks of `4**w` cells at every layer | one reshape + SDPA | one block, whatever the depth |
+| `"alternate_level"` | `shifted=False`: blocks of `4**w`; `shifted=True`: blocks of `4**(w+1)` | the shifted layers attend over 4× longer windows (4× the cost) | one block of `4**(w+1)` cells after 2 layers; it grows further only through Down/Up, as in the hierarchical stages of Swin |
+| `"coarse_centred"` | queries: a block of `4**w` cells; keys: the cells within `(1 + halo) r_c` of the block centre, `r_c` the radius of the block | keys gathered and masked: about 2.5× more keys than `"none"` at `halo=0.25` | grows at every layer, across block borders |
+
+`shift=None` takes the module constant `DEFAULT_WINDOW_SHIFT`
+(`"alternate_level"`), so the default can be changed in one place.
+`benchmarks/benchmark_attention.py receptive` prints the receptive field of
+one cell after 1 to 6 layers for each option.
+
+## Neighbourhood attention
+
+```{include} ../_generated/glance/neighbourhood_attention.md
+```
+
+Cell `n` attends to the `P = kernel_sz**2` taps of the stencil of
+`HealPixConv` around it. The key and the value of a tap are the bilinear
+interpolations of the keys and values of the 4 cells around the tap point,
+with the weights of the convolution:
+
+```text
+s[h, g, n, p] = <q[h, n], k_p[h, g, n]> / sqrt(D) + bias[h, p]
+out[g, n]     = proj( sum_p softmax_p(s) v_p[g, n] )
+```
+
+The stencil is oriented by the gauge, so one relative position bias table
+`[num_heads, P]` serves the whole sphere. With `n_gauges = G`, the stencil
+turns by `pi / G` from one gauge to the next and the output stacks the G
+gauges, `[B, G*C, N]`, as `HealPixConv` does. The gauge options
+(`gauge_type`, `singularity_lonlat`, `ref_direction`) are those of
+`HealPixConv`, and the geometry shares its disk cache.
+
+On a regional domain, a tap whose 4 cells are all outside the domain is left
+out of the softmax (`outside="mask"`, the default) or reads the centre cell
+(`outside="centre"`, the rule of `HealPixConv`). A tap with some cells inside
+uses the renormalised weights of those cells.
+
+```python
+from healpix_analyse import HealPixNeighbourhoodAttention
+
+na = HealPixNeighbourhoodAttention(level=8, embed_dim=128, num_heads=4, kernel_sz=3)
+y = na(torch.randn(2, 128, 12 * 4**8))          # [2, 128, N]
+```
+
+### Backends
+
+`backend="auto"` runs fused Triton kernels on CUDA for float32, float16 and
+bfloat16 (and under `torch.autocast`) when the optional `triton` package is
+installed, and a PyTorch loop over the taps otherwise (CPU, float64).
+
+- **Forward (Triton):** one program per block of cells, batch, gauge and head
+  gathers the 4 cells of each tap in registers, then runs an online softmax
+  over the taps. The gathered keys and values `[B, H, G, N, P, D]` are never
+  stored; the layer keeps the output and one log-sum-exp per cell and head.
+- **Backward (Triton), deterministic:** a first kernel recomputes the scores
+  and writes the query gradient, the attention weights and the score
+  gradients (`P` values per cell, head and gauge). A second kernel gathers
+  the key and value gradients of each cell from the transposed stencil map,
+  in a fixed order: no atomics, the same bits at every run. The map is built
+  at the first backward pass and kept (about the size of the geometry).
+- **PyTorch:** one tap at a time, with a hand-written backward. On CUDA its
+  `index_add_` is deterministic only under
+  `torch.use_deterministic_algorithms(True)`.
+- A double backward (`create_graph=True`) runs the PyTorch backward on every
+  device.
+
+`neighbourhood_attention_naive` in `healpix_analyse._attention_backend`
+materialises the gathered keys and values; it is the reference of the tests
+and the baseline of the benchmark.
+
+## Cost
+
+- Window attention: `N * 4**w` scores per head (`"none"`), memory linear in
+  `N` with the flash and memory-efficient kernels. The gathered path of a
+  padded domain, and the overlapping keys of `"coarse_centred"`, accumulate
+  their backward with `index_put_`, whose order on CUDA is fixed only under
+  `torch.use_deterministic_algorithms(True)`.
+- Neighbourhood attention: `N * P` scores per head and gauge, linear in `N`;
+  each score reads 4 rows of keys and 4 of values. The geometry is the one of
+  a `HealPixConv` with the same arguments.
+- `benchmarks/benchmark_attention.py` measures both layers against dense
+  attention and against the naive gather.

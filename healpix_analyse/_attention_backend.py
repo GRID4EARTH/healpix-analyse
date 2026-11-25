@@ -111,83 +111,99 @@ def neighbourhood_attention_naive(q, k, v, bias, idx, w, valid=None):
 # PyTorch backend: loop over the taps, hand-written backward
 # ===========================================================================
 
+def _cells_first(t):
+    """[B, H, N, D] -> [N, B*H, D] (contiguous): the gathers read whole rows."""
+    B, H, N, D = t.shape
+    return t.permute(2, 0, 1, 3).reshape(N, B * H, D)
+
+
 def _gather_tap(t, idx_p, w_p):
-    """t [B, H, N, D]; idx_p, w_p [4, G, N] -> [B, H, G, N, D]."""
-    B, H, _, D = t.shape
+    """t [N, BH, D]; idx_p, w_p [4, G, N] -> [G, N, BH, D] = sum_j w * t[idx].
+
+    The 4 neighbours are gathered by one call (int64 indices: index_select is
+    much slower with int32 on CPU), then weighted and summed.
+    """
+    _, BH, D = t.shape
     G, N = idx_p.shape[1], idx_p.shape[2]
-    acc = None
-    for j in range(4):
-        # int64 indices: index_select / index_add_ are much slower with int32 on CPU
-        sel = t.index_select(2, idx_p[j].reshape(-1).long()).view(B, H, G, N, D)
-        sel = sel * w_p[j].to(t.dtype).view(1, 1, G, N, 1)
-        acc = sel if acc is None else acc + sel
-    return acc
+    sel = t.index_select(0, idx_p.reshape(-1).long()).view(4, G * N, BH, D)
+    wj = w_p.to(t.dtype).reshape(4, G * N, 1, 1)
+    if torch.is_grad_enabled():
+        return (sel * wj).sum(0).view(G, N, BH, D)
+    return sel.mul_(wj).sum(0).view(G, N, BH, D)
 
 
 def _scatter_tap(dst, idx_p, w_p, h):
-    """dst [B, H, N, D] += sum_j scatter of w_p[j] * h (h [B, H, G, N, D]); out of place."""
-    B, H, N_in, D = dst.shape
-    G, N = idx_p.shape[1], idx_p.shape[2]
+    """dst [N, BH, D] + the scatter of sum_j w_p[j] * h (h [G, N, BH, D])."""
+    _, BH, D = dst.shape
+    inplace = not torch.is_grad_enabled()
     for j in range(4):
-        dst = dst.index_add(
-            2, idx_p[j].reshape(-1).long(),
-            (h * w_p[j].to(h.dtype).view(1, 1, G, N, 1)).reshape(B, H, G * N, D),
-        )
+        src = (h * w_p[j].to(h.dtype).view(*w_p[j].shape, 1, 1)).reshape(-1, BH, D)
+        idx = idx_p[j].reshape(-1).long()
+        dst = dst.index_add_(0, idx, src) if inplace else dst.index_add(0, idx, src)
     return dst
 
 
-def _torch_scores(q, k, bias, idx, w, valid, scale):
-    """Scores [B, H, G, N, P], masked taps at -inf."""
-    P = idx.shape[0]
-    cols = []
-    for p in range(P):
-        kt = _gather_tap(k, idx[p], w[p])
-        cols.append((q.unsqueeze(2) * kt).sum(-1))
+def _torch_scores(qt, kt, bias, idx, w, valid, scale, B):
+    """Scores [G, N, BH, P] (cells-first inputs), masked taps at -inf."""
+    cols = [(qt * _gather_tap(kt, idx[p], w[p])).sum(-1) for p in range(idx.shape[0])]
     s = torch.stack(cols, dim=-1) * scale
     if bias is not None:
-        s = s + bias.to(s.dtype)[None, :, None, None, :]
+        s = s + bias.to(s.dtype).repeat(B, 1)                     # [BH, P]
     if valid is not None:
-        s = s.masked_fill(~valid.bool().permute(1, 2, 0)[None, None], float("-inf"))
+        s = s.masked_fill(~valid.bool().permute(1, 2, 0)[:, :, None, :], float("-inf"))
     return s
 
 
 def _torch_forward(q, k, v, bias, idx, w, valid, scale):
-    """Returns out [B, G, H, N, D] and the probabilities a [B, H, G, N, P]."""
-    a = torch.softmax(_torch_scores(q, k, bias, idx, w, valid, scale), dim=-1)
+    """Returns out [B, G, H, N, D] and the probabilities a [G, N, BH, P]."""
+    B, H, N, D = q.shape
+    G = idx.shape[2]
+    qt, kt, vt = _cells_first(q), _cells_first(k), _cells_first(v)
+    a = torch.softmax(_torch_scores(qt, kt, bias, idx, w, valid, scale, B), dim=-1)
     out = None
     for p in range(idx.shape[0]):
-        term = a[..., p, None] * _gather_tap(v, idx[p], w[p])
-        out = term if out is None else out + term
-    return out.permute(0, 2, 1, 3, 4).contiguous(), a
+        vp = _gather_tap(vt, idx[p], w[p])
+        if out is None:
+            out = vp.mul_(a[..., p, None]) if not torch.is_grad_enabled() else vp * a[..., p, None]
+        else:
+            out = out.addcmul(a[..., p, None], vp)
+    out = out.view(G, N, B, H, D).permute(2, 0, 3, 1, 4).contiguous()
+    return out, a
 
 
 def _torch_backward(q, k, v, bias, idx, w, valid, scale, out, a, gout, needs):
     """Gradients of q, k, v, bias.  ``a`` None: recomputed (double backward)."""
     need_q, need_k, need_v, need_b = needs
+    B, H, N, D = q.shape
+    G = idx.shape[2]
+    qt, kt, vt = _cells_first(q), _cells_first(k), _cells_first(v)
     if a is None:
-        a = torch.softmax(_torch_scores(q, k, bias, idx, w, valid, scale), dim=-1)
-    go = gout.to(q.dtype).permute(0, 2, 1, 3, 4)                # [B, H, G, N, D]
-    o = out.permute(0, 2, 1, 3, 4)
-    delta = (go * o).sum(-1)                                    # [B, H, G, N]
-    P = idx.shape[0]
-    dq = torch.zeros_like(q) if need_q else None
-    dk = torch.zeros_like(k) if need_k else None
-    dv = torch.zeros_like(v) if need_v else None
+        a = torch.softmax(_torch_scores(qt, kt, bias, idx, w, valid, scale, B), dim=-1)
+    go = gout.to(q.dtype).permute(1, 3, 0, 2, 4).reshape(G, N, B * H, D)
+    o = out.permute(1, 3, 0, 2, 4).reshape(G, N, B * H, D)
+    delta = (go * o).sum(-1)                                    # [G, N, BH]
+    dq = torch.zeros_like(qt) if need_q else None
+    dk = torch.zeros_like(kt) if need_k else None
+    dv = torch.zeros_like(vt) if need_v else None
     ds_cols = []
-    for p in range(P):
+    for p in range(idx.shape[0]):
         a_p = a[..., p]
-        ds_p = a_p * ((go * _gather_tap(v, idx[p], w[p])).sum(-1) - delta)
+        ds_p = a_p * ((go * _gather_tap(vt, idx[p], w[p])).sum(-1) - delta)
         ds_cols.append(ds_p)
         if need_q:
-            dq = dq + (ds_p[..., None] * _gather_tap(k, idx[p], w[p])).sum(2) * scale
+            dq = dq + (ds_p[..., None] * _gather_tap(kt, idx[p], w[p])).sum(0) * scale
         if need_k:
-            dk = _scatter_tap(dk, idx[p], w[p], ds_p[..., None] * q.unsqueeze(2) * scale)
+            dk = _scatter_tap(dk, idx[p], w[p], ds_p[..., None] * qt * scale)
         if need_v:
             dv = _scatter_tap(dv, idx[p], w[p], a_p[..., None] * go)
+
+    def back(t):
+        return None if t is None else t.view(N, B, H, D).permute(1, 2, 0, 3)
+
     db = None
     if need_b:
-        db = torch.stack(ds_cols, dim=-1).sum(dim=(0, 2, 3)).to(bias.dtype)   # [H, P]
-    return dq, dk, dv, db
+        db = torch.stack(ds_cols, dim=-1).view(G, N, B, H, -1).sum(dim=(0, 1, 2)).to(bias.dtype)
+    return back(dq), back(dk), back(dv), db
 
 
 # ===========================================================================
