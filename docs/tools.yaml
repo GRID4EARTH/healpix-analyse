@@ -350,6 +350,89 @@ tools:
       page: conv/radial_filter
   optional_deps: triton (triton extra), only for the fused CUDA kernels
 
+- id: window_attention
+  title: Window attention on NESTED blocks (HealPixWindowAttention)
+  family: A
+  page: conv/attention
+  status: experimental
+  symbols: [HealPixWindowAttention, WINDOW_SHIFTS, DEFAULT_WINDOW_SHIFT]
+  also: [shift, shifted, halo]
+  summary: >-
+    A torch nn.Module for Swin-like transformers: multi-head attention of
+    the cells of each NESTED block of 4**window_level cells over their
+    window; by default the windows are centred on the cells of a coarser
+    level and overlap across the block borders (`shift`).
+  tasks:
+    - build a Swin-like transformer layer on the sphere or on a regional domain
+    - attend over all the cells of a NESTED block (local self-attention)
+  keywords: [attention, transformer, Swin, window attention, self-attention, flash attention, deep learning]
+  domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction
+  ordering: NESTED; sorted domains of complete blocks take the reshape path, other orders are gathered and masked
+  ellipsoid: '"WGS84" for the cell centres of shift="coarse_centred"'
+  io: "[B, C, N] -> [B, C, N]"
+  differentiable: yes, in the input and the projections
+  gpu: yes; fused flash-style Triton kernels (float32, float16, bfloat16, autocast) with the optional triton package, deterministic backward
+  nan: not handled (NaN propagates)
+  cost: >-
+    N * 4**w scores per head with shift="none"; with the default
+    shift="coarse_centred", 3.4-3.8 times more at halo=0.25 and 2.2-3.1 times
+    more at halo=0 (window_level 1 to 4); memory linear in N.
+    benchmarks/benchmark_attention.py measures it against dense attention.
+  pros:
+    - Fused Triton kernels on every kind of window (padded, unsorted, overlapping), with a deterministic backward.
+    - The receptive field grows at every layer by default; the default is a module constant.
+  cons:
+    - Windows follow the NESTED base-cell axes, not the gauge.
+    - Without Triton (or on CPU), the backward of the gathered windows uses index_put_ (deterministic on CUDA only under torch.use_deterministic_algorithms).
+  use_instead:
+    - when: each cell should attend to a small gauge-oriented neighbourhood
+      use: HealPixNeighbourhoodAttention
+      page: conv/attention
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
+
+- id: neighbourhood_attention
+  title: Neighbourhood attention on the gauge stencil (HealPixNeighbourhoodAttention)
+  family: A
+  page: conv/attention
+  status: experimental
+  symbols: [HealPixNeighbourhoodAttention]
+  also: [attend, outside, pos_bias]
+  summary: >-
+    A torch nn.Module where each cell attends to the kernel_sz x kernel_sz
+    taps of the gauge-oriented stencil of HealPixConv, with one relative
+    position bias per head and tap shared over the sphere; fused Triton
+    kernels on CUDA.
+  tasks:
+    - build a local self-attention layer (neighbourhood attention, NATTEN-like) on the sphere or a regional domain
+    - replace a HealPixConv by attention over the same stencil
+  keywords: [attention, transformer, neighbourhood attention, NATTEN, local attention, gauge, relative position bias, deep learning]
+  domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction (any order)
+  ordering: NESTED
+  ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
+  io: "[B, C, N] -> [B, G*C, N] (G = n_gauges)"
+  differentiable: yes, in the input, the projections and the position bias
+  gpu: yes; fused Triton kernels (float32, float16, bfloat16, autocast) with the optional triton package, deterministic backward
+  nan: not handled (NaN propagates)
+  cost: >-
+    N * P scores per head and gauge, linear in N; the gathered keys and values
+    are never stored. Geometry as HealPixConv with the same arguments, plus a
+    transposed map built at the first backward on the Triton path.
+    benchmarks/benchmark_attention.py measures it against the naive gather.
+  pros:
+    - Gauge-oriented like HealPixConv, so one bias table serves the whole sphere.
+    - Deterministic Triton backward with no atomics; PyTorch reference with double backward.
+  cons:
+    - "Reach is `kernel_sz // 2` cells per layer."
+    - Outputs G*C channels with several gauges.
+  use_instead:
+    - when: attention over larger blocks with PyTorch's flash kernels
+      use: HealPixWindowAttention
+      page: conv/attention
+    - when: a fixed linear combination of the stencil is enough
+      use: HealPixConv
+      page: conv/convol
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
+
 - id: large_conv
   title: Wide receptive field (LargeConv) and its Gaussian recipe
   family: A
@@ -854,19 +937,24 @@ tools:
   ellipsoid: '"WGS84" (the only accepted value with the cell-centre neighbourhood)'
   io: "values [..., N] -> [..., len(domain)]; NumPy in -> NumPy out; dtype depends on the reduction"
   differentiable: for mean, sum, min, max, median, std (Torch); not for count, mode, any, all
-  gpu: the reduction runs on the input device; neighbourhoods built on CPU
+  gpu: >-
+    the reduction runs on the input device; fused Triton kernels on CUDA for
+    sum, mean, min, max and median (optional triton extra); neighbourhoods
+    built on CPU
   nan: propagates (mean, std, min, max, median)
   cost: >-
-    A Python loop over the output cells; in one CPU test (20 000 cells,
-    level 12, 3 km) mean_filter took about 0.5 s per call, slower than
-    radial_filter with a top-hat kernel. HealPixNeighbourReducer keeps the
-    neighbourhoods between calls.
+    Neighbourhoods built once (vectorised NumPy, plus healpix-geo and pyproj
+    geodesics); a call is a gather-reduce over the padded neighbourhoods,
+    with no per-cell loop: a loop over the neighbours on CPU, one fused
+    kernel on CUDA, and a deterministic hand-written backward.
+    HealPixNeighbourReducer keeps the neighbourhoods between calls;
+    neighbour_reduce rebuilds them. Timings in benchmarks/benchmark_reductions.py.
   pros:
     - Ten reductions, including categorical ones (mode, any, all, count).
     - Radius in metres, the same meaning at every level.
   cons:
     - NaN propagates; no weights.
-    - Not the cheapest operator (per-cell Python loop).
+    - neighbour_reduce rebuilds the neighbourhoods at every call (use HealPixNeighbourReducer).
   use_instead:
     - when: a weighted or NaN-aware mean
       use: radial_filter / gaussian_filter
@@ -880,7 +968,7 @@ tools:
   title: East/North gradient of a scalar field (gradient)
   family: B
   page: stats/gradient
-  symbols: [gradient, gradient_magnitude, directional_derivative]
+  symbols: [gradient, gradient_magnitude, directional_derivative, HealPixGradient]
   summary: >-
     Least-squares East and North derivatives of a scalar field from the
     immediate neighbours of each cell, in units per metre on WGS84; its
@@ -889,20 +977,32 @@ tools:
     - compute the slope, gradient or gradient magnitude of a field (e.g. a DEM, SST fronts)
     - do: compute the derivative of a field along a direction (azimuth from North)
       use: [directional_derivative]
+    - do: compute gradients of many fields or batches (e.g. inside a model) without rebuilding the geometry
+      use: [HealPixGradient]
   keywords: [gradient, slope, aspect, DEM, fronts, derivative, east, north, azimuth]
   domain: whole sphere or regional set of cell ids; `domain` selects the output cells
   ordering: NESTED
   ellipsoid: hard-coded "WGS84" (no argument)
-  io: "1-D values only -> (grad_east, grad_north) in units per metre; NumPy in -> NumPy out"
-  differentiable: yes (Torch)
-  gpu: the fit runs on the input device; geometry on CPU at every call
+  io: "gradient(): 1-D values; HealPixGradient: values [..., N] -> (grad_east, grad_north) [..., len(domain)] in units per metre; NumPy in -> NumPy out"
+  differentiable: >-
+    yes (Torch); on CUDA with the optional triton extra a deterministic
+    hand-written backward (fused kernels), elsewhere autograd through the
+    reference fit
+  gpu: >-
+    the fit runs on the input device: fused Triton kernels on CUDA with the
+    optional triton extra (float32, float64, and float16 / bfloat16 with fp32
+    accumulation); geometry built on CPU
   nan: NaN neighbours are dropped; a cell gets NaN when its value is not finite or fewer than 2 valid neighbours remain or the fit is degenerate
-  cost: the geometry is rebuilt at every call (no cache); to be measured
+  cost: >-
+    gradient() rebuilds the WGS84 geometry at every call (most of its time);
+    HealPixGradient builds it once; a call is then the vectorised fit on CPU,
+    and one fused kernel (no [N, K] tensor) on CUDA with Triton. Timings in
+    benchmarks/benchmark_reductions.py.
   pros:
     - True East/North directions and metric distances, no Cartesian assumption.
     - Works on regional domains and across base-cell boundaries.
   cons:
-    - One 1-D field per call; no radius, no weights (immediate neighbours only).
+    - gradient() takes one 1-D field per call (HealPixGradient takes batches); no radius, no weights (immediate neighbours only).
     - WGS84 hard-coded.
   use_instead:
     - when: a smoother gradient over a larger scale
@@ -933,7 +1033,11 @@ tools:
   ellipsoid: '"sphere" (HealPixDivCurl); inherited from the HealPixDecomp ("WGS84" by default) for HealPixMultiScaleDivCurl'
   io: "[..., 2, N] (u, v) -> [..., 2, N] (div, curl) in 1/s for m/s input; NumPy in -> NumPy out"
   differentiable: yes, in the input
-  gpu: yes (CUDA by default when available)
+  gpu: >-
+    yes (CUDA by default when available); with the optional triton extra the
+    embedding of (u, v) and the contraction to divergence / curl around the
+    HealPixConv stencil are fused kernels, forward and backward (float32 and
+    float64, the dtypes of the module)
   nan: not handled; NaN propagates
   cost: one HealPixConv per scale; geometry cached on disk by HealPixConv
   pros:
@@ -1059,18 +1163,21 @@ tools:
   domain: whole sphere or regional set of cell ids at construction
   ordering: NESTED
   ellipsoid: '"WGS84"'
-  io: "[N] or [B, N] only -> tuple (y, cell_ids_out); cast to dtype (float32 by default)"
+  io: "[N], [B, N] or [..., N] (leading dims flattened by a view) -> tuple (y, cell_ids_out); cast to dtype (float32 by default)"
   differentiable: yes (maxpool almost everywhere, the gradient goes to the largest child)
   gpu: yes (CUDA by default when available)
   nan: '"smooth" spreads NaN; "mean" keeps it to the parent, or ignores it with skipna=True'
-  cost: a sparse matrix built once at construction (about 1.5 s at level 8 for smooth in the documented benchmark), then one sparse product
+  cost: >-
+    "mean" / "maxpool" on contiguous NESTED data (full sphere, sorted complete regional domain): a view and a reduction, no stored index.
+    "smooth": a sparse matrix built once at construction (about 1.5 s at level 8 in the documented benchmark), applied as an ELL gather
+    (Triton kernel on CUDA, embedding_bag elsewhere; backend="csr" for the CSR reference)
   pros:
     - Four modes, with a table of what each conserves.
     - Whole sphere or regional domain; NumPy or Torch.
   cons:
     - "`\"smooth\"` does not conserve the global mean."
     - "Known issue: `\"maxpool\"` on a regional domain gives a parent with missing children the value of the first input cell."
-    - Only [N] or [B, N] inputs; returns a tuple.
+    - Returns a tuple.
   use_instead:
     - when: several levels at once, or another output domain
       use: resample_healpix
@@ -1095,11 +1202,11 @@ tools:
   domain: whole sphere or regional set of coarse cell ids
   ordering: NESTED
   ellipsoid: '"WGS84" (or that of paired_down)'
-  io: "[N] or [B, N] only -> tuple (y, cell_ids_out)"
+  io: "[N], [B, N] or [..., N] (leading dims flattened by a view) -> tuple (y, cell_ids_out)"
   differentiable: yes
   gpu: yes
   nan: not handled
-  cost: sparse matrix built once, then one sparse product
+  cost: sparse matrix built once, then one ELL gather (Triton kernel on CUDA); an expand with no stored matrix when paired with a "mean" Down on contiguous NESTED data
   pros:
     - "`col_l1` with `weight_norm=\"l1\"` preserves constants; `paired_down` reuses the exact Down matrix."
   cons:
@@ -1253,6 +1360,118 @@ tools:
       use: HealPixConv / LargeConv
       page: conv/compare_wide
   optional_deps: "termcolor (dino extra, torch-hub route) or transformers (dino-hf extra)"
+
+- id: masked_norm
+  title: Masked normalisation layers (HealPixGroupNorm, HealPixLayerNorm, HealPixBatchNorm)
+  family: D
+  page: other/masked_norm
+  status: experimental
+  symbols: [HealPixGroupNorm, HealPixLayerNorm, HealPixBatchNorm]
+  also: [fill, backend, masked_norm_reference]
+  summary: >-
+    GroupNorm, LayerNorm (over the channels of each cell) and BatchNorm (with
+    running statistics) for [B, C, N] HEALPix data, with a validity mask or a
+    coverage: cells of weight 0 (NaN by default) do not enter the statistics,
+    and their output is 0, NaN or the input (fill=).
+  tasks:
+    - do: normalise the activations of a spherical CNN or transformer when some cells are missing (clouds, land, outside the swath)
+      use: [HealPixGroupNorm, HealPixLayerNorm, HealPixBatchNorm]
+    - weight the statistics of a normalisation by the coverage of each cell
+  keywords: [GroupNorm, LayerNorm, BatchNorm, normalisation, normalization, mask, coverage, NaN, missing data, deep learning]
+  domain: the cells of the input, full sphere or regional domain, in any order
+  ordering: any (the layers do not use the cell ids)
+  io: "x [B, C, N] and mask [N], [B, N] or [B, C, N] (bool or float in [0, 1]) -> [B, C, N], same dtype"
+  differentiable: yes, in x and in the affine parameters (the mask is not differentiated); exact gradients, double backward through the PyTorch reference
+  gpu: yes; fused Triton kernels (float32, float16, bfloat16, fp32 accumulation, deterministic) with the optional triton package
+  nan: NaN and inf are invalid cells; they never reach the output (except fill="passthrough") or the gradients
+  cost: >-
+    Triton forward 3 passes over x for GroupNorm / BatchNorm (one-pass
+    statistics, then normalisation and affine step), 2 for LayerNorm with
+    C <= 512; backward 5 and 3. benchmarks/benchmark_layers.py measures them
+    against torch.nn (see the page).
+  pros:
+    - Same parameters and state_dict as torch.nn.GroupNorm / LayerNorm / BatchNorm1d; with an all-valid mask the outputs are the same.
+    - Coverage weights (cells have equal area); deterministic Triton kernels with a PyTorch reference.
+  cons:
+    - Experimental. LayerNorm normalises over the channels of each cell only (for channels and cells use HealPixGroupNorm(1, C)).
+    - The masked PyTorch path (CPU, float64, CUDA without Triton) is 2-15x slower than the unmasked torch.nn layer.
+  use_instead:
+    - when: every cell is valid and speed is all that matters
+      use: torch.nn.GroupNorm / LayerNorm / BatchNorm1d
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
+
+- id: masked_pool
+  title: Masked global and regional pooling (global_pool, region_pool)
+  family: D
+  page: other/masked_norm#pooling
+  status: experimental
+  symbols: [HealPixGlobalPool, HealPixRegionPool, global_pool, region_pool]
+  also: [from_cell_ids]
+  summary: >-
+    Mean, sum or max of [B, C, N] HEALPix data over all the cells or over
+    labelled regions (for instance the parent cells of a coarser level),
+    weighted by a validity mask or a coverage.
+  tasks:
+    - do: pool the features of a classification or regression head over the full sphere or a regional domain, ignoring missing cells
+      use: [global_pool, HealPixGlobalPool]
+    - do: average features over labelled regions (basins, countries, coarser cells) with a mask
+      use: [region_pool, HealPixRegionPool]
+  keywords: [pooling, global average pooling, max pooling, regional mean, mask, coverage, readout]
+  domain: the cells of the input, full sphere or regional domain, in any order
+  ordering: any; HealPixRegionPool.from_cell_ids builds regions from NESTED ids
+  io: "x [B, C, N] -> [B, C] (global) or [B, C, R] (regions)"
+  differentiable: yes, in x
+  gpu: yes; Triton kernels (one read of x, CSR int32 regions, no atomics) with the optional triton package
+  nan: NaN cells are invalid; a region without valid cells gets 0 or NaN (fill=)
+  cost: >-
+    One read of x on both backends. Triton: region_pool reads contiguous
+    sorted regions as one tile, other regions through a CSR (int32) gather.
+    PyTorch: region_pool gathers the cells into a padded [B, C, R, L] tensor
+    (L = size of the largest region).
+  pros:
+    - Area weighting is exact (equal-area cells); deterministic forward and backward.
+  cons:
+    - Experimental. Very unequal regions waste memory in the padded layout.
+  use_instead:
+    - when: one level coarser on every cell, keeping the grid
+      use: HealPixDown
+      page: other/down
+  optional_deps: triton (triton extra), only for the CUDA kernels
+
+- id: positional_encoding
+  title: Positional encodings of HEALPix cells (HealPixPositionalEncoding)
+  family: D
+  page: other/positional_encoding
+  status: experimental
+  symbols: [HealPixPositionalEncoding, healpix_positional_encoding, positional_encoding_cache_info, clear_positional_encoding_cache]
+  also: [feature_names, frequencies, gauge_type, include_level]
+  summary: >-
+    Fourier features of the cell-centre unit vector (x, y, z) at several
+    frequencies, optionally the gauge angle of HealPixConv and the level,
+    computed once per domain and cached.
+  tasks:
+    - do: give a transformer or a CNN on HEALPix cells the position of each cell
+      use: [HealPixPositionalEncoding]
+    - add position channels to the input of a model on a regional domain
+  keywords: [positional encoding, Fourier features, position embedding, transformer, ViT, tokens, coordinates]
+  domain: full sphere (cell_ids=None) or a regional set of cell ids, in any order
+  ordering: NESTED ids
+  ellipsoid: '"WGS84" (geodetic latitude of the cell centres from healpix-geo)'
+  io: "-> [F, N] tensor; the module also concatenates it to x [B, C, N]"
+  differentiable: no (a constant input)
+  gpu: yes; one Triton kernel writes all the features (optional triton package); the module buffer follows .to()
+  cost: >-
+    healpix-geo cell centres at the first call for a domain, then an
+    in-memory cache (8 domains) keyed by a hash of the cell ids; F x N
+    values in the output.
+  pros:
+    - One shared encoding for every model; unsorted regional domains supported.
+  cons:
+    - Experimental. Stores F x N values (F = 3 + 6 x number of frequencies + extras) on the device.
+  use_instead:
+    - when: a learned position embedding per token
+      use: a torch.nn.Parameter of shape [F, N]
+  optional_deps: triton (triton extra), only for the CUDA kernel
 
 - id: validation
   title: Reference convolution for tests (validation)
