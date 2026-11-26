@@ -350,6 +350,52 @@ tools:
       page: conv/radial_filter
   optional_deps: triton (triton extra), only for the fused CUDA kernels
 
+- id: patches
+  title: Patch tokens and their fold (HealPixPatches)
+  family: A
+  page: conv/patches
+  status: experimental
+  symbols: [HealPixPatches]
+  also: [fold, centre_ids, coverage, index, zorder]
+  summary: >-
+    Cut a field into square N x N patches (N a power of 2), the tokens of
+    ViT, MAE and JEPA models: gauge-oriented grids sampled like a HealPixConv
+    kernel, or NESTED tiles; plus the adjoint fold and masked token sampling.
+  tasks:
+    - extract patch tokens for a ViT, MAE or JEPA model on the sphere or a regional domain
+    - do: keep only part of the tokens (MAE masking) and gather only those
+      use: [HealPixPatches]
+    - do: fold patches back onto the cells (MAE decoder, dense head)
+      use: [HealPixPatches.fold]
+  keywords: [ViT, MAE, JEPA, tokens, patch embedding, foundation model, transformer, fold, unfold, masking]
+  domain: whole sphere (cell_ids=None) or a regional set of cell ids, in any order, given at construction
+  ordering: NESTED
+  ellipsoid: none (the grid is placed on the sphere of the HEALPix grid)
+  io: "[B, C, K] -> [B, M, G, C, N, N] (M centres, G gauges); fold: [B, M, G, C, N, N] -> [B, C, K]"
+  differentiable: yes, forward and fold, to any order
+  gpu: yes; fused Triton kernels for float32, float16 and bfloat16 with the optional triton package, deterministic backward
+  nan: not handled (NaN propagates); cells outside the domain are 0, with their fraction in `coverage`
+  cost: >-
+    Geometry of 32*M*G*N^2 bytes in gauge mode (M*N^2 = K for coarse
+    centres), built at construction, not cached on disk.
+    benchmarks/benchmark_patches.py measures the extraction, its backward
+    and the fold against a plain gather of the same size.
+  pros:
+    - "Gauge-oriented tokens: the same orientation everywhere, unlike face-oriented NESTED tiles."
+    - "Masked sampling: an MAE that keeps 25 % of the tokens gathers only those, with one draw per sample."
+    - "`mode=\"nested\"` is a view plus one gather on complete domains (`zorder=True`: zero-copy)."
+  cons:
+    - "Experimental. With coarse centres, the gauge squares do not tile the diamond-shaped cells: from N = 8, the fold misses the tips of the diamonds."
+    - "With `index`, the fold costs as much as a full fold."
+  use_instead:
+    - when: NumPy tiles for the DINOv3 pipeline, with mean filling of the gaps
+      use: nested_to_tiles
+      page: other/dino
+    - when: a learned local filter rather than tokens
+      use: HealPixConv
+      page: conv/convol
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
+
 - id: window_attention
   title: Window attention on NESTED blocks (HealPixWindowAttention)
   family: A
