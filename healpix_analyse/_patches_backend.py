@@ -377,13 +377,13 @@ if _HAS_TRITON:
         v = tl.load(y_base + off, mask=ok[:, None] & c_ok[None, :], other=0.0)
         return wv, v.to(tl.float32), ok
 
-    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "HAS_MARK", "CL", "SIZE"])
+    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "HAS_MARK", "CL", "UNROLL", "SIZE"])
     @triton.jit
     def _fold_kernel(y_ptr, inv_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr, mark_ptr,
                      C, K, NY, G, P, INV_SB, MARK_SB, SIZE,
                      HAS_INV: tl.constexpr, NORM: tl.constexpr, WRITE_SCALE: tl.constexpr,
                      CL: tl.constexpr, HAS_MARK: tl.constexpr, MARK_SHIFT: tl.constexpr,
-                     BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr):
+                     UNROLL: tl.constexpr, BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr):
         """x[b, c, s] = sum_e tw[e] y[b, i(e), g(e), c, p(e)] / norm[b, s], no atomics.
 
         ``y`` is ``[B, NY, G, C, P]`` (``[B, NY, G, P, C]`` with ``CL``).
@@ -422,7 +422,10 @@ if _HAS_TRITON:
         start = tl.load(ptr_ptr + s, mask=act, other=0)
         n = tl.load(ptr_ptr + s + 1, mask=act, other=0) - start
         n_max = tl.max(n, axis=0)
-        n_four = (n_max // 4) * 4
+        if UNROLL:
+            n_four = (n_max // 4) * 4
+        else:   # wide channel tiles: one entry at a time (occupancy)
+            n_four = n_max * 0
         y_base = y_ptr + b * NY * G * C * P
         inv_base = inv_ptr + b * INV_SB
         acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
@@ -485,6 +488,10 @@ def _size_class(n):
 # staged gather is 1.2-1.6x faster for C = 16 and 1.15x slower for C = 3.
 GATHER_CL_MIN_C = 8
 FOLD_CL_MIN_C = 1
+# The fold keeps four entries of each cell in flight when its channel tile
+# has at most this many channels: 1.4x faster at C = 3 on an A100, but 12 %
+# slower for the masked fold at C = 16 (four [64, 16] tiles in registers).
+FOLD_UNROLL_MAX_C = 8
 
 
 def _triton_extract(x, geom, sel):
@@ -550,7 +557,8 @@ def _triton_fold(y, geom, inv=None, norm="none", want_scale=False, mark=None):
             scale if scale is not None else tw, mark_t if mark_t is not None else ptr,
             C, K, NY, G, P, inv_sb, mark_sb, _size_class(K),
             HAS_INV=inv is not None, NORM=mode, WRITE_SCALE=scale is not None, CL=cl,
-            HAS_MARK=mark_t is not None, MARK_SHIFT=shift, BLOCK_C=BLOCK_C,
+            HAS_MARK=mark_t is not None, MARK_SHIFT=shift,
+            UNROLL=BLOCK_C <= FOLD_UNROLL_MAX_C, BLOCK_C=BLOCK_C,
         )
     return x, scale
 
