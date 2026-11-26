@@ -493,6 +493,26 @@ def test_fused_kernels_interpreter(antialias, zoom):
         (g,) = torch.autograd.grad(o.x, x, gy)
         res[be] = (o.x.detach(), o.valid, o.labels, g)
     a, r = res["auto"], res["torch"]
-    torch.testing.assert_close(a[0], r[0], rtol=1e-5, atol=1e-5)
+    assert torch.equal(a[0], r[0])          # bit-identical forward
     assert torch.equal(a[1], r[1]) and torch.equal(a[2], r[2])
     torch.testing.assert_close(a[3], r[3], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("kind", ["block", "scattered"])
+def test_nest_table_lookup(kind):
+    """Two-level NESTED -> position table of the fused kernel, against the ids."""
+    rng = np.random.default_rng(0)
+    if kind == "block":
+        ids = rng.permutation(BLOCK)
+    else:
+        ids = 37 * 4**6 + rng.choice(4**6, 1500, replace=False)
+    aug = HealPixAugment([RandomRotation()], LEVEL, ids)
+    _, parent, block, kb = aug.grid.nest_table(0, "cpu")
+    allc = torch.arange(36 * 4**6, 39 * 4**6)
+    slot = parent[allc >> kb].long()
+    pos = torch.where(slot >= 0, block[slot.clamp_min(0) * (1 << kb) + (allc & ((1 << kb) - 1))].long(),
+                      torch.full_like(allc, -1))
+    expect = torch.full_like(allc, -1)
+    expect[torch.as_tensor(ids) - 36 * 4**6] = torch.arange(ids.size)
+    assert torch.equal(pos, expect)
+    assert parent.numel() + block.numel() <= 12 * 4**LEVEL

@@ -88,6 +88,7 @@ def _sync(dev):
 
 
 def _time(fn, dev, reps):
+    fn()  # two warm-up calls: the first one may autotune / compile
     fn()
     _sync(dev)
     ts = []

@@ -340,22 +340,90 @@ if _HAS_TRITON:
         return sp + i1, sp + i2, 1.0 - w1, w1
 
     @triton.jit
+    def _tl_isqrt(v):
+        v = tl.maximum(v, 0)
+        r = tl.floor(tl.sqrt(v.to(tl.float64))).to(tl.int64)
+        r = r - (r * r > v).to(tl.int64)
+        r = r + ((r + 1) * (r + 1) <= v).to(tl.int64)
+        return r
+
+    @triton.jit
+    def _tl_spread(x):
+        x = x & 0x00000000FFFFFFFF
+        x = (x | (x << 16)) & 0x0000FFFF0000FFFF
+        x = (x | (x << 8)) & 0x00FF00FF00FF00FF
+        x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0F
+        x = (x | (x << 2)) & 0x3333333333333333
+        x = (x | (x << 1)) & 0x5555555555555555
+        return x
+
+    @triton.jit
+    def _tl_ring2nest(pix, ORDER: tl.constexpr):
+        """Closed-form HEALPix ring2xyf + xyf2nest (same as :func:`ring_to_nest`)."""
+        n: tl.constexpr = 1 << ORDER
+        ncap: tl.constexpr = 2 * n * (n - 1)
+        npix: tl.constexpr = 12 * n * n
+        nl2: tl.constexpr = 2 * n
+        # north polar cap
+        ir_n = (1 + _tl_isqrt(1 + 2 * pix)) >> 1
+        ir_n_s = tl.maximum(ir_n, 1)
+        iphi_n = (pix + 1) - 2 * ir_n * (ir_n - 1)
+        face_n = (iphi_n - 1) // ir_n_s
+        # equatorial belt
+        ip = tl.maximum(pix - ncap, 0)
+        tmp = ip >> (ORDER + 2)
+        ir_e = tmp + n
+        iphi_e = ip - tmp * 4 * n + 1
+        ks_e = (ir_e + n) & 1
+        ire = tmp + 1
+        irm = nl2 + 1 - tmp
+        ifm = (iphi_e - (ire >> 1) + n - 1) >> ORDER
+        ifp = (iphi_e - (irm >> 1) + n - 1) >> ORDER
+        face_e = tl.where(ifp == ifm, ifp | 4, tl.where(ifp < ifm, ifp, ifm + 8))
+        # south polar cap
+        ips = tl.maximum(npix - pix, 1)
+        ir_s = (1 + _tl_isqrt(2 * ips - 1)) >> 1
+        ir_s_s = tl.maximum(ir_s, 1)
+        iphi_s = 4 * ir_s + 1 - (ips - 2 * ir_s * (ir_s - 1))
+        face_s = (iphi_s - 1) // ir_s_s + 8
+        north = pix < ncap
+        eq = (pix >= ncap) & (pix < npix - ncap)
+        iring = tl.where(north, ir_n, tl.where(eq, ir_e, 2 * nl2 - ir_s))
+        iphi = tl.where(north, iphi_n, tl.where(eq, iphi_e, iphi_s))
+        nr = tl.where(north, ir_n, tl.where(eq, n, ir_s))
+        kshift = tl.where(eq, ks_e, 0)
+        face = tl.minimum(tl.maximum(tl.where(north, face_n, tl.where(eq, face_e, face_s)), 0), 11)
+        # jpll = (1, 3, 5, 7, 0, 2, 4, 6, 1, 3, 5, 7)[face]
+        jpll = 2 * (face & 3) + ((face >> 2) != 1).to(tl.int64)
+        irt = iring - (2 + (face >> 2)) * n + 1
+        ipt = 2 * iphi - jpll * nr - kshift - 1
+        ipt = tl.where(ipt >= nl2, ipt - 8 * n, ipt)
+        ix = (ipt - irt) >> 1
+        iy = (-ipt - irt) >> 1
+        return (face << (2 * ORDER)) + _tl_spread(ix) + (_tl_spread(iy) << 1)
+
+    @triton.jit
     def _tl_find(key, rs_ptr, rp_ptr, n_rs, MODE: tl.constexpr, LOG2: tl.constexpr):
-        if MODE == 1:
-            pos = tl.load(rs_ptr + key)
-            present = key >= 0
+        """Position in the source array of the RING cell ``key`` (level ``LOG2``).
+
+        No search: the RING id is converted to NESTED in closed form.
+        ``MODE == 0`` (full sphere): the NESTED id is the position.
+        ``MODE == 1`` (regional domain): two-level table, built once per
+        domain: ``rs[nest >> n_rs]`` is the slot of the parent block (or -1)
+        and ``rp[slot * 2**n_rs + (nest & (2**n_rs - 1))]`` the position (or
+        -1 when the cell is not in the domain).
+        """
+        nest = _tl_ring2nest(key, LOG2)
+        if MODE == 0:
+            pos = nest
+            present = nest >= 0
         else:
-            lo = tl.zeros(key.shape, dtype=tl.int64)
-            hi = tl.zeros(key.shape, dtype=tl.int64) + n_rs
-            for _ in range(LOG2):  # dynamic loop: no unrolling (compile time)
-                mid = (lo + hi) >> 1
-                v = tl.load(rs_ptr + tl.minimum(mid, n_rs - 1))
-                go = (v < key) & (mid < n_rs)
-                lo = tl.where(go, mid + 1, lo)
-                hi = tl.where(go, hi, mid)
-            p = tl.minimum(lo, n_rs - 1)
-            present = tl.load(rs_ptr + p) == key
-            pos = tl.load(rp_ptr + p)
+            slot = tl.load(rs_ptr + (nest >> n_rs))
+            has = slot >= 0
+            bsz = tl.full(nest.shape, 1, tl.int64) << n_rs
+            pos = tl.load(rp_ptr + tl.maximum(slot, 0).to(tl.int64) * bsz + (nest & (bsz - 1)),
+                          mask=has, other=-1).to(tl.int64)
+            present = pos >= 0
         return pos, present
 
     @triton.jit
@@ -710,12 +778,11 @@ def fused_augment_triton(geo, src=None, *, gout=None, scale=None, store_map=Fals
         nb = bsel.numel()
         if nb == 0:
             continue
-        if lookup[0] == "table":
-            mode, rs, rp, n_rs, log2 = 1, lookup[1], lookup[1], lookup[1].numel(), 1
-        else:
-            rs, rp = lookup[1], lookup[2]
-            mode, n_rs = 0, rs.numel()
-            log2 = max(1, int(math.ceil(math.log2(n_rs + 1))))
+        log2 = int(nside).bit_length() - 1  # the order of the launch
+        if lookup[0] == "full":
+            mode, rs, rp, n_rs = 0, dummy, dummy, 0
+        else:  # ("nest2", parent table, block table, 2k)
+            mode, rs, rp, n_rs = 1, lookup[1], lookup[2], lookup[3]
         grid = lambda meta: (triton.cdiv(N, meta["BLOCK"]), n_cb, nb)  # noqa: E731
         _aug_kernel[grid](
             geo["uv"] if has_a else dummy, geo["xyz"] if not has_a else dummy,

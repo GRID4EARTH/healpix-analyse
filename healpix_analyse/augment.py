@@ -543,6 +543,45 @@ class _Grid(nn.Module):
             self._pyr[key] = ring_theta_table(int(nside), dtype, device)
         return self._pyr[key]
 
+    # -- NESTED -> position tables (fused kernel) ----------------------------
+    def nest_table(self, k, device):
+        """Lookup of the NESTED cells of level ``L - k`` for the fused kernel.
+
+        ``("full",)`` on the full sphere (the NESTED id is the position).
+        Otherwise ``("nest2", parent, block, 2*j)``: a two-level table built
+        once per domain.  ``parent`` [12 * 4**(L-k-j)] holds the slot of each
+        level-(L-k-j) parent that has cells in the domain (-1 otherwise), and
+        ``block`` [n_slots * 4**j] the position of each of its 4**j children
+        in the source array of that level (-1 when absent).  ``j`` minimises
+        the size of the two arrays (dense over the id range for a compact
+        domain, block-sparse for a scattered one).
+        """
+        key = ("nest2", int(k), str(device))
+        if key not in self._pyr:
+            order = self.level - k
+            if self.full and k == 0:
+                self._pyr[key] = ("full",)
+            else:
+                if k == 0:
+                    ids, pos = self._ids_np, self._perm_np
+                else:
+                    ids = self.pyramid(k, "cpu")[k - 1][0].numpy()
+                    pos = np.arange(ids.size)
+                best = None
+                for j in range(order + 1):
+                    par = np.unique(ids >> (2 * j))
+                    size = 12 * 4 ** (order - j) + par.size * 4 ** j
+                    if best is None or size < best[0]:
+                        best = (size, j, par)
+                _, j, par = best
+                parent = np.full(12 * 4 ** (order - j), -1, dtype=np.int32)
+                parent[par] = np.arange(par.size, dtype=np.int32)
+                block = np.full(par.size * 4 ** j, -1, dtype=np.int32)
+                block[parent[ids >> (2 * j)].astype(np.int64) * 4 ** j + (ids & (4 ** j - 1))] = pos
+                self._pyr[key] = ("nest2", torch.as_tensor(parent, device=device),
+                                  torch.as_tensor(block, device=device), 2 * j)
+        return self._pyr[key]
+
     # -- RING lookup tables --------------------------------------------------
     def ring_index(self, k, device):
         """Lookup of RING ids of level ``L - k`` into positions of the source.
@@ -1161,7 +1200,7 @@ class GeometricGroup:
             for k in range(self.kmax + 1):
                 bsel = torch.nonzero(self.levels == k).reshape(-1).to(torch.int32).to(dev)
                 nside = 1 << (g.level - k)
-                launches.append((bsel, nside, g.theta_table(nside, gd, dev), g.ring_index(k, dev),
+                launches.append((bsel, nside, g.theta_table(nside, gd, dev), g.nest_table(k, dev),
                                  0 if k == 0 else pyr[k - 1][2]))
             self._geo = dict(
                 uv=g.uv.contiguous(), xyz=g.xyz.contiguous(), A=self.A, R=self.R, off=self.off,
@@ -1181,7 +1220,7 @@ class GeometricGroup:
         geo0.update(T=1, t_nn=0, off=torch.zeros(1, 2, dtype=self.off.dtype, device=dev),
                     launches=[(torch.arange(self.B, dtype=torch.int32, device=dev), nside,
                                g.theta_table(nside, self.aug.geom_dtype, dev),
-                               g.ring_index(0, dev), 0)])
+                               g.nest_table(0, dev), 0)])
         _, _, nn0, _ = fused_augment_triton(geo0, None, store_nn=True)
         return torch.where(scale > 0, nn0, torch.full((), -1, dtype=torch.long, device=dev))
 
