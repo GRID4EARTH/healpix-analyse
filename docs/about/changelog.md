@@ -26,6 +26,15 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `HealPixPatches` (#109, section 2): square patches of `N = 2**p` pixels,
+  the tokens of ViT, MAE and JEPA models, centred on the cells of level
+  `L - p` or on every cell. `mode="gauge"` (default) samples an `N x N` grid
+  oriented by the gauge, like a `HealPixConv` kernel; `mode="nested"` takes
+  the NESTED descendants (a view plus one gather on complete domains). With
+  the adjoint `fold` (normalised by the weights, the overlap count or not at
+  all), masked token sampling (`index=`, one draw per sample), and fused
+  Triton kernels on CUDA whose backward is a gather on the transposed map
+  (deterministic). Experimental.
 - `HealPixDown` / `HealPixUp(backend="auto" | "triton" | "torch" | "csr")`
   (#109, section 1). `"mean"` and `"maxpool"` Down on contiguous NESTED data
   (the full sphere, or sorted `cell_ids` whose parents are complete, detected
