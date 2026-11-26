@@ -163,12 +163,11 @@ fold is an extraction, and both are differentiable again
 `index_add_`; on CUDA, `index_add_` is deterministic only under
 `torch.use_deterministic_algorithms(True)`.
 
-With `index`, the Triton fold copies the selected patches to the position of
-their centre in a buffer of all `M` patches, in the channels-last layout
-(the copy it makes anyway). The buffer is left uninitialised for the other
-patches, and a byte per centre tells the kernel which entries count.
+With `index`, the Triton fold reads the selected patches through an inverse
+map (the position of each centre in the selection, or −1), so nothing is
+written for the patches left out.
 
-The fold then visits only the cells that the selected patches read:
+It visits only the cells that the selected patches read:
 - at construction, each centre stores its footprint, the list of the blocks
   of cells its patch reads (single cells for `N = 4`, blocks of 4 cells for
   `N = 8`, of 16 cells for `N = 16`);
@@ -177,8 +176,13 @@ The fold then visits only the cells that the selected patches read:
 
 The result is the same, bit for bit, as the fold of the patches expanded with
 zeros. With overlapping patches (`centres="all"`) every cell is read by many
-patches, so there is little to skip. The buffer has the size of all `M`
-patches while the fold runs.
+patches, so there is little to skip.
+
+The fold kernel is bound by the latency of its dependent loads (the row of
+each entry, then the inverse map, then the patch value), not by memory
+bandwidth. It therefore keeps four entries of each cell in flight at a time.
+The sums are still made one entry at a time, in the order of the map, so the
+result does not depend on this.
 
 The PyTorch backend writes the selected patches into a zero tensor of all `M`
 patches, then folds it. A normalised fold needs distinct centres in each row

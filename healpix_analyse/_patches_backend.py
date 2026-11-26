@@ -351,27 +351,55 @@ if _HAS_TRITON:
 
     _FOLD_CONFIGS = [
         triton.Config({"BLOCK_S": bs}, num_warps=nw)
-        for bs, nw in ((64, 4), (128, 4))
+        for bs, nw in ((64, 2), (64, 4), (128, 4))
     ]
 
-    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_SEL", "HAS_MARK", "CL", "SIZE"])
     @triton.jit
-    def _fold_kernel(y_ptr, sel_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr, mark_ptr,
-                     C, K, NY, G, P, SEL_SB, MARK_SB, SIZE,
-                     HAS_SEL: tl.constexpr, NORM: tl.constexpr, WRITE_SCALE: tl.constexpr,
+    def _fold_entry(e_ok, e, rows_ptr, tw_ptr, y_base, inv_base, c, c_ok, C, G, P,
+                    HAS_INV: tl.constexpr, CL: tl.constexpr):
+        """Weight, value and validity of entry ``e`` of each cell of the tile."""
+        r = tl.load(rows_ptr + e, mask=e_ok, other=0).to(tl.int64)
+        mg = r // P
+        p = r - mg * P
+        if HAS_INV:
+            m = mg // G
+            i = tl.load(inv_base + m, mask=e_ok, other=-1).to(tl.int64)
+            ok = e_ok & (i >= 0)
+            yrow = i * G + (mg - m * G)
+        else:
+            ok = e_ok
+            yrow = mg
+        wv = tl.load(tw_ptr + e, mask=ok, other=0.0).to(tl.float32)
+        if CL:   # y is [B, NY, G, P, C]
+            off = ((yrow * P + p) * C)[:, None] + c[None, :]
+        else:
+            off = (yrow * C)[:, None] * P + c[None, :] * P + p[:, None]
+        v = tl.load(y_base + off, mask=ok[:, None] & c_ok[None, :], other=0.0)
+        return wv, v.to(tl.float32), ok
+
+    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "HAS_MARK", "CL", "SIZE"])
+    @triton.jit
+    def _fold_kernel(y_ptr, inv_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr, mark_ptr,
+                     C, K, NY, G, P, INV_SB, MARK_SB, SIZE,
+                     HAS_INV: tl.constexpr, NORM: tl.constexpr, WRITE_SCALE: tl.constexpr,
                      CL: tl.constexpr, HAS_MARK: tl.constexpr, MARK_SHIFT: tl.constexpr,
                      BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr):
-        """x[b, c, s] = sum_e tw[e] y[b, m(e), g(e), c, p(e)] / norm[b, s], no atomics.
+        """x[b, c, s] = sum_e tw[e] y[b, i(e), g(e), c, p(e)] / norm[b, s], no atomics.
 
-        ``y`` is ``[B, NY, G, C, P]`` (``[B, NY, G, P, C]`` with ``CL``), and row
-        ``r = (m*G + g)*P + p`` of the map reads patch ``m``.  ``HAS_SEL``:
-        ``sel[b, m]`` is 1 for the centres selected in sample ``b``; the entries
-        of the others count as 0.  The selection byte and the patch value are
-        loaded side by side (the value of a centre not selected is read and
-        discarded), so no load waits on the selection.  ``NORM``: 0 none, 1
-        sum of the weights read, 2 their number; computed on the fly from the
-        same entries (written to ``scale`` with ``WRITE_SCALE``, for the
-        backward pass).
+        ``y`` is ``[B, NY, G, C, P]`` (``[B, NY, G, P, C]`` with ``CL``).
+        Without ``HAS_INV`` row ``r = (m*G + g)*P + p`` of the map reads patch
+        ``i = m``; with it, ``i = inv[b, m]`` (the position of centre ``m`` in
+        the selection of sample ``b``, -1 when not selected: the entry counts
+        as 0).  ``NORM``: 0 none, 1 sum of the weights read, 2 their number;
+        computed on the fly from the same entries (written to ``scale`` with
+        ``WRITE_SCALE``, for the backward pass).
+
+        The kernel is bound by the latency of the dependent loads of each
+        entry (row, then the inverse map, then the patch value).  The loop
+        over the entries of a cell is unrolled by 4 so that four chains are in
+        flight; the sums are still made one entry at a time, in the order of
+        the map, over the same ``n_max`` steps as a plain loop, so the result
+        does not depend on the unrolling, bit for bit.
 
         ``HAS_MARK``: ``mark[b, s >> MARK_SHIFT]`` is 0 for the cells that no
         selected patch reads; their entries are not visited (they would all
@@ -394,34 +422,42 @@ if _HAS_TRITON:
         start = tl.load(ptr_ptr + s, mask=act, other=0)
         n = tl.load(ptr_ptr + s + 1, mask=act, other=0) - start
         n_max = tl.max(n, axis=0)
+        n_four = (n_max // 4) * 4
         y_base = y_ptr + b * NY * G * C * P
+        inv_base = inv_ptr + b * INV_SB
         acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
         nacc = tl.zeros((BLOCK_S,), dtype=tl.float32)
-        for jj in range(0, n_max):
-            e_ok = s_ok & (jj < n)
-            e = start + jj
-            r = tl.load(rows_ptr + e, mask=e_ok, other=0).to(tl.int64)
-            mg = r // P
-            p = r - mg * P
-            yrow = mg
-            wv = tl.load(tw_ptr + e, mask=e_ok, other=0.0).to(tl.float32)
-            if CL:   # y is [B, NY, G, P, C]
-                off = ((yrow * P + p) * C)[:, None] + c[None, :]
-            else:
-                off = (yrow * C)[:, None] * P + c[None, :] * P + p[:, None]
-            v = tl.load(y_base + off, mask=e_ok[:, None] & c_ok[None, :], other=0.0)
-            if HAS_SEL:
-                sb = tl.load(sel_ptr + b * SEL_SB + mg // G, mask=e_ok, other=0)
-                ok = e_ok & (sb != 0)
-                wv = tl.where(ok, wv, 0.0)
-                v = tl.where(ok[:, None], v, 0.0)
-            else:
-                ok = e_ok
+        for jj in range(0, n_four, 4):
+            w0, v0, o0 = _fold_entry(s_ok & (jj < n), start + jj, rows_ptr, tw_ptr, y_base,
+                                     inv_base, c, c_ok, C, G, P, HAS_INV, CL)
+            w1, v1, o1 = _fold_entry(s_ok & (jj + 1 < n), start + jj + 1, rows_ptr, tw_ptr,
+                                     y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
+            w2, v2, o2 = _fold_entry(s_ok & (jj + 2 < n), start + jj + 2, rows_ptr, tw_ptr,
+                                     y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
+            w3, v3, o3 = _fold_entry(s_ok & (jj + 3 < n), start + jj + 3, rows_ptr, tw_ptr,
+                                     y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
             if NORM == 1:
-                nacc += wv
+                nacc += w0
+                nacc += w1
+                nacc += w2
+                nacc += w3
             if NORM == 2:
-                nacc += tl.where(ok, 1.0, 0.0)
-            acc += wv[:, None] * v.to(tl.float32)
+                nacc += tl.where(o0, 1.0, 0.0)
+                nacc += tl.where(o1, 1.0, 0.0)
+                nacc += tl.where(o2, 1.0, 0.0)
+                nacc += tl.where(o3, 1.0, 0.0)
+            acc += w0[:, None] * v0
+            acc += w1[:, None] * v1
+            acc += w2[:, None] * v2
+            acc += w3[:, None] * v3
+        for jj in range(n_four, n_max):
+            w0, v0, o0 = _fold_entry(s_ok & (jj < n), start + jj, rows_ptr, tw_ptr, y_base,
+                                     inv_base, c, c_ok, C, G, P, HAS_INV, CL)
+            if NORM == 1:
+                nacc += w0
+            if NORM == 2:
+                nacc += tl.where(o0, 1.0, 0.0)
+            acc += w0[:, None] * v0
         if NORM != 0:
             sc = tl.where(nacc > 0, 1.0 / tl.where(nacc > 0, nacc, 1.0), 0.0)
             acc = acc * sc[:, None]
@@ -480,16 +516,14 @@ def _triton_extract(x, geom, sel):
     return y
 
 
-def _triton_fold(y, geom, sel=None, norm="none", want_scale=False, mark=None):
+def _triton_fold(y, geom, inv=None, norm="none", want_scale=False, mark=None):
     """y [B, NY, G, C, P] -> (x [B, C, K], scale [B, K] or None).
 
-    ``sel`` [Bs, Ms]: the distinct centres of the ``NY = Ms`` patches of ``y``
-    (None when ``y`` holds all ``M`` centres).  The patches are copied, in
-    the channels-last layout, into a buffer of all ``M`` centres that is not
-    initialised for the others; a ``[Bs, M]`` selection byte tells the kernel
-    which entries count.  ``mark`` (from :func:`selection_mark`) restricts
-    the fold to the cells the selection reads.  The normalisation is
-    computed in the kernel, from the entries it reads.
+    ``inv`` [Bs, M] int32: position of each centre in the selection (-1: not
+    selected); None when ``y`` holds all ``M`` centres.  ``mark`` (from
+    :func:`selection_mark`) restricts the fold to the cells the selection
+    reads.  The normalisation is computed in the kernel, from the entries it
+    reads.
     """
     B, NY, G, C, P = y.shape
     K = geom.K
@@ -500,28 +534,11 @@ def _triton_fold(y, geom, sel=None, norm="none", want_scale=False, mark=None):
              if (want_scale and mode) else None)
     if x.numel() == 0:
         return x, scale
+    inv_sb = inv.stride(0) if (inv is not None and inv.shape[0] > 1) else 0
     mark_t, shift = mark if mark is not None else (None, 0)
     mark_sb = mark_t.stride(0) if (mark_t is not None and mark_t.shape[0] > 1) else 0
-    sbit, sel_sb = None, 0
-    if sel is not None:
-        # the selected patches at the position of their centre, channels-last
-        # (one copy, as the channels-last staging), the others not initialised
-        cl = True
-        M = geom.M
-        full = torch.empty(B, M, G, P, C, device=y.device, dtype=y.dtype)
-        src = y.transpose(3, 4)
-        if sel.shape[0] == 1:
-            full[:, sel[0].long()] = src
-        else:
-            bb = torch.arange(B, device=y.device).view(B, 1)
-            full[bb, sel.long()] = src
-        y, NY = full, M
-        sbit = torch.zeros(sel.shape[0], M, dtype=torch.uint8, device=y.device)
-        sbit.scatter_(1, sel.long(), 1)
-        sel_sb = M if sel.shape[0] > 1 else 0
-    else:
-        cl = C >= FOLD_CL_MIN_C
-        y = y.transpose(3, 4).contiguous() if cl else y.contiguous()
+    cl = C >= FOLD_CL_MIN_C
+    y = y.transpose(3, 4).contiguous() if cl else y.contiguous()
     BLOCK_C = _block_c(C)
 
     def grid(meta):
@@ -529,10 +546,10 @@ def _triton_fold(y, geom, sel=None, norm="none", want_scale=False, mark=None):
 
     with _device_ctx(y):
         _fold_kernel[grid](
-            y, sbit if sbit is not None else ptr, ptr, rows, tw, x,
+            y, inv if inv is not None else ptr, ptr, rows, tw, x,
             scale if scale is not None else tw, mark_t if mark_t is not None else ptr,
-            C, K, NY, G, P, sel_sb, mark_sb, _size_class(K),
-            HAS_SEL=sbit is not None, NORM=mode, WRITE_SCALE=scale is not None, CL=cl,
+            C, K, NY, G, P, inv_sb, mark_sb, _size_class(K),
+            HAS_INV=inv is not None, NORM=mode, WRITE_SCALE=scale is not None, CL=cl,
             HAS_MARK=mark_t is not None, MARK_SHIFT=shift, BLOCK_C=BLOCK_C,
         )
     return x, scale
@@ -566,12 +583,18 @@ def _expand_selected(y, sel, M):
     return full
 
 
-def has_repeats(sel):
-    """True when a row of ``sel`` repeats a centre (one device sync)."""
-    if sel.shape[1] < 2:
-        return False
+def inverse_selection(sel, M):
+    """``[Bs, M]`` int32: position of centre m in row b of ``sel``, -1 if absent.
+
+    None when a row repeats a centre (the fold then sums the copies through
+    a full tensor instead)."""
     srt = torch.sort(sel, dim=1).values
-    return bool((srt[:, 1:] == srt[:, :-1]).any())
+    if srt.shape[1] > 1 and bool((srt[:, 1:] == srt[:, :-1]).any()):
+        return None
+    inv = torch.full((sel.shape[0], M), -1, dtype=torch.int32, device=sel.device)
+    pos = torch.arange(sel.shape[1], dtype=torch.int32, device=sel.device)
+    inv.scatter_(1, sel.long(), pos.expand_as(sel).contiguous())
+    return inv
 
 
 def _extract(x, geom, sel, use_tri):
@@ -590,14 +613,15 @@ def _fold(y, geom, sel, norm, use_tri, want_scale):
     """Normalised fold; returns (x, scale) with scale [K] or [B, K] or None."""
     if use_tri:
         y = y.contiguous()
-        mark = None
+        inv = mark = None
         if sel is not None:
-            if has_repeats(sel):
-                # the copies are summed in a full tensor of all M centres
-                y, sel = _expand_selected(y, sel, geom.M), None
+            inv = inverse_selection(sel, geom.M)
+            if inv is None:
+                # a repeated centre: the copies are summed in a full tensor
+                y = _expand_selected(y, sel, geom.M)
             elif MASKED_FOLD_SKIP:
                 mark = selection_mark(geom, sel)
-        return _triton_fold(y, geom, sel=sel, norm=norm, want_scale=want_scale, mark=mark)
+        return _triton_fold(y, geom, inv=inv, norm=norm, want_scale=want_scale, mark=mark)
     scale = fold_scale(geom, norm, sel, y.shape[0], y.device, y.dtype)
     yy = _expand_selected(y, sel, geom.M) if sel is not None else y
     out = _torch_fold(yy, geom)
