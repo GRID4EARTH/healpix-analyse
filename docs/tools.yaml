@@ -1253,6 +1253,118 @@ tools:
       page: conv/compare_wide
   optional_deps: "termcolor (dino extra, torch-hub route) or transformers (dino-hf extra)"
 
+- id: masked_norm
+  title: Masked normalisation layers (HealPixGroupNorm, HealPixLayerNorm, HealPixBatchNorm)
+  family: D
+  page: other/masked_norm
+  status: experimental
+  symbols: [HealPixGroupNorm, HealPixLayerNorm, HealPixBatchNorm]
+  also: [fill, backend, masked_norm_reference]
+  summary: >-
+    GroupNorm, LayerNorm (over the channels of each cell) and BatchNorm (with
+    running statistics) for [B, C, N] HEALPix data, with a validity mask or a
+    coverage: cells of weight 0 (NaN by default) do not enter the statistics,
+    and their output is 0, NaN or the input (fill=).
+  tasks:
+    - do: normalise the activations of a spherical CNN or transformer when some cells are missing (clouds, land, outside the swath)
+      use: [HealPixGroupNorm, HealPixLayerNorm, HealPixBatchNorm]
+    - weight the statistics of a normalisation by the coverage of each cell
+  keywords: [GroupNorm, LayerNorm, BatchNorm, normalisation, normalization, mask, coverage, NaN, missing data, deep learning]
+  domain: the cells of the input, full sphere or regional domain, in any order
+  ordering: any (the layers do not use the cell ids)
+  io: "x [B, C, N] and mask [N], [B, N] or [B, C, N] (bool or float in [0, 1]) -> [B, C, N], same dtype"
+  differentiable: yes, in x and in the affine parameters (the mask is not differentiated); exact gradients, double backward through the PyTorch reference
+  gpu: yes; fused Triton kernels (float32, float16, bfloat16, fp32 accumulation, deterministic) with the optional triton package
+  nan: NaN and inf are invalid cells; they never reach the output (except fill="passthrough") or the gradients
+  cost: >-
+    Triton forward 3 passes over x for GroupNorm / BatchNorm (one-pass
+    statistics, then normalisation and affine step), 2 for LayerNorm with
+    C <= 512; backward 5 and 3. benchmarks/benchmark_layers.py measures them
+    against torch.nn (see the page).
+  pros:
+    - Same parameters and state_dict as torch.nn.GroupNorm / LayerNorm / BatchNorm1d; with an all-valid mask the outputs are the same.
+    - Coverage weights (cells have equal area); deterministic Triton kernels with a PyTorch reference.
+  cons:
+    - Experimental. LayerNorm normalises over the channels of each cell only (for channels and cells use HealPixGroupNorm(1, C)).
+    - The masked PyTorch path (CPU, float64, CUDA without Triton) is 2-15x slower than the unmasked torch.nn layer.
+  use_instead:
+    - when: every cell is valid and speed is all that matters
+      use: torch.nn.GroupNorm / LayerNorm / BatchNorm1d
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
+
+- id: masked_pool
+  title: Masked global and regional pooling (global_pool, region_pool)
+  family: D
+  page: other/masked_norm#pooling
+  status: experimental
+  symbols: [HealPixGlobalPool, HealPixRegionPool, global_pool, region_pool]
+  also: [from_cell_ids]
+  summary: >-
+    Mean, sum or max of [B, C, N] HEALPix data over all the cells or over
+    labelled regions (for instance the parent cells of a coarser level),
+    weighted by a validity mask or a coverage.
+  tasks:
+    - do: pool the features of a classification or regression head over the full sphere or a regional domain, ignoring missing cells
+      use: [global_pool, HealPixGlobalPool]
+    - do: average features over labelled regions (basins, countries, coarser cells) with a mask
+      use: [region_pool, HealPixRegionPool]
+  keywords: [pooling, global average pooling, max pooling, regional mean, mask, coverage, readout]
+  domain: the cells of the input, full sphere or regional domain, in any order
+  ordering: any; HealPixRegionPool.from_cell_ids builds regions from NESTED ids
+  io: "x [B, C, N] -> [B, C] (global) or [B, C, R] (regions)"
+  differentiable: yes, in x
+  gpu: yes; Triton kernels (one read of x, CSR int32 regions, no atomics) with the optional triton package
+  nan: NaN cells are invalid; a region without valid cells gets 0 or NaN (fill=)
+  cost: >-
+    One read of x on both backends. Triton: region_pool reads contiguous
+    sorted regions as one tile, other regions through a CSR (int32) gather.
+    PyTorch: region_pool gathers the cells into a padded [B, C, R, L] tensor
+    (L = size of the largest region).
+  pros:
+    - Area weighting is exact (equal-area cells); deterministic forward and backward.
+  cons:
+    - Experimental. Very unequal regions waste memory in the padded layout.
+  use_instead:
+    - when: one level coarser on every cell, keeping the grid
+      use: HealPixDown
+      page: other/down
+  optional_deps: triton (triton extra), only for the CUDA kernels
+
+- id: positional_encoding
+  title: Positional encodings of HEALPix cells (HealPixPositionalEncoding)
+  family: D
+  page: other/positional_encoding
+  status: experimental
+  symbols: [HealPixPositionalEncoding, healpix_positional_encoding, positional_encoding_cache_info, clear_positional_encoding_cache]
+  also: [feature_names, frequencies, gauge_type, include_level]
+  summary: >-
+    Fourier features of the cell-centre unit vector (x, y, z) at several
+    frequencies, optionally the gauge angle of HealPixConv and the level,
+    computed once per domain and cached.
+  tasks:
+    - do: give a transformer or a CNN on HEALPix cells the position of each cell
+      use: [HealPixPositionalEncoding]
+    - add position channels to the input of a model on a regional domain
+  keywords: [positional encoding, Fourier features, position embedding, transformer, ViT, tokens, coordinates]
+  domain: full sphere (cell_ids=None) or a regional set of cell ids, in any order
+  ordering: NESTED ids
+  ellipsoid: '"WGS84" (geodetic latitude of the cell centres from healpix-geo)'
+  io: "-> [F, N] tensor; the module also concatenates it to x [B, C, N]"
+  differentiable: no (a constant input)
+  gpu: yes; one Triton kernel writes all the features (optional triton package); the module buffer follows .to()
+  cost: >-
+    healpix-geo cell centres at the first call for a domain, then an
+    in-memory cache (8 domains) keyed by a hash of the cell ids; F x N
+    values in the output.
+  pros:
+    - One shared encoding for every model; unsorted regional domains supported.
+  cons:
+    - Experimental. Stores F x N values (F = 3 + 6 x number of frequencies + extras) on the device.
+  use_instead:
+    - when: a learned position embedding per token
+      use: a torch.nn.Parameter of shape [F, N]
+  optional_deps: triton (triton extra), only for the CUDA kernel
+
 - id: validation
   title: Reference convolution for tests (validation)
   family: D
