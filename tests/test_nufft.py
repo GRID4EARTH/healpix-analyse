@@ -157,3 +157,26 @@ def test_bbox_keeps_shape():
     assert w[(x < 0) | (x > 2) | (y < 0) | (y > 1)].max() == 0
     assert windowing_weights_bbox([1.0], [0.5], [0, 0, 2, 1], length=0.2)[0] == 1
     assert windowing_weights_bbox([0.1], [0.5], [0, 0, 2, 1], length=0.2)[0] == pytest.approx(0.5)
+
+
+def test_rectangle_equivalent_tukey():
+    """Test that a rectangular window is equal to a product of tukey functions."""
+
+    def tukey(x, L):
+        x = x - x[0]
+        w = np.ones(x.size, dtype=np.float64)
+        taper = 0.5 * (1 - np.cos(x * np.pi / L))
+        w = np.where(x < L, taper, w)
+        w = np.where(x > x[-1] - L, taper[::-1], w)
+        return w
+
+    x = np.linspace(-5, 5, 100)
+    y = np.linspace(-3, 3, 150)
+    wx = tukey(x, 1)
+    wy = tukey(y, 1)
+    w_product = wx[None, :] * wy[:, None]
+
+    xx, yy = np.meshgrid(x, y)
+    w = windowing_weights_bbox(xx, yy, [-5, -3, 5, 3], length=1)
+
+    np.testing.assert_allclose(w, w_product)

@@ -20,6 +20,7 @@ periods. This is the sign of :func:`numpy.fft.fft2`. On a regular grid of
 ``np.fft.fftshift(np.fft.fft2(data.reshape(ny, nx)))``.
 """
 
+import itertools
 from collections.abc import Sequence
 
 import numpy as np
@@ -43,7 +44,7 @@ def windowing_weights_polygon(
     Weights equal 0 outside the polygon and on its border. Inside, they rise to
     1 over a distance *length* from the border following a cosine:
     ``(1 - cos(pi * d / length)) / 2`` at a distance ``d < length`` from the
-    nearest edge, 1 beyond.
+    nearest edge, 1 beyond. Weights of all segments are multiplied together.
 
     The polygon can be concave and its vertices can be given in either
     orientation. It must be simple (edges do not cross); inside and outside are
@@ -83,24 +84,25 @@ def windowing_weights_polygon(
         raise ValueError("A polygon needs at least 3 distinct vertices.")
 
     inside = np.zeros(x.shape, dtype=bool)
-    dist2 = np.full(x.shape, np.inf)
-    for (x1, y1), (x2, y2) in zip(vertices[:-1], vertices[1:]):
+    weights = np.ones(x.shape, dtype=np.float64)
+    for (x1, y1), (x2, y2) in itertools.pairwise(vertices):
         # even-odd rule: does the ray from (x, y) towards +x cross this edge?
         if y1 != y2:
             crosses = (y1 > y) != (y2 > y)
             x_cross = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
             inside ^= crosses & (x < x_cross)
-        # squared distance to the segment (not to the infinite line)
+
+        # distance to the segment (not to the infinite line)
         sx, sy = x2 - x1, y2 - y1
         seg2 = sx * sx + sy * sy
         t = 0.0
         if seg2 > 0:
             t = np.clip(((x - x1) * sx + (y - y1) * sy) / seg2, 0.0, 1.0)
-        dist2 = np.minimum(dist2, (x - x1 - t * sx) ** 2 + (y - y1 - t * sy) ** 2)
+        dist = np.sqrt((x - x1 - t * sx) ** 2 + (y - y1 - t * sy) ** 2)
 
-    dist = np.sqrt(dist2)
-    taper = 0.5 * (1.0 - np.cos(np.pi * dist / length))
-    weights = np.where(dist < length, taper, 1.0)
+        taper = 0.5 * (1.0 - np.cos(np.pi * dist / length))
+        weights *= np.where(dist < length, taper, 1.0)
+
     return np.where(inside, weights, 0.0)
 
 
