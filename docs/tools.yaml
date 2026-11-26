@@ -349,6 +349,89 @@ tools:
       page: conv/radial_filter
   optional_deps: triton (triton extra), only for the fused CUDA kernels
 
+- id: window_attention
+  title: Window attention on NESTED blocks (HealPixWindowAttention)
+  family: A
+  page: conv/attention
+  status: experimental
+  symbols: [HealPixWindowAttention, WINDOW_SHIFTS, DEFAULT_WINDOW_SHIFT]
+  also: [shift, shifted, halo]
+  summary: >-
+    A torch nn.Module for Swin-like transformers: multi-head attention of
+    the cells of each NESTED block of 4**window_level cells over their
+    window; by default the windows are centred on the cells of a coarser
+    level and overlap across the block borders (`shift`).
+  tasks:
+    - build a Swin-like transformer layer on the sphere or on a regional domain
+    - attend over all the cells of a NESTED block (local self-attention)
+  keywords: [attention, transformer, Swin, window attention, self-attention, flash attention, deep learning]
+  domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction
+  ordering: NESTED; sorted domains of complete blocks take the reshape path, other orders are gathered and masked
+  ellipsoid: '"WGS84" for the cell centres of shift="coarse_centred"'
+  io: "[B, C, N] -> [B, C, N]"
+  differentiable: yes, in the input and the projections
+  gpu: yes; fused flash-style Triton kernels (float32, float16, bfloat16, autocast) with the optional triton package, deterministic backward
+  nan: not handled (NaN propagates)
+  cost: >-
+    N * 4**w scores per head with shift="none"; with the default
+    shift="coarse_centred", 3.4-3.8 times more at halo=0.25 and 2.2-3.1 times
+    more at halo=0 (window_level 1 to 4); memory linear in N.
+    benchmarks/benchmark_attention.py measures it against dense attention.
+  pros:
+    - Fused Triton kernels on every kind of window (padded, unsorted, overlapping), with a deterministic backward.
+    - The receptive field grows at every layer by default; the default is a module constant.
+  cons:
+    - Windows follow the NESTED base-cell axes, not the gauge.
+    - Without Triton (or on CPU), the backward of the gathered windows uses index_put_ (deterministic on CUDA only under torch.use_deterministic_algorithms).
+  use_instead:
+    - when: each cell should attend to a small gauge-oriented neighbourhood
+      use: HealPixNeighbourhoodAttention
+      page: conv/attention
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
+
+- id: neighbourhood_attention
+  title: Neighbourhood attention on the gauge stencil (HealPixNeighbourhoodAttention)
+  family: A
+  page: conv/attention
+  status: experimental
+  symbols: [HealPixNeighbourhoodAttention]
+  also: [attend, outside, pos_bias]
+  summary: >-
+    A torch nn.Module where each cell attends to the kernel_sz x kernel_sz
+    taps of the gauge-oriented stencil of HealPixConv, with one relative
+    position bias per head and tap shared over the sphere; fused Triton
+    kernels on CUDA.
+  tasks:
+    - build a local self-attention layer (neighbourhood attention, NATTEN-like) on the sphere or a regional domain
+    - replace a HealPixConv by attention over the same stencil
+  keywords: [attention, transformer, neighbourhood attention, NATTEN, local attention, gauge, relative position bias, deep learning]
+  domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction (any order)
+  ordering: NESTED
+  ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
+  io: "[B, C, N] -> [B, G*C, N] (G = n_gauges)"
+  differentiable: yes, in the input, the projections and the position bias
+  gpu: yes; fused Triton kernels (float32, float16, bfloat16, autocast) with the optional triton package, deterministic backward
+  nan: not handled (NaN propagates)
+  cost: >-
+    N * P scores per head and gauge, linear in N; the gathered keys and values
+    are never stored. Geometry as HealPixConv with the same arguments, plus a
+    transposed map built at the first backward on the Triton path.
+    benchmarks/benchmark_attention.py measures it against the naive gather.
+  pros:
+    - Gauge-oriented like HealPixConv, so one bias table serves the whole sphere.
+    - Deterministic Triton backward with no atomics; PyTorch reference with double backward.
+  cons:
+    - "Reach is `kernel_sz // 2` cells per layer."
+    - Outputs G*C channels with several gauges.
+  use_instead:
+    - when: attention over larger blocks with PyTorch's flash kernels
+      use: HealPixWindowAttention
+      page: conv/attention
+    - when: a fixed linear combination of the stencil is enough
+      use: HealPixConv
+      page: conv/convol
+  optional_deps: triton (triton extra), only for the fused CUDA kernels
+
 - id: large_conv
   title: Wide receptive field (LargeConv) and its Gaussian recipe
   family: A
