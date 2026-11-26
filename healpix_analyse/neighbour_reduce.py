@@ -285,9 +285,12 @@ def _numerical_median(
     NaN values propagate.
     """
 
+    # A stable sort: the values are those of any sort, and on ties the
+    # subgradient goes to the first sample (the rule of the fused backends).
     sorted_values = torch.sort(
         values,
         dim=-1,
+        stable=True,
     ).values
 
     number_of_values = sorted_values.shape[-1]
