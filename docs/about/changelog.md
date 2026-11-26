@@ -55,6 +55,22 @@
   versions still load with `strict=True` (their `_children_idx` /
   `_children_valid` keys are dropped); a checkpoint written by this version
   loads into an earlier version only with `strict=False`.
+- Masked, coverage-aware normalisation and pooling for AI models (#109,
+  section 5): `HealPixGroupNorm`, `HealPixLayerNorm` (over the channels of
+  each cell) and `HealPixBatchNorm` (running statistics) take a validity
+  mask or a coverage of shape `[N]`, `[B, N]` or `[B, C, N]`; with
+  `mask=None` the NaN cells are invalid. Invalid cells stay out of the
+  statistics and output 0, NaN or the input (`fill=`). With an all-valid
+  mask the layers equal their `torch.nn` versions (same `state_dict`). On
+  CUDA they run fused, deterministic Triton kernels (optional `triton`);
+  elsewhere a few PyTorch passes with a hand-written backward. `global_pool`,
+  `region_pool`, `HealPixGlobalPool` and `HealPixRegionPool`
+  (`from_cell_ids` for parent cells) pool with the same masks.
+- Positional encodings (#109, section 6): `HealPixPositionalEncoding` and
+  `healpix_positional_encoding` give Fourier features of the cell-centre
+  unit vector (healpix-geo centres, WGS84 by default), optionally the gauge
+  angle of `HealPixConv` and the level; the geometry is cached per domain,
+  keyed by a hash of the `cell_ids`, and the module buffer follows `.to()`.
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is
