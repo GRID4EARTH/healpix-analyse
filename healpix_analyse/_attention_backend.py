@@ -338,7 +338,7 @@ if _HAS_TRITON:
             s = tl.where((ok != 0)[:, None], s, float("-inf"))
         return s
 
-    @triton.autotune(configs=_NA_CONFIGS, key=["H", "D", "P", "G", "SIZE"])
+    @triton.autotune(configs=_NA_CONFIGS, key=["H", "D", "P", "G", "SIZE", "HAS_VALID"])
     @triton.jit
     def _na_fwd_kernel(qkv_ptr, SB, SN, idx_ptr, w_ptr, bias_ptr, valid_ptr, o_ptr, lse_ptr,
                        B, H, G, N, D, scale, SIZE, P: tl.constexpr,
@@ -381,7 +381,7 @@ if _HAS_TRITON:
         lrow = (bg * H + h[None, :]) * N + n[:, None]
         tl.store(lse_ptr + lrow, m_i + tl.log(l_i), mask=n_ok[:, None] & h_ok[None, :])
 
-    @triton.autotune(configs=_NA_CONFIGS, key=["H", "D", "P", "G", "SIZE"])
+    @triton.autotune(configs=_NA_CONFIGS, key=["H", "D", "P", "G", "SIZE", "HAS_VALID"])
     @triton.jit
     def _na_bwd_q_kernel(qkv_ptr, SB, SN, idx_ptr, w_ptr, bias_ptr, valid_ptr,
                          go_ptr, lse_ptr, delta_ptr, dqkv_ptr, a_ptr, ds_ptr,
@@ -501,7 +501,7 @@ if _HAS_TRITON:
             return tl.load(kvlen_ptr + wi)
         return TK
 
-    @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D"])
+    @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D", "Q_CONTIG", "KV_CONTIG", "HAS_LEN"])
     @triton.jit
     def _win_fwd_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, kvlen_ptr, o_ptr, lse_ptr,
                         H, N, D, TQ, TK, scale,
@@ -548,7 +548,7 @@ if _HAS_TRITON:
                  mask=q_ok[:, None] & d_ok[None, :])
         tl.store(lse_ptr + rows * H + h, m_i + tl.log(l_i), mask=q_ok)
 
-    @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D"])
+    @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D", "Q_CONTIG", "KV_CONTIG", "HAS_LEN"])
     @triton.jit
     def _win_bwd_q_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, kvlen_ptr, go_ptr, lse_ptr,
                           delta_ptr, dqkv_ptr, H, N, D, TQ, TK, scale,
@@ -591,7 +591,7 @@ if _HAS_TRITON:
         tl.store(dqkv_ptr + b.to(tl.int64) * SB + h * D + qpos[:, None] * SN + d[None, :],
                  (dq * scale).to(dqkv_ptr.dtype.element_ty), mask=mq)
 
-    @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D"])
+    @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D", "Q_CONTIG", "KV_CONTIG", "HAS_LEN"])
     @triton.jit
     def _win_bwd_kv_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, kvlen_ptr, wlist_ptr,
                            go_ptr, lse_ptr, delta_ptr, acc_ptr, ASB, ASN, H, N, D, TQ, TK,

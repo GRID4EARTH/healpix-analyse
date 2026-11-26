@@ -376,7 +376,7 @@ def main(argv=None):
     for name in ("window", "neighbourhood"):
         p = sub.add_parser(name)
         p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-        p.add_argument("--configs", choices=("cpu", "gpu", "reduced"), default=None)
+        p.add_argument("--configs", choices=("cpu", "gpu", "reduced", "regional"), default=None)
         p.add_argument("--dtype", default="float32")
         p.add_argument("--reps", type=int, default=5)
         p.add_argument("--variants", nargs="*", default=None)
@@ -391,6 +391,8 @@ def main(argv=None):
     p = sub.add_parser("table")
     p.add_argument("files", nargs="+")
     args = ap.parse_args(argv)
+    WINDOW_CONFIGS["regional"] = WINDOW_CONFIGS["reduced"][-1:]
+    NA_CONFIGS["regional"] = NA_CONFIGS["reduced"][-1:]
     if getattr(args, "configs", "x") is None:
         args.configs = "gpu" if args.device.startswith("cuda") else "cpu"
     {"window": bench_window, "neighbourhood": bench_neighbourhood,
