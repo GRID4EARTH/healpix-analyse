@@ -11,9 +11,12 @@ input and to the target alike; then a random NaN masking of NESTED blocks
 on the input only. Cells read outside the domain come back as NaN
 (fill) with valid=False, so they drop out of the input mask and of the loss.
 
-Mixed precision: inside torch.autocast, torch.nn.Linear runs in bfloat16;
-HealPixConv casts its input to its own dtype (float32 here), and the masked
-norms keep the dtype of their input. bfloat16 needs no GradScaler.
+Mixed precision: inside torch.autocast, torch.nn.Linear runs in bfloat16.
+On CUDA with Triton, HealPixConv computes in bfloat16 too (fp32
+accumulation, float32 weights) and returns bfloat16; on the CPU it casts
+its input to the layer dtype (float32) and returns float32. The masked
+norms keep the dtype of their input; the loss is computed in float32.
+bfloat16 needs no GradScaler.
 Runs on CPU in a few seconds at level 4.
 """
 
@@ -69,7 +72,7 @@ class Denoiser(nn.Module):
         h = torch.cat([torch.nan_to_num(x), mask[:, None].to(x.dtype)], dim=1)
         h = torch.relu(self.norm1(self.conv1(h), mask))
         h = self.mix(h.transpose(1, 2)).transpose(1, 2)
-        return self.conv2(h)                        # cast to float32 by the layer
+        return self.conv2(h)                        # bf16 on CUDA + Triton, float32 on CPU
 
 
 def masked_mse(pred, target, valid):

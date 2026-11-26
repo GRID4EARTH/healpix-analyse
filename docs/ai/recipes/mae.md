@@ -24,6 +24,13 @@ Points to copy:
   diamond-shaped cells: `fold` misses up to 16 cells next to the poles at
   `N = 4`, and the tips of the diamonds from `N = 8` (see
   {doc}`/conv/patches`);
+- `patches.fold(y, index=...)` folds only the patches listed, for instance
+  the 25 % of kept tokens of an MAE; on CUDA, with patches of at least 64
+  pixels (`N ≥ 8`) and at most 37.5 % of the centres selected, the Triton
+  fold then visits only the cells that those patches read, with the same
+  result bit for bit (see {doc}`/conv/patches`). Above 37.5 % (the 75 % of
+  masked tokens, say) it walks every cell. The recipe folds every
+  predicted patch;
 - for a ViT classifier, drop the masking and the decoder and pool the
   encoded tokens (mean over `M`);
 - for a JEPA-style model, keep this encoder as the context encoder, an EMA

@@ -40,11 +40,12 @@ class HealPixMAE(nn.Module):
         self.pos = nn.Linear(F_, dim)
         layer = lambda d: nn.TransformerEncoderLayer(d, heads, 2 * d, dropout=0.0,
                                                      batch_first=True, norm_first=True)
-        self.encoder = nn.TransformerEncoder(layer(dim), depth)
+        # enable_nested_tensor=False: no fast-path warning with norm_first=True
+        self.encoder = nn.TransformerEncoder(layer(dim), depth, enable_nested_tensor=False)
         self.to_dec = nn.Linear(dim, dec_dim)
         self.dec_pos = nn.Linear(F_, dec_dim)
         self.mask_token = nn.Parameter(torch.zeros(dec_dim))
-        self.decoder = nn.TransformerEncoder(layer(dec_dim), dec_depth)
+        self.decoder = nn.TransformerEncoder(layer(dec_dim), dec_depth, enable_nested_tensor=False)
         self.out = nn.Linear(dec_dim, channels * patch_size ** 2)
 
     def forward(self, x):                      # x [B, C, K], NaN = missing

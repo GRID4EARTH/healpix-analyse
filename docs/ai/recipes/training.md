@@ -21,9 +21,12 @@ Points to copy:
 - the model zero-fills NaN and adds a validity channel, and the masked norm
   gets the mask;
 - the loss is a weighted mean over valid target cells;
-- inside `torch.autocast`, `torch.nn.Linear` runs in bfloat16, while
-  `HealPixConv` casts its input to its own dtype (float32 here) and the
-  masked norm keeps the dtype of its input; bfloat16 needs no `GradScaler`.
+- inside `torch.autocast`, `torch.nn.Linear` runs in bfloat16; on CUDA with
+  Triton `HealPixConv` computes in bfloat16 as well (fp32 accumulation,
+  float32 weights) and returns bfloat16, while on the CPU it casts its input
+  to the layer dtype and returns float32; the masked norm keeps the dtype of
+  its input; the loss is computed in float32 (`pred.float()`), and bfloat16
+  needs no `GradScaler`.
 
 ```{literalinclude} training.py
 :language: python

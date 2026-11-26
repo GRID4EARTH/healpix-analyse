@@ -451,7 +451,7 @@ tools:
       - The domain is fixed at construction (cell_ids, or the full sphere); N must equal len(cell_ids) and row k is cell_ids[k].
       - stride=2 writes on the parent cells conv.cell_ids_out (sorted, np.unique(cell_ids // 4)); the next level builds its layers with those ids.
       - HealPixConvTranspose(level, in_channels, out_channels, cell_ids=fine ids) mirrors HealPixConv(level, out_channels, in_channels, stride=2, cell_ids=fine ids); it reads n_gauges*in_channels channels on the parents and sums over the gauges.
-      - The input is cast to the layer dtype (float32 by default), also inside torch.autocast; build with dtype=torch.bfloat16 for 16-bit kernels.
+      - "Under torch.autocast on CUDA with Triton, float32 inputs are computed in the autocast dtype with fp32 accumulation: the output is 16-bit and the weights (and their gradients) stay float32. Elsewhere (CPU, the PyTorch path) the input is cast to the layer dtype (float32 by default)."
       - NaN propagates by default; zero-fill and pass a validity channel, or use missing="local_mean" (PyTorch reference path, more memory).
       - Pass device= at construction (default CUDA when available); the geometry is cached on disk (cache_dir, format 4).
       - The stencil geometry is built in float64 whatever the dtype; a bilinear neighbour inside the domain counts only if its weight is at least 1e-6 of the full weight of its point, and a point with none falls back to the centre.
@@ -504,7 +504,7 @@ tools:
   ai:
     role: tokenizer
     does: square N x N patch tokens (gauge-oriented or NESTED tiles), masked token sampling and the fold back onto the cells
-    api: [healpix_analyse.patches.HealPixPatches]
+    api: [healpix_analyse.patches.HealPixPatches, healpix_analyse.patches.HealPixPatches.fold]
     shapes: "[B, C, K] -> [B, M, G, C, N, N] (y.flatten(2): M tokens of G*C*N*N); index [B, Ms] -> [B, Ms, G, C, N, N]; fold: back to [B, C, K]"
     grad: yes (extraction and fold, to any order)
     gpu_kernel: Triton (float32, float16, bfloat16; nested mode on complete domains is a view plus one gather)
@@ -1675,7 +1675,7 @@ tools:
   ai:
     role: augment
     does: batched random augmentation, own parameters per sample (shift, rotation, zoom, flip, SO(3), noise, MAE masking, NESTED crops), geometric transforms fused into one gather
-    api: [healpix_analyse.augment.HealPixAugment, healpix_analyse.augment.AugmentPlan]
+    api: [healpix_analyse.augment.HealPixAugment, healpix_analyse.augment.HealPixAugment.sample, healpix_analyse.augment.AugmentPlan.apply]
     shapes: "[B, N], [B, C, N] or [B, ..., N] -> AugmentResult(x [same layout], labels, valid [B, N], mask [B, N], ids_keep, ids_restore, cell_ids)"
     grad: yes (with respect to the data, not the random parameters)
     gpu_kernel: Triton (one fused kernel per geometric group; float32, float16, bfloat16)
@@ -1776,7 +1776,7 @@ tools:
   ai:
     role: pooling
     does: masked mean / sum / max over all cells (readout) or over labelled regions
-    api: [healpix_analyse.masked_norm.global_pool, healpix_analyse.masked_norm.region_pool, healpix_analyse.masked_norm.HealPixRegionPool]
+    api: [healpix_analyse.masked_norm.global_pool, healpix_analyse.masked_norm.HealPixGlobalPool, healpix_analyse.masked_norm.region_pool, healpix_analyse.masked_norm.HealPixRegionPool]
     shapes: "x [B, C, N] -> [B, C] (global) or [B, C, R] (regions)"
     grad: yes (x)
     gpu_kernel: Triton (CSR int32 regions, no atomics)

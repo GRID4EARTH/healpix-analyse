@@ -205,19 +205,33 @@ def _fmt_args(fn, skip_first):
     return ast.unparse(args)
 
 
+def _api_name(qual):
+    """Short name of an ``ai.api`` entry: ``Name`` or ``Class.method``."""
+    return ".".join(qual.split(".")[2:])
+
+
 def _signatures(srcdir, qual):
     """Signature lines of ``healpix_analyse.module.Name``, read with :mod:`ast`.
 
-    A class gives its constructor and its ``forward`` (when defined), a
-    function its own signature. Raises LookupError when the name is absent.
+    A class gives its constructor and its ``forward`` (or ``__call__``), a
+    function its own signature, and ``healpix_analyse.module.Class.method``
+    the signature of that method. Raises LookupError when the name is absent.
     """
     parts = qual.split(".")
-    if parts[0] != "healpix_analyse" or len(parts) != 3:
-        raise LookupError("expected healpix_analyse.<module>.<name>")
+    if parts[0] != "healpix_analyse" or len(parts) not in (3, 4):
+        raise LookupError("expected healpix_analyse.<module>.<name> or "
+                          "healpix_analyse.<module>.<Class>.<method>")
     path = os.path.join(srcdir, "..", *parts[:2]) + ".py"
     with open(path, encoding="utf-8") as fh:
         tree = ast.parse(fh.read())
     name = parts[2]
+    if len(parts) == 4:
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == name:
+                for m in node.body:
+                    if isinstance(m, ast.FunctionDef) and m.name == parts[3]:
+                        return [f"{name}.{m.name}({_fmt_args(m, True)})"]
+        raise LookupError(f"{name}.{parts[3]} not defined in {'/'.join(parts[:2])}.py")
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return [f"{name}({_fmt_args(node, False)})"]
@@ -249,7 +263,7 @@ def _ai_table(cat):
     for role in roles:
         for tool in (t for t in _ai_tools(cat) if t["ai"]["role"] == role):
             a = tool["ai"]
-            names = ", ".join(f"`{q.rsplit('.', 1)[-1]}`" for q in a["api"])
+            names = ", ".join(f"`{_api_name(q)}`" for q in a["api"])
             out.append(f"| {names} | {role} | {_cell(a['does'])} | {_cell(a['shapes'])} "
                        f"| {_cell(a['grad'])} | {_cell(a['gpu_kernel'])} "
                        f"| {_cell(a['deterministic'])} | {_doc_link(tool['page'])} |\n")
@@ -270,7 +284,7 @@ def _ai_card(tool, srcdir, md=True):
     """API card of one AI building block (Markdown for the docs, text for llms)."""
     a = tool["ai"]
     sigs = [s for q in a["api"] for s in _signatures(srcdir, q)]
-    imports = ", ".join(q.rsplit(".", 1)[-1] for q in a["api"])
+    imports = ", ".join(dict.fromkeys(_api_name(q).split(".")[0] for q in a["api"]))
     lines = [f"Role: {a['role']} — {_cell(a['does'])}",
              f"Import: from healpix_analyse import {imports}",
              f"Shapes: {_cell(a['shapes'])}",
@@ -470,7 +484,7 @@ def _llms_txt(cat, base):
                    "llms-full.txt has an API card (signature, shapes, gradient, "
                    "determinism) for each and the full code of the recipes\n")
         for tool in _ai_tools(cat):
-            names = ", ".join(q.rsplit(".", 1)[-1] for q in tool["ai"]["api"])
+            names = ", ".join(_api_name(q) for q in tool["ai"]["api"])
             out.append(f"- [{names}]({_url(base, tool['page'])}) [{tool['ai']['role']}]: "
                        f"{_cell(tool['ai']['does'])}\n")
         for rec in ai.get("recipes", []):

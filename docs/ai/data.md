@@ -54,6 +54,11 @@ Clouds, land, outside the swath: most blocks let NaN propagate.
    in [0, 1] — the masked norms and the pooling accept both.
 5. Compute the loss on valid cells only (a weighted mean with the mask).
 
+`HealPixWindowAttention` and `HealPixNeighbourhoodAttention` take no mask
+(`forward(x)` only): zero-filled invalid cells enter the attention as zero
+tokens (after a masked norm, exactly 0), so keep the validity channel in the
+input and the mask in the loss.
+
 `HealPixConv(missing="local_mean")` and `HealPixWaveletSpectrum` complete
 the missing cells by the local mean instead; this runs the PyTorch
 reference path, which keeps the gathered stencil in memory.
@@ -100,6 +105,9 @@ See the {doc}`training recipe <recipes/training>`.
   domains is cheap after the first time.
 - Mixed precision: inside `torch.autocast`, `torch.nn.Linear`,
   `HealPixWindowAttention` and `HealPixNeighbourhoodAttention` run in
-  bfloat16; `HealPixConv` casts its input to its own dtype (build it
-  with `dtype=torch.bfloat16` for 16-bit kernels); the masked norms keep the
-  dtype of their input. See {doc}`recipes/training`.
+  bfloat16. On CUDA with Triton, `HealPixConv` also computes in the autocast
+  dtype (fp32 accumulation): its output is 16-bit while its weights stay
+  float32. On the CPU, and on the PyTorch path, it casts its input to the
+  layer dtype (float32 by default), so its output is float32 there. The
+  masked norms keep the dtype of their input. Compute the loss in float32
+  (`pred.float()`). See {doc}`recipes/training`.
