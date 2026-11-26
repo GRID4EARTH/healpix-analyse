@@ -150,9 +150,8 @@ def test_cache_paths(tmp_path):
     x = torch.randn(2, len(DOMAIN), dtype=torch.float64)
     xn = x.clone()
     xn[0, ::7] = float("nan")
-    # local_mean builds its geometry in float64: it shares the file of the
-    # float64 layers (_conv builds float64 layers), which holds the support;
-    # a float32 layer in the default mode has its own file
+    # every layer builds its geometry in float64 (#109): local_mean, float32
+    # and float64 layers share one file, which holds the support
     _conv(cache_dir=tmp_path)
     (lm_file,) = tmp_path.glob("healpixconv_*.pt")
     _conv(cache_dir=tmp_path, missing="local_mean")
@@ -160,7 +159,7 @@ def test_cache_paths(tmp_path):
     assert "support" in load(lm_file)
     _conv(cache_dir=tmp_path, dtype=torch.float32)
     _conv(cache_dir=tmp_path, dtype=torch.float32, missing="local_mean")
-    assert len(set(tmp_path.glob("healpixconv_*.pt"))) == 2
+    assert set(tmp_path.glob("healpixconv_*.pt")) == {lm_file}
     # a local_mean file without the support is recomputed once, and rewritten
     data = load(lm_file)
     del data["support"]

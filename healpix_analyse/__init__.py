@@ -79,7 +79,7 @@ from healpix_analyse.resample import (
     resample_to_latlon_grid,
 )
 from healpix_analyse.healpix_interp import get_interp_val, get_interp_weights
-from healpix_analyse.convol import HealPixConv
+from healpix_analyse.convol import HealPixConv, HealPixConvTranspose
 from healpix_analyse.patches import HealPixPatches
 from healpix_analyse.attention import (
     DEFAULT_WINDOW_SHIFT,
@@ -275,6 +275,7 @@ __all__ = [
     "get_interp_val",
     "get_interp_weights",
     "HealPixConv",
+    "HealPixConvTranspose",
     "HealPixPatches",
     "HealPixWindowAttention",
     "HealPixNeighbourhoodAttention",

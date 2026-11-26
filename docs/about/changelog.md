@@ -3,6 +3,50 @@
 ## Unreleased
 
 ### Changed
+- Stencil binding (`HealPixConv`, its strided and transposed forms,
+  `missing="local_mean"`, `HealPixNeighbourhoodAttention`, and the gauge mode
+  of `HealPixPatches`): a bilinear neighbour inside the domain counts only if
+  its weight is at least 1e-6 of the full 4-neighbour weight of its point
+  (#109). A point left with no neighbour that counts falls back to the centre,
+  as when all its neighbours are outside the domain (for `HealPixPatches`, it
+  is 0, as before). Two kinds of points change:
+  - a neighbour inside the domain with a rounding-size weight, which the
+    renormalisation raised to 1, so the point read a far cell; it is dropped;
+  - a point whose only neighbours inside the domain have an exact 0 weight:
+    before, its weights summed to 0 and it contributed nothing; it now falls
+    back to the centre, like a point with no neighbour inside.
+
+  **Outputs change only at such degenerate points, mostly on regional
+  domains with the `"phi"` gauge**, and the size of the change depends on the
+  kernel and the data. Measured against the previous version (kernel 3, 2
+  channels, maximum over 5 random kernels and inputs, change relative to
+  max |y|):
+  - `"phi"` gauge, ragged regional domain of 226 cells at level 6: 3 cells
+    (G = 1 or 2), 20 cells (G = 4), by up to 43–73 %; ragged domain of 864
+    cells at level 7: 5 cells (G = 1 or 2), 50 cells (G = 4), by up to
+    31–53 %;
+  - `"projected_ref"` gauge, the same domains: no change above 1e-6;
+  - full sphere, levels 6 and 7, G = 4: 16 to 264 cells move by at most
+    6e-7 (by up to 3e-6 with `missing="local_mean"`, in other runs).
+
+  `HealPixPatches` now also builds its gauge grid in float64 for every dtype,
+  as `HealPixConv`. The disk-cache format is bumped (4), so geometry cached by
+  earlier versions is rebuilt once instead of being reused.
+- `HealPixConv` builds its stencil geometry in float64 for every layer
+  dtype and casts only the final weights (#109). **This changes the outputs
+  of existing float32 layers at a few degenerate points, mostly on regional
+  domains: float32 models trained on regional domains shift there.** A
+  float32 build let a stencil point whose bilinear neighbours lie outside the
+  domain keep a present neighbour with a rounding-size weight, which the
+  renormalisation raised to 1, so the choice depended on rounding (device,
+  float32 implementation, library version). Measured on float32 layers:
+  regional domain at level 6 (`"phi"` gauge), 5 of 226 cells change, by up to
+  43 % of max |y|; regional domain at level 7, 3 of 864 cells; full sphere at
+  level 6 with `"projected_ref"`, about 1e-4 on 2 cells. float64 layers are
+  unchanged. The build now runs by chunks of output cells, so its peak memory
+  is lower than before despite float64: 2.5 GB instead of 10.0 GB at level 8,
+  G = 4, kernel 3, full sphere (CPU, maximum resident set); float32 layers share the disk-cache entry of float64 layers,
+  and existing float32 entries are rebuilt once.
 - `HEALPixSHT.uv_to_curl_div` now returns the divergence and the relative
   vorticity, in s⁻¹ for u, v in m/s (#94): the spin-1 E/B coefficients are
   multiplied by −√(ℓ(ℓ+1))/R before the spin-0 synthesis, with the new
@@ -26,6 +70,29 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `HealPixConv(stride=2)`, the strided gauge convolution of an encoder, and
+  `HealPixConvTranspose`, its adjoint for a decoder (#109, 1c). The strided
+  layer evaluates the stencil only at the centres of the parent cells (fine
+  spacing, centred on the parent centre), so it computes N/4 outputs and
+  replaces a convolution followed by `HealPixDown`; its output lies on
+  `cell_ids_out` (sorted parents, as for `HealPixDown`). With the same
+  arguments and weights, `HealPixConvTranspose` is its exact adjoint, from
+  the parent cells back to the fine ones. Both reuse the geometry, the disk
+  cache and the Triton kernels of `HealPixConv`, deterministic by default.
+- `HealPixConv` on the Triton backend: a double backward
+  (`create_graph=True`, gradient penalties) now runs on the Triton kernels
+  instead of the PyTorch backward (#109, 9). The convolution, its adjoint and
+  its weight gradient are three autograd Functions whose backward calls the
+  others. They also define `jvp` and `vmap`, so `torch.func.vmap`,
+  `jacrev`, `jacfwd` and `jvp` work again on the layer, as before #90.
+- `HealPixConv` with the PyTorch backend on CUDA (no Triton):
+  `deterministic=True` (the default) computes the input gradient by a gather
+  on the transposed stencil map instead of `index_add_`, so it gives the same
+  bits at every run without `torch.use_deterministic_algorithms` (#109, 9).
+- `benchmarks/benchmark_healpix_conv.py encoder`: an encoder block,
+  `HealPixConv` + `HealPixDown` against `HealPixConv(stride=2)`, and the
+  transposed convolution; `conv` variants `torch_det` and `penalty`
+  (gradient-penalty step).
 - `HealPixPatches` (#109, section 2): square patches of `N = 2**p` pixels,
   the tokens of ViT, MAE and JEPA models, centred on the cells of level
   `L - p` or on every cell. `mode="gauge"` (default) samples an `N x N` grid
@@ -148,11 +215,8 @@
   backward pass and kept, at about the size of the stencil buffers again
   (0.2–2.6 GiB in the benchmark configurations). `deterministic=False`
   scatters the gradient with fp32 atomics instead, with no extra memory and
-  last bits that vary between runs. `deterministic` applies to the Triton
-  backend only: on CUDA, the PyTorch backend (used without Triton) is
-  deterministic only under `torch.use_deterministic_algorithms(True)`. A
-  double backward (`create_graph=True`) runs the PyTorch backward on every
-  device, so gradient penalties keep their second-order terms.
+  last bits that vary between runs. For the PyTorch backend on CUDA and the
+  double backward (`create_graph=True`), see the #109 entries above.
   `missing="local_mean"` keeps the PyTorch reference path (gathered tensor
   and matrix product) on every device.
 - `benchmarks/benchmark_healpix_conv.py`: forward, forward + backward, peak
