@@ -385,9 +385,12 @@ def test_triton_strided_and_transpose(case, stride, deterministic):
     ref_conv = make(cs, stride)
     A, _ = dense_operator(ref_conv, cs["cell_ids"])
     A = A.float().to(dev)
-    conv = make(cs, stride, torch.float32, dev, backend="triton", deterministic=deterministic)
-    convT = make(cs, stride, torch.float32, dev, transpose=True, backend="triton",
-                 deterministic=deterministic)
+    # geometry built in float64, like the reference: a float32 build rounds
+    # stencil points at the edge of the ragged domain onto other neighbours
+    conv = make(cs, stride, torch.float64, dev, backend="triton",
+                deterministic=deterministic).float()
+    convT = make(cs, stride, torch.float64, dev, transpose=True, backend="triton",
+                 deterministic=deterministic).float()
     x0 = torch.randn(cs["B"], cs["C"], conv.K, device=dev)
     errs = rel_errs(grads(conv, conv, x0),
                     grads(lambda x: ref_s(A, conv.weight, conv.bias, x), conv, x0))
@@ -417,7 +420,7 @@ def test_torch_backend_on_cuda_is_deterministic_by_default(stride):
     """No use_deterministic_algorithms needed: S^T is a gather on CUDA."""
     cs = dict(CASES["regional"], C=16, Co=16)
     dev = torch.device("cuda")
-    conv = make(cs, stride, torch.float32, dev, backend="torch")
+    conv = make(cs, stride, torch.float64, dev, backend="torch").float()   # float64 geometry
     assert not torch.are_deterministic_algorithms_enabled()
     x0 = torch.randn(cs["B"], 16, conv.K, device=dev)
     a, b = grads(conv, conv, x0), grads(conv, conv, x0)
