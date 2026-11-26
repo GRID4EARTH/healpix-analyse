@@ -280,6 +280,12 @@ if _HAS_TRITON:
                 for bq, bk, nw, ns in spec]
 
     _WIN_CONFIGS = _win_configs(((64, 64, 4, 2), (64, 32, 4, 2), (128, 64, 8, 2)))
+    # dk / dv: four fp32 [BLOCK_K, BLOCK_Q] tiles live in the loop over the
+    # query blocks; with fp32 data and gathered rows the 2-stage pipeline
+    # measured 60x slower on an A100 (occupancy), so 1-stage and smaller tiles
+    # are in the space too
+    _WIN_KV_CONFIGS = _win_configs(((64, 64, 4, 2), (64, 64, 4, 1), (32, 64, 4, 1),
+                                    (64, 32, 4, 1)))
 
     # -----------------------------------------------------------------------
     # delta[row, h] = sum_d go[row, h, d] * o[row, h, d]  (fp32, both layouts)
@@ -591,7 +597,8 @@ if _HAS_TRITON:
         tl.store(dqkv_ptr + b.to(tl.int64) * SB + h * D + qpos[:, None] * SN + d[None, :],
                  (dq * scale).to(dqkv_ptr.dtype.element_ty), mask=mq)
 
-    @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D", "Q_CONTIG", "KV_CONTIG", "HAS_LEN"])
+    @triton.autotune(configs=_WIN_KV_CONFIGS,
+                     key=["TQ", "TK", "D", "Q_CONTIG", "KV_CONTIG", "HAS_LEN"])
     @triton.jit
     def _win_bwd_kv_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, kvlen_ptr, wlist_ptr,
                            go_ptr, lse_ptr, delta_ptr, acc_ptr, ASB, ASN, H, N, D, TQ, TK,
