@@ -382,8 +382,8 @@ tools:
   title: Gauge-equivariant convolution (HealPixConv)
   family: A
   page: conv/convol
-  symbols: [HealPixConv]
-  also: [set_kernel, missing, completed_stencil]
+  symbols: [HealPixConv, HealPixConvTranspose]
+  also: [set_kernel, missing, completed_stencil, stride, cell_ids_out]
   summary: >-
     A torch nn.Module that applies a small learned stencil (kernel_sz x
     kernel_sz) at every cell, transported into a local frame, so the result
@@ -391,12 +391,13 @@ tools:
   tasks:
     - learn a small convolution (3x3, 5x5) in a neural network on the sphere or on a regional domain
     - build a spherical U-Net or CNN layer that does not depend on the grid orientation
-  keywords: [CNN, deep learning, neural network, learned kernel, equivariant, gauge, U-Net, stencil]
+    - downsample in an encoder with a strided convolution (stride=2) and upsample in a decoder with its adjoint (HealPixConvTranspose)
+  keywords: [CNN, deep learning, neural network, learned kernel, equivariant, gauge, U-Net, stencil, strided, transposed convolution, encoder, decoder]
   domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction
   ordering: NESTED (the `nest` flag has no effect on the geometry)
   ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
-  io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out"
-  differentiable: yes, in the input and in the kernel weights
+  io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out. stride=2: N -> N/4 outputs on the parent cells. HealPixConvTranspose: [B, G*C_in, N/4] -> [B, C_out, N]"
+  differentiable: yes, in the input and in the kernel weights; double backward on the same kernels; torch.func (vmap, jacrev, jacfwd, jvp)
   gpu: yes (CUDA by default when available); fused Triton kernels for float32, float16 and bfloat16 with the optional triton package
   nan: not handled by default (NaN propagates); missing="local_mean" completes NaN like pixels outside the domain
   cost: >-
