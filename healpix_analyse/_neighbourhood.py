@@ -594,12 +594,40 @@ def build_neighbourhoods(
     ellipsoid: str,
 ) -> list[np.ndarray]:
     """Build a geometric neighbourhood for each HEALPix cell."""
+    offsets, flat = build_neighbourhoods_csr(
+        cells,
+        radius,
+        refinement_level,
+        neighbourhood=neighbourhood,
+        ellipsoid=ellipsoid,
+    )
+    return [
+        flat[start:stop]
+        for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
+    ]
+
+
+def build_neighbourhoods_csr(
+    cells: np.ndarray,
+    radius: float,
+    refinement_level: int,
+    *,
+    neighbourhood: NeighbourhoodMethod,
+    ellipsoid: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Geometric neighbourhoods in CSR form: ``(offsets, flat_cell_ids)``.
+
+    Row ``i`` is ``flat_cell_ids[offsets[i]:offsets[i + 1]]``, with the same
+    cells in the same order as :func:`build_neighbourhoods`.  No Python list
+    of per-cell arrays is built, which matters on the full sphere at fine
+    levels.
+    """
     ellipsoid = canonicalize_ellipsoid(ellipsoid)
     validate_neighbourhood(neighbourhood)
 
     cells_array = np.asarray(cells, dtype=np.uint64)
     if cells_array.size == 0:
-        return []
+        return np.zeros(1, dtype=np.int64), np.empty(0, dtype=np.uint64)
 
     # healpix-geo calls have appreciable fixed overhead. Convert all centres
     # and query all cones in one batched call each; every row keeps the
@@ -616,13 +644,9 @@ def build_neighbourhoods(
         refinement_level,
         ellipsoid=ellipsoid,
     )
-    candidates = [
-        flat_candidates[start:stop]
-        for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
-    ]
 
     if neighbourhood == "cone_coverage":
-        return candidates
+        return offsets, flat_candidates
 
     if ellipsoid != "WGS84":
         raise NotImplementedError(
@@ -632,7 +656,7 @@ def build_neighbourhoods(
 
     counts = np.diff(offsets)
     if not np.any(counts):
-        return candidates
+        return offsets, flat_candidates
 
     # Candidate IDs repeat heavily between adjacent centres. Resolve each
     # distinct HEALPix centre once, then expand the coordinates without
@@ -665,10 +689,17 @@ def build_neighbourhoods(
     )
     within_radius = distance <= radius
 
-    return [
-        flat_candidates[start:stop][within_radius[start:stop]]
-        for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
-    ]
+    rows = np.repeat(
+        np.arange(counts.size, dtype=np.int64),
+        counts,
+    )
+    row_counts = np.bincount(
+        rows[within_radius],
+        minlength=counts.size,
+    )
+    new_offsets = np.zeros(offsets.size, dtype=np.int64)
+    np.cumsum(row_counts, out=new_offsets[1:])
+    return new_offsets, flat_candidates[within_radius]
 
 
 def _neighbourhood(

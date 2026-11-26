@@ -45,11 +45,18 @@ from typing import Literal
 import numpy as np
 import torch
 
+from healpix_analyse import _neighbourhood
 from healpix_analyse._neighbourhood import (
     NeighbourhoodMethod,
     build_neighbourhoods,
 )
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
+from healpix_analyse._stencil_backend import (
+    BACKENDS,
+    FAST_REDUCTIONS,
+    Stencil,
+    stencil_reduce,
+)
 
 
 ArrayLike = np.ndarray | torch.Tensor
@@ -278,9 +285,12 @@ def _numerical_median(
     NaN values propagate.
     """
 
+    # A stable sort: the values are those of any sort, and on ties the
+    # subgradient goes to the first sample (the rule of the fused backends).
     sorted_values = torch.sort(
         values,
         dim=-1,
+        stable=True,
     ).values
 
     number_of_values = sorted_values.shape[-1]
@@ -484,6 +494,121 @@ def _reduce_selected(
     )
 
 
+def _generic_reduce(
+    work: torch.Tensor,
+    stencil,
+    reduction: str,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Vectorised ``std``, ``any``, ``all``, ``mode`` and integer reductions.
+
+    The neighbourhoods are gathered in row chunks of bounded size, padded
+    with the identity of the reduction (or masked).
+    """
+
+    batch = work.shape[0]
+    idx = stencil.idx
+    counts = stencil.cnt.long()
+    n_out, kp = idx.shape
+    output = torch.empty(
+        (batch, n_out),
+        dtype=output_dtype,
+        device=work.device,
+    )
+
+    if reduction == "std" and not work.dtype.is_floating_point:
+        work = work.to(torch.float64)
+
+    if reduction == "sum" and not work.dtype.is_floating_point:
+        work = work.to(torch.int64)
+
+    if reduction in {"min", "max", "mode"} and work.dtype == torch.bool:
+        work = work.to(torch.uint8)
+
+    if reduction in {"min", "max", "mode"}:
+        info = torch.iinfo(work.dtype)
+        fill = info.min if reduction == "max" else info.max
+    elif reduction == "all":
+        fill = True
+    elif reduction == "any":
+        fill = False
+    else:
+        fill = 0
+
+    extended = torch.cat(
+        [work, work.new_full((batch, 1), fill)],
+        dim=1,
+    )
+
+    step = max(1, (1 << 24) // max(1, batch * max(kp, 1)))
+    taps = torch.arange(kp, device=work.device)
+
+    for r0 in range(0, n_out, step):
+        r1 = min(n_out, r0 + step)
+        gathered = extended[:, idx[r0:r1].long()]
+        c = counts[r0:r1]
+        mask = taps[None, :] < c[:, None]
+
+        if reduction == "sum":
+            result = gathered.sum(dim=-1)
+        elif reduction == "min":
+            result = gathered.amin(dim=-1)
+        elif reduction == "max":
+            result = gathered.amax(dim=-1)
+        elif reduction == "any":
+            result = gathered.any(dim=-1)
+        elif reduction == "all":
+            result = gathered.all(dim=-1)
+        elif reduction == "std":
+            m = mask.to(gathered.dtype)
+            mean = (gathered * m).sum(dim=-1) / c
+            centred = (gathered - mean[..., None]) * m
+            variance = (centred * centred).sum(dim=-1) / c
+            # sqrt has an infinite derivative at 0 (NaN gradient on a
+            # constant neighbourhood); torch.std, the reference, gives 0.
+            # (NaN still propagates: only an exact zero is special-cased.)
+            zero = variance == 0
+            result = torch.where(
+                zero,
+                torch.zeros_like(variance),
+                torch.sqrt(torch.where(zero, torch.ones_like(variance), variance)),
+            )
+        elif reduction == "mode":
+            result = _vectorised_mode(gathered, mask)
+        else:  # pragma: no cover - dispatched elsewhere
+            raise AssertionError(reduction)
+
+        output[:, r0:r1] = result.to(output_dtype)
+
+    return output
+
+
+def _vectorised_mode(
+    gathered: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Smallest most frequent value of every row (pads sort last)."""
+
+    values, _ = torch.sort(gathered, dim=-1)
+    batch, rows, kp = values.shape
+    valid = mask.expand(batch, -1, -1)
+    start = torch.ones_like(valid)
+    start[..., 1:] = values[..., 1:] != values[..., :-1]
+    run = torch.cumsum(start.to(torch.int64), dim=-1) - 1
+    run_counts = torch.zeros(
+        (batch, rows, kp),
+        dtype=torch.int64,
+        device=values.device,
+    ).scatter_add_(-1, run, valid.to(torch.int64))
+    best_run = torch.argmax(run_counts, dim=-1, keepdim=True)
+    first = torch.argmax(
+        ((run == best_run) & valid).to(torch.int8),
+        dim=-1,
+        keepdim=True,
+    )
+    return values.gather(-1, first)[..., 0]
+
+
 class HealPixNeighbourReducer:
     """Reusable HEALPix neighbourhood-reduction operator.
 
@@ -600,21 +725,17 @@ class HealPixNeighbourReducer:
                     "'cell_ids'."
                 )
 
-        self._source_positions = {
-            int(cell): position
-            for position, cell
-            in enumerate(
-                self.cell_ids.tolist()
-            )
-        }
-
-        self._domain_set = set(
-            self.domain.tolist()
+        offsets, positions = self._build_csr()
+        self._stencil = Stencil(
+            offsets,
+            positions,
+            self.cell_ids.size,
         )
-
-        self._positions = (
-            self._build_positions()
-        )
+        self._counts = np.diff(offsets)
+        empty = np.flatnonzero(self._counts == 0)
+        # first output cell with an empty neighbourhood (checked at every
+        # call for the reductions that need values; kept off the hot path)
+        self._first_empty = int(empty[0]) if empty.size else -1
 
     @property
     def output_cell_ids(
@@ -624,25 +745,17 @@ class HealPixNeighbourReducer:
 
         return self.domain.copy()
 
-    def _build_positions(
-        self,
-    ) -> tuple[np.ndarray, ...]:
-        """Build input-array positions for each effective neighbourhood."""
-
-        if self.domain.size == 0:
-            return tuple()
+    def _geometric_csr(self) -> tuple[np.ndarray, np.ndarray]:
+        """Geometric neighbourhoods of the domain cells in CSR form."""
 
         if self.radius_m == 0:
-            geometrical_neighbourhoods = [
-                np.asarray(
-                    [cell],
-                    dtype=np.uint64,
-                )
-                for cell in self.domain
-            ]
+            return (
+                np.arange(self.domain.size + 1, dtype=np.int64),
+                self.domain.copy(),
+            )
 
-        else:
-            geometrical_neighbourhoods = build_neighbourhoods(
+        if build_neighbourhoods is _neighbourhood.build_neighbourhoods:
+            return _neighbourhood.build_neighbourhoods_csr(
                 self.domain,
                 self.radius_m,
                 self.refinement_level,
@@ -650,86 +763,239 @@ class HealPixNeighbourReducer:
                 ellipsoid=self.ellipsoid,
             )
 
-        all_positions = []
-
-        for target_cell, neighbours in zip(
+        # ``build_neighbourhoods`` was replaced (tests inject a fake
+        # geometry): use the per-cell lists it returns.
+        rows = build_neighbourhoods(
             self.domain,
-            geometrical_neighbourhoods,
-            strict=True,
-        ):
-            target_cell_int = int(
-                target_cell
+            self.radius_m,
+            self.refinement_level,
+            neighbourhood=self.neighbourhood,
+            ellipsoid=self.ellipsoid,
+        )
+        counts = np.asarray(
+            [len(row) for row in rows],
+            dtype=np.int64,
+        )
+        offsets = np.zeros(counts.size + 1, dtype=np.int64)
+        np.cumsum(counts, out=offsets[1:])
+        flat = (
+            np.concatenate(
+                [np.asarray(row, dtype=np.uint64) for row in rows]
+            )
+            if counts.sum()
+            else np.empty(0, dtype=np.uint64)
+        )
+        return offsets, flat
+
+    def _build_csr(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Input-array positions of every effective neighbourhood (CSR).
+
+        Row ``i`` holds the sorted, unique positions in ``cell_ids`` of the
+        cells of ``domain`` that lie in the neighbourhood of ``domain[i]``
+        (and of ``domain[i]`` itself when ``include_self``).  Geometrically
+        neighbouring cells outside the processing domain are absent from the
+        effective neighbourhood: they are NOT zero padded.
+        """
+
+        n_domain = self.domain.size
+
+        if n_domain == 0:
+            return (
+                np.zeros(1, dtype=np.int64),
+                np.empty(0, dtype=np.int64),
             )
 
-            positions = []
+        offsets, flat = self._geometric_csr()
+        flat = np.asarray(flat, dtype=np.uint64)
+        counts = np.diff(offsets)
+        rows = np.repeat(
+            np.arange(n_domain, dtype=np.int64),
+            counts,
+        )
 
-            for neighbour in neighbours:
-                neighbour_int = int(
-                    neighbour
-                )
+        # Keep the neighbours that belong to the processing domain.
+        domain_order = np.argsort(self.domain, kind="stable")
+        sorted_domain = self.domain[domain_order]
+        at = np.searchsorted(sorted_domain, flat)
+        at_clipped = np.minimum(at, n_domain - 1)
+        in_domain = sorted_domain[at_clipped] == flat
 
-                # Partial-domain semantics:
-                #
-                # geometrically neighbouring cells outside the
-                # processing domain are absent from the effective
-                # neighbourhood. They are NOT zero padded.
-                if neighbour_int not in self._domain_set:
-                    continue
+        if not self.include_self:
+            in_domain &= flat != self.domain[rows]
 
-                if (
-                    not self.include_self
-                    and neighbour_int
-                    == target_cell_int
-                ):
-                    continue
+        rows = rows[in_domain]
+        flat = flat[in_domain]
 
-                source_position = (
-                    self._source_positions.get(
-                        neighbour_int
-                    )
-                )
+        # Map cell IDs to positions in ``cell_ids`` (domain is a subset).
+        source_order = np.argsort(self.cell_ids, kind="stable")
+        sorted_sources = self.cell_ids[source_order]
+        positions = source_order[
+            np.searchsorted(sorted_sources, flat)
+        ].astype(np.int64)
 
-                # This should normally be redundant because domain is
-                # validated as a subset of cell_ids, but keeping the
-                # check makes the geometry-to-data relationship
-                # explicit and robust.
-                if source_position is None:
-                    continue
-
-                positions.append(
-                    source_position
-                )
-
-            if self.include_self:
-                target_position = (
-                    self._source_positions[
-                        target_cell_int
-                    ]
-                )
-
-                if (
-                    target_position
-                    not in positions
-                ):
-                    positions.append(
-                        target_position
-                    )
-
-            # Reductions are order-independent. Sorting by source-array
-            # position makes the internal representation deterministic.
-            positions = sorted(
-                set(positions)
+        if self.include_self:
+            target_positions = source_order[
+                np.searchsorted(sorted_sources, self.domain)
+            ].astype(np.int64)
+            rows = np.concatenate(
+                [rows, np.arange(n_domain, dtype=np.int64)]
+            )
+            positions = np.concatenate(
+                [positions, target_positions]
             )
 
-            all_positions.append(
-                np.asarray(
-                    positions,
-                    dtype=np.int64,
-                )
+        # Reductions are order-independent. Sorting by source-array
+        # position makes the internal representation deterministic.
+        order = np.lexsort((positions, rows))
+        rows = rows[order]
+        positions = positions[order]
+
+        if positions.size:
+            keep = np.ones(positions.size, dtype=bool)
+            keep[1:] = (rows[1:] != rows[:-1]) | (
+                positions[1:] != positions[:-1]
             )
+            rows = rows[keep]
+            positions = positions[keep]
+
+        new_offsets = np.zeros(n_domain + 1, dtype=np.int64)
+        np.cumsum(
+            np.bincount(rows, minlength=n_domain),
+            out=new_offsets[1:],
+        )
+
+        return new_offsets, positions
+
+    @property
+    def _positions(
+        self,
+    ) -> tuple[np.ndarray, ...]:
+        """Input positions of each effective neighbourhood (one array per cell)."""
+
+        stencil = self._stencil
 
         return tuple(
-            all_positions
+            stencil.idx[row, : stencil.cnt[row]].astype(np.int64)
+            for row in range(stencil.n_out)
+        )
+
+    @property
+    def max_neighbours(
+        self,
+    ) -> int:
+        """Largest number of cells in an effective neighbourhood."""
+
+        return self._stencil.kp
+
+    def _reference_reduce(
+        self,
+        tensor: torch.Tensor,
+        reduction: str,
+    ) -> torch.Tensor:
+        """Reference implementation: one ``index_select`` per output cell.
+
+        Kept as the ground truth of the vectorised backends (tests).
+        ``tensor`` is ``[B, N_in]``; returns ``[B, N_out]``.
+        """
+
+        output_columns = []
+
+        for target_cell, positions in zip(
+            self.domain,
+            self._positions,
+            strict=True,
+        ):
+            index = torch.as_tensor(
+                positions,
+                dtype=torch.long,
+                device=tensor.device,
+            )
+
+            selected = tensor.index_select(
+                -1,
+                index,
+            )
+
+            output_columns.append(
+                _reduce_selected(
+                    selected,
+                    reduction,
+                    target_cell=int(target_cell),
+                )
+            )
+
+        return torch.stack(
+            output_columns,
+            dim=-1,
+        )
+
+    def _check_empty_neighbourhoods(
+        self,
+        reduction: str,
+    ) -> None:
+        """Raise like the reference for an undefined empty reduction."""
+
+        if reduction in {"sum", "count", "any", "all"}:
+            return
+
+        if self._first_empty >= 0:
+            target_cell = int(self.domain[self._first_empty])
+
+            raise ValueError(
+                f"Cell {target_cell} has an empty neighbourhood "
+                f"for reduction={reduction!r}. "
+                "Use include_self=True, increase radius_m, enlarge "
+                "the processing domain, or select a reduction with "
+                "a defined empty-neighbourhood identity."
+            )
+
+    def _reduce(
+        self,
+        flattened: torch.Tensor,
+        reduction: str,
+        output_dtype: torch.dtype,
+        *,
+        backend: str,
+    ) -> torch.Tensor:
+        """Vectorised reduction of ``flattened [B, N_in]`` -> ``[B, N_out]``."""
+
+        stencil = self._stencil
+        device = flattened.device
+
+        if reduction == "count":
+            counts = stencil.on(device).cnt
+
+            return counts.to(torch.int64).expand(
+                flattened.shape[0],
+                -1,
+            ).clone()
+
+        work = flattened
+
+        if (
+            reduction in {"mean", "median"}
+            and not work.dtype.is_floating_point
+        ):
+            work = work.to(torch.float64)
+
+        if (
+            reduction in FAST_REDUCTIONS
+            and work.dtype.is_floating_point
+        ):
+            return stencil_reduce(
+                work,
+                stencil,
+                reduction,
+                backend=backend,
+            )
+
+        return _generic_reduce(
+            work,
+            stencil.on(device),
+            reduction,
+            output_dtype,
         )
 
     def __call__(
@@ -737,6 +1003,7 @@ class HealPixNeighbourReducer:
         values: ArrayLike,
         *,
         reduction: Reduction = "mean",
+        backend: str = "auto",
     ) -> ArrayLike:
         """Apply a neighbourhood reduction to a field.
 
@@ -764,6 +1031,12 @@ class HealPixNeighbourReducer:
             - ``"any"``
             - ``"all"``
             - ``"mode"``
+        backend
+            ``"auto"`` (default), ``"triton"`` or ``"torch"``.  ``"auto"``
+            runs the fused Triton kernels for ``sum``, ``mean``, ``min``,
+            ``max`` and ``median`` of floating-point CUDA tensors when Triton
+            is installed, and the PyTorch backend otherwise.  Both give the
+            same values; see the notes.
 
         Returns
         -------
@@ -787,11 +1060,25 @@ class HealPixNeighbourReducer:
           bool and require boolean input.
         - ``min``, ``max``, ``mode``:
           preserve input dtype.
+
+        Gradients: ``sum``, ``mean``, ``min``, ``max`` and ``median`` have a
+        hand-written backward pass (deterministic: a gather on the transposed
+        neighbourhoods on CUDA, ``index_add_`` on CPU).  ``min``, ``max`` and
+        ``median`` use the subgradient of torch: the whole gradient goes to
+        the selected value (half to each central value of an even median),
+        ties go to the first cell in the order of ``cell_ids``, a NaN row of
+        ``median`` gets no gradient and ``min`` / ``max`` select the first
+        NaN.
         """
 
         reduction = _validate_reduction(
             reduction
         )
+
+        if backend not in BACKENDS:
+            raise ValueError(
+                f"'backend' must be one of {BACKENDS}, got {backend!r}."
+            )
 
         is_numpy = isinstance(
             values,
@@ -870,7 +1157,7 @@ class HealPixNeighbourReducer:
             reduction,
         )
 
-        if len(self._positions) == 0:
+        if self.domain.size == 0:
             output = torch.empty(
                 (*leading_shape, 0),
                 dtype=output_dtype,
@@ -878,41 +1165,13 @@ class HealPixNeighbourReducer:
             )
 
         else:
-            output_columns = []
+            self._check_empty_neighbourhoods(reduction)
 
-            for target_cell, positions in zip(
-                self.domain,
-                self._positions,
-                strict=True,
-            ):
-                index = torch.as_tensor(
-                    positions,
-                    dtype=torch.long,
-                    device=tensor.device,
-                )
-
-                selected = (
-                    flattened.index_select(
-                        -1,
-                        index,
-                    )
-                )
-
-                reduced = _reduce_selected(
-                    selected,
-                    reduction,
-                    target_cell=int(
-                        target_cell
-                    ),
-                )
-
-                output_columns.append(
-                    reduced
-                )
-
-            output = torch.stack(
-                output_columns,
-                dim=-1,
+            output = self._reduce(
+                flattened,
+                reduction,
+                output_dtype,
+                backend=backend,
             )
 
             output = output.reshape(

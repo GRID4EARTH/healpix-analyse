@@ -41,5 +41,7 @@ resample
 interpolation
 augment
 dino
+masked_norm
+positional_encoding
 validation
 ```
