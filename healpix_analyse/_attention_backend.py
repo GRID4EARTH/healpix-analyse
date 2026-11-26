@@ -29,9 +29,11 @@ values.
     differentiable operations, so a double backward works.
 
 ``"triton"`` (CUDA, float32 / float16 / bfloat16, fp32 accumulation)
-    Forward: one program per (block of cells, batch, gauge, head) gathers the
-    4 neighbours of each tap in registers and runs an online softmax over the
-    taps (flash-attention style); it stores the output and the log-sum-exp.
+    Forward: one program per (block of cells, batch, gauge), all heads at
+    once (the stencil indices and weights are read once, and each gathered
+    row holds the H*D values of a cell), gathers the 4 neighbours of each tap
+    in registers and runs an online softmax over the taps (flash-attention
+    style); it stores the output and the log-sum-exp.
     Backward, deterministic, no atomics: a first kernel recomputes the scores
     and writes ``dq`` (summed over the gauges in registers) together with the
     probabilities ``a`` and the score gradients ``ds`` (``[B, G, H, P, N]``,
@@ -49,12 +51,15 @@ Window attention (:class:`~healpix_analyse.attention.HealPixWindowAttention`)
 ``"triton"``: flash-attention kernels on gathered windows.  Forward: one
 program per (window, block of queries, batch, head) gathers its query rows
 and loops over the key blocks of the window (``tl.dot`` for q k^T and p v,
-online softmax); padding keys are masked in registers, so a padded or
-overlapping window costs no gathered copy and no mask tensor.  Backward,
-deterministic, no atomics: ``dq`` per block of queries; ``dk``, ``dv`` per
-block of keys, written to the cells directly when each cell is the key of
-one window slot, else to per-slot partial sums reduced per cell in a fixed
-order (CSR).  ``"torch"``: gather, ``scaled_dot_product_attention``, scatter.
+online softmax); each window loops over its own number of keys only, and
+padding keys are masked in registers, so a padded or overlapping window
+costs no gathered copy and no mask tensor.  Backward, deterministic, no
+atomics: ``dq`` per block of queries; ``dk``, ``dv`` per block of keys,
+written to the cells directly when each cell is the key of one window slot.
+Overlapping windows are coloured so that no two windows of a colour share a
+key cell; the colours run one after the other and add their contribution in
+place (fixed order, fp32).  ``"torch"``: gather,
+``scaled_dot_product_attention``, scatter.
 """
 
 from __future__ import annotations
@@ -236,11 +241,18 @@ def _torch_backward(q, k, v, bias, idx, w, valid, scale, out, a, gout, needs):
 #   qkv   [B, N, 3, H, D]  the output of the qkv projection, read with strides
 #                          (batch stride SB, cell stride SN, in elements);
 #   dqkv  same layout: the kernels write the gradient of the projection output.
-#   neighbourhood: o [B, G, N, H, D], lse [B, G, H, N] (fp32);
-#   window:        o [B, N, H, D],    lse [B, N, H]    (fp32).
+#   neighbourhood: o [B, G, N, H, D], lse and delta [B, G, H, N] (fp32);
+#   window:        o [B, N, H, D],    lse and delta [B, N, H]    (fp32).
+# The neighbourhood kernels process all the heads of a cell in one program:
+# the stencil indices and weights are read once, and each gathered row is the
+# H*D values of a cell (wider memory transactions than one head).
+
+def _pow2(n, lo=1):
+    return max(lo, 1 << max(0, int(n) - 1).bit_length())
+
 
 def _block_d(D):
-    return max(16, 1 << max(0, int(D) - 1).bit_length())
+    return _pow2(D, 16)       # tl.dot needs >= 16
 
 
 def _precision(dtype):
@@ -258,8 +270,8 @@ if _HAS_TRITON:
             spec = spec[:1]
         return [triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=1) for bm, nw in spec]
 
-    # a small autotune space (the likely winners): gather-bound kernels
-    _NA_CONFIGS = _configs(((64, 4), (32, 4), (128, 8)))
+    # small autotune spaces (the likely winners)
+    _NA_CONFIGS = _configs(((32, 4), (16, 4), (64, 8)))
 
     def _win_configs(spec):
         if _INTERPRET:
@@ -267,153 +279,180 @@ if _HAS_TRITON:
         return [triton.Config({"BLOCK_Q": bq, "BLOCK_K": bk}, num_warps=nw, num_stages=ns)
                 for bq, bk, nw, ns in spec]
 
-    # a small autotune space (the likely winners of flash attention at D <= 64)
-    _WIN_CONFIGS = _win_configs((
-        (64, 64, 4, 2), (64, 32, 4, 2), (128, 64, 8, 2)))
+    _WIN_CONFIGS = _win_configs(((64, 64, 4, 2), (64, 32, 4, 2), (128, 64, 8, 2)))
 
     # -----------------------------------------------------------------------
-    # Neighbourhood attention
+    # delta[row, h] = sum_d go[row, h, d] * o[row, h, d]  (fp32, both layouts)
     # -----------------------------------------------------------------------
 
     @triton.jit
-    def _tap_kv(k_base, v_base, idx_ptr, w_ptr, p, g, n, n_ok, d, d_ok, G, N, SN,
-                BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr):
-        """Bilinear key and value of tap p for the cells n: [BLOCK_M, BLOCK_D] fp32."""
-        kt = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-        vt = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-        md = n_ok[:, None] & d_ok[None, :]
+    def _delta_kernel(go_ptr, o_ptr, delta_ptr, R, NC, H, D,
+                      HN_LAYOUT: tl.constexpr, BLOCK_M: tl.constexpr,
+                      BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
+        """Rows ``r`` of ``[R, H, D]``; HN_LAYOUT: row r = bg*NC + n -> delta[(bg*H + h)*NC + n],
+        else delta[r*H + h]."""
+        r = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        r_ok = r < R
+        h = tl.arange(0, BLOCK_H)
+        d = tl.arange(0, BLOCK_D)
+        hd = h[:, None] * D + d[None, :]
+        m3 = r_ok[:, None, None] & ((h < H)[:, None] & (d < D)[None, :])[None, :, :]
+        off = r.to(tl.int64)[:, None, None] * (H * D) + hd[None, :, :]
+        x = tl.load(go_ptr + off, mask=m3, other=0.0).to(tl.float32)
+        y = tl.load(o_ptr + off, mask=m3, other=0.0).to(tl.float32)
+        s = tl.sum(x * y, axis=2)                                         # [BM, BH]
+        r64 = r.to(tl.int64)[:, None]
+        if HN_LAYOUT:
+            dst = ((r64 // NC) * H + h[None, :]) * NC + (r64 % NC)
+        else:
+            dst = r64 * H + h[None, :]
+        tl.store(delta_ptr + dst, s, mask=r_ok[:, None] & (h < H)[None, :])
+
+    # -----------------------------------------------------------------------
+    # Neighbourhood attention (all heads per program)
+    # -----------------------------------------------------------------------
+
+    @triton.jit
+    def _na_tap_kv(k_base, v_base, idx_ptr, w_ptr, p, g, n, n_ok, hd, m3, G, N, SN,
+                   BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
+        """Bilinear key and value of tap p for the cells n, all heads: [BM, BH, BD] fp32."""
+        kt = tl.zeros((BLOCK_M, BLOCK_H, BLOCK_D), dtype=tl.float32)
+        vt = tl.zeros((BLOCK_M, BLOCK_H, BLOCK_D), dtype=tl.float32)
         for j in tl.static_range(4):
             off = ((p * 4 + j) * G + g).to(tl.int64) * N + n
             src = tl.load(idx_ptr + off, mask=n_ok, other=0).to(tl.int64)
             ww = tl.load(w_ptr + off, mask=n_ok, other=0.0).to(tl.float32)
-            rows = src[:, None] * SN + d[None, :]
-            kt += ww[:, None] * tl.load(k_base + rows, mask=md, other=0.0).to(tl.float32)
-            vt += ww[:, None] * tl.load(v_base + rows, mask=md, other=0.0).to(tl.float32)
+            rows = src[:, None, None] * SN + hd[None, :, :]
+            kt += ww[:, None, None] * tl.load(k_base + rows, mask=m3, other=0.0).to(tl.float32)
+            vt += ww[:, None, None] * tl.load(v_base + rows, mask=m3, other=0.0).to(tl.float32)
         return kt, vt
 
     @triton.jit
-    def _tap_score(qv, kt, bias_ptr, valid_ptr, h, p, g, n, n_ok, G, N, P, scale,
-                   HAS_BIAS: tl.constexpr, HAS_VALID: tl.constexpr):
-        s = tl.sum(qv * kt, axis=1) * scale
+    def _na_tap_score(qv, kt, bias_ptr, valid_ptr, h, h_ok, p, g, n, n_ok, G, N, P, scale,
+                      HAS_BIAS: tl.constexpr, HAS_VALID: tl.constexpr):
+        s = tl.sum(qv * kt, axis=2) * scale                                # [BM, BH]
         if HAS_BIAS:
-            s += tl.load(bias_ptr + h * P + p).to(tl.float32)
+            s += tl.load(bias_ptr + h * P + p, mask=h_ok, other=0.0).to(tl.float32)[None, :]
         if HAS_VALID:
             ok = tl.load(valid_ptr + (p * G + g).to(tl.int64) * N + n, mask=n_ok, other=1)
-            s = tl.where(ok != 0, s, float("-inf"))
+            s = tl.where((ok != 0)[:, None], s, float("-inf"))
         return s
 
-    @triton.autotune(configs=_NA_CONFIGS, key=["D", "P", "G", "SIZE"])
+    @triton.autotune(configs=_NA_CONFIGS, key=["H", "D", "P", "G", "SIZE"])
     @triton.jit
     def _na_fwd_kernel(qkv_ptr, SB, SN, idx_ptr, w_ptr, bias_ptr, valid_ptr, o_ptr, lse_ptr,
                        B, H, G, N, D, scale, SIZE, P: tl.constexpr,
                        HAS_BIAS: tl.constexpr, HAS_VALID: tl.constexpr,
-                       BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr):
-        """o[b, g, n, h] = sum_p softmax_p(s) v_p; lse[b, g, h, n] = logsumexp_p(s)."""
+                       BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
+        """o[b, g, n] = sum_p softmax_p(s) v_p; lse[b, g, h, n] = logsumexp_p(s)."""
         pid_n = tl.program_id(0)
-        pid = tl.program_id(1)           # head fastest, then batch: the same idx / w
-        h = pid % H                      # tiles are reused from L2
-        rest = pid // H
-        b = rest % B
-        g = rest // B
+        pid = tl.program_id(1)           # batch fastest: the same idx / w tiles
+        b = pid % B                      # are reused from L2
+        g = pid // B
         C = H * D
         n = pid_n * BLOCK_M + tl.arange(0, BLOCK_M)
         n_ok = n < N
+        h = tl.arange(0, BLOCK_H)
+        h_ok = h < H
         d = tl.arange(0, BLOCK_D)
-        d_ok = d < D
-        md = n_ok[:, None] & d_ok[None, :]
-        q_base = qkv_ptr + b.to(tl.int64) * SB + h * D
-        qv = tl.load(q_base + n.to(tl.int64)[:, None] * SN + d[None, :], mask=md,
+        hd = h[:, None] * D + d[None, :]
+        m3 = n_ok[:, None, None] & (h_ok[:, None] & (d < D)[None, :])[None, :, :]
+        q_base = qkv_ptr + b.to(tl.int64) * SB
+        qv = tl.load(q_base + n.to(tl.int64)[:, None, None] * SN + hd[None, :, :], mask=m3,
                      other=0.0).to(tl.float32)
-        m_i = tl.full((BLOCK_M,), -1.0e30, dtype=tl.float32)   # finite: no inf - inf
-        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        m_i = tl.full((BLOCK_M, BLOCK_H), -1.0e30, dtype=tl.float32)   # finite: no inf - inf
+        l_i = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, BLOCK_H, BLOCK_D), dtype=tl.float32)
         for p in tl.static_range(P):
-            kt, vt = _tap_kv(q_base + C, q_base + 2 * C, idx_ptr, w_ptr, p, g, n, n_ok, d, d_ok,
-                             G, N, SN, BLOCK_M, BLOCK_D)
-            s = _tap_score(qv, kt, bias_ptr, valid_ptr, h, p, g, n, n_ok, G, N, P, scale,
-                           HAS_BIAS, HAS_VALID)
+            kt, vt = _na_tap_kv(q_base + C, q_base + 2 * C, idx_ptr, w_ptr, p, g, n, n_ok, hd,
+                                m3, G, N, SN, BLOCK_M, BLOCK_H, BLOCK_D)
+            s = _na_tap_score(qv, kt, bias_ptr, valid_ptr, h, h_ok, p, g, n, n_ok, G, N, P,
+                              scale, HAS_BIAS, HAS_VALID)
             m_new = tl.maximum(m_i, s)
             alpha = tl.exp(m_i - m_new)
             e = tl.exp(s - m_new)
             l_i = l_i * alpha + e
-            acc = acc * alpha[:, None] + e[:, None] * vt
+            acc = acc * alpha[:, :, None] + e[:, :, None] * vt
             m_i = m_new
-        acc = acc / l_i[:, None]
-        orow = ((b * G + g).to(tl.int64) * N + n) * C + h * D
-        tl.store(o_ptr + orow[:, None] + d[None, :], acc.to(o_ptr.dtype.element_ty), mask=md)
-        tl.store(lse_ptr + ((b * G + g) * H + h).to(tl.int64) * N + n, m_i + tl.log(l_i),
-                 mask=n_ok)
+        acc = acc / l_i[:, :, None]
+        bg = (b * G + g).to(tl.int64)
+        orow = (bg * N + n)[:, None, None] * C + hd[None, :, :]
+        tl.store(o_ptr + orow, acc.to(o_ptr.dtype.element_ty), mask=m3)
+        lrow = (bg * H + h[None, :]) * N + n[:, None]
+        tl.store(lse_ptr + lrow, m_i + tl.log(l_i), mask=n_ok[:, None] & h_ok[None, :])
 
-    @triton.autotune(configs=_NA_CONFIGS, key=["D", "P", "G", "SIZE"])
+    @triton.autotune(configs=_NA_CONFIGS, key=["H", "D", "P", "G", "SIZE"])
     @triton.jit
     def _na_bwd_q_kernel(qkv_ptr, SB, SN, idx_ptr, w_ptr, bias_ptr, valid_ptr,
                          go_ptr, lse_ptr, delta_ptr, dqkv_ptr, a_ptr, ds_ptr,
                          B, H, G, N, D, scale, SIZE, P: tl.constexpr,
                          HAS_BIAS: tl.constexpr, HAS_VALID: tl.constexpr,
-                         BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr):
+                         BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
         """dq (summed over the gauges in registers), a and ds [B, G, H, P, N]."""
         pid_n = tl.program_id(0)
-        pid = tl.program_id(1)
-        h = pid % H
-        b = pid // H
+        b = tl.program_id(1)
         C = H * D
         n = pid_n * BLOCK_M + tl.arange(0, BLOCK_M)
         n_ok = n < N
+        h = tl.arange(0, BLOCK_H)
+        h_ok = h < H
         d = tl.arange(0, BLOCK_D)
-        d_ok = d < D
-        md = n_ok[:, None] & d_ok[None, :]
-        q_base = qkv_ptr + b.to(tl.int64) * SB + h * D
-        nrow = n.to(tl.int64)[:, None] * SN + d[None, :]
-        qv = tl.load(q_base + nrow, mask=md, other=0.0).to(tl.float32)
-        dq = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        hd = h[:, None] * D + d[None, :]
+        m3 = n_ok[:, None, None] & (h_ok[:, None] & (d < D)[None, :])[None, :, :]
+        mh = n_ok[:, None] & h_ok[None, :]
+        q_base = qkv_ptr + b.to(tl.int64) * SB
+        nrow = n.to(tl.int64)[:, None, None] * SN + hd[None, :, :]
+        qv = tl.load(q_base + nrow, mask=m3, other=0.0).to(tl.float32)
+        dq = tl.zeros((BLOCK_M, BLOCK_H, BLOCK_D), dtype=tl.float32)
         for g in range(0, G):
-            bgh = ((b * G + g) * H + h).to(tl.int64)
-            orow = ((b * G + g).to(tl.int64) * N + n) * C + h * D
-            go = tl.load(go_ptr + orow[:, None] + d[None, :], mask=md, other=0.0).to(tl.float32)
-            lse = tl.load(lse_ptr + bgh * N + n, mask=n_ok, other=0.0)
-            delta = tl.load(delta_ptr + bgh * N + n, mask=n_ok, other=0.0)
+            bg = (b * G + g).to(tl.int64)
+            go = tl.load(go_ptr + (bg * N + n)[:, None, None] * C + hd[None, :, :], mask=m3,
+                         other=0.0).to(tl.float32)
+            lrow = (bg * H + h[None, :]) * N + n[:, None]
+            lse = tl.load(lse_ptr + lrow, mask=mh, other=0.0)
+            delta = tl.load(delta_ptr + lrow, mask=mh, other=0.0)
             for p in tl.static_range(P):
-                kt, vt = _tap_kv(q_base + C, q_base + 2 * C, idx_ptr, w_ptr, p, g, n, n_ok,
-                                 d, d_ok, G, N, SN, BLOCK_M, BLOCK_D)
-                s = _tap_score(qv, kt, bias_ptr, valid_ptr, h, p, g, n, n_ok, G, N, P, scale,
-                               HAS_BIAS, HAS_VALID)
+                kt, vt = _na_tap_kv(q_base + C, q_base + 2 * C, idx_ptr, w_ptr, p, g, n, n_ok,
+                                    hd, m3, G, N, SN, BLOCK_M, BLOCK_H, BLOCK_D)
+                s = _na_tap_score(qv, kt, bias_ptr, valid_ptr, h, h_ok, p, g, n, n_ok, G, N, P,
+                                  scale, HAS_BIAS, HAS_VALID)
                 a = tl.exp(s - lse)
-                ds = a * (tl.sum(go * vt, axis=1) - delta)
-                dq += ds[:, None] * kt
-                row = (bgh * P + p) * N + n
-                tl.store(a_ptr + row, a, mask=n_ok)
-                tl.store(ds_ptr + row, ds, mask=n_ok)
-        tl.store(dqkv_ptr + b.to(tl.int64) * SB + h * D + nrow,
-                 (dq * scale).to(dqkv_ptr.dtype.element_ty), mask=md)
+                ds = a * (tl.sum(go * vt, axis=2) - delta)
+                dq += ds[:, :, None] * kt
+                row = ((bg * H + h[None, :]) * P + p) * N + n[:, None]
+                tl.store(a_ptr + row, a, mask=mh)
+                tl.store(ds_ptr + row, ds, mask=mh)
+        tl.store(dqkv_ptr + b.to(tl.int64) * SB + nrow,
+                 (dq * scale).to(dqkv_ptr.dtype.element_ty), mask=m3)
 
-    @triton.autotune(configs=_NA_CONFIGS, key=["D", "P", "G", "SIZE"])
+    @triton.autotune(configs=_NA_CONFIGS, key=["H", "D", "P", "G", "SIZE"])
     @triton.jit
     def _na_bwd_kv_kernel(qkv_ptr, SB, SN, go_ptr, a_ptr, ds_ptr, tptr_ptr, tbase_ptr, tk_ptr,
                           tw_ptr, dqkv_ptr, B, H, G, N, D, scale, SIZE, P: tl.constexpr,
-                          BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr):
+                          BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
         """dk[s] = scale sum tw ds q[t], dv[s] = sum tw a go[t] over the entries of s.
 
-        One program per (block of source cells, batch, head); the entries of
-        each source cell come from the transposed map, in a fixed order: no
-        atomics.
+        One program per (block of source cells, batch); the entries of each
+        source cell come from the transposed map, in a fixed order: no atomics.
         """
         pid_n = tl.program_id(0)
-        pid = tl.program_id(1)
-        h = pid % H
-        b = pid // H
+        b = tl.program_id(1)
         C = H * D
         s_ = pid_n * BLOCK_M + tl.arange(0, BLOCK_M)
         s_ok = s_ < N
         s64 = s_.to(tl.int64)
+        h = tl.arange(0, BLOCK_H)
+        h_ok = h < H
         d = tl.arange(0, BLOCK_D)
-        d_ok = d < D
-        q_base = qkv_ptr + b.to(tl.int64) * SB + h * D
+        hd = h[:, None] * D + d[None, :]
+        hd_ok = h_ok[:, None] & (d < D)[None, :]
+        q_base = qkv_ptr + b.to(tl.int64) * SB
         GN1 = (G * N + 1).to(tl.int64)       # row stride of ptr [P, G*N + 1]
-        dk = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-        dv = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        dk = tl.zeros((BLOCK_M, BLOCK_H, BLOCK_D), dtype=tl.float32)
+        dv = tl.zeros((BLOCK_M, BLOCK_H, BLOCK_D), dtype=tl.float32)
         for g in range(0, G):
-            bgh = ((b * G + g) * H + h).to(tl.int64)
-            go_base = go_ptr + (b * G + g).to(tl.int64) * N * C + h * D
+            bg = (b * G + g).to(tl.int64)
+            go_base = go_ptr + bg * N * C
             for p in tl.static_range(P):
                 base = tl.load(tbase_ptr + p)
                 row = s64 + g * N + p * GN1
@@ -425,27 +464,30 @@ if _HAS_TRITON:
                     e = base + start.to(tl.int64) + jj
                     t = tl.load(tk_ptr + e, mask=m, other=0).to(tl.int64)
                     ww = tl.load(tw_ptr + e, mask=m, other=0.0).to(tl.float32)
-                    pr = (bgh * P + p) * N + t
-                    av = tl.load(a_ptr + pr, mask=m, other=0.0)
-                    dsv = tl.load(ds_ptr + pr, mask=m, other=0.0)
-                    mm = m[:, None] & d_ok[None, :]
-                    qv = tl.load(q_base + t[:, None] * SN + d[None, :], mask=mm, other=0.0)
-                    gov = tl.load(go_base + t[:, None] * C + d[None, :], mask=mm, other=0.0)
-                    dk += (ww * dsv)[:, None] * qv.to(tl.float32)
-                    dv += (ww * av)[:, None] * gov.to(tl.float32)
-        md = s_ok[:, None] & d_ok[None, :]
-        out = dqkv_ptr + b.to(tl.int64) * SB + h * D + s64[:, None] * SN + d[None, :]
-        tl.store(out + C, (dk * scale).to(dqkv_ptr.dtype.element_ty), mask=md)
-        tl.store(out + 2 * C, dv.to(dqkv_ptr.dtype.element_ty), mask=md)
+                    mh = m[:, None] & h_ok[None, :]
+                    pr = ((bg * H + h[None, :]) * P + p) * N + t[:, None]
+                    av = tl.load(a_ptr + pr, mask=mh, other=0.0)
+                    dsv = tl.load(ds_ptr + pr, mask=mh, other=0.0)
+                    m3 = m[:, None, None] & hd_ok[None, :, :]
+                    qv = tl.load(q_base + t[:, None, None] * SN + hd[None, :, :], mask=m3,
+                                 other=0.0)
+                    gov = tl.load(go_base + t[:, None, None] * C + hd[None, :, :], mask=m3,
+                                  other=0.0)
+                    dk += (ww[:, None] * dsv)[:, :, None] * qv.to(tl.float32)
+                    dv += (ww[:, None] * av)[:, :, None] * gov.to(tl.float32)
+        m3 = s_ok[:, None, None] & hd_ok[None, :, :]
+        out = dqkv_ptr + b.to(tl.int64) * SB + s64[:, None, None] * SN + hd[None, :, :]
+        tl.store(out + C, (dk * scale).to(dqkv_ptr.dtype.element_ty), mask=m3)
+        tl.store(out + 2 * C, dv.to(dqkv_ptr.dtype.element_ty), mask=m3)
 
     # -----------------------------------------------------------------------
     # Window attention (flash-attention style, gathered windows)
     # -----------------------------------------------------------------------
 
     @triton.jit
-    def _win_rows(idx_ptr, wi, slot, T, N, CONTIG: tl.constexpr):
+    def _win_rows(idx_ptr, wi, slot, T, n_valid, N, CONTIG: tl.constexpr):
         """Cell positions of the window slots (padding -> N) and their mask."""
-        s_ok = slot < T
+        s_ok = slot < n_valid
         if CONTIG:
             pos = (wi * T + slot).to(tl.int64)
         else:
@@ -453,11 +495,18 @@ if _HAS_TRITON:
         ok = s_ok & (pos < N)
         return tl.where(ok, pos, 0), ok
 
+    @triton.jit
+    def _win_nkeys(kvlen_ptr, wi, TK, HAS_LEN: tl.constexpr):
+        if HAS_LEN:
+            return tl.load(kvlen_ptr + wi)
+        return TK
+
     @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D"])
     @triton.jit
-    def _win_fwd_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, o_ptr, lse_ptr,
+    def _win_fwd_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, kvlen_ptr, o_ptr, lse_ptr,
                         H, N, D, TQ, TK, scale,
-                        Q_CONTIG: tl.constexpr, KV_CONTIG: tl.constexpr, PRECISION: tl.constexpr,
+                        Q_CONTIG: tl.constexpr, KV_CONTIG: tl.constexpr, HAS_LEN: tl.constexpr,
+                        PRECISION: tl.constexpr,
                         BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr):
         """o[b, n, h] = softmax(q k^T * scale) v over the keys of the window of n."""
         n_qb = tl.cdiv(TQ, BLOCK_Q)
@@ -471,14 +520,17 @@ if _HAS_TRITON:
         d = tl.arange(0, BLOCK_D)
         d_ok = d < D
         base = qkv_ptr + b.to(tl.int64) * SB + h * D
-        qpos, q_ok = _win_rows(qidx_ptr, wi, qb * BLOCK_Q + tl.arange(0, BLOCK_Q), TQ, N, Q_CONTIG)
+        qpos, q_ok = _win_rows(qidx_ptr, wi, qb * BLOCK_Q + tl.arange(0, BLOCK_Q), TQ, TQ, N,
+                               Q_CONTIG)
         q = tl.load(base + qpos[:, None] * SN + d[None, :], mask=q_ok[:, None] & d_ok[None, :],
                     other=0.0)
+        n_k = _win_nkeys(kvlen_ptr, wi, TK, HAS_LEN)
         m_i = tl.full((BLOCK_Q,), -1.0e30, dtype=tl.float32)
         l_i = tl.zeros((BLOCK_Q,), dtype=tl.float32)
         acc = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-        for k0 in range(0, TK, BLOCK_K):
-            kpos, k_ok = _win_rows(kvidx_ptr, wi, k0 + tl.arange(0, BLOCK_K), TK, N, KV_CONTIG)
+        for k0 in range(0, n_k, BLOCK_K):
+            kpos, k_ok = _win_rows(kvidx_ptr, wi, k0 + tl.arange(0, BLOCK_K), TK, n_k, N,
+                                   KV_CONTIG)
             mk = k_ok[:, None] & d_ok[None, :]
             k = tl.load(base + C + kpos[:, None] * SN + d[None, :], mask=mk, other=0.0)
             v = tl.load(base + 2 * C + kpos[:, None] * SN + d[None, :], mask=mk, other=0.0)
@@ -498,10 +550,10 @@ if _HAS_TRITON:
 
     @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D"])
     @triton.jit
-    def _win_bwd_q_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, go_ptr, lse_ptr, delta_ptr,
-                          dqkv_ptr, H, N, D, TQ, TK, scale,
+    def _win_bwd_q_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, kvlen_ptr, go_ptr, lse_ptr,
+                          delta_ptr, dqkv_ptr, H, N, D, TQ, TK, scale,
                           Q_CONTIG: tl.constexpr, KV_CONTIG: tl.constexpr,
-                          PRECISION: tl.constexpr,
+                          HAS_LEN: tl.constexpr, PRECISION: tl.constexpr,
                           BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr):
         """dq of the queries of one block of the window, written into dqkv."""
         n_qb = tl.cdiv(TQ, BLOCK_Q)
@@ -515,16 +567,19 @@ if _HAS_TRITON:
         d = tl.arange(0, BLOCK_D)
         d_ok = d < D
         base = qkv_ptr + b.to(tl.int64) * SB + h * D
-        qpos, q_ok = _win_rows(qidx_ptr, wi, qb * BLOCK_Q + tl.arange(0, BLOCK_Q), TQ, N, Q_CONTIG)
+        qpos, q_ok = _win_rows(qidx_ptr, wi, qb * BLOCK_Q + tl.arange(0, BLOCK_Q), TQ, TQ, N,
+                               Q_CONTIG)
         mq = q_ok[:, None] & d_ok[None, :]
         q = tl.load(base + qpos[:, None] * SN + d[None, :], mask=mq, other=0.0)
         rows = b.to(tl.int64) * N + qpos
         go = tl.load(go_ptr + rows[:, None] * C + h * D + d[None, :], mask=mq, other=0.0)
         lse = tl.load(lse_ptr + rows * H + h, mask=q_ok, other=0.0)
         delta = tl.load(delta_ptr + rows * H + h, mask=q_ok, other=0.0)
+        n_k = _win_nkeys(kvlen_ptr, wi, TK, HAS_LEN)
         dq = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-        for k0 in range(0, TK, BLOCK_K):
-            kpos, k_ok = _win_rows(kvidx_ptr, wi, k0 + tl.arange(0, BLOCK_K), TK, N, KV_CONTIG)
+        for k0 in range(0, n_k, BLOCK_K):
+            kpos, k_ok = _win_rows(kvidx_ptr, wi, k0 + tl.arange(0, BLOCK_K), TK, n_k, N,
+                                   KV_CONTIG)
             mk = k_ok[:, None] & d_ok[None, :]
             k = tl.load(base + C + kpos[:, None] * SN + d[None, :], mask=mk, other=0.0)
             v = tl.load(base + 2 * C + kpos[:, None] * SN + d[None, :], mask=mk, other=0.0)
@@ -538,84 +593,67 @@ if _HAS_TRITON:
 
     @triton.autotune(configs=_WIN_CONFIGS, key=["TQ", "TK", "D"])
     @triton.jit
-    def _win_bwd_kv_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, go_ptr, lse_ptr, delta_ptr,
-                           dqkv_ptr, part_ptr, H, N, D, TQ, TK, NW, scale,
+    def _win_bwd_kv_kernel(qkv_ptr, SB, SN, qidx_ptr, kvidx_ptr, kvlen_ptr, wlist_ptr,
+                           go_ptr, lse_ptr, delta_ptr, acc_ptr, ASB, ASN, H, N, D, TQ, TK,
+                           scale,
                            Q_CONTIG: tl.constexpr, KV_CONTIG: tl.constexpr,
-                           DIRECT: tl.constexpr, PRECISION: tl.constexpr,
+                           HAS_LEN: tl.constexpr, ACCUMULATE: tl.constexpr,
+                           PRECISION: tl.constexpr,
                            BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr):
         """dk, dv of one block of keys of one window.
 
-        ``DIRECT`` (every cell is the key of one window slot): written into
-        dqkv.  Otherwise (overlapping windows): written into the partial
-        buffer ``part [B, NW*TK, 2, H, D]`` (fp32), reduced per cell by
-        :func:`_win_reduce_kernel` in a fixed order (no atomics).
+        Written to ``acc`` (k at offset 0, v at offset C of each row, strides
+        ASB / ASN).  ``ACCUMULATE`` (overlapping windows): the windows come
+        from ``wlist``, one colour at a time, and no two windows of a colour
+        share a key cell, so the read-add-write below never races and the
+        summation order is fixed by the colour order: deterministic, no
+        atomics.
         """
         n_kb = tl.cdiv(TK, BLOCK_K)
         pid0 = tl.program_id(0)
-        wi = pid0 // n_kb
         kb = pid0 % n_kb
-        pid1 = tl.program_id(1)
-        h = pid1 % H
-        b = pid1 // H
-        C = H * D
-        d = tl.arange(0, BLOCK_D)
-        d_ok = d < D
-        base = qkv_ptr + b.to(tl.int64) * SB + h * D
-        kslot = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-        kpos, k_ok = _win_rows(kvidx_ptr, wi, kslot, TK, N, KV_CONTIG)
-        mk = k_ok[:, None] & d_ok[None, :]
-        k = tl.load(base + C + kpos[:, None] * SN + d[None, :], mask=mk, other=0.0)
-        v = tl.load(base + 2 * C + kpos[:, None] * SN + d[None, :], mask=mk, other=0.0)
-        dk = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
-        dv = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
-        for q0 in range(0, TQ, BLOCK_Q):
-            qpos, q_ok = _win_rows(qidx_ptr, wi, q0 + tl.arange(0, BLOCK_Q), TQ, N, Q_CONTIG)
-            mq = q_ok[:, None] & d_ok[None, :]
-            q = tl.load(base + qpos[:, None] * SN + d[None, :], mask=mq, other=0.0)
-            rows = b.to(tl.int64) * N + qpos
-            go = tl.load(go_ptr + rows[:, None] * C + h * D + d[None, :], mask=mq, other=0.0)
-            lse = tl.load(lse_ptr + rows * H + h, mask=q_ok, other=0.0)
-            delta = tl.load(delta_ptr + rows * H + h, mask=q_ok, other=0.0)
-            sT = tl.dot(k, tl.trans(q), input_precision=PRECISION) * scale       # [BK, BQ]
-            pT = tl.where(k_ok[:, None] & q_ok[None, :], tl.exp(sT - lse[None, :]), 0.0)
-            dv = tl.dot(pT.to(go.dtype), go, dv, input_precision=PRECISION)
-            dpT = tl.dot(v, tl.trans(go), input_precision=PRECISION)
-            dsT = pT * (dpT - delta[None, :])
-            dk = tl.dot(dsT.to(q.dtype), q, dk, input_precision=PRECISION)
-        if DIRECT:
-            out = dqkv_ptr + b.to(tl.int64) * SB + h * D + kpos[:, None] * SN + d[None, :]
-            tl.store(out + C, (dk * scale).to(dqkv_ptr.dtype.element_ty), mask=mk)
-            tl.store(out + 2 * C, dv.to(dqkv_ptr.dtype.element_ty), mask=mk)
+        if ACCUMULATE:
+            wi = tl.load(wlist_ptr + pid0 // n_kb)
         else:
-            prow = (b.to(tl.int64) * NW + wi) * TK + kslot
-            out = part_ptr + prow[:, None] * (2 * C) + h * D + d[None, :]
-            ms = (kslot < TK)[:, None] & d_ok[None, :]
-            tl.store(out, dk * scale, mask=ms)
-            tl.store(out + C, dv, mask=ms)
-
-    @triton.jit
-    def _win_reduce_kernel(part_ptr, kptr_ptr, kent_ptr, dqkv_ptr, SB, SN, N, C2, R,
-                           BLOCK_M: tl.constexpr, BLOCK_F: tl.constexpr):
-        """dqkv[b, m, C:3C] = sum over the window slots of m of part[b, slot] (fixed order)."""
-        pid = tl.program_id(0)
-        b = tl.program_id(1)
-        pf = tl.program_id(2)
-        m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-        m_ok = m < N
-        f = pf * BLOCK_F + tl.arange(0, BLOCK_F)
-        f_ok = f < C2
-        start = tl.load(kptr_ptr + m, mask=m_ok, other=0)
-        cnt = tl.load(kptr_ptr + m + 1, mask=m_ok, other=0) - start
-        n_max = tl.max(cnt, axis=0)
-        acc = tl.zeros((BLOCK_M, BLOCK_F), dtype=tl.float32)
-        pb = part_ptr + b.to(tl.int64) * R * C2
-        for jj in range(0, n_max):
-            ok = m_ok & (jj < cnt)
-            e = tl.load(kent_ptr + start + jj, mask=ok, other=0).to(tl.int64)
-            acc += tl.load(pb + e[:, None] * C2 + f[None, :], mask=ok[:, None] & f_ok[None, :],
-                           other=0.0)
-        out = dqkv_ptr + b.to(tl.int64) * SB + m.to(tl.int64)[:, None] * SN + (C2 // 2) + f[None, :]
-        tl.store(out, acc.to(dqkv_ptr.dtype.element_ty), mask=m_ok[:, None] & f_ok[None, :])
+            wi = pid0 // n_kb
+        n_k = _win_nkeys(kvlen_ptr, wi, TK, HAS_LEN)
+        if kb * BLOCK_K < n_k:
+            pid1 = tl.program_id(1)
+            h = pid1 % H
+            b = pid1 // H
+            C = H * D
+            d = tl.arange(0, BLOCK_D)
+            d_ok = d < D
+            base = qkv_ptr + b.to(tl.int64) * SB + h * D
+            kslot = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+            kpos, k_ok = _win_rows(kvidx_ptr, wi, kslot, TK, n_k, N, KV_CONTIG)
+            mk = k_ok[:, None] & d_ok[None, :]
+            k = tl.load(base + C + kpos[:, None] * SN + d[None, :], mask=mk, other=0.0)
+            v = tl.load(base + 2 * C + kpos[:, None] * SN + d[None, :], mask=mk, other=0.0)
+            dk = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
+            dv = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
+            for q0 in range(0, TQ, BLOCK_Q):
+                qpos, q_ok = _win_rows(qidx_ptr, wi, q0 + tl.arange(0, BLOCK_Q), TQ, TQ, N,
+                                       Q_CONTIG)
+                mq = q_ok[:, None] & d_ok[None, :]
+                q = tl.load(base + qpos[:, None] * SN + d[None, :], mask=mq, other=0.0)
+                rows = b.to(tl.int64) * N + qpos
+                go = tl.load(go_ptr + rows[:, None] * C + h * D + d[None, :], mask=mq, other=0.0)
+                lse = tl.load(lse_ptr + rows * H + h, mask=q_ok, other=0.0)
+                delta = tl.load(delta_ptr + rows * H + h, mask=q_ok, other=0.0)
+                sT = tl.dot(k, tl.trans(q), input_precision=PRECISION) * scale     # [BK, BQ]
+                pT = tl.where(k_ok[:, None] & q_ok[None, :], tl.exp(sT - lse[None, :]), 0.0)
+                dv = tl.dot(pT.to(go.dtype), go, dv, input_precision=PRECISION)
+                dpT = tl.dot(v, tl.trans(go), input_precision=PRECISION)
+                dsT = pT * (dpT - delta[None, :])
+                dk = tl.dot(dsT.to(q.dtype), q, dk, input_precision=PRECISION)
+            out = acc_ptr + b.to(tl.int64) * ASB + h * D + kpos[:, None] * ASN + d[None, :]
+            dk = dk * scale
+            if ACCUMULATE:
+                dk += tl.load(out, mask=mk, other=0.0).to(tl.float32)
+                dv += tl.load(out + C, mask=mk, other=0.0).to(tl.float32)
+            tl.store(out, dk.to(acc_ptr.dtype.element_ty), mask=mk)
+            tl.store(out + C, dv.to(acc_ptr.dtype.element_ty), mask=mk)
 
 
 def _size_class(n):
@@ -635,6 +673,24 @@ def _qkv_strides(qkv):
     return qkv.stride(0), qkv.stride(1)
 
 
+def _delta(gout, out, nc, hn_layout):
+    """sum_d gout * out in fp32, without fp32 copies of the two tensors."""
+    H, D = out.shape[-2], out.shape[-1]
+    R = out.numel() // (H * D)
+    if hn_layout:      # neighbourhood: rows (b, g, n) -> [B, G, H, N]
+        delta = torch.empty(out.shape[0], out.shape[1], H, nc, device=out.device,
+                            dtype=torch.float32)
+    else:              # window: rows (b, n) -> [B, N, H]
+        delta = torch.empty(out.shape[:-1], device=out.device, dtype=torch.float32)
+    BH, BD = _pow2(H), _pow2(D)
+    BM = max(1, min(64, 4096 // (BH * BD)))
+    with _device_ctx(out.device):
+        _delta_kernel[(triton.cdiv(R, BM),)](gout, out, delta, R, nc, H, D,
+                                             HN_LAYOUT=hn_layout, BLOCK_M=BM,
+                                             BLOCK_H=BH, BLOCK_D=BD)
+    return delta
+
+
 # ---------------------------------------------------------------------------
 # Neighbourhood attention: launchers
 # ---------------------------------------------------------------------------
@@ -647,14 +703,15 @@ def _na_triton_forward(qkv, bias, idx, w, valid, scale):
     lse = torch.empty(B, G, H, N, device=qkv.device, dtype=torch.float32)
 
     def grid(meta):
-        return (triton.cdiv(N, meta["BLOCK_M"]), B * G * H)
+        return (triton.cdiv(N, meta["BLOCK_M"]), B * G)
 
     with _device_ctx(qkv.device):
         _na_fwd_kernel[grid](
             qkv, SB, SN, idx, w, bias if bias is not None else w,
             valid if valid is not None else idx, out, lse,
             B, H, G, N, D, scale, _size_class(B * N), P=P,
-            HAS_BIAS=bias is not None, HAS_VALID=valid is not None, BLOCK_D=_block_d(D),
+            HAS_BIAS=bias is not None, HAS_VALID=valid is not None,
+            BLOCK_H=_pow2(H), BLOCK_D=_pow2(D),
         )
     return out, lse
 
@@ -664,7 +721,7 @@ def _na_triton_backward(qkv, bias, idx, w, valid, scale, out, lse, gout, transpo
     P, _, G, _ = idx.shape
     SB, SN = _qkv_strides(qkv)
     gout = gout.to(qkv.dtype).contiguous()                              # [B, G, N, H, D]
-    delta = (gout.float() * out.float()).sum(-1).permute(0, 1, 3, 2).contiguous()  # [B,G,H,N]
+    delta = _delta(gout, out, N, True)                                  # [B, G, H, N]
     dqkv = torch.empty(B, N, 3, H, D, device=qkv.device, dtype=qkv.dtype)
     a = torch.empty(B, G, H, P, N, device=qkv.device, dtype=torch.float32)
     ds = torch.empty_like(a)
@@ -673,18 +730,19 @@ def _na_triton_backward(qkv, bias, idx, w, valid, scale, out, lse, gout, transpo
     size = _size_class(B * N)
 
     def grid(meta):
-        return (triton.cdiv(N, meta["BLOCK_M"]), B * H)
+        return (triton.cdiv(N, meta["BLOCK_M"]), B)
 
     with _device_ctx(qkv.device):
         _na_bwd_q_kernel[grid](
             qkv, SB, SN, idx, w, bias if bias is not None else w,
             valid if valid is not None else idx,
             gout, lse, delta, dqkv, a, ds, B, H, G, N, D, scale, size, P=P,
-            HAS_BIAS=bias is not None, HAS_VALID=valid is not None, BLOCK_D=_block_d(D),
+            HAS_BIAS=bias is not None, HAS_VALID=valid is not None,
+            BLOCK_H=_pow2(H), BLOCK_D=_pow2(D),
         )
         _na_bwd_kv_kernel[grid](
             qkv, SB, SN, gout, a, ds, tptr, tbase, tk, tw, dqkv,
-            B, H, G, N, D, scale, size, P=P, BLOCK_D=_block_d(D),
+            B, H, G, N, D, scale, size, P=P, BLOCK_H=_pow2(H), BLOCK_D=_pow2(D),
         )
     db = ds.sum(dim=(0, 1, 4)).to(bias.dtype) if bias is not None else None   # [H, P]
     return dqkv, db
@@ -793,8 +851,7 @@ def neighbourhood_attention_qkv(qkv, bias, idx, w, valid=None, *, backend="auto"
     use_triton = _use_triton(qkv, backend) if backend != "auto" else \
         (_HAS_TRITON and qkv.is_cuda and qkv.dtype in _TRITON_DTYPES)
     if use_triton:
-        if qkv.stride(4) != 1 or qkv.stride(3) != D or qkv.stride(2) != qkv.shape[3] * D:
-            qkv = qkv.contiguous()
+        qkv = qkv.contiguous()      # the gradient is written with the strides of qkv
         if valid is not None:
             valid = valid.to(torch.int8).contiguous()
         if bias is not None:
@@ -850,11 +907,13 @@ class WindowPlan:
     """Windows of :class:`~healpix_analyse.attention.HealPixWindowAttention` (device tensors).
 
     ``q_index [NW, TQ]`` / ``kv_index [NW, TK]`` (int32, padding = N) or None
-    when the windows are consecutive cells; ``q_inv [N]`` (int64): the flat
-    query slot of each cell (None with consecutive windows); ``kv_mask
-    [NW, TK]`` (bool) or None when no key slot is padding; ``kptr [N+1]`` /
-    ``kent`` (int32): for each cell, the flat key slots ``w * TK + s`` that
-    hold it (CSR, fixed order), None when every cell is the key of one slot.
+    when the windows are consecutive cells; ``kv_len [NW]`` (int32): the
+    number of keys of each window (its first slots), None when all have TK;
+    ``q_inv [N]`` (int64): the flat query slot of each cell (None with
+    consecutive windows); ``kv_mask [NW, TK]`` (bool) or None when no key slot
+    is padding; ``colours`` (int32, the window ids sorted by colour) and
+    ``colour_bounds`` (the start of each colour in it): set when windows
+    overlap; no two windows of a colour share a key cell.
     """
     N: int
     NW: int
@@ -862,10 +921,11 @@ class WindowPlan:
     TK: int
     q_index: Optional[torch.Tensor] = None
     kv_index: Optional[torch.Tensor] = None
+    kv_len: Optional[torch.Tensor] = None
     q_inv: Optional[torch.Tensor] = None
     kv_mask: Optional[torch.Tensor] = None
-    kptr: Optional[torch.Tensor] = None
-    kent: Optional[torch.Tensor] = None
+    colours: Optional[torch.Tensor] = None
+    colour_bounds: tuple = ()
 
 
 def _win_triton_forward(qkv, plan, scale):
@@ -875,14 +935,16 @@ def _win_triton_forward(qkv, plan, scale):
     lse = torch.empty(B, N, H, device=qkv.device, dtype=torch.float32)
     qi = plan.q_index if plan.q_index is not None else qkv
     ki = plan.kv_index if plan.kv_index is not None else qkv
+    kl = plan.kv_len if plan.kv_len is not None else qkv
 
     def grid(meta):
         return (plan.NW * triton.cdiv(plan.TQ, meta["BLOCK_Q"]), B * H)
 
     with _device_ctx(qkv.device):
         _win_fwd_kernel[grid](
-            qkv, SB, SN, qi, ki, out, lse, H, N, D, plan.TQ, plan.TK, scale,
+            qkv, SB, SN, qi, ki, kl, out, lse, H, N, D, plan.TQ, plan.TK, scale,
             Q_CONTIG=plan.q_index is None, KV_CONTIG=plan.kv_index is None,
+            HAS_LEN=plan.kv_len is not None,
             PRECISION=_precision(qkv.dtype), BLOCK_D=_block_d(D),
         )
     return out, lse
@@ -892,29 +954,43 @@ def _win_triton_backward(qkv, plan, scale, out, lse, gout):
     B, N, _, H, D = qkv.shape
     SB, SN = _qkv_strides(qkv)
     gout = gout.to(qkv.dtype).contiguous()                               # [B, N, H, D]
-    delta = (gout.float() * out.float()).sum(-1).contiguous()           # [B, N, H]
+    delta = _delta(gout, out, N, False)                                  # [B, N, H]
     dqkv = torch.empty(B, N, 3, H, D, device=qkv.device, dtype=qkv.dtype)
     qi = plan.q_index if plan.q_index is not None else qkv
     ki = plan.kv_index if plan.kv_index is not None else qkv
-    direct = plan.kptr is None
-    C = H * D
-    part = qkv if direct else torch.empty(B, plan.NW * plan.TK, 2, H, D, device=qkv.device,
-                                          dtype=torch.float32)
-    prec = _precision(qkv.dtype)
-    common = dict(Q_CONTIG=plan.q_index is None, KV_CONTIG=plan.kv_index is None,
-                  PRECISION=prec, BLOCK_D=_block_d(D))
+    kl = plan.kv_len if plan.kv_len is not None else qkv
+    flags = dict(Q_CONTIG=plan.q_index is None, KV_CONTIG=plan.kv_index is None,
+                 HAS_LEN=plan.kv_len is not None, PRECISION=_precision(qkv.dtype),
+                 BLOCK_D=_block_d(D))
+    overlap = plan.colours is not None
     with _device_ctx(qkv.device):
         _win_bwd_q_kernel[lambda m: (plan.NW * triton.cdiv(plan.TQ, m["BLOCK_Q"]), B * H)](
-            qkv, SB, SN, qi, ki, gout, lse, delta, dqkv, H, N, D, plan.TQ, plan.TK, scale,
-            **common)
-        _win_bwd_kv_kernel[lambda m: (plan.NW * triton.cdiv(plan.TK, m["BLOCK_K"]), B * H)](
-            qkv, SB, SN, qi, ki, gout, lse, delta, dqkv, part, H, N, D, plan.TQ, plan.TK,
-            plan.NW, scale, DIRECT=direct, **common)
-        if not direct:
-            BF = min(128, triton.next_power_of_2(2 * C))
-            _win_reduce_kernel[(triton.cdiv(N, 64), B, triton.cdiv(2 * C, BF))](
-                part, plan.kptr, plan.kent, dqkv, SB, SN, N, 2 * C, plan.NW * plan.TK,
-                BLOCK_M=64, BLOCK_F=BF, num_warps=4)
+            qkv, SB, SN, qi, ki, kl, gout, lse, delta, dqkv, H, N, D, plan.TQ, plan.TK,
+            scale, **flags)
+        dkv = dqkv[:, :, 1:]
+        if not overlap:
+            # each cell is the key of one window slot: written in place
+            _win_bwd_kv_kernel[lambda m: (plan.NW * triton.cdiv(plan.TK, m["BLOCK_K"]), B * H)](
+                qkv, SB, SN, qi, ki, kl, qkv, gout, lse, delta, dkv, SB, SN, H, N, D,
+                plan.TQ, plan.TK, scale, ACCUMULATE=False, **flags)
+        else:
+            # overlapping windows: accumulate colour by colour (fp32)
+            if qkv.dtype == torch.float32:
+                dkv.zero_()
+                acc, ASB, ASN = dkv, SB, SN
+            else:
+                acc = torch.zeros(B, N, 2, H, D, device=qkv.device, dtype=torch.float32)
+                ASB, ASN = acc.stride(0), acc.stride(1)
+            bounds = plan.colour_bounds
+            for c in range(len(bounds) - 1):
+                lo, hi = bounds[c], bounds[c + 1]
+                wl = plan.colours[lo:hi]
+                _win_bwd_kv_kernel[
+                    lambda m, n=hi - lo: (n * triton.cdiv(plan.TK, m["BLOCK_K"]), B * H)](
+                    qkv, SB, SN, qi, ki, kl, wl, gout, lse, delta, acc, ASB, ASN, H, N, D,
+                    plan.TQ, plan.TK, scale, ACCUMULATE=True, **flags)
+            if acc is not dkv:
+                dkv.copy_(acc)
     return dqkv
 
 
@@ -953,6 +1029,16 @@ def window_attention_torch(qkv, plan, scale, dropout_p=0.0):
     return o if plan.q_inv is None else o[:, plan.q_inv]
 
 
+def _sdpa_math():
+    """Context: SDPA on its math kernel (the fused ones have no double backward)."""
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel(SDPBackend.MATH)
+    except ImportError:  # pragma: no cover - torch < 2.3
+        return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False,
+                                              enable_math=True)
+
+
 class WindowAttentionFunction(torch.autograd.Function):
     """``qkv [B, N, 3, H, D] -> [B, N, H, D]`` with the fused Triton kernels."""
 
@@ -968,7 +1054,7 @@ class WindowAttentionFunction(torch.autograd.Function):
         qkv, out, lse = ctx.saved_tensors
         if torch.is_grad_enabled():
             # double backward: differentiate the PyTorch reference
-            with torch.enable_grad():
+            with torch.enable_grad(), _sdpa_math():
                 ref = window_attention_torch(qkv, ctx.plan, ctx.scale)
                 (g,) = torch.autograd.grad(ref, qkv, gout, create_graph=True)
             return g, None, None
@@ -998,6 +1084,5 @@ def window_attention(qkv, plan, *, scale=None, backend="auto", dropout_p=0.0):
                            "no attention dropout.")
     if backend == "torch" or not ok or (backend == "auto" and not qkv.is_cuda):
         return window_attention_torch(qkv, plan, scale, dropout_p)
-    if qkv.stride(4) != 1 or qkv.stride(3) != D or qkv.stride(2) != qkv.shape[3] * D:
-        qkv = qkv.contiguous()
+    qkv = qkv.contiguous()          # the gradient is written with the strides of qkv
     return WindowAttentionFunction.apply(qkv, plan, float(scale))

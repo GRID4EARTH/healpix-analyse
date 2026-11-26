@@ -418,10 +418,32 @@ def test_window_triton_backward_is_bitwise_reproducible():
 def test_window_triton_double_backward():
     m = _window("coarse_centred", "regional", device="cuda", dtype=torch.float32)
     x = torch.randn(1, 32, m.N, device="cuda", requires_grad=True)
+    from healpix_analyse._attention_backend import _sdpa_math
     pens = []
     for backend in ("triton", "torch"):
         m.backend = backend
-        (gx,) = torch.autograd.grad(m(x).square().sum(), x, create_graph=True)
-        (ggx,) = torch.autograd.grad(gx.square().sum(), x)
+        with _sdpa_math():      # the fused SDPA kernels have no double backward
+            (gx,) = torch.autograd.grad(m(x).square().sum(), x, create_graph=True)
+            (ggx,) = torch.autograd.grad(gx.square().sum(), x)
         pens.append(ggx)
     torch.testing.assert_close(pens[0], pens[1], rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("domain", ["full", "regional"])
+def test_window_colouring(domain):
+    """Windows of one colour share no key cell; non-overlapping windows need none."""
+    m = _window("coarse_centred", domain)
+    assert m._colours is not None and 2 <= m.n_colours <= 8
+    kv = m._kv_index.numpy()
+    order = m._colours.numpy()
+    b = m._colour_bounds
+    assert sorted(order.tolist()) == list(range(m.n_windows))
+    for c in range(m.n_colours):
+        keys = kv[order[b[c]:b[c + 1]]].ravel()
+        keys = keys[keys < m.N]
+        assert np.unique(keys).size == keys.size
+    assert _window("none", domain)._colours is None
+    # per-window key counts: the keys fill the first slots
+    if m._kv_len is not None:
+        lens = m._kv_len.numpy()
+        assert np.all((kv < m.N).sum(1) == lens) and m.mean_keys < m.key_len

@@ -179,8 +179,11 @@ def bench_window(args):
                 rec["oom"] = True
             if m is not None and "fwd_ms" in rec:
                 # FLOPs of q k^T and p v on the (padded) windows
-                flops = 4.0 * B * H * m.n_windows * m.window_len * m.key_len * D
+                # (padding slots are skipped by the kernels and not counted)
+                flops = 4.0 * B * H * N * m.mean_keys * D
                 rec["keys_per_window"] = m.key_len
+                rec["mean_keys"] = m.mean_keys
+                rec["colours"] = m.n_colours
                 rec["fwd_TFLOPs"] = flops / (rec["fwd_ms"] * 1e-3) / 1e12
             _emit(rec)
             if dev.type == "cuda":

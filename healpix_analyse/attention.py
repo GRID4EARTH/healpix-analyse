@@ -174,6 +174,46 @@ def _centred_keys(ids, level, wl, blocks, halo, ellipsoid, chunk_cells=1 << 22):
     return kv
 
 
+def _colour_windows(kv_index, N):
+    """Greedy colouring of overlapping windows: no two windows of a colour share a key.
+
+    Returns the window ids sorted by colour (int32) and the start of each
+    colour in that list.  With windows that overlap only their neighbours,
+    a handful of colours suffice (4 to 6 on HEALPix).
+    """
+    NW, TK = kv_index.shape
+    flat = kv_index.ravel()
+    ok = flat < N
+    cell = flat[ok]
+    win = np.repeat(np.arange(NW), TK)[ok]
+    order = np.lexsort((win, cell))
+    cell, win = cell[order], win[order]
+    # pairs of windows that share a cell: consecutive entries of the same cell,
+    # up to the largest number of windows per cell
+    pairs = []
+    k = 1
+    while True:
+        same = cell[k:] == cell[:-k]
+        if not same.any():
+            break
+        pairs.append(np.stack([win[:-k][same], win[k:][same]], axis=1))
+        k += 1
+    pairs = np.concatenate(pairs) if pairs else np.empty((0, 2), dtype=np.int64)
+    pairs = np.unique(np.concatenate([pairs, pairs[:, ::-1]]), axis=0)
+    start = np.searchsorted(pairs[:, 0], np.arange(NW + 1))
+    colour = np.full(NW, -1, dtype=np.int64)
+    for w in range(NW):
+        nb = colour[pairs[start[w]:start[w + 1], 1]]
+        used = set(nb[nb >= 0].tolist())
+        c = 0
+        while c in used:
+            c += 1
+        colour[w] = c
+    order = np.argsort(colour, kind="stable")
+    bounds = tuple(int(b) for b in np.searchsorted(colour[order], np.arange(colour.max() + 2)))
+    return order.astype(np.int32), bounds
+
+
 class HealPixWindowAttention(nn.Module):
     """Multi-head self-attention inside NESTED windows (Swin-like).
 
@@ -327,19 +367,22 @@ class HealPixWindowAttention(nn.Module):
             t = None if a is None else torch.as_tensor(a, dtype=dt, device=device)
             self.register_buffer(name, t, persistent=False)
 
-        kptr = kent = None
+        kv_len = colours = None
+        self._colour_bounds = ()
+        if kv_index is not None:
+            # the keys of a window fill its first slots: loop over them only
+            lens = (kv_index < self.N).sum(axis=1)
+            if lens.min() != kv_index.shape[1]:
+                kv_len = lens
         if kv_index is not None and kv_index is not q_index:
-            # overlapping windows: for each cell, its key slots (CSR, fixed order)
-            flat = kv_index.ravel()
-            slots = np.nonzero(flat < self.N)[0]
-            order = np.argsort(flat[slots], kind="stable")
-            kent = slots[order]
-            kptr = np.searchsorted(flat[slots][order], np.arange(self.N + 1))
+            colours, self._colour_bounds = _colour_windows(kv_index, self.N)
+        self.n_colours = max(0, len(self._colour_bounds) - 1)
+        self.mean_keys = float(kv_len.mean()) if kv_len is not None else float(self.key_len)
         buf("_q_index", q_index)
         buf("_q_inv", q_inv, torch.long)
         buf("_kv_index", kv_index)
-        buf("_kptr", kptr)
-        buf("_kent", kent)
+        buf("_kv_len", kv_len)
+        buf("_colours", colours)
         self.register_buffer(
             "_kv_mask",
             None if kv_index is None or not bool((kv_index >= self.N).any())
@@ -359,8 +402,8 @@ class HealPixWindowAttention(nn.Module):
     def plan(self) -> WindowPlan:
         """The windows as a ``WindowPlan`` (``healpix_analyse._attention_backend``)."""
         return WindowPlan(self.N, self.n_windows, self.window_len, self.key_len,
-                          self._q_index, self._kv_index, self._q_inv, self._kv_mask,
-                          self._kptr, self._kent)
+                          self._q_index, self._kv_index, self._kv_len, self._q_inv,
+                          self._kv_mask, self._colours, self._colour_bounds)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``x [B, C, N] -> [B, C, N]``."""
