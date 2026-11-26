@@ -147,6 +147,17 @@ def _rot2(a):
     return torch.stack([torch.stack([c, -s], -1), torch.stack([s, c], -1)], -2)
 
 
+def _bmm(a, b):
+    """Batched product of small matrices with elementwise ops only.
+
+    The per-draw parameters are [B, 3, 3] / [B, 2, 2] CPU tensors; ``@`` and
+    ``torch.linalg.det`` send them to the BLAS / LAPACK thread pools, whose
+    spinning threads can exhaust a job's CPU quota and stall the whole
+    process for ~10 ms windows (seen on the A100 nodes).
+    """
+    return (a.unsqueeze(-1) * b.unsqueeze(-3)).sum(-2)
+
+
 def _rodrigues(axis, angle):
     """Rotation matrices [B, 3, 3] about unit ``axis`` [B, 3] by ``angle`` [B]."""
     B = axis.shape[0]
@@ -157,7 +168,7 @@ def _rodrigues(axis, angle):
     s = torch.sin(angle).view(B, 1, 1)
     c = torch.cos(angle).view(B, 1, 1)
     eye = torch.eye(3, dtype=axis.dtype).expand(B, 3, 3)
-    return eye + s * K + (1 - c) * (K @ K)
+    return eye + s * K + (1 - c) * _bmm(K, K)
 
 
 # ===========================================================================
@@ -1002,10 +1013,10 @@ class HealPixAugment(nn.Module):
                     if grp[3]:
                         flush()
                         grp = [torch.eye(3, dtype=_F64).repeat(B, 1, 1), torch.eye(2, dtype=_F64).repeat(B, 1, 1), False, False]
-                    grp[0] = grp[0] @ M
+                    grp[0] = _bmm(grp[0], M)
                     grp[2] = True
                 else:
-                    grp[1] = grp[1] @ M
+                    grp[1] = _bmm(grp[1], M)
                     grp[3] = True
             elif k == "gauge":
                 perm, p = t.draw(B, gen, self.grid)
@@ -1076,7 +1087,7 @@ class HealPixAugment(nn.Module):
         B = R.shape[0]
         # Footprint growth of the tangent map (largest singular value of A).
         a2 = (A ** 2).sum((1, 2))
-        det = torch.linalg.det(A)
+        det = A[:, 0, 0] * A[:, 1, 1] - A[:, 0, 1] * A[:, 1, 0]
         smax = torch.sqrt((a2 + torch.sqrt((a2 ** 2 - 4 * det ** 2).clamp_min(0))) / 2)
         n_ss, levels = 1, torch.zeros(B, dtype=torch.long)
         if has_a and self.antialias == "supersample":
