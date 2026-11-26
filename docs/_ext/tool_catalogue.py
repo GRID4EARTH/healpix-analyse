@@ -20,6 +20,10 @@ At ``config-inited`` this extension
    - ``api_families.md``: the API reference, grouped by family, as
      ``autoapisummary`` tables built from the qualified names of the public
      symbols;
+   - ``ai_blocks.md``, ``ai_architectures.md`` and ``ai_cards.md``: the
+     "Basic tools for AI" tables and API cards (``docs/ai/``), from the
+     ``ai:`` fields of the tools and the ``ai:`` section; the signatures of
+     the cards are read from the source code with :mod:`ast`;
 3. writes redirect stubs for the pages moved by the docs overhaul (the
    ``redirects`` mapping of the catalogue), and ``llms.txt`` and
    ``llms-full.txt`` (https://llmstxt.org) into
@@ -34,6 +38,7 @@ read from ``healpix_analyse/__init__.py`` with :mod:`ast`.
 from __future__ import annotations
 
 import ast
+import copy
 import os
 import textwrap
 from collections import Counter
@@ -133,9 +138,174 @@ def _check(cat, public, qual, srcdir, eval_set, require_complete=True):
             if ans.split(".")[0] not in known:
                 errors.append(f"eval case {case.get('id')!r}: expected answer {ans!r} "
                               "is not a catalogued symbol")
+    errors += _check_ai(cat, known, srcdir)
     if errors:
         raise ExtensionError("tool catalogue (docs/tools.yaml) is inconsistent:\n  - "
                              + "\n  - ".join(errors))
+
+
+AI_FIELDS = ("role", "does", "api", "shapes", "grad", "gpu_kernel", "deterministic")
+
+
+def _check_ai(cat, known, srcdir):
+    """Checks of the AI section and of the ``ai:`` field of the tools."""
+    errors = []
+    ai = cat.get("ai")
+    if not ai:
+        return errors
+    for key in ("page", "data_page"):
+        if not os.path.exists(os.path.join(srcdir, ai[key] + ".md")):
+            errors.append(f"ai.{key}: page {ai[key]!r} does not exist")
+    roles = ai.get("roles", {})
+    for tool in _ai_tools(cat):
+        tid, spec = tool["id"], tool["ai"]
+        for key in AI_FIELDS:
+            if key not in spec:
+                errors.append(f"{tid}: missing field ai.{key}")
+        if spec.get("role") not in roles:
+            errors.append(f"{tid}: ai.role {spec.get('role')!r} is not one of {sorted(roles)}")
+        for qual in spec.get("api", []):
+            try:
+                _signatures(srcdir, qual)
+            except (OSError, LookupError) as exc:
+                errors.append(f"{tid}: ai.api {qual!r}: {exc}")
+    ids = set()
+    for rec in ai.get("recipes", []):
+        ids.add(rec["id"])
+        for key in ("page", "script"):
+            path = rec[key] + (".md" if key == "page" else "")
+            if not os.path.exists(os.path.join(srcdir, path)):
+                errors.append(f"ai recipe {rec['id']!r}: {key} {rec[key]!r} does not exist")
+        for name in rec.get("uses", []):
+            if name.split(".")[0] not in known:
+                errors.append(f"ai recipe {rec['id']!r}: {name!r} is not a catalogued symbol")
+    for arch in ai.get("architectures", []):
+        if arch.get("recipe") and arch["recipe"] not in ids:
+            errors.append(f"ai architecture {arch['name']!r}: unknown recipe {arch['recipe']!r}")
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# AI building blocks: signatures read from the source code
+# ---------------------------------------------------------------------------
+
+
+def _ai_tools(cat):
+    return [t for t in cat["tools"] if t.get("ai")]
+
+
+def _fmt_args(fn, skip_first):
+    """The argument list of ``fn``, without ``self`` / ``cls`` when ``skip_first``."""
+    args = copy.deepcopy(fn.args)
+    if skip_first and args.args:
+        args.args = args.args[1:]
+        # defaults belong to the last arguments: drop the one of self, if any
+        if len(args.defaults) > len(args.args):
+            args.defaults = args.defaults[len(args.defaults) - len(args.args):]
+    return ast.unparse(args)
+
+
+def _api_name(qual):
+    """Short name of an ``ai.api`` entry: ``Name`` or ``Class.method``."""
+    return ".".join(qual.split(".")[2:])
+
+
+def _signatures(srcdir, qual):
+    """Signature lines of ``healpix_analyse.module.Name``, read with :mod:`ast`.
+
+    A class gives its constructor and its ``forward`` (or ``__call__``), a
+    function its own signature, and ``healpix_analyse.module.Class.method``
+    the signature of that method. Raises LookupError when the name is absent.
+    """
+    parts = qual.split(".")
+    if parts[0] != "healpix_analyse" or len(parts) not in (3, 4):
+        raise LookupError("expected healpix_analyse.<module>.<name> or "
+                          "healpix_analyse.<module>.<Class>.<method>")
+    path = os.path.join(srcdir, "..", *parts[:2]) + ".py"
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    name = parts[2]
+    if len(parts) == 4:
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == name:
+                for m in node.body:
+                    if isinstance(m, ast.FunctionDef) and m.name == parts[3]:
+                        return [f"{name}.{m.name}({_fmt_args(m, True)})"]
+        raise LookupError(f"{name}.{parts[3]} not defined in {'/'.join(parts[:2])}.py")
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return [f"{name}({_fmt_args(node, False)})"]
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            methods = {m.name: m for m in node.body if isinstance(m, ast.FunctionDef)}
+            # forward inherited from a base class of the same module
+            bases = [b.id for b in node.bases if isinstance(b, ast.Name)]
+            for base in (n for n in tree.body
+                         if isinstance(n, ast.ClassDef) and n.name in bases):
+                for m in base.body:
+                    if isinstance(m, ast.FunctionDef) and m.name == "forward":
+                        methods.setdefault("forward", m)
+            out = []
+            if "__init__" in methods:
+                out.append(f"{name}({_fmt_args(methods['__init__'], True)})")
+            if "forward" in methods:
+                out.append(f"{name}.forward({_fmt_args(methods['forward'], True)})")
+            elif "__call__" in methods:  # plain callable operators (not nn.Module)
+                out.append(f"{name}.__call__({_fmt_args(methods['__call__'], True)})")
+            return out or [f"{name}(...)"]
+    raise LookupError(f"{name} not defined in {'/'.join(parts[:2])}.py")
+
+
+def _ai_table(cat):
+    """The building-block table of docs/ai/index.md."""
+    roles = cat["ai"]["roles"]
+    out = ["| Block | Role | What it does | Shapes | Differentiable | GPU kernel "
+           "| Deterministic backward | Page |\n|---|---|---|---|---|---|---|---|\n"]
+    for role in roles:
+        for tool in (t for t in _ai_tools(cat) if t["ai"]["role"] == role):
+            a = tool["ai"]
+            names = ", ".join(f"`{_api_name(q)}`" for q in a["api"])
+            out.append(f"| {names} | {role} | {_cell(a['does'])} | {_cell(a['shapes'])} "
+                       f"| {_cell(a['grad'])} | {_cell(a['gpu_kernel'])} "
+                       f"| {_cell(a['deterministic'])} | {_doc_link(tool['page'])} |\n")
+    return "".join(out)
+
+
+def _ai_architectures(cat, link):
+    recipes = {r["id"]: r for r in cat["ai"].get("recipes", [])}
+    out = ["| Architecture | Blocks | Recipe |\n|---|---|---|\n"]
+    for arch in cat["ai"].get("architectures", []):
+        rec = recipes.get(arch.get("recipe"))
+        out.append(f"| {_cell(arch['name'])} | {_cell(arch['blocks'])} | "
+                   + (link(rec) if rec else "—") + " |\n")
+    return "".join(out)
+
+
+def _ai_card(tool, srcdir, md=True):
+    """API card of one AI building block (Markdown for the docs, text for llms)."""
+    a = tool["ai"]
+    sigs = [s for q in a["api"] for s in _signatures(srcdir, q)]
+    imports = ", ".join(dict.fromkeys(_api_name(q).split(".")[0] for q in a["api"]))
+    lines = [f"Role: {a['role']} — {_cell(a['does'])}",
+             f"Import: from healpix_analyse import {imports}",
+             f"Shapes: {_cell(a['shapes'])}",
+             f"GPU and device: {_cell(tool.get('gpu', ''))}",
+             f"Gradient: {_cell(a['grad'])}",
+             f"GPU kernel: {_cell(a['gpu_kernel'])}",
+             f"Deterministic backward: {_cell(a['deterministic'])}"]
+    if tool.get("nan"):
+        lines.append(f"Missing values (NaN): {_cell(tool['nan'])}")
+    notes = a.get("notes", [])
+    if md:
+        out = [f"### {tool['title']}\n\n```python\n" + "\n".join(sigs) + "\n```\n\n"]
+        out += [f"- {line}\n" for line in lines]
+        out += [f"- Note: {_cell(n)}\n" for n in notes]
+        out.append(f"- Page: {_doc_link(tool['page'])}\n\n")
+        return "".join(out)
+    out = [f"\n### {tool['title']}\n\n"]
+    out += ["Signature: " + s + "\n" for s in sigs]
+    out += [line + "\n" for line in lines]
+    out += [f"Note: {_cell(n)}\n" for n in notes]
+    return "".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +321,8 @@ def _names(tool):
 
 
 def _cell(text):
+    if isinstance(text, bool):  # YAML reads a bare yes / no as a boolean
+        text = "yes" if text else "no"
     return " ".join(str(text).split()).replace("|", "\\|")
 
 
@@ -303,6 +475,20 @@ def _llms_txt(cat, base):
             status = "" if tool.get("status", "stable") == "stable" else f" [{tool['status']}]"
             out.append(f"- [{names}]({_url(base, tool['page'])}){status}: "
                        f"{_cell(tool['summary'])}\n")
+    ai = cat.get("ai")
+    if ai:
+        out.append("\n## AI building blocks\n\n")
+        out.append(f"- [Basic tools for AI — landing page]({_url(base, ai['page'])}): "
+                   "the layers, norms, pooling, encodings and resampling operators to "
+                   "build neural networks on HEALPix data, with runnable recipes; "
+                   "llms-full.txt has an API card (signature, shapes, gradient, "
+                   "determinism) for each and the full code of the recipes\n")
+        for tool in _ai_tools(cat):
+            names = ", ".join(_api_name(q) for q in tool["ai"]["api"])
+            out.append(f"- [{names}]({_url(base, tool['page'])}) [{tool['ai']['role']}]: "
+                       f"{_cell(tool['ai']['does'])}\n")
+        for rec in ai.get("recipes", []):
+            out.append(f"- [Recipe: {rec['title']}]({_url(base, rec['page'])})\n")
     return "".join(out)
 
 
@@ -345,6 +531,37 @@ def _llms_full(cat, base, srcdir):
                 f"{i['when']} -> use {i['use']}" for i in tool["use_instead"]]))
             if tool.get("optional_deps"):
                 out.append(f"Optional dependencies: {_cell(tool['optional_deps'])}\n")
+    if cat.get("ai"):
+        out.append(_llms_full_ai(cat, base, srcdir))
+    return "".join(out)
+
+
+def _llms_full_ai(cat, base, srcdir):
+    """The "AI building blocks" part of llms-full.txt."""
+    ai = cat["ai"]
+    out = ["\n\n# AI building blocks\n\n",
+           f"Landing page: {_url(base, ai['page'])}\n\n",
+           "To build a neural network on HEALPix data, combine these blocks with "
+           "torch.nn. Signatures below are read from the source code. The layers "
+           "take [B, C, N] tensors on a domain fixed at construction (cell_ids, "
+           "NESTED); HealPixDown / HealPixUp return a tuple (values, cell_ids_out); "
+           "HealPixGradient and HealPixNeighbourReducer are plain callables "
+           "without parameters.\n\n"
+           "Roles:\n"]
+    out += [f"  - {k}: {v}\n" for k, v in ai["roles"].items()]
+    out.append("\n## Which block for which architecture\n\n")
+    out.append(_ai_architectures(cat, lambda r: f"recipe {r['id']} ({_url(base, r['page'])})"))
+    out.append("\n## API cards\n")
+    for tool in _ai_tools(cat):
+        out.append(_ai_card(tool, srcdir, md=False))
+    with open(os.path.join(srcdir, ai["data_page"] + ".md"), encoding="utf-8") as fh:
+        out.append(f"\n\n<!-- source: {_url(base, ai['data_page'])} -->\n\n" + fh.read())
+    out.append("\n\n## Recipes (complete, runnable code)\n")
+    for rec in ai.get("recipes", []):
+        with open(os.path.join(srcdir, rec["script"]), encoding="utf-8") as fh:
+            code = fh.read()
+        out.append(f"\n### Recipe: {rec['title']}\n\nPage: {_url(base, rec['page'])}\n"
+                   f"Uses: {', '.join(rec.get('uses', []))}\n\n```python\n{code}```\n")
     return "".join(out)
 
 
@@ -384,6 +601,12 @@ def generate(app, config):
     os.makedirs(os.path.join(gen, "glance"), exist_ok=True)
     for tool in cat["tools"]:
         write(os.path.join(gen, "glance", f"{tool['id']}.md"), _glance(tool))
+    if cat.get("ai"):
+        write(os.path.join(gen, "ai_blocks.md"), _ai_table(cat))
+        write(os.path.join(gen, "ai_architectures.md"), _ai_architectures(
+            cat, lambda r: _doc_link(r["page"], r["title"])))
+        write(os.path.join(gen, "ai_cards.md"),
+              "".join(_ai_card(t, srcdir) for t in _ai_tools(cat)))
     base = config.html_baseurl or ""
     if base and not base.endswith("/"):
         base += "/"

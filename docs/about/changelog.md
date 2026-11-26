@@ -70,6 +70,23 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- Docs: a "Basic tools for AI" section (`docs/ai/`, #109): the AI building
+  blocks in one table (role, shapes, gradient, GPU kernel, deterministic
+  backward), an API card per block with signatures read from the source
+  code, a "which block for which architecture" table, a page on data
+  (domains, NaN and masks, augmentation, batching), and runnable recipes
+  (ResNet classifier, U-Net, ViT / MAE with `HealPixPatches` tokens, training
+  loop with `HealPixAugment`, masks and bf16 autocast, Swin-like transformer with
+  `HealPixWindowAttention`, neighbourhood-attention segmenter, GAN critic
+  with a gradient penalty; the U-Net uses `HealPixConv(stride=2)` and
+  `HealPixConvTranspose`, or `HealPixDown` / `HealPixUp`) run by
+  `tests/test_ai_recipes.py`. The window and neighbourhood attention,
+  `HealPixGradient`, `HealPixNeighbourReducer` and `HealPixDivCurl` have AI
+  cards too.
+  `docs/tools.yaml` gains an `ai:` field per block and an `ai:` section;
+  `llms.txt` and `llms-full.txt` gain an "AI building blocks" section (API
+  cards and the code of the recipes); new AI cases in the tool-choice
+  evaluation set.
 - `healpix_analyse.augment` (#109, section 8): batched data augmentation on
   the GPU. `HealPixAugment` applies a list of transforms to a whole batch
   with per-sample random parameters from a seeded `torch.Generator`:

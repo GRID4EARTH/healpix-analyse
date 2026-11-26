@@ -696,25 +696,29 @@ class HealPixConv(nn.Module):
         PyTorch tap loop otherwise (CPU, float64).  Can be changed after
         construction (``conv.backend = "torch"``).  ``missing="local_mean"``
         always runs the PyTorch reference path (gathered stencil + matrix
-        product) and ignores this setting.  A double backward
-        (``create_graph=True``, e.g. a gradient penalty) runs the backward
-        of the PyTorch tap loop on every device: the Triton kernels are not
-        differentiable themselves.
+        product) and ignores this setting.  The forward pass, the input
+        gradient and the weight gradient are autograd Functions whose
+        backward calls the others, so a double backward
+        (``create_graph=True``, e.g. a gradient penalty) runs on the same
+        backend and kernels as the first one, Triton included, with the same
+        determinism; ``torch.func`` (``vmap``, ``jacrev``, ``jacfwd``,
+        ``jvp``) works too.
     deterministic : bool, default True
-        Applies to the Triton backend only.  ``True`` computes the gradient with respect to
-        the input by a gather on the transposed stencil map: no atomics, the
-        same bits at every run, and a training step 1.6-2.2x shorter than
-        with atomics on an A100.  The cost is memory: the map is built at the
-        first backward pass (0.02-0.2 s on an A100) and kept on the GPU,
-        about the size of the geometry buffers again (0.2-2.6 GiB in the
-        configurations of ``benchmarks/benchmark_healpix_conv.py``).
-        ``False`` scatters the gradient with fp32 atomics instead: no extra
-        memory, but the summation order, so the last bits, vary between
-        runs.  ``torch.use_deterministic_algorithms(True)`` selects the
-        gather even with ``False``.  The PyTorch backend ignores this
-        option.  On CPU it is deterministic.  On CUDA without Triton, and for
-        a double backward, its ``index_add_`` is deterministic only under
-        ``torch.use_deterministic_algorithms(True)``.
+        ``True`` computes the gradient with respect to the input by a gather
+        on the transposed stencil map: no atomics, the same bits at every
+        run.  With the Triton kernels, a training step is also 1.6-2.2x
+        shorter than with atomics on an A100.  The cost is memory: the map is
+        built at the first backward pass (0.02-0.2 s on an A100) and kept on
+        the GPU, about the size of the geometry buffers again (0.2-2.6 GiB in
+        the configurations of ``benchmarks/benchmark_healpix_conv.py``).  The
+        PyTorch backend on CUDA gathers on a map of its own
+        (``build_gather_map``), also built at the first backward pass and
+        kept.  ``False`` scatters the gradient with fp32 atomics (Triton) or
+        ``index_add_`` (PyTorch on CUDA) instead: no extra memory, but the
+        summation order, so the last bits, vary between runs.
+        ``torch.use_deterministic_algorithms(True)`` selects the gather even
+        with ``False``.  On CPU the PyTorch backend is deterministic either
+        way.
     missing : {"centre", "local_mean"}, default "centre"
         How a stencil value is formed when its pixels are missing.  Each
         stencil value is a bilinear interpolation of 4 pixels.

@@ -125,3 +125,56 @@ cases:
   - id: unet-pooling
     question: What should I use for the pooling and unpooling layers of a HEALPix U-Net?
     expected: [HealPixDown, HealPixUp]
+
+  # --- AI building blocks (docs/ai/) --------------------------------------
+  - id: ai-unet-regional
+    question: Build a U-Net on a regional HEALPix domain (a few Sentinel-2 scenes at level 14) to segment clouds. Which layers do I use for the convolutions and for going down and up in resolution?
+    expected: [HealPixConv, HealPixDown, HealPixUp]
+  - id: ai-norm-clouds
+    question: My CNN activations contain cells under clouds that must not enter the BatchNorm statistics. What normalisation layer handles a validity mask?
+    expected: [HealPixBatchNorm, HealPixGroupNorm, HealPixLayerNorm]
+  - id: ai-readout-masked
+    question: For a regression head I need the average of the features over the whole domain, ignoring the land cells.
+    expected: [global_pool, HealPixGlobalPool]
+  - id: ai-tokens-mae-position
+    question: I tokenise a global HEALPix field for a masked autoencoder; how do I give each token its position on the sphere?
+    expected: [HealPixPositionalEncoding, healpix_positional_encoding]
+  - id: ai-pool-basins
+    question: Average the per-cell features of my network over river basins, with a mask of valid cells, as the input of a basin-scale classifier.
+    expected: [region_pool, HealPixRegionPool]
+  - id: ai-spectral-loss
+    question: My generative model of sea surface temperature produces fields with too little small-scale variance; I want a differentiable loss on the power spectrum, and land is missing.
+    expected: [HealPixWaveletSpectrum]
+  - id: ai-wide-receptive-unet
+    question: The bottleneck of my spherical U-Net needs a receptive field of about 30 cells at level 9 without a huge stencil.
+    expected: [LargeConv]
+  - id: ai-swin-windows
+    question: I want a Swin-like transformer on global HEALPix fields at level 8, with attention restricted to local windows that still exchange information across window borders.
+    expected: [HealPixWindowAttention]
+  - id: ai-local-attention-stencil
+    question: Each cell of my regional Sentinel-1 domain should attend only to its 3x3 neighbours, with a learned relative position bias, for a per-pixel segmentation transformer.
+    expected: [HealPixNeighbourhoodAttention]
+  - id: ai-physics-loss-divergence
+    question: My model predicts ocean surface currents (u, v) on HEALPix cells and I want to penalise the divergence of the prediction in the loss, on the GPU.
+    expected: [HealPixDivCurl]
+  - id: ai-gradient-feature
+    question: Add the east and north gradients of sea level anomaly as extra input channels of my network, computed on the GPU at every batch over a fixed regional domain.
+    expected: [HealPixGradient]
+  - id: ai-patch-tokens
+    question: I need 16x16 patch tokens of a global HEALPix field for a ViT, with the same orientation of the patches everywhere on the sphere.
+    expected: [HealPixPatches]
+  - id: ai-mae-masked-sampling
+    question: My MAE keeps 25 % of the tokens per sample; how do I extract only the kept patches on the GPU and fold the decoder output back onto the HEALPix cells?
+    expected: [HealPixPatches, HealPixPatches.fold]
+  - id: ai-strided-encoder
+    question: In my HEALPix U-Net encoder I want a learned downsampling (a strided convolution) instead of a fixed pooling, and its transposed counterpart in the decoder.
+    expected: [HealPixConv, HealPixConvTranspose]
+  - id: ai-gradient-penalty
+    question: I train a WGAN-GP critic built from HEALPix convolutions; the gradient penalty needs second-order gradients through the convolution layers on the GPU.
+    expected: [HealPixConv]
+  - id: ai-augment-batch
+    question: I train a cloud-segmentation network on regional Sentinel-2 HEALPix domains and want random rotations, shifts and zooms with different parameters for every sample of the batch, on the GPU, with the label masks transformed the same way.
+    expected: [HealPixAugment]
+  - id: ai-synthetic-gaps
+    question: To make my model robust to clouds I want to blank random NESTED blocks of 64 cells in each training sample.
+    expected: [RandomMask, HealPixAugment]
