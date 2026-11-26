@@ -556,11 +556,18 @@ def test_min_weight_removes_the_rounding_case(monkeypatch):
     ref = make(cs, 1)                                     # float64 geometry
     monkeypatch.setattr(hc, "_geometry_dtype", lambda dtype: torch.float32)
     f32 = make(cs, 1)
+    monkeypatch.setattr(hc, "_STENCIL_MIN_WEIGHT", 0.0)   # the rule before #109
+    f32_old = make(cs, 1)
     monkeypatch.undo()
+    k = int(np.nonzero(np.asarray(cs["cell_ids"]) == 4694)[0][0])
     x = torch.randn(cs["B"], cs["C"], ref.K, dtype=torch.float64)
     with torch.no_grad():
-        a, b = ref(x), f32(x)
-    assert float((a - b).abs().max() / a.abs().max()) < 1e-4
+        a, b, c = ref(x), f32(x), f32_old(x)
+    scale = float(a.abs().max())
+    # cell 4694 itself: wrong before the rule, right with it
+    assert float((a[..., k] - c[..., k]).abs().max()) > 1e-2 * scale
+    assert float((a[..., k] - b[..., k]).abs().max()) < 1e-4 * scale
+    assert float((a - b).abs().max()) < 1e-4 * scale
 
 
 def test_min_weight_full_sphere_changes_only_rounding(monkeypatch):
@@ -595,3 +602,23 @@ def test_min_weight_patches_follow_the_rule():
     assert torch.equal(a._idx, b._idx)
     w = b._w
     assert bool(((w == 0) | (w >= 1e-6 * 0.999)).all())
+
+
+def test_old_cache_format_is_not_reused(tmp_path, monkeypatch):
+    """Geometry cached before the 1e-6 rule (format 3) is not read back: the
+    layer rebuilds it with the rule and writes a new entry."""
+    import healpix_analyse.convol as hc
+
+    kw = dict(n_gauges=1, cell_ids=ragged_patch(6, 4), device="cpu", dtype=torch.float32,
+              cache_dir=tmp_path)
+    monkeypatch.setattr(hc, "_CACHE_FORMAT", 3)
+    monkeypatch.setattr(hc, "_STENCIL_MIN_WEIGHT", 0.0)
+    old = HealPixConv(6, 1, 1, **kw)                      # written by the old rule
+    monkeypatch.undo()
+    assert hc._CACHE_FORMAT >= 4
+    assert len(list(tmp_path.glob("healpixconv_*.pt"))) == 1
+    new = HealPixConv(6, 1, 1, **kw)
+    fresh = HealPixConv(6, 1, 1, **{**kw, "cache_dir": None})
+    assert len(list(tmp_path.glob("healpixconv_*.pt"))) == 2
+    assert torch.equal(new._tap_idx, fresh._tap_idx) and torch.equal(new._tap_w, fresh._tap_w)
+    assert not torch.equal(old._tap_w, fresh._tap_w)       # the rule changes this domain

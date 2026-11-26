@@ -50,7 +50,8 @@ _DEFAULT_CACHE_DIR = Path(
 # ===========================================================================
 
 # Bump when the meaning or layout of any cached buffer changes.
-_CACHE_FORMAT = 3
+# 4: neighbours below _STENCIL_MIN_WEIGHT no longer count (#109).
+_CACHE_FORMAT = 4
 
 # A bilinear neighbour inside the domain counts only if its weight is at
 # least this fraction of the full 4-neighbour weight of its stencil point
