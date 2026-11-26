@@ -115,6 +115,37 @@ def _bind(cells, ids_np, full):
     return np.where(present, order[pos_c], 0), present
 
 
+def _nested_tiles(x, perm, M):
+    """[B, C, M*Q] -> [B, M, C, Q], pixels of each block permuted: one gather."""
+    B, C, _ = x.shape
+    return x.view(B, C, M, perm.numel()).permute(0, 2, 1, 3).index_select(3, perm)
+
+
+def _nested_untiles(y, iperm):
+    """Inverse of :func:`_nested_tiles`: [B, M, C, Q] -> [B, C, M*Q], one gather."""
+    B, M, C, Q = y.shape
+    return y.permute(0, 2, 1, 3).index_select(3, iperm).reshape(B, C, M * Q)
+
+
+class _NestedTiles(torch.autograd.Function):
+    """Contiguous NESTED fast path.  Both directions are permutations, so the
+    backward of each is the other one: a gather, not the atomic ``index_add_``
+    of the backward of ``index_select``."""
+
+    @staticmethod
+    def forward(ctx, x, perm, iperm, inverse):
+        ctx.save_for_backward(perm, iperm)
+        ctx.inverse = inverse
+        if inverse:
+            return _nested_untiles(x, iperm)
+        return _nested_tiles(x, perm, x.shape[2] // perm.numel())
+
+    @staticmethod
+    def backward(ctx, g):
+        perm, iperm = ctx.saved_tensors
+        return _NestedTiles.apply(g.contiguous(), perm, iperm, not ctx.inverse), None, None, None
+
+
 class HealPixPatches(nn.Module):
     """
     Square patches (tokens) of a HEALPix field, gauge-oriented or NESTED.
@@ -428,8 +459,8 @@ class HealPixPatches(nn.Module):
             return self._restore(y, is_numpy, nd)
         if self.mode == "nested" and self.contiguous and sel is None:
             # one gather: [B, C, M, Q] viewed as [B, M, C, Q], pixels permuted
-            y = (t.view(B, C, self.M, self.P).permute(0, 2, 1, 3)
-                 .index_select(3, self._perm)).view(B, self.M, 1, C, N, N)
+            y = _NestedTiles.apply(t, self._perm, self._iperm, False).view(
+                B, self.M, 1, C, N, N)
         else:
             y = PatchExtractFunction.apply(t, self._geometry(), sel, self._opts(t))
             y = y.view(B, y.shape[1], self.G, C, N, N)
@@ -482,8 +513,8 @@ class HealPixPatches(nn.Module):
                                  "index; use norm='none' to sum repeated patches.")
         if self.mode == "nested" and self.contiguous and sel is None:
             # every cell is read once, with weight 1: the three norms agree
-            out = (t5.view(B, self.M, C, self.P).permute(0, 2, 1, 3)
-                   .index_select(3, self._iperm)).reshape(B, C, self.K)
+            out = _NestedTiles.apply(t5.reshape(B, self.M, C, self.P), self._perm,
+                                     self._iperm, True)
         else:
             if not t5.is_floating_point():
                 t5 = t5.to(self._w.dtype)

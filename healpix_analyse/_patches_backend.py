@@ -344,9 +344,11 @@ def _size_class(n):
 # Channels-last staging: copy the input to [B, K, C] (gather) or the patches to
 # [B, NY, G, P, C] (fold) when C >= these thresholds, so that every neighbour
 # read is one contiguous run of C values instead of C scattered words.
-# Set from the A100 measurements of benchmarks/benchmark_patches.py.
+# A100, float32 (benchmarks/benchmark_patches.py, configurations gpu_short):
+# the staged fold is 1.3-3.4x faster for every C (3 and 16 measured); the
+# staged gather is 1.2-1.6x faster for C = 16 and 1.15x slower for C = 3.
 GATHER_CL_MIN_C = 8
-FOLD_CL_MIN_C = 8
+FOLD_CL_MIN_C = 1
 
 
 def _triton_extract(x, geom, sel):

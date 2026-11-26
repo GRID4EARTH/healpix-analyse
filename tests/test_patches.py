@@ -190,6 +190,7 @@ def test_gradcheck(mode, centres, regional):
     with pytest.raises(ValueError):
         hp.fold(ys, index=torch.tensor([[1, 1, 2]]))
     assert torch.autograd.gradgradcheck(lambda t: hp(t, index=index) ** 2, (x,))
+    assert torch.autograd.gradgradcheck(lambda t: hp(t) ** 2, (x,))   # nested fast path too
 
 
 # ---------------------------------------------------------------------------
