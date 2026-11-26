@@ -123,7 +123,7 @@ def grads(fn, conv, x0):
 
 
 def rel_errs(got, ref):
-    return [float((a.double() - b.double()).abs().max() / b.double().abs().max())
+    return [float((a.double().cpu() - b.double().cpu()).abs().max() / b.double().cpu().abs().max())
             for a, b in zip(got, ref)]
 
 
