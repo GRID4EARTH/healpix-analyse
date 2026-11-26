@@ -50,6 +50,7 @@ caption: Learned convolutions
 convol
 large_conv
 fft_conv
+patches
 attention
 ```
 

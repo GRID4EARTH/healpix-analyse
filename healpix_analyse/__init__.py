@@ -80,6 +80,7 @@ from healpix_analyse.resample import (
 )
 from healpix_analyse.healpix_interp import get_interp_val, get_interp_weights
 from healpix_analyse.convol import HealPixConv
+from healpix_analyse.patches import HealPixPatches
 from healpix_analyse.attention import (
     DEFAULT_WINDOW_SHIFT,
     WINDOW_SHIFTS,
@@ -274,6 +275,7 @@ __all__ = [
     "get_interp_val",
     "get_interp_weights",
     "HealPixConv",
+    "HealPixPatches",
     "HealPixWindowAttention",
     "HealPixNeighbourhoodAttention",
     "WINDOW_SHIFTS",
