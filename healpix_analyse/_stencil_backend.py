@@ -367,8 +367,11 @@ if _HAS_TRITON:
 
     def _cfgs(spec):
         configs = [triton.Config(kw, num_warps=w) for kw, w in spec]
-        if os.environ.get("TRITON_INTERPRET") == "1":
-            # one config in the interpreter, with several batch rows per program
+        if (os.environ.get("TRITON_INTERPRET") == "1"
+                or os.environ.get("HEALPIX_ANALYSE_TRITON_AUTOTUNE", "1") == "0"):
+            # One config per kernel, with several batch rows per program: the
+            # Triton interpreter, and test runs (HEALPIX_ANALYSE_TRITON_AUTOTUNE=0)
+            # where compiling every config of every shape dominates the time.
             configs = [c for c in configs if c.kwargs["BB"] == 4][:1] or configs[:1]
         return configs
 
