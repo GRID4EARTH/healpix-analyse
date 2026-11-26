@@ -1,0 +1,544 @@
+"""Compute backends of :class:`healpix_analyse.patches.HealPixPatches`.
+
+A patch extraction is a sparse linear map from the cells to the patch pixels.
+Each patch pixel is a weighted sum of ``J`` input cells (``J = 4`` bilinear
+neighbours in ``mode="gauge"``, ``J = 1`` in ``mode="nested"``)::
+
+    y[b, i, g, c, p] = sum_j w[j, r] x[b, c, idx[j, r]],   r = (m*G + g)*P + p
+
+with ``m = sel[b, i]`` (the selected centres) or ``m = i``.  ``idx`` and ``w``
+are the *patch geometry*, both ``[J, M*G*P]``: ``idx`` holds int32 positions
+in the order of the input and ``w`` the weights (0 for a neighbour outside
+the domain).
+
+The adjoint, ``fold``, is the transposed map::
+
+    x[b, c, s] = scale[b, s] * sum_{(j, r): idx[j, r] = s} w[j, r] y[b, m(r), g(r), c, p(r)]
+
+It runs as a *gather* on the transposed map (for each cell, its incoming
+(row, weight) entries in CSR form), so it needs no atomics and gives the same
+bits at every run.  The backward of the extraction is the raw fold, and the
+backward of the fold is an extraction: both autograd Functions call each
+other, so the gradients of any order are available on both backends.
+
+``"torch"`` (CPU, float64, and the reference everywhere)
+    ``index_select`` of the J neighbours and a weighted sum; the fold uses
+    ``index_add_`` (deterministic on CPU).
+``"triton"`` (CUDA, float32 / float16 / bfloat16, fp32 accumulation)
+    One gather kernel and one CSR gather kernel.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from dataclasses import dataclass, field
+from typing import Optional
+
+import torch
+
+try:  # Triton is an optional extra
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover - depends on the environment
+    triton = None
+    tl = None
+    _HAS_TRITON = False
+
+BACKENDS = ("auto", "triton", "torch")
+_TRITON_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+FOLD_NORMS = ("weight", "count", "none")
+
+
+def triton_available() -> bool:
+    """True when the Triton kernels can run (Triton importable and CUDA present)."""
+    return _HAS_TRITON and torch.cuda.is_available()
+
+
+# ===========================================================================
+# Geometry
+# ===========================================================================
+
+@dataclass(eq=False)
+class PatchGeometry:
+    """Sparse map from ``K`` cells to ``M`` patches of ``G`` gauges and ``P`` pixels.
+
+    ``idx`` int32 and ``w`` (float32 or float64) are ``[J, M*G*P]``.  The
+    transposed map and the normalisations of ``fold`` are built on demand
+    and cached here.
+    """
+
+    idx: torch.Tensor
+    w: torch.Tensor
+    K: int
+    M: int
+    G: int
+    P: int
+    _tmap: Optional[tuple] = field(default=None, repr=False)
+    _norms: dict = field(default_factory=dict, repr=False)
+    _idx64: Optional[torch.Tensor] = field(default=None, repr=False)
+    _wcast: dict = field(default_factory=dict, repr=False)
+
+    def idx64(self):
+        """int64 copy of ``idx`` for the PyTorch backend (``index_select`` and
+        ``index_add_`` take a slow path with int32 indices on CPU)."""
+        if self._idx64 is None:
+            self._idx64 = self.idx.long()
+        return self._idx64
+
+    def w_as(self, dtype):
+        """``w`` cast to ``dtype`` (cached)."""
+        if dtype == self.w.dtype:
+            return self.w
+        if dtype not in self._wcast:
+            self._wcast[dtype] = self.w.to(dtype)
+        return self._wcast[dtype]
+
+    @property
+    def J(self) -> int:
+        return self.idx.shape[0]
+
+    def to(self, device=None, dtype=None):
+        """Copy on ``device``; ``dtype`` casts the weights (float64 or float32)."""
+        w = self.w.to(device=device, dtype=dtype if dtype is not None else self.w.dtype)
+        return PatchGeometry(self.idx.to(device=device), w, self.K, self.M, self.G, self.P)
+
+    def transposed(self):
+        """``(ptr [K+1] int64, rows [nnz] int32, tw [nnz])``, zero weights dropped.
+
+        Entries of cell ``s`` are ``ptr[s] <= e < ptr[s+1]``, in increasing
+        row order (a fixed order, hence a deterministic sum).
+        """
+        if self._tmap is None or self._tmap[0].device != self.idx.device:
+            self._tmap = build_transposed_map(self.idx, self.w, self.K)
+        return self._tmap
+
+    def norm(self, kind):
+        """``[K]`` normalisation of the full fold: sum of the weights
+        (``"weight"``) or number of entries (``"count"``) that read each cell."""
+        key = (kind, self.w.device)
+        if key not in self._norms:
+            if kind == "count":
+                ptr = self.transposed()[0]
+                n = (ptr[1:] - ptr[:-1]).to(self.w.dtype)
+            else:
+                # summed in float64 on the CPU: deterministic, once per geometry
+                n = torch.zeros(self.K, dtype=torch.float64)
+                n.index_add_(0, self.idx.reshape(-1).cpu().long(),
+                             self.w.reshape(-1).cpu().to(torch.float64))
+                n = n.to(device=self.w.device, dtype=self.w.dtype)
+            self._norms[key] = n
+        return self._norms[key]
+
+
+def build_transposed_map(idx, w, K):
+    """CSR transpose of the patch geometry (see :meth:`PatchGeometry.transposed`)."""
+    J, R = idx.shape
+    if R >= 2**31:
+        raise ValueError("patch geometry too large for int32 row numbers.")
+    nz = (w != 0).reshape(-1)
+    src = idx.reshape(-1).long()[nz]
+    rows = torch.arange(R, device=idx.device, dtype=torch.int64).repeat(J)[nz]
+    tw = w.reshape(-1)[nz]
+    # sort by (source cell, row): a fixed order of the entries of each cell
+    key = src * R + rows
+    order = torch.argsort(key)
+    src, rows, tw = src[order], rows[order], tw[order]
+    ptr = torch.searchsorted(src, torch.arange(K + 1, device=idx.device, dtype=torch.int64))
+    return ptr, rows.to(torch.int32), tw.contiguous()
+
+
+# ===========================================================================
+# PyTorch backend
+# ===========================================================================
+
+def _torch_extract(x, geom, sel):
+    """x [B, C, K] -> y [B, Msel, G, C, P]."""
+    B, C, K = x.shape
+    J, R = geom.idx.shape
+    G, P, GP = geom.G, geom.P, geom.G * geom.P
+    w = geom.w_as(x.dtype)
+    idx = geom.idx64()
+    # channels last: one row of B*C contiguous values per cell, so each
+    # neighbour is a contiguous row copy (20-37x faster than gathering along
+    # the last axis of [B, C, K] on a 16-core CPU)
+    xt = x.reshape(B * C, K).t().contiguous()                     # [K, B*C]
+    if sel is None:
+        Ms = geom.M
+        y = xt[idx[0]] * w[0, :, None]                             # [R, B*C]
+        for j in range(1, J):
+            y.addcmul_(xt[idx[j]], w[j, :, None])
+    else:
+        Ms = sel.shape[1]
+        rows = (sel.long().unsqueeze(-1) * GP
+                + torch.arange(GP, device=x.device)).reshape(sel.shape[0], -1)   # [Bs, Rs]
+        if sel.shape[0] == 1:
+            r = rows[0]
+            y = xt[idx[0][r]] * w[0][r, None]                      # [Rs, B*C]
+            for j in range(1, J):
+                y.addcmul_(xt[idx[j][r]], w[j][r, None])
+        else:                                                      # one draw per sample
+            x3 = xt.view(K, B, C)
+            bb = torch.arange(B, device=x.device).view(B, 1)
+            y = x3[idx[0][rows], bb] * w[0][rows, None]            # [B, Rs, C]
+            for j in range(1, J):
+                y.addcmul_(x3[idx[j][rows], bb], w[j][rows, None])
+            return y.view(B, Ms, G, P, C).transpose(3, 4).contiguous()
+    return y.view(Ms, G, P, B, C).permute(3, 0, 1, 4, 2).contiguous()
+
+
+def _torch_fold(y, geom, ones=False):
+    """Raw adjoint: y [B, M, G, C, P] (all centres) -> x [B, C, K]."""
+    B, M, G, C, P = y.shape
+    J = geom.J
+    w = geom.w_as(y.dtype)
+    if ones:
+        w = (w != 0).to(y.dtype)
+    idx = geom.idx64()
+    yt = y.permute(1, 2, 4, 0, 3).reshape(M * G * P, B * C)       # [R, B*C]
+    out = y.new_zeros(geom.K, B * C)
+    for j in range(J):
+        out.index_add_(0, idx[j], yt * w[j, :, None])
+    return out.t().reshape(B, C, geom.K)
+
+
+# ===========================================================================
+# Triton backend
+# ===========================================================================
+
+def _next_pow2(n):
+    return 1 << max(0, int(n) - 1).bit_length()
+
+
+def _block_c(C):
+    return min(32, max(2, _next_pow2(C)))
+
+
+if _HAS_TRITON:
+
+    _GATHER_CONFIGS = [
+        triton.Config({"BLOCK_R": br}, num_warps=nw)
+        for br, nw in ((128, 4), (256, 8))
+    ]
+
+    @triton.autotune(configs=_GATHER_CONFIGS, key=["C", "J", "P", "CL", "SIZE"])
+    @triton.jit
+    def _gather_kernel(x_ptr, idx_ptr, w_ptr, sel_ptr, y_ptr,
+                       C, K, R_FULL, G, P, NSEL, SEL_SB, SIZE,
+                       J: tl.constexpr, HAS_SEL: tl.constexpr, CL: tl.constexpr,
+                       BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr):
+        """y[b, i, g, c, p] = sum_j w[j, r] x[b, c, idx[j, r]], r = (sel[b, i]*G + g)*P + p."""
+        pid_r = tl.program_id(0)
+        b = tl.program_id(1).to(tl.int64)
+        pid_c = tl.program_id(2)
+        GP = G * P
+        r = pid_r.to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
+        r_ok = r < NSEL.to(tl.int64) * GP
+        i = r // GP
+        q = r - i * GP
+        if HAS_SEL:
+            m = tl.load(sel_ptr + b * SEL_SB + i, mask=r_ok, other=0).to(tl.int64)
+        else:
+            m = i
+        row = m * GP + q
+        c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_ok = c < C
+        ok = r_ok[:, None] & c_ok[None, :]
+        if CL:   # x is [B, K, C]: one contiguous run of C values per neighbour
+            x_base = x_ptr + b * K * C + c[None, :]
+        else:    # x is [B, C, K]
+            x_base = x_ptr + (b * C + c.to(tl.int64))[None, :] * K
+        acc = tl.zeros((BLOCK_R, BLOCK_C), dtype=tl.float32)
+        for j in tl.static_range(J):
+            ix = tl.load(idx_ptr + j * R_FULL + row, mask=r_ok, other=0).to(tl.int64)
+            wv = tl.load(w_ptr + j * R_FULL + row, mask=r_ok, other=0.0).to(tl.float32)
+            if CL:
+                v = tl.load(x_base + ix[:, None] * C, mask=ok, other=0.0).to(tl.float32)
+            else:
+                v = tl.load(x_base + ix[:, None], mask=ok, other=0.0).to(tl.float32)
+            acc += wv[:, None] * v
+        g = q // P
+        p = q - g * P
+        out = (((b * NSEL + i) * G + g) * C)[:, None] + c[None, :]
+        tl.store(y_ptr + out * P + p[:, None], acc.to(y_ptr.dtype.element_ty), mask=ok)
+
+    _FOLD_CONFIGS = [
+        triton.Config({"BLOCK_S": bs}, num_warps=nw)
+        for bs, nw in ((64, 4), (128, 4))
+    ]
+
+    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "CL", "SIZE"])
+    @triton.jit
+    def _fold_kernel(y_ptr, inv_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr,
+                     C, K, NY, G, P, INV_SB, SIZE,
+                     HAS_INV: tl.constexpr, NORM: tl.constexpr, WRITE_SCALE: tl.constexpr,
+                     CL: tl.constexpr,
+                     BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr):
+        """x[b, c, s] = sum_e tw[e] y[b, i(e), g(e), c, p(e)] / norm[b, s], no atomics.
+
+        ``y`` is ``[B, NY, G, C, P]``.  Without ``HAS_INV`` row ``r = (m*G + g)*P + p``
+        of the map reads patch ``i = m``; with it, ``i = inv[b, m]`` (the position of
+        centre ``m`` in the selection of sample ``b``, -1 when not selected: the
+        entry is skipped).  ``NORM``: 0 none, 1 sum of the weights read, 2 their
+        number; computed on the fly from the same entries (written to ``scale``
+        with ``WRITE_SCALE``, for the backward pass).
+        """
+        pid_s = tl.program_id(0)
+        b = tl.program_id(1).to(tl.int64)
+        pid_c = tl.program_id(2)
+        s = pid_s.to(tl.int64) * BLOCK_S + tl.arange(0, BLOCK_S)
+        s_ok = s < K
+        c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_ok = c < C
+        start = tl.load(ptr_ptr + s, mask=s_ok, other=0)
+        n = tl.load(ptr_ptr + s + 1, mask=s_ok, other=0) - start
+        n_max = tl.max(n, axis=0)
+        y_base = y_ptr + b * NY * G * C * P
+        acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+        nacc = tl.zeros((BLOCK_S,), dtype=tl.float32)
+        for jj in range(0, n_max):
+            e_ok = s_ok & (jj < n)
+            e = start + jj
+            r = tl.load(rows_ptr + e, mask=e_ok, other=0).to(tl.int64)
+            mg = r // P
+            p = r - mg * P
+            if HAS_INV:
+                m = mg // G
+                i = tl.load(inv_ptr + b * INV_SB + m, mask=e_ok, other=-1).to(tl.int64)
+                ok = e_ok & (i >= 0)
+                yrow = i * G + (mg - m * G)
+            else:
+                ok = e_ok
+                yrow = mg
+            wv = tl.load(tw_ptr + e, mask=ok, other=0.0).to(tl.float32)
+            if NORM == 1:
+                nacc += wv
+            if NORM == 2:
+                nacc += tl.where(ok, 1.0, 0.0)
+            if CL:   # y is [B, NY, G, P, C]
+                off = ((yrow * P + p) * C)[:, None] + c[None, :]
+            else:
+                off = (yrow * C)[:, None] * P + c[None, :] * P + p[:, None]
+            v = tl.load(y_base + off, mask=ok[:, None] & c_ok[None, :], other=0.0)
+            acc += wv[:, None] * v.to(tl.float32)
+        if NORM != 0:
+            sc = tl.where(nacc > 0, 1.0 / tl.where(nacc > 0, nacc, 1.0), 0.0)
+            acc = acc * sc[:, None]
+            if WRITE_SCALE:
+                tl.store(scale_ptr + b * K + s, sc, mask=s_ok & (pid_c == 0))
+        tl.store(x_ptr + (b * C + c.to(tl.int64))[None, :] * K + s[:, None],
+                 acc.to(x_ptr.dtype.element_ty), mask=s_ok[:, None] & c_ok[None, :])
+
+
+def _device_ctx(t):
+    # a CPU tensor reaches the kernels only under TRITON_INTERPRET=1 (tests)
+    return torch.cuda.device(t.device) if t.is_cuda else contextlib.nullcontext()
+
+
+def _size_class(n):
+    """Autotune key: one bucket per factor of 4 of the problem size."""
+    return max(0, int(n).bit_length() // 2)
+
+
+# Channels-last staging: copy the input to [B, K, C] (gather) or the patches to
+# [B, NY, G, P, C] (fold) when C >= these thresholds, so that every neighbour
+# read is one contiguous run of C values instead of C scattered words.
+# A100, float32 (benchmarks/benchmark_patches.py, configurations gpu_short):
+# the staged fold is 1.3-3.4x faster for every C (3 and 16 measured); the
+# staged gather is 1.2-1.6x faster for C = 16 and 1.15x slower for C = 3.
+GATHER_CL_MIN_C = 8
+FOLD_CL_MIN_C = 1
+
+
+def _triton_extract(x, geom, sel):
+    B, C, K = x.shape
+    cl = C >= GATHER_CL_MIN_C
+    x = x.transpose(1, 2).contiguous() if cl else x.contiguous()
+    G, P = geom.G, geom.P
+    if sel is None:
+        nsel, sel_t, sel_sb = geom.M, geom.idx, 0      # sel_ptr unused
+    else:
+        nsel = sel.shape[1]
+        sel_t = sel
+        sel_sb = sel.stride(0) if sel.shape[0] > 1 else 0
+    y = torch.empty(B, nsel, G, C, P, device=x.device, dtype=x.dtype)
+    if y.numel() == 0:
+        return y
+    BLOCK_C = _block_c(C)
+    R_full = geom.idx.shape[1]
+
+    def grid(meta):
+        return (triton.cdiv(nsel * G * P, meta["BLOCK_R"]), B, triton.cdiv(C, BLOCK_C))
+
+    with _device_ctx(x):
+        _gather_kernel[grid](
+            x, geom.idx, geom.w, sel_t, y,
+            C, K, R_full, G, P, nsel, sel_sb, _size_class(nsel * G * P),
+            J=geom.J, HAS_SEL=sel is not None, CL=cl, BLOCK_C=BLOCK_C,
+        )
+    return y
+
+
+def _triton_fold(y, geom, inv=None, norm="none", want_scale=False):
+    """y [B, NY, G, C, P] -> (x [B, C, K], scale [B, K] or None).
+
+    ``inv`` [Bs, M] int32: position of each centre in the selection (-1: not
+    selected); None when ``y`` holds all ``M`` centres.  The normalisation is
+    computed in the kernel, from the entries it reads.
+    """
+    B, NY, G, C, P = y.shape
+    K = geom.K
+    ptr, rows, tw = geom.transposed()
+    x = torch.empty(B, C, K, device=y.device, dtype=y.dtype)
+    mode = {"none": 0, "weight": 1, "count": 2}[norm]
+    scale = (torch.empty(B, K, device=y.device, dtype=torch.float32)
+             if (want_scale and mode) else None)
+    if x.numel() == 0:
+        return x, scale
+    inv_sb = inv.stride(0) if (inv is not None and inv.shape[0] > 1) else 0
+    cl = C >= FOLD_CL_MIN_C
+    y = y.transpose(3, 4).contiguous() if cl else y.contiguous()
+    BLOCK_C = _block_c(C)
+
+    def grid(meta):
+        return (triton.cdiv(K, meta["BLOCK_S"]), B, triton.cdiv(C, BLOCK_C))
+
+    with _device_ctx(y):
+        _fold_kernel[grid](
+            y, inv if inv is not None else ptr, ptr, rows, tw, x,
+            scale if scale is not None else tw,
+            C, K, NY, G, P, inv_sb, _size_class(K),
+            HAS_INV=inv is not None, NORM=mode, WRITE_SCALE=scale is not None, CL=cl,
+            BLOCK_C=BLOCK_C,
+        )
+    return x, scale
+
+
+# ===========================================================================
+# Dispatch
+# ===========================================================================
+
+def use_triton(x, backend):
+    if backend not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
+    if backend == "torch":
+        return False
+    ok = _HAS_TRITON and x.is_cuda and x.dtype in _TRITON_DTYPES
+    if backend == "triton" and not ok:
+        raise RuntimeError(
+            "backend='triton' needs Triton, a CUDA tensor and float32, float16 "
+            "or bfloat16 data (float64 runs on backend='torch')."
+        )
+    return ok
+
+
+def _expand_selected(y, sel, M):
+    """[B, Ms, G, C, P] -> [B, M, G, C, P], zeros for the centres not selected
+    (and sums for a centre selected twice)."""
+    B = y.shape[0]
+    full = y.new_zeros((B, M) + tuple(y.shape[2:]))
+    b_ids = torch.arange(B, device=y.device).view(B, 1).expand(B, sel.shape[1])
+    full.index_put_((b_ids, sel.long().expand(B, -1)), y, accumulate=True)
+    return full
+
+
+def inverse_selection(sel, M):
+    """``[Bs, M]`` int32: position of centre m in row b of ``sel``, -1 if absent.
+
+    None when a row repeats a centre (the fold then sums the copies through
+    a full tensor instead)."""
+    srt = torch.sort(sel, dim=1).values
+    if srt.shape[1] > 1 and bool((srt[:, 1:] == srt[:, :-1]).any()):
+        return None
+    inv = torch.full((sel.shape[0], M), -1, dtype=torch.int32, device=sel.device)
+    pos = torch.arange(sel.shape[1], dtype=torch.int32, device=sel.device)
+    inv.scatter_(1, sel.long(), pos.expand_as(sel).contiguous())
+    return inv
+
+
+def _extract(x, geom, sel, use_tri):
+    if use_tri:
+        return _triton_extract(x, geom, sel)
+    return _torch_extract(x, geom, sel)
+
+
+def _fold(y, geom, sel, norm, use_tri, want_scale):
+    """Normalised fold; returns (x, scale) with scale [K] or [B, K] or None."""
+    if use_tri:
+        y = y.contiguous()
+        inv = None
+        if sel is not None:
+            inv = inverse_selection(sel, geom.M)
+            if inv is None:
+                y = _expand_selected(y, sel, geom.M)
+        return _triton_fold(y, geom, inv=inv, norm=norm, want_scale=want_scale)
+    scale = fold_scale(geom, norm, sel, y.shape[0], y.device, y.dtype)
+    yy = _expand_selected(y, sel, geom.M) if sel is not None else y
+    out = _torch_fold(yy, geom)
+    if scale is not None:
+        out = out * scale.view(-1, 1, geom.K)
+    return out, scale
+
+
+@dataclass(frozen=True)
+class _Options:
+    use_triton: bool
+
+
+class PatchExtractFunction(torch.autograd.Function):
+    """``x [B, C, K] -> y [B, Msel, G, C, P]``; its backward is the raw fold."""
+
+    @staticmethod
+    def forward(ctx, x, geom, sel, opts):
+        ctx.geom, ctx.opts = geom, opts
+        ctx.save_for_backward(*([sel] if sel is not None else []))
+        ctx.has_sel = sel is not None
+        return _extract(x, geom, sel, opts.use_triton)
+
+    @staticmethod
+    def backward(ctx, gy):
+        sel = ctx.saved_tensors[0] if ctx.has_sel else None
+        gx = None
+        if ctx.needs_input_grad[0]:
+            gx = PatchFoldFunction.apply(gy, ctx.geom, sel, "none", ctx.opts)
+        return gx, None, None, None
+
+
+class PatchFoldFunction(torch.autograd.Function):
+    """``y [B, Msel, G, C, P] -> x [B, C, K] = scale * P^T y``; its backward is
+    an extraction of ``scale * gx``."""
+
+    @staticmethod
+    def forward(ctx, y, geom, sel, norm, opts):
+        ctx.geom, ctx.opts = geom, opts
+        x, scale = _fold(y, geom, sel, norm, opts.use_triton, ctx.needs_input_grad[0])
+        ctx.has_sel = sel is not None
+        ctx.has_scale = scale is not None
+        ctx.save_for_backward(*[t for t in (sel, scale) if t is not None])
+        return x
+
+    @staticmethod
+    def backward(ctx, gx):
+        saved = list(ctx.saved_tensors)
+        sel = saved.pop(0) if ctx.has_sel else None
+        scale = saved.pop(0) if ctx.has_scale else None
+        gy = None
+        if ctx.needs_input_grad[0]:
+            g = gx if scale is None else gx * scale.to(gx.dtype).view(-1, 1, ctx.geom.K)
+            gy = PatchExtractFunction.apply(g, ctx.geom, sel, ctx.opts)
+        return gy, None, None, None, None
+
+
+def fold_scale(geom, norm, sel, B, device, dtype):
+    """PyTorch backend: ``1 / norm`` of the fold (0 where no patch reads a
+    cell), [K] or [B, K]."""
+    if norm == "none":
+        return None
+    if sel is None:
+        n = geom.norm(norm).to(device=device, dtype=dtype)
+    else:
+        ones = torch.ones((B, sel.shape[1], geom.G, 1, geom.P), device=device, dtype=dtype)
+        n = _torch_fold(_expand_selected(ones, sel, geom.M), geom,
+                        ones=(norm == "count")).view(B, geom.K)
+    return torch.where(n > 0, 1.0 / n.clamp_min(torch.finfo(n.dtype).tiny), torch.zeros_like(n))
