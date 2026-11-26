@@ -160,7 +160,8 @@ def run(args):
             ncell = 12 * 4**lev if full else args.cells
             B = args.full_batch if full else args.batch
             for be in backends:
-                aug = HealPixAugment(tr, lev, None if full else ids, backend=be, **kw).to(dev)
+                aug = HealPixAugment(tr, lev, None if full else ids, backend=be,
+                                     geom_dtype=getattr(torch, args.geom_dtype), **kw).to(dev)
                 gen = torch.Generator().manual_seed(0)
                 x = torch.randn(B, Ce, ncell, device=dev, dtype=dtype)
                 gy = torch.randn_like(x)
@@ -205,7 +206,7 @@ def run(args):
 def _emit(r, args, B):
     r.setdefault("cells", args.cells)
     r.setdefault("level", args.level)
-    r.update(device=args.device, B=B, dtype=args.dtype,
+    r.update(device=args.device, B=B, dtype=args.dtype, geom_dtype=args.geom_dtype,
              threads=torch.get_num_threads(), label=args.label,
              samples_per_s=B / r["total_s"] if r.get("total_s") else None)
     line = json.dumps(r)
@@ -251,6 +252,8 @@ def main(argv=None):
                     choices=list(PIPELINES) + ["naive"])
     ap.add_argument("--backends", nargs="*", default=None)
     ap.add_argument("--dtype", default="float32")
+    ap.add_argument("--geom-dtype", default="float64", choices=["float64", "float32"],
+                    help="geometry dtype (float64: exact identity; float32: faster)")
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--no-backward", action="store_true")

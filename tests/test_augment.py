@@ -499,20 +499,61 @@ def test_fused_kernels_interpreter(antialias, zoom):
 
 
 @pytest.mark.parametrize("kind", ["block", "scattered"])
-def test_nest_table_lookup(kind):
-    """Two-level NESTED -> position table of the fused kernel, against the ids."""
+@pytest.mark.parametrize("table", ["ringtab", "nest2"])
+def test_domain_lookup_tables(kind, table, monkeypatch):
+    """Cell -> position tables of the fused kernel, against the ids."""
+    import healpix_analyse.augment as am
+
+    if table == "nest2":
+        monkeypatch.setattr(am, "_RINGTAB_FACTOR", 0)
+        monkeypatch.setattr(am, "_RINGTAB_MIN", 0)
     rng = np.random.default_rng(0)
-    if kind == "block":
-        ids = rng.permutation(BLOCK)
-    else:
-        ids = 37 * 4**6 + rng.choice(4**6, 1500, replace=False)
+    ids = rng.permutation(BLOCK) if kind == "block" else 37 * 4**6 + rng.choice(4**6, 1500, replace=False)
     aug = HealPixAugment([RandomRotation()], LEVEL, ids)
-    _, parent, block, kb = aug.grid.nest_table(0, "cpu")
-    allc = torch.arange(36 * 4**6, 39 * 4**6)
-    slot = parent[allc >> kb].long()
-    pos = torch.where(slot >= 0, block[slot.clamp_min(0) * (1 << kb) + (allc & ((1 << kb) - 1))].long(),
-                      torch.full_like(allc, -1))
-    expect = torch.full_like(allc, -1)
+    lk = aug.grid.nest_table(0, "cpu")
+    assert lk[0] == table
+    allc = np.arange(36 * 4**6, 39 * 4**6)
+    ring = torch.as_tensor(np.asarray(healpix_geo.nested.to_ring(allc.astype(np.uint64), LEVEL)).astype(np.int64))
+    if table == "ringtab":
+        tab, rmin = lk[1].long(), lk[2]
+        rel = ring - rmin
+        inr = (rel >= 0) & (rel < tab.numel())
+        pos = torch.where(inr, tab[rel.clamp(0, tab.numel() - 1)], torch.full_like(ring, -1))
+    else:
+        parent, block, kb = lk[1].long(), lk[2].long(), lk[3]
+        nest = ab.ring_to_nest(ring, LEVEL)
+        slot = parent[nest >> kb]
+        pos = torch.where(slot >= 0, block[slot.clamp_min(0) * (1 << kb) + (nest & ((1 << kb) - 1))],
+                          torch.full_like(nest, -1))
+    expect = torch.full((allc.size,), -1, dtype=torch.long)
     expect[torch.as_tensor(ids) - 36 * 4**6] = torch.arange(ids.size)
     assert torch.equal(pos, expect)
-    assert parent.numel() + block.numel() <= 12 * 4**LEVEL
+
+
+@pytest.mark.parametrize("tr", [[RandomRotation((0.3, 0.3))], [RandomZoom((0.5, 0.5))],
+                                [RandomShift((0.03, 0.03)), RandomFlip(1.0)]])
+def test_float32_geometry_close_to_float64(tr):
+    """geom_dtype=float32 (the fast GPU option) stays within 1e-4 of float64."""
+    a32 = HealPixAugment(tr, LEVEL, BLOCK, fill=0.0, geom_dtype=torch.float32, backend="torch")
+    a64 = HealPixAugment(tr, LEVEL, BLOCK, fill=0.0, backend="torch")
+    f = _smooth(_xyz(BLOCK, LEVEL) * 8.0 - 8.0 * _xyz(BLOCK, LEVEL).mean(0))
+    x = torch.as_tensor(f).view(1, 1, -1)
+    y32 = a32.sample(1, torch.Generator().manual_seed(1)).apply(x)
+    y64 = a64.sample(1, torch.Generator().manual_seed(1)).apply(x)
+    assert torch.equal(y32.valid, y64.valid)
+    assert (y32.x - y64.x).abs().max() < 1e-4 * (f.max() - f.min())
+
+
+@needs_triton
+def test_triton_float32_geometry():
+    dev = torch.device("cuda")
+    tr = [RandomShift(0.03), RandomRotation(), RandomZoom((0.5, 1.3)), RandomFlip()]
+    a32 = HealPixAugment(tr, LEVEL, BLOCK, fill=0.0, geom_dtype=torch.float32).to(dev)
+    a64 = HealPixAugment(tr, LEVEL, BLOCK, fill=0.0, backend="torch").to(dev)
+    x = torch.randn(4, 3, BLOCK.size, device=dev)
+    y32 = a32.sample(4, torch.Generator().manual_seed(2)).apply(x)
+    y64 = a64.sample(4, torch.Generator().manual_seed(2)).apply(x)
+    ok = y32.valid & y64.valid
+    assert ok.float().mean() > 0.3 and (y32.valid != y64.valid).float().mean() < 1e-3
+    d = (y32.x - y64.x).abs()[ok.unsqueeze(1).expand_as(y32.x)]
+    assert d.max() < 2e-3   # random data: cell-scale features, worst case

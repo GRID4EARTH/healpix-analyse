@@ -403,31 +403,49 @@ if _HAS_TRITON:
         return (face << (2 * ORDER)) + _tl_spread(ix) + (_tl_spread(iy) << 1)
 
     @triton.jit
-    def _tl_find(key, rs_ptr, rp_ptr, n_rs, MODE: tl.constexpr, LOG2: tl.constexpr):
+    def _tl_find(key, rs_ptr, rp_ptr, n_rs, n_tab, MODE: tl.constexpr, LOG2: tl.constexpr):
         """Position in the source array of the RING cell ``key`` (level ``LOG2``).
 
-        No search: the RING id is converted to NESTED in closed form.
-        ``MODE == 0`` (full sphere): the NESTED id is the position.
-        ``MODE == 1`` (regional domain): two-level table, built once per
-        domain: ``rs[nest >> n_rs]`` is the slot of the parent block (or -1)
-        and ``rp[slot * 2**n_rs + (nest & (2**n_rs - 1))]`` the position (or
-        -1 when the cell is not in the domain).
+        No search in any mode:
+
+        * ``MODE == 2`` (full sphere): ``rs[key]``, the RING -> NESTED table;
+        * ``MODE == 3`` (compact regional domain): ``rs[key - n_rs]``, a dense
+          RING -> position table over the RING range of the domain
+          (``n_tab`` entries, -1 outside the domain);
+        * ``MODE == 1`` (scattered regional domain): closed-form RING ->
+          NESTED, then a two-level table: ``rs[nest >> n_rs]`` is the slot
+          of the parent block and ``rp[slot * 2**n_rs + low bits]`` the
+          position;
+        * ``MODE == 0`` (full sphere above 2**28 cells): closed-form RING ->
+          NESTED, which is the position.
+
+        The table modes avoid the int64 arithmetic of the closed form (int64
+        multiplications are emulated on the GPU).
         """
-        nest = _tl_ring2nest(key, LOG2)
-        if MODE == 0:
-            pos = nest
-            present = nest >= 0
-        else:
-            slot = tl.load(rs_ptr + (nest >> n_rs))
-            has = slot >= 0
-            bsz = tl.full(nest.shape, 1, tl.int64) << n_rs
-            pos = tl.load(rp_ptr + tl.maximum(slot, 0).to(tl.int64) * bsz + (nest & (bsz - 1)),
-                          mask=has, other=-1).to(tl.int64)
+        if MODE == 2:
+            pos = tl.load(rs_ptr + key).to(tl.int64)
             present = pos >= 0
+        elif MODE == 3:
+            rel = key - n_rs
+            inr = (rel >= 0) & (rel < n_tab)
+            pos = tl.load(rs_ptr + tl.where(inr, rel, 0), mask=inr, other=-1).to(tl.int64)
+            present = pos >= 0
+        else:
+            nest = _tl_ring2nest(key, LOG2)
+            if MODE == 0:
+                pos = nest
+                present = nest >= 0
+            else:
+                slot = tl.load(rs_ptr + (nest >> n_rs))
+                has = slot >= 0
+                bsz = tl.full(nest.shape, 1, tl.int64) << n_rs
+                pos = tl.load(rp_ptr + tl.maximum(slot, 0).to(tl.int64) * bsz + (nest & (bsz - 1)),
+                              mask=has, other=-1).to(tl.int64)
+                present = pos >= 0
         return pos, present
 
     @triton.jit
-    def _tl_lookup(qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, snap, pos_off,
+    def _tl_lookup(qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, n_tab, snap, pos_off,
                    MODE: tl.constexpr, LOG2: tl.constexpr):
         """get_interpol (RING) at the points q, then the domain lookup.
 
@@ -475,10 +493,10 @@ if _HAS_TRITON:
         g1 = tl.where(g1 < snap, 0.0, g1)
         g2 = tl.where(g2 < snap, 0.0, g2)
         g3 = tl.where(g3 < snap, 0.0, g3)
-        q0, f0 = _tl_find(k0, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-        q1, f1 = _tl_find(k1, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-        q2, f2 = _tl_find(k2, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-        q3, f3 = _tl_find(k3, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+        q0, f0 = _tl_find(k0, rs_ptr, rp_ptr, n_rs, n_tab, MODE, LOG2)
+        q1, f1 = _tl_find(k1, rs_ptr, rp_ptr, n_rs, n_tab, MODE, LOG2)
+        q2, f2 = _tl_find(k2, rs_ptr, rp_ptr, n_rs, n_tab, MODE, LOG2)
+        q3, f3 = _tl_find(k3, rs_ptr, rp_ptr, n_rs, n_tab, MODE, LOG2)
         return (q0 + pos_off, q1 + pos_off, q2 + pos_off, q3 + pos_off,
                 g0, g1, g2, g3, f0, f1, f2, f3)
 
@@ -519,7 +537,7 @@ if _HAS_TRITON:
     def _aug_kernel(
         uv_ptr, xyz_ptr, a_ptr, r_ptr, off_ptr, fr_ptr, thr_ptr, rs_ptr, rp_ptr, bsel_ptr,
         src_ptr, out_ptr, idx_ptr, w_ptr, scale_ptr, nn_ptr, gout_ptr, gsrc_ptr, fsc_ptr,
-        N, NS, C, n_rs, nside_in, pos_off, min_support, snap, fill,
+        N, NS, C, n_rs, n_tab, nside_in, pos_off, min_support, snap, fill,
         T: tl.constexpr, T_NN: tl.constexpr, HAS_A: tl.constexpr, HAS_R: tl.constexpr,
         MODE: tl.constexpr, LOG2: tl.constexpr, GATHER: tl.constexpr, SCATTER: tl.constexpr,
         STORE_MAP: tl.constexpr, STORE_NN: tl.constexpr, FIXED: tl.constexpr,
@@ -623,7 +641,7 @@ if _HAS_TRITON:
                 qy = py
                 qz = pz
             q0, q1, q2, q3, g0, g1, g2, g3, f0, f1, f2, f3 = _tl_lookup(
-                qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, snap, pos_off, MODE, LOG2)
+                qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, n_tab, snap, pos_off, MODE, LOG2)
             h0 = tl.where(f0, g0, 0.0)
             h1 = tl.where(f1, g1, 0.0)
             h2 = tl.where(f2, g2, 0.0)
@@ -684,9 +702,9 @@ if _HAS_TRITON:
                     qy = py
                     qz = pz
                 q0, q1, q2, q3, g0, g1, g2, g3, f0, f1, f2, f3 = _tl_lookup(
-                    qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, snap, pos_off, MODE, LOG2)
+                    qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, n_tab, snap, pos_off, MODE, LOG2)
                 nn_pos = _tl_nearest(q0, q1, q2, q3, g0, g1, g2, g3, f0, f1, f2, f3, pos_off)
-        ok = (s_in >= min_support * tot - 1e-12) & (s_in > 0)
+        ok = (s_in >= (min_support - 0.1 * snap) * tot) & (s_in > 0)  # relative tolerance
         scale = tl.where(ok, 1.0 / tl.where(ok, s_in, 1.0), 0.0)
         if GATHER:
             res = tl.where(ok[None, :], acc * scale.to(tl.float32)[None, :], fill)
@@ -779,8 +797,13 @@ def fused_augment_triton(geo, src=None, *, gout=None, scale=None, store_map=Fals
         if nb == 0:
             continue
         log2 = int(nside).bit_length() - 1  # the order of the launch
+        n_tab = 0
         if lookup[0] == "full":
             mode, rs, rp, n_rs = 0, dummy, dummy, 0
+        elif lookup[0] == "r2n":       # full sphere, RING -> NESTED table
+            mode, rs, rp, n_rs = 2, lookup[1], dummy, 0
+        elif lookup[0] == "ringtab":   # dense RING -> position over [rmin, rmin + n)
+            mode, rs, rp, n_rs, n_tab = 3, lookup[1], dummy, lookup[2], lookup[1].numel()
         else:  # ("nest2", parent table, block table, 2k)
             mode, rs, rp, n_rs = 1, lookup[1], lookup[2], lookup[3]
         grid = lambda meta: (triton.cdiv(N, meta["BLOCK"]), n_cb, nb)  # noqa: E731
@@ -791,7 +814,7 @@ def fused_augment_triton(geo, src=None, *, gout=None, scale=None, store_map=Fals
             src if gather else dummy, out if gather else dummy, idx, w, scale,
             nn if store_nn else dummy, gout if scatter else dummy,
             gsrc if scatter else torch.zeros(1, device=dev), fsc,
-            N, NS, C, n_rs, int(nside), int(pos_off),
+            N, NS, C, n_rs, n_tab, int(nside), int(pos_off),
             float(geo["min_support"]), float(geo["snap"]), float(fill),
             T=T, T_NN=geo["t_nn"], HAS_A=bool(has_a), HAS_R=bool(has_r), MODE=mode, LOG2=log2,
             GATHER=gather, SCATTER=scatter, STORE_MAP=bool(store_map), STORE_NN=bool(store_nn),

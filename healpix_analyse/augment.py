@@ -111,6 +111,10 @@ _F64 = torch.float64
 # Geometry points per chunk: bounds the transient memory on CUDA, and keeps
 # the temporaries in cache on the CPU (large fresh allocations page-fault).
 _MAX_POINTS = {"cuda": 1 << 22, "cpu": 1 << 15}
+# Dense RING -> position table for a regional domain when its RING range is at
+# most _RINGTAB_FACTOR times its number of cells (or _RINGTAB_MIN entries).
+_RINGTAB_FACTOR = 64
+_RINGTAB_MIN = 1 << 22
 
 
 # ===========================================================================
@@ -545,10 +549,14 @@ class _Grid(nn.Module):
 
     # -- NESTED -> position tables (fused kernel) ----------------------------
     def nest_table(self, k, device):
-        """Lookup of the NESTED cells of level ``L - k`` for the fused kernel.
+        """Cell -> position lookup of level ``L - k`` for the fused kernel.
 
-        ``("full",)`` on the full sphere (the NESTED id is the position).
-        Otherwise ``("nest2", parent, block, 2*j)``: a two-level table built
+        Built once per domain; no search in the kernel.  Full sphere:
+        ``("r2n", table)``, the RING -> NESTED table (int32), or ``("full",)``
+        (closed-form RING -> NESTED) above 2**28 cells.  Compact regional
+        domain (RING range at most 64 times the number of cells, or 4M
+        entries): ``("ringtab", table, rmin)``, a dense RING -> position
+        table.  Otherwise ``("nest2", parent, block, 2*j)``: a two-level table built
         once per domain.  ``parent`` [12 * 4**(L-k-j)] holds the slot of each
         level-(L-k-j) parent that has cells in the domain (-1 otherwise), and
         ``block`` [n_slots * 4**j] the position of each of its 4**j children
@@ -559,9 +567,24 @@ class _Grid(nn.Module):
         key = ("nest2", int(k), str(device))
         if key not in self._pyr:
             order = self.level - k
+            npix = 12 * 4 ** order
             if self.full and k == 0:
-                self._pyr[key] = ("full",)
+                if npix <= (1 << 28):
+                    r2n = np.asarray(healpix_geo.ring.to_nested(
+                        np.arange(npix, dtype=np.uint64), order)).astype(np.int32)
+                    self._pyr[key] = ("r2n", torch.as_tensor(r2n, device=device))
+                else:
+                    self._pyr[key] = ("full",)
             else:
+                ids_k = self._ids_np if k == 0 else self.pyramid(k, "cpu")[k - 1][0].numpy()
+                ring = np.asarray(healpix_geo.nested.to_ring(ids_k.astype(np.uint64), order)).astype(np.int64)
+                rmin, rmax = int(ring.min()), int(ring.max())
+                span = rmax - rmin + 1
+                if span <= max(_RINGTAB_FACTOR * ids_k.size, _RINGTAB_MIN) and span < (1 << 31):
+                    tab = np.full(span, -1, dtype=np.int32)
+                    tab[ring - rmin] = self._perm_np if k == 0 else np.arange(ids_k.size)
+                    self._pyr[key] = ("ringtab", torch.as_tensor(tab, device=device), rmin)
+                    return self._pyr[key]
                 if k == 0:
                     ids, pos = self._ids_np, self._perm_np
                 else:
@@ -1081,7 +1104,7 @@ class HealPixAugment(nn.Module):
             wp = wp.permute(0, 1, 3, 2).reshape(bs, 4 * T, N)
             pp = pos.permute(0, 1, 3, 2).reshape(bs, 4 * T, N)
             s_in = wp.sum(1)
-            ok = s_in >= self.min_support * total - 1e-12
+            ok = s_in >= (self.min_support - 0.1 * self._snap) * total  # relative tolerance
             ok &= s_in > 0
             wn = torch.where(ok.unsqueeze(1), wp / s_in.clamp_min(1e-300).unsqueeze(1), torch.zeros((), dtype=gd, device=dev))
             idx[b0:b1] = torch.where(wn > 0, pp, torch.full((), -1, dtype=pp.dtype, device=dev)).int()
