@@ -87,10 +87,21 @@ def _sync(dev):
         torch.cuda.synchronize(dev)
 
 
+WARMUP_S = 0.5
+
+
 def _time(fn, dev, reps):
-    fn()  # two warm-up calls: the first one may autotune / compile
+    # Warm up for a fixed time, not a fixed number of calls: the first calls
+    # autotune / compile, and a GPU that was idle (process start) runs at low
+    # clocks for a while. Two warm-up calls left the first configuration of a
+    # process ~8x too slow (the "bf16 rotate" row of the first runs).
+    fn()
     fn()
     _sync(dev)
+    t_end = time.perf_counter() + WARMUP_S
+    while time.perf_counter() < t_end:
+        fn()
+        _sync(dev)
     ts = []
     for _ in range(reps):
         t0 = time.perf_counter()
@@ -257,10 +268,14 @@ def main(argv=None):
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--no-backward", action="store_true")
+    ap.add_argument("--warmup-s", type=float, default=0.5,
+                    help="warm-up time per measurement (seconds); 0 = two calls only")
     ap.add_argument("--label", default="")
     ap.add_argument("--out", default="")
     ap.add_argument("--table", nargs="+", default=None, help="print the Markdown table of JSON-line files")
     args = ap.parse_args(argv)
+    global WARMUP_S
+    WARMUP_S = args.warmup_s
     if args.table:
         table(args.table)
         return
