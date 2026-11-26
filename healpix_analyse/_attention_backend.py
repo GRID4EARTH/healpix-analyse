@@ -950,6 +950,9 @@ def _win_triton_forward(qkv, plan, scale):
     return out, lse
 
 
+_ACC_CONFIG = (64, 64)       # BLOCK_Q, BLOCK_K of the accumulating (coloured) launches
+
+
 def _win_triton_backward(qkv, plan, scale, out, lse, gout):
     B, N, _, H, D = qkv.shape
     SB, SN = _qkv_strides(qkv)
@@ -981,14 +984,17 @@ def _win_triton_backward(qkv, plan, scale, out, lse, gout):
             else:
                 acc = torch.zeros(B, N, 2, H, D, device=qkv.device, dtype=torch.float32)
                 ASB, ASN = acc.stride(0), acc.stride(1)
+            # The read-add-write kernel must run exactly once per colour: no
+            # autotune (its trial runs would add the contribution again).
             bounds = plan.colour_bounds
+            BQ, BK = _ACC_CONFIG
             for c in range(len(bounds) - 1):
                 lo, hi = bounds[c], bounds[c + 1]
                 wl = plan.colours[lo:hi]
-                _win_bwd_kv_kernel[
-                    lambda m, n=hi - lo: (n * triton.cdiv(plan.TK, m["BLOCK_K"]), B * H)](
+                _win_bwd_kv_kernel.fn[((hi - lo) * triton.cdiv(plan.TK, BK), B * H)](
                     qkv, SB, SN, qi, ki, kl, wl, gout, lse, delta, acc, ASB, ASN, H, N, D,
-                    plan.TQ, plan.TK, scale, ACCUMULATE=True, **flags)
+                    plan.TQ, plan.TK, scale, ACCUMULATE=True, BLOCK_Q=BQ, BLOCK_K=BK,
+                    num_warps=4, num_stages=2, **flags)
             if acc is not dkv:
                 dkv.copy_(acc)
     return dqkv

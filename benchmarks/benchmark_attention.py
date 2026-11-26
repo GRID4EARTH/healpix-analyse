@@ -211,11 +211,16 @@ NA_CONFIGS = {
 }
 
 
-def _region_ids(level, radius_deg, seed=0):
+def _region_ids(level, radius_deg, seed=None):
+    """A cone on the sphere, in the sorted NESTED order of cone_coverage.
+
+    ``seed``: a random permutation of it instead (worst case for memory
+    locality: the gathered rows are scattered).
+    """
     import healpix_geo
     ids, _, _ = healpix_geo.nested.cone_coverage((10.0, 45.0), radius_deg, level)
     ids = np.asarray(ids, dtype=np.int64)
-    return np.random.default_rng(seed).permutation(ids)     # unsorted on purpose
+    return ids if seed is None else np.random.default_rng(seed).permutation(ids)
 
 
 def bench_neighbourhood(args):
