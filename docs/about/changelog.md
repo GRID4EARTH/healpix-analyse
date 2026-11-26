@@ -26,6 +26,17 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- Docs: a "Basic tools for AI" section (`docs/ai/`, #109): the AI building
+  blocks in one table (role, shapes, gradient, GPU kernel, deterministic
+  backward), an API card per block with signatures read from the source
+  code, a "which block for which architecture" table, a page on data
+  (domains, NaN and masks, augmentation, batching), and runnable recipes
+  (ResNet classifier, U-Net, ViT / MAE with NESTED-block tokens, training
+  loop with masks and bf16 autocast) run by `tests/test_ai_recipes.py`.
+  `docs/tools.yaml` gains an `ai:` field per block and an `ai:` section;
+  `llms.txt` and `llms-full.txt` gain an "AI building blocks" section (API
+  cards and the code of the recipes); new AI cases in the tool-choice
+  evaluation set.
 - Masked, coverage-aware normalisation and pooling for AI models (#109,
   section 5): `HealPixGroupNorm`, `HealPixLayerNorm` (over the channels of
   each cell) and `HealPixBatchNorm` (running statistics) take a validity

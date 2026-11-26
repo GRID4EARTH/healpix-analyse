@@ -77,6 +77,71 @@ full_text_pages:
   - start/overview
   - start/conventions
 
+# Basic tools for AI (docs/ai/): the building blocks of neural networks on
+# HEALPix data. A tool is an AI building block when it has an `ai:` field:
+#   ai.role:          one of the keys of ai.roles below
+#   ai.does:          one line, what it does in a model
+#   ai.api:           qualified names; the docs build reads their signatures
+#                     (and that of forward) from the source code
+#   ai.shapes, ai.grad, ai.gpu_kernel, ai.deterministic: short table cells
+#   ai.notes:         what a code generator must know (optional)
+# ai.recipes are runnable scripts (docs/ai/recipes/*.py) run by
+# tests/test_ai_recipes.py; ai.architectures feeds the "which block for which
+# architecture" table; ai.data_page is copied into llms-full.txt.
+ai:
+  page: ai/index
+  data_page: ai/data
+  roles:
+    layer: learned convolution
+    resample: one level coarser or finer (pooling / unpooling)
+    multiscale: multiscale decomposition
+    norm: normalisation with a validity mask
+    pooling: readout over all cells or regions
+    encoding: positional encoding of the cells
+    tokenizer: cells to tokens and back
+    attention: attention over windows or neighbourhoods
+    augment: data augmentation
+    reduction: neighbourhood reductions and differential operators
+    loss: differentiable statistic used in a loss
+  recipes:
+    - id: resnet
+      title: ResNet block and a small classifier
+      page: ai/recipes/resnet
+      script: ai/recipes/resnet.py
+      uses: [HealPixConv, HealPixGroupNorm, HealPixDown, global_pool]
+    - id: unet
+      title: U-Net on a regional domain with gaps
+      page: ai/recipes/unet
+      script: ai/recipes/unet.py
+      uses: [HealPixConv, HealPixGroupNorm, HealPixDown, HealPixUp]
+    - id: mae
+      title: Masked autoencoder (ViT / MAE) with NESTED-block tokens
+      page: ai/recipes/mae
+      script: ai/recipes/mae.py
+      uses: [HealPixPositionalEncoding]
+    - id: training
+      title: Training loop with NaN masks and bf16 autocast
+      page: ai/recipes/training
+      script: ai/recipes/training.py
+      uses: [HealPixConv, HealPixGroupNorm, HealPixUp]
+  architectures:
+    - name: CNN / ResNet classifier or regressor
+      blocks: "HealPixConv + HealPixGroupNorm (masked) + residual; HealPixDown(mode=\"mean\") between stages; global_pool or region_pool readout"
+      recipe: resnet
+    - name: U-Net (segmentation, denoising, downscaling)
+      blocks: "encoder HealPixConv + HealPixGroupNorm, HealPixDown; decoder HealPixUp, skip concatenation, HealPixConv; LargeConv for a wide receptive field at one level"
+      recipe: unet
+    - name: ViT / MAE
+      blocks: "NESTED-block tokens (reshape) + HealPixPositionalEncoding of the token cells + torch.nn.TransformerEncoder (scaled dot-product attention); random token masking; linear decoder back to the blocks"
+      recipe: mae
+    - name: Swin-like (windowed attention)
+      blocks: "NESTED-block windows (reshape) + torch scaled_dot_product_attention inside each window; windows shifted across parents are not available yet"
+    - name: JEPA / DINO-style self-supervised learning
+      blocks: "the ViT / MAE encoder as context and target encoders (EMA copy in torch), HealPixPositionalEncoding for the predictor queries; masks drawn on NESTED blocks; geometric augmentations are not available yet"
+      recipe: mae
+    - name: Spectral or physics-aware loss
+      blocks: "HealPixWaveletSpectrum (differentiable, NaN-aware band powers) next to a pixel loss"
+
 families:
   A:
     title: Convolution & filtering
@@ -348,6 +413,19 @@ tools:
       use: gaussian_filter / radial_filter
       page: conv/radial_filter
   optional_deps: triton (triton extra), only for the fused CUDA kernels
+  ai:
+    role: layer
+    does: learned 3x3 / 5x5 convolution, equivariant to the grid orientation
+    api: [healpix_analyse.convol.HealPixConv]
+    shapes: "[B, C_in, N] -> [B, G*C_out, N] (G = n_gauges, 1 by default)"
+    grad: yes (input and weights; double backward through the PyTorch path)
+    gpu_kernel: Triton (float32, float16, bfloat16)
+    deterministic: yes by default (deterministic=True; CPU always)
+    notes:
+      - The domain is fixed at construction (cell_ids, or the full sphere); N must equal len(cell_ids) and row k is cell_ids[k].
+      - The input is cast to the layer dtype (float32 by default), also inside torch.autocast; build with dtype=torch.bfloat16 for 16-bit kernels.
+      - NaN propagates by default; zero-fill and pass a validity channel, or use missing="local_mean" (PyTorch reference path, more memory).
+      - Pass device= at construction (default CUDA when available); the geometry is cached on disk (cache_dir).
 
 - id: large_conv
   title: Wide receptive field (LargeConv) and its Gaussian recipe
@@ -393,6 +471,16 @@ tools:
       use: HealPixWideConv
       page: conv/wide_conv
   optional_deps: none
+  ai:
+    role: layer
+    does: learned convolution with a wide receptive field (Down, small HealPixConv, Up)
+    api: [healpix_analyse.large_conv.LargeConv]
+    shapes: as HealPixConv
+    grad: yes (input and compact kernel)
+    gpu_kernel: HealPixConv Triton kernels plus sparse Down / Up products
+    deterministic: as HealPixConv and HealPixDown / HealPixUp
+    notes:
+      - NESTED only; a regional domain needs a halo (Down and Up pad with zeros).
 
 - id: wide_conv
   title: Wide kernel given as an image, a formula in metres or a raster (HealPixWideConv)
@@ -768,6 +856,14 @@ tools:
       use: local_ps
       page: sht/fft_local
   optional_deps: none
+  ai:
+    role: loss
+    does: differentiable band power spectrum with NaN and masks, usable as a spectral loss
+    api: [healpix_analyse.wavelet_spectrum.HealPixWaveletSpectrum]
+    shapes: "[..., N] (+ weights) -> dataclass: power [..., S, G], power_total [..., S]"
+    grad: yes (data and weights)
+    gpu_kernel: "no custom kernel: HealPixConv(missing=\"local_mean\") reference path and HealPixDown"
+    deterministic: "not guaranteed on CUDA (PyTorch gather / scatter backward)"
 
 - id: flat_spectra
   title: Deprecated flat spectrum (powerspectra)
@@ -1078,6 +1174,18 @@ tools:
       use: gaussian_filter
       page: conv/compare_gaussian
   optional_deps: none
+  ai:
+    role: resample
+    does: one level coarser (pooling layer of an encoder); mean, max, Gaussian or mean-conserving Gaussian
+    api: [healpix_analyse.down.HealPixDown]
+    shapes: "[B, N] -> ([B, N_out], cell_ids_out); fold channels into the batch for [B, C, N]"
+    grad: yes (maxpool almost everywhere)
+    gpu_kernel: "no custom kernel: torch.sparse.mm (smooth modes) or a gather (mean, maxpool)"
+    deterministic: "mean / maxpool: each child has one parent; smooth: product with the stored CSR transpose (torch.sparse.mm)"
+    notes:
+      - Returns a tuple (values, cell_ids_out); cell_ids_out = np.unique(cell_ids // 4) on a regional domain.
+      - Only [N] or [B, N] inputs; reshape [B, C, N] to [B*C, N] and back.
+      - On a regional domain, build it from complete parents (every descendant of coarse cells); maxpool with incomplete parents has a known issue.
 
 - id: up
   title: One level finer (HealPixUp)
@@ -1111,6 +1219,17 @@ tools:
       use: resample_healpix
       page: other/resample
   optional_deps: none
+  ai:
+    role: resample
+    does: one level finer (upsampling layer of a decoder)
+    api: [healpix_analyse.up.HealPixUp]
+    shapes: "[B, N] -> ([B, 4*N], cell_ids_out) on complete parents; fold channels into the batch"
+    grad: "yes"
+    gpu_kernel: "no custom kernel: torch.sparse.mm"
+    deterministic: "product with the stored CSR transpose (torch.sparse.mm)"
+    notes:
+      - level is the coarse (input) level; cell_ids are the coarse cells; returns (values, cell_ids_out).
+      - paired_down= reuses the matrix of an existing HealPixDown (then omit cell_ids).
 
 - id: decomp
   title: Exactly invertible multiscale pyramid (HealPixDecomp)
@@ -1147,6 +1266,14 @@ tools:
       use: HealPixMultiScaleDivCurl
       page: stats/divcurl
   optional_deps: none
+  ai:
+    role: multiscale
+    does: exactly invertible multiscale bands (Laplacian pyramid), NaN-aware variant
+    api: [healpix_analyse.decomp.HealPixDecomp]
+    shapes: "[..., N] -> HealPixPyramid (one band per level)"
+    grad: "yes"
+    gpu_kernel: "no custom kernel: HealPixDown / HealPixUp products"
+    deterministic: as HealPixDown / HealPixUp
 
 - id: resample
   title: Between any levels and domains (resample_healpix)
@@ -1291,6 +1418,17 @@ tools:
     - when: every cell is valid and speed is all that matters
       use: torch.nn.GroupNorm / LayerNorm / BatchNorm1d
   optional_deps: triton (triton extra), only for the fused CUDA kernels
+  ai:
+    role: norm
+    does: GroupNorm / LayerNorm / BatchNorm with a validity mask or a coverage
+    api: [healpix_analyse.masked_norm.HealPixGroupNorm, healpix_analyse.masked_norm.HealPixLayerNorm, healpix_analyse.masked_norm.HealPixBatchNorm]
+    shapes: "x [B, C, N], mask [N], [B, N] or [B, C, N] (bool or float) -> [B, C, N]"
+    grad: yes (x and affine parameters)
+    gpu_kernel: Triton (float32, float16, bfloat16, fp32 accumulation)
+    deterministic: yes (fixed reduction tiles, no atomics)
+    notes:
+      - mask=None treats NaN / inf as invalid; invalid cells get fill= ("zero" by default, "nan", "passthrough").
+      - Same parameters and state_dict as torch.nn.GroupNorm / LayerNorm / BatchNorm1d.
 
 - id: masked_pool
   title: Masked global and regional pooling (global_pool, region_pool)
@@ -1329,6 +1467,16 @@ tools:
       use: HealPixDown
       page: other/down
   optional_deps: triton (triton extra), only for the CUDA kernels
+  ai:
+    role: pooling
+    does: masked mean / sum / max over all cells (readout) or over labelled regions
+    api: [healpix_analyse.masked_norm.global_pool, healpix_analyse.masked_norm.region_pool, healpix_analyse.masked_norm.HealPixRegionPool]
+    shapes: "x [B, C, N] -> [B, C] (global) or [B, C, R] (regions)"
+    grad: yes (x)
+    gpu_kernel: Triton (CSR int32 regions, no atomics)
+    deterministic: "yes"
+    notes:
+      - HealPixRegionPool.from_cell_ids(cell_ids, level, region_level) pools onto the parent cells at region_level.
 
 - id: positional_encoding
   title: Positional encodings of HEALPix cells (HealPixPositionalEncoding)
@@ -1364,6 +1512,16 @@ tools:
     - when: a learned position embedding per token
       use: a torch.nn.Parameter of shape [F, N]
   optional_deps: triton (triton extra), only for the CUDA kernel
+  ai:
+    role: encoding
+    does: Fourier features of the cell position (and gauge angle, level), cached per domain
+    api: [healpix_analyse.positional_encoding.HealPixPositionalEncoding, healpix_analyse.positional_encoding.healpix_positional_encoding]
+    shapes: "-> [F, N]; module(x [B, C, N]) -> [B, C + F, N]; module().T is [N, F] for tokens"
+    grad: no (a constant buffer)
+    gpu_kernel: Triton (one kernel writes every feature)
+    deterministic: n/a (no gradient)
+    notes:
+      - F = module.num_features; the buffer follows .to() and is not in the state_dict.
 
 - id: validation
   title: Reference convolution for tests (validation)

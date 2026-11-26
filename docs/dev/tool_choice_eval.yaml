@@ -125,3 +125,26 @@ cases:
   - id: unet-pooling
     question: What should I use for the pooling and unpooling layers of a HEALPix U-Net?
     expected: [HealPixDown, HealPixUp]
+
+  # --- AI building blocks (docs/ai/) --------------------------------------
+  - id: ai-unet-regional
+    question: Build a U-Net on a regional HEALPix domain (a few Sentinel-2 scenes at level 14) to segment clouds. Which layers do I use for the convolutions and for going down and up in resolution?
+    expected: [HealPixConv, HealPixDown, HealPixUp]
+  - id: ai-norm-clouds
+    question: My CNN activations contain cells under clouds that must not enter the BatchNorm statistics. What normalisation layer handles a validity mask?
+    expected: [HealPixBatchNorm, HealPixGroupNorm, HealPixLayerNorm]
+  - id: ai-readout-masked
+    question: For a regression head I need the average of the features over the whole domain, ignoring the land cells.
+    expected: [global_pool, HealPixGlobalPool]
+  - id: ai-tokens-mae-position
+    question: I tokenise a global HEALPix field for a masked autoencoder; how do I give each token its position on the sphere?
+    expected: [HealPixPositionalEncoding, healpix_positional_encoding]
+  - id: ai-pool-basins
+    question: Average the per-cell features of my network over river basins, with a mask of valid cells, as the input of a basin-scale classifier.
+    expected: [region_pool, HealPixRegionPool]
+  - id: ai-spectral-loss
+    question: My generative model of sea surface temperature produces fields with too little small-scale variance; I want a differentiable loss on the power spectrum, and land is missing.
+    expected: [HealPixWaveletSpectrum]
+  - id: ai-wide-receptive-unet
+    question: The bottleneck of my spherical U-Net needs a receptive field of about 30 cells at level 9 without a huge stencil.
+    expected: [LargeConv]

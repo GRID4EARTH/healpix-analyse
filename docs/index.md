@@ -57,6 +57,15 @@ power spectra.
 Coarser and finer resolutions, multiscale pyramids, resampling,
 interpolation at points, tiles, DINOv3 embeddings.
 :::
+
+:::{grid-item-card} Basic tools for AI
+:link: ai/index
+:link-type: doc
+
+The building blocks of neural networks on HEALPix data (convolutions,
+resolution changes, masked norms, pooling, positional encodings) and
+runnable ResNet, U-Net and MAE recipes.
+:::
 ::::
 
 ## Every tool, one line each
@@ -116,6 +125,15 @@ caption: D. Other tools
 hidden: true
 ---
 other/index
+```
+
+```{toctree}
+---
+maxdepth: 2
+caption: Basic tools for AI
+hidden: true
+---
+ai/index
 ```
 
 ```{toctree}
