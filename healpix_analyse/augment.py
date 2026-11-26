@@ -105,6 +105,7 @@ __all__ = [
     "RandomMask",
     "RandomCrop",
     "gauge_rotate",
+    "neighbour_mismatch",
 ]
 
 _F64 = torch.float64
@@ -879,8 +880,16 @@ class HealPixAugment(nn.Module):
     max_pyramid : int, default 4
         Number of coarser levels available to ``"pyramid"``.
     geom_dtype : torch.dtype, default torch.float64
-        Dtype of the geometry (positions and weights).  float64 makes the
-        identity transform exact; float32 is faster on consumer GPUs.
+        Dtype of the geometry (positions and weights).  float64 (default)
+        makes the identity transform exact and the fused kernel bit-identical
+        to the torch reference, on the CPU and on the GPU.  float32 is
+        opt-in.  Its positions are rounded to ~1e-7 rad, so at points within
+        rounding distance of a cell or face boundary it can pick a different
+        bilinear neighbour than float64 (or than the same transform on
+        another device).  Bilinear interpolation is continuous, so the
+        swapped neighbour carries a weight of order 1e-4 at level 10; at
+        level 10, 0.4-0.7 % of the output cells are concerned (see
+        :func:`neighbour_mismatch`).
     backend : {"auto", "triton", "torch"}
         Gather backend: Triton on CUDA for float32 / float16 / bfloat16 data
         when available, the PyTorch reference otherwise.
@@ -1278,3 +1287,26 @@ class _NNOnly:
 
     def __init__(self, nn):
         self.nn = nn
+
+
+def neighbour_mismatch(map_a: GatherMap, map_b: GatherMap, tol: float = 1e-4):
+    """Compare the neighbours chosen by two maps of the same draw.
+
+    Returns ``(n_diff, max_w)``: the number of output cells whose sets of
+    source cells (entries with a non-zero weight) differ, and the largest
+    weight, in either map, carried by a source cell that the other map does
+    not use.  Near a cell or face boundary, rounding can change the
+    neighbours; bilinear interpolation is continuous there, so the cells that
+    are swapped carry a weight within rounding distance of 0 (below ``tol``).
+    """
+    def lost(a, b):
+        ia, wa = a.idx.long(), a.w
+        ib = b.idx.long()
+        inb = (ia.unsqueeze(2) == ib.unsqueeze(1)).any(2)        # [B, J, N]
+        return torch.where((wa > 0) & ~inb, wa, torch.zeros((), dtype=wa.dtype, device=wa.device))
+
+    la, lb = lost(map_a, map_b), lost(map_b, map_a)
+    both = map_a.valid & map_b.valid
+    diff = ((la > 0).any(1) | (lb > 0).any(1)) & both
+    max_w = torch.maximum(la.amax(1), lb.amax(1).to(la.dtype))[both]
+    return int(diff.sum()), float(max_w.max()) if max_w.numel() else 0.0

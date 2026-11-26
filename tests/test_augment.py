@@ -557,3 +557,24 @@ def test_triton_float32_geometry():
     assert ok.float().mean() > 0.3 and (y32.valid != y64.valid).float().mean() < 1e-3
     d = (y32.x - y64.x).abs()[ok.unsqueeze(1).expand_as(y32.x)]
     assert d.max() < 2e-3   # random data: cell-scale features, worst case
+
+
+@pytest.mark.parametrize("tr", [[RandomShift(0.05), RandomRotation(), RandomZoom((0.6, 1.4)), RandomFlip()],
+                                [RandomRotation()]])
+def test_float32_neighbours_differ_only_at_boundaries(tr):
+    """float32 geometry may swap a neighbour only where its weight is ~0.
+
+    Near a cell or face boundary rounding can pick different bilinear
+    neighbours (the HealPixConv finding of #110); bilinear interpolation is
+    continuous there, so a swapped neighbour carries a weight within rounding
+    distance of 0 in both maps.  The test bounds that weight by 1e-4 and the
+    number of cells concerned by 1 %.
+    """
+    from healpix_analyse.augment import neighbour_mismatch
+    a32 = HealPixAugment(tr, LEVEL, BLOCK, geom_dtype=torch.float32, backend="torch")
+    a64 = HealPixAugment(tr, LEVEL, BLOCK, backend="torch")
+    m32 = a32.sample(4, torch.Generator().manual_seed(3)).gather_maps[0]
+    m64 = a64.sample(4, torch.Generator().manual_seed(3)).gather_maps[0]
+    n_diff, max_w = neighbour_mismatch(m32, m64)
+    assert max_w < 1e-4, max_w
+    assert n_diff <= 0.01 * 4 * BLOCK.size, n_diff

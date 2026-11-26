@@ -130,7 +130,15 @@ ya = plan.apply(y).x          # same rotation, shift, zoom, noise and mask
   generator; the noise is drawn on the device of the data, from a seed taken
   from the generator.
 - With the float64 geometry (`geom_dtype`, the default), the identity
-  transform is exact, bit for bit.
+  transform is exact, bit for bit, and the fused CUDA kernel gives exactly the
+  same output as the torch reference.
+- `geom_dtype=torch.float32` is opt-in. Near a cell or face boundary, its
+  rounding (about 1e-7 rad) can pick a different bilinear neighbour than
+  float64 does, or than the same transform does on another device. The
+  swapped neighbour carries a weight of order 1e-4 at level 10. In the
+  benchmark cases, 0.36–0.68 % of the output cells are concerned, and the
+  validity mask differs at 0–4 cells in 3×10⁵. `neighbour_mismatch(map_a,
+  map_b)` measures this for a given draw.
 - A rotation by 0.7 rad followed by its inverse (two gathers) brings back a
   field that varies over the scale of the domain to 6×10⁻⁵ of its range.
 - An SO(3) rotation of a full-sphere ℓ ≤ 3 field at level 6 preserves its
