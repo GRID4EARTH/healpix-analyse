@@ -37,6 +37,84 @@
   `llms.txt` and `llms-full.txt` gain an "AI building blocks" section (API
   cards and the code of the recipes); new AI cases in the tool-choice
   evaluation set.
+- `HealPixDown` / `HealPixUp(backend="auto" | "triton" | "torch" | "csr")`
+  (#109, section 1). `"mean"` and `"maxpool"` Down on contiguous NESTED data
+  (the full sphere, or sorted `cell_ids` whose parents are complete, detected
+  at construction) reduce a `[B, N/4, 4]` view of the input, with no index
+  array; an Up paired with such a `"mean"` Down is an `expand` of the
+  coarse values, with no matrix. Both are bit-identical to the previous
+  implementation. The Gaussian modes, and every other Up, store their matrix
+  and its transpose in ELL form (fixed fan-in, int32 indices) and apply it
+  with a Triton gather-reduce kernel on CUDA (float32, float16, bfloat16;
+  float32 accumulation, so 16-bit data is no longer copied to float32). The
+  backward is a gather with the stored transpose: no atomics,
+  deterministic, twice differentiable. Where the Triton kernel does not run
+  (CPU, float64, CUDA without Triton), `"auto"` keeps the CSR product,
+  which is faster there; `backend="torch"` runs the ELL product with
+  `embedding_bag`.
+  On CUDA the other paths are fused Triton kernels too, forward and
+  backward: `maxpool` (int8 argmax, one-pass backward), the expand Up, and
+  `smooth_conservative` (float64 row sums in Triton; the backward is one ELL
+  gather with the mean correction fused in).
+  `backend="csr"` keeps the previous CSR / `torch.sparse.mm` implementation
+  as the reference. `forward` now accepts `[..., N]` inputs (a `[B, C, N]`
+  feature map is flattened by a view, without a copy) and returns a
+  contiguous `[..., N_out]`. New benchmark `benchmarks/benchmark_updown.py`.
+  Checkpoints: the child indices of `"mean"` / `"maxpool"` are no longer
+  written to the `state_dict` (they are rebuilt by the constructor), so
+  `"auto"` and `"csr"` checkpoints are the same. Checkpoints of earlier
+  versions still load with `strict=True` (their `_children_idx` /
+  `_children_valid` keys are dropped); a checkpoint written by this version
+  loads into an earlier version only with `strict=False`.
+- Neighbourhood reductions and the local gradient run as vectorised stencil
+  operations (#109, section 4). `HealPixNeighbourReducer` no longer loops
+  over the output cells in Python: its neighbourhoods are built once with
+  vectorised NumPy and stored padded, and a call is a gather-reduce, a loop
+  over the neighbours on CPU and fused Triton kernels on CUDA for `sum`,
+  `mean`, `min`, `max` and `median` of floating-point data (the median by
+  ranking the neighbours in registers). Their backward passes are written by
+  hand and deterministic (a gather on the transposed neighbourhoods on
+  CUDA); `min`, `max` and `median` keep the subgradient of torch, with ties
+  going to the first cell in the order of `cell_ids`. `std`, `mode`, `any`,
+  `all` and integer reductions are vectorised too. New keyword
+  `backend="auto" | "triton" | "torch"` of `HealPixNeighbourReducer.__call__`.
+  Values are unchanged (exact for `min`, `max`, `median`, `count`, `mode`,
+  `any`, `all`; to rounding for the sums). One difference in the gradient:
+  on ties, the median's subgradient now goes to the first cell in the order
+  of `cell_ids` (a stable sort), where it depended on the unstable
+  `torch.sort` before.
+- `HealPixGradient`: the least-squares East/North gradient as a reusable
+  operator. The WGS84 geometry is built once, a call takes values
+  `[..., N]`. On CUDA with Triton, tensors run fused kernels with a
+  deterministic hand-written backward, without building the `[..., N, 8]`
+  gathered tensor (float16 / bfloat16 with fp32 accumulation); elsewhere the
+  reference implementation runs. `gradient()` delegates to it (same values
+  to about 1e-12 relative in float64).
+- `HealPixDivCurl` (and `HealPixMultiScaleDivCurl`): on CUDA with Triton,
+  the embedding of (u, v) in a Cartesian tangent vector and the contraction
+  of the `HealPixConv` derivatives to divergence and curl (with the gauge
+  mean) are fused kernels, forward and backward, instead of about ten
+  PyTorch operations and their intermediate tensors. Values unchanged to
+  rounding. `benchmarks/benchmark_reductions.py` measures the reductions,
+  the gradient and `HealPixDivCurl` (time, peak memory, and bandwidth against
+  the HBM peak of the GPU).
+- `HealPixWindowAttention` and `HealPixNeighbourhoodAttention` (#109,
+  section 3), new page "Attention layers". Window attention runs full
+  multi-head attention inside NESTED blocks of `4**window_level` cells, by a
+  reshape and `scaled_dot_product_attention` on the full sphere and on sorted
+  domains of complete blocks, with padded and masked windows otherwise. The
+  replacement of Swin's shifted windows is the option
+  `shift="coarse_centred" | "alternate_level" | "none"`: the default,
+  chosen in #109, is `"coarse_centred"` (windows centred on the cells of a
+  coarser level, overlapping across block borders), set by the module
+  constant `DEFAULT_WINDOW_SHIFT`. Neighbourhood attention lets each cell
+  attend to the taps of the gauge-oriented `HealPixConv` stencil, with one
+  relative position bias per head and tap. On CUDA both layers run fused
+  Triton kernels (flash-style online softmax, 16-bit data with fp32
+  accumulation, autotuned tiles, deterministic backward without atomics,
+  the packed projection read and its gradient written in place); a
+  PyTorch path runs elsewhere and serves as the reference. `benchmarks/benchmark_attention.py` compares them
+  with dense attention and with a naive gather.
 - Masked, coverage-aware normalisation and pooling for AI models (#109,
   section 5): `HealPixGroupNorm`, `HealPixLayerNorm` (over the channels of
   each cell) and `HealPixBatchNorm` (running statistics) take a validity

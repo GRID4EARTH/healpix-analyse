@@ -9,7 +9,11 @@ band returned by `HealPixDecomp`.
 ```
 
 The implementation is local, differentiable, GPU-aware, compatible with
-partial masks, and built directly on `HealPixConv`.
+partial masks, and built directly on `HealPixConv`. On CUDA with the optional
+`triton` package, the three steps of a call (embedding of u, v in a Cartesian
+tangent vector, the `HealPixConv` stencil, contraction to divergence and curl
+with the gauge mean) are three fused kernels, forward and backward, with no
+other intermediate tensor and no atomics.
 
 ## Quick start
 

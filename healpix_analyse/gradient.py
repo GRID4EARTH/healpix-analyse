@@ -42,6 +42,12 @@ from healpix_analyse.neighbour_reduce import (
     _normalise_ids,
     _validate_refinement_level,
 )
+from healpix_analyse._stencil_backend import (
+    BACKENDS,
+    GradientStencil,
+    lsq_gradient,
+    triton_available,
+)
 
 
 ArrayLike = np.ndarray | torch.Tensor
@@ -552,7 +558,12 @@ def _torch_gradient_from_geometry(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Evaluate differentiable least-squares gradients using Torch."""
+    """Evaluate differentiable least-squares gradients using Torch.
+
+    Reference implementation (materialises ``[..., N, K]``); ``values``
+    may have leading dimensions.  The fast path is
+    :func:`healpix_analyse._stencil_backend.lsq_gradient`.
+    """
 
     dtype = _torch_output_dtype(
         values
@@ -600,15 +611,16 @@ def _torch_gradient_from_geometry(
 
     gathered = torch.index_select(
         work,
-        0,
+        -1,
         safe_positions.reshape(-1),
     ).reshape(
-        safe_positions.shape
+        *work.shape[:-1],
+        *safe_positions.shape,
     )
 
     center_values = torch.index_select(
         work,
-        0,
+        -1,
         centers,
     )
 
@@ -624,7 +636,7 @@ def _torch_gradient_from_geometry(
         geometry_valid
         & (positions >= 0)
         & finite_neighbour
-        & finite_center[:, None]
+        & finite_center[..., None]
     )
 
     safe_gathered = torch.where(
@@ -645,7 +657,7 @@ def _torch_gradient_from_geometry(
 
     delta = (
         safe_gathered
-        - safe_center[:, None]
+        - safe_center[..., None]
     )
 
     zeros = torch.zeros_like(
@@ -675,31 +687,31 @@ def _torch_gradient_from_geometry(
     s_ee = torch.sum(
         east_safe
         * east_safe,
-        dim=1,
+        dim=-1,
     )
 
     s_en = torch.sum(
         east_safe
         * north_safe,
-        dim=1,
+        dim=-1,
     )
 
     s_nn = torch.sum(
         north_safe
         * north_safe,
-        dim=1,
+        dim=-1,
     )
 
     rhs_e = torch.sum(
         east_safe
         * delta,
-        dim=1,
+        dim=-1,
     )
 
     rhs_n = torch.sum(
         north_safe
         * delta,
-        dim=1,
+        dim=-1,
     )
 
     determinant = (
@@ -711,7 +723,7 @@ def _torch_gradient_from_geometry(
 
     number_of_valid_neighbours = torch.sum(
         valid,
-        dim=1,
+        dim=-1,
     )
 
     epsilon = torch.finfo(
@@ -783,6 +795,318 @@ def _torch_gradient_from_geometry(
     return (
         grad_east,
         grad_north,
+    )
+
+
+class HealPixGradient:
+    """Reusable least-squares gradient operator.
+
+    The immediate-neighbour geometry (WGS84 geodesics) is built once at
+    construction; every call then only gathers the values.  This is the form
+    to use inside a model or a training loop: :func:`gradient` rebuilds the
+    geometry at every call.
+
+    Parameters
+    ----------
+    cell_ids
+        NESTED HEALPix cell IDs of the input values (last dimension).
+    refinement_level
+        HEALPix refinement level.
+    domain
+        Optional processing/output domain, a subset of ``cell_ids``; see
+        :func:`gradient`.
+    method
+        ``"least_squares"`` (the only method).
+
+    Notes
+    -----
+    A call accepts values of shape ``[..., N]`` (NumPy or torch) and returns
+    ``(grad_east, grad_north)`` of shape ``[..., N_domain]``.
+
+    On CUDA with Triton installed, torch tensors run fused kernels (float16 /
+    bfloat16 with fp32 accumulation; the reference would compute the normal
+    equations in the 16-bit dtype, where squared offsets in metres
+    overflow).  Elsewhere, and with ``backend="torch"``, the materialised
+    reference implementation runs (on CPU it is faster than a loop over the
+    neighbours).  The kernels do not materialise the ``[..., N, K]``
+    gathered tensor, and their backward pass is written by hand (a gather on
+    the transposed neighbourhoods: no atomics, deterministic).  Their values
+    agree with the reference to rounding (about 1e-12 relative in float64).
+    """
+
+    def __init__(
+        self,
+        cell_ids,
+        refinement_level: int,
+        *,
+        domain=None,
+        method: GradientMethod = "least_squares",
+    ) -> None:
+        self.refinement_level = _validate_refinement_level(
+            refinement_level
+        )
+        self.method = _validate_method(
+            method
+        )
+        self.cell_ids = _normalise_ids(
+            cell_ids,
+            name="cell_ids",
+            refinement_level=self.refinement_level,
+        )
+
+        if domain is None:
+            self.domain = self.cell_ids.copy()
+        else:
+            self.domain = _normalise_ids(
+                domain,
+                name="domain",
+                refinement_level=self.refinement_level,
+            )
+
+        (
+            self._geometry,
+            self._neighbour_positions,
+            self._center_positions,
+        ) = _prepare_gradient_geometry(
+            self.cell_ids,
+            self.domain,
+            self.refinement_level,
+        )
+
+        self._stencil = None
+
+    @property
+    def output_cell_ids(
+        self,
+    ) -> np.ndarray:
+        """Output HEALPix IDs in exact output order."""
+
+        return self.domain.copy()
+
+    def _gradient_stencil(
+        self,
+    ) -> GradientStencil:
+        if self._stencil is None:
+            geometry = self._geometry
+            self._stencil = GradientStencil(
+                self._neighbour_positions,
+                geometry.valid_mask,
+                geometry.east_offset_m,
+                geometry.north_offset_m,
+                self._center_positions,
+                self.cell_ids.size,
+            )
+
+        return self._stencil
+
+    def __call__(
+        self,
+        values: ArrayLike,
+        *,
+        backend: str = "auto",
+    ) -> tuple[
+        ArrayLike,
+        ArrayLike,
+    ]:
+        """Return ``(grad_east, grad_north)`` of ``values [..., N]``.
+
+        ``backend`` is ``"auto"``, ``"triton"`` or ``"torch"``: ``"auto"``
+        uses the Triton kernels on CUDA when available, ``"torch"`` the
+        reference implementation.
+        """
+
+        if backend not in BACKENDS:
+            raise ValueError(
+                f"'backend' must be one of {BACKENDS}, got {backend!r}."
+            )
+
+        n_cells = self.cell_ids.size
+
+        if torch.is_tensor(values):
+            if values.ndim < 1 or values.shape[-1] != n_cells:
+                raise ValueError(
+                    "The last dimension of 'values' must match "
+                    "the number of 'cell_ids'."
+                )
+
+            if values.dtype == torch.bool:
+                raise TypeError(
+                    "'values' must contain numerical scalar values, not bool."
+                )
+
+            # The fused kernels run on CUDA with Triton (float16 / bfloat16
+            # with fp32 accumulation).  Elsewhere the materialised reference
+            # is used: on CPU it is faster than a loop over the neighbours.
+            fused = (
+                values.dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                )
+                and values.is_cuda
+                and backend != "torch"
+                and triton_available()
+            )
+
+            if (not fused and backend != "triton") or self.domain.size == 0:
+                return _torch_gradient_from_geometry(
+                    values,
+                    self._geometry,
+                    self._neighbour_positions,
+                    self._center_positions,
+                )
+
+            leading = tuple(values.shape[:-1])
+            flat = values.reshape(-1, n_cells)
+            grad_east, grad_north = lsq_gradient(
+                flat,
+                self._gradient_stencil(),
+                backend=backend,
+            )
+
+            return (
+                grad_east.reshape(*leading, self.domain.size),
+                grad_north.reshape(*leading, self.domain.size),
+            )
+
+        array = np.asarray(
+            values
+        )
+
+        if array.ndim < 1 or array.shape[-1] != n_cells:
+            raise ValueError(
+                "The last dimension of 'values' must match "
+                "the number of 'cell_ids'."
+            )
+
+        if array.dtype == np.bool_ or not np.issubdtype(
+            array.dtype,
+            np.number,
+        ):
+            raise TypeError(
+                "'values' must contain numerical scalar values."
+            )
+
+        if array.ndim == 1:
+            return _numpy_gradient_from_geometry(
+                array,
+                self._geometry,
+                self._neighbour_positions,
+                self._center_positions,
+            )
+
+        leading = array.shape[:-1]
+        rows = [
+            _numpy_gradient_from_geometry(
+                row,
+                self._geometry,
+                self._neighbour_positions,
+                self._center_positions,
+            )
+            for row in array.reshape(-1, n_cells)
+        ]
+        shape = (*leading, self.domain.size)
+
+        return (
+            np.stack([row[0] for row in rows]).reshape(shape),
+            np.stack([row[1] for row in rows]).reshape(shape),
+        )
+
+    def magnitude(
+        self,
+        values: ArrayLike,
+        **kwargs,
+    ) -> ArrayLike:
+        """Magnitude of the local geographic gradient."""
+
+        grad_east, grad_north = self(
+            values,
+            **kwargs,
+        )
+
+        return _hypot(
+            grad_east,
+            grad_north,
+        )
+
+    def directional_derivative(
+        self,
+        values: ArrayLike,
+        azimuth_rad,
+        **kwargs,
+    ) -> ArrayLike:
+        """Derivative along a geographic azimuth (clockwise from North)."""
+
+        grad_east, grad_north = self(
+            values,
+            **kwargs,
+        )
+
+        return _directional(
+            grad_east,
+            grad_north,
+            azimuth_rad,
+        )
+
+
+def _hypot(
+    grad_east,
+    grad_north,
+):
+    if torch.is_tensor(
+        grad_east
+    ):
+        return torch.hypot(
+            grad_east,
+            grad_north,
+        )
+
+    return np.hypot(
+        grad_east,
+        grad_north,
+    )
+
+
+def _directional(
+    grad_east,
+    grad_north,
+    azimuth_rad,
+):
+    if torch.is_tensor(
+        grad_east
+    ):
+        azimuth = torch.as_tensor(
+            azimuth_rad,
+            dtype=grad_east.dtype,
+            device=grad_east.device,
+        )
+
+        return (
+            grad_east
+            * torch.sin(
+                azimuth
+            )
+            + grad_north
+            * torch.cos(
+                azimuth
+            )
+        )
+
+    azimuth = np.asarray(
+        azimuth_rad,
+        dtype=grad_east.dtype,
+    )
+
+    return (
+        grad_east
+        * np.sin(
+            azimuth
+        )
+        + grad_north
+        * np.cos(
+            azimuth
+        )
     )
 
 
@@ -865,42 +1189,15 @@ def gradient(
         number_of_cells=cells.size,
     )
 
-    if domain is None:
-        output_domain = cells.copy()
-    else:
-        output_domain = _normalise_ids(
-            domain,
-            name="domain",
-            refinement_level=refinement_level,
-        )
-
-    (
-        geometry,
-        neighbour_positions,
-        center_positions,
-    ) = _prepare_gradient_geometry(
+    operator = HealPixGradient(
         cells,
-        output_domain,
         refinement_level,
+        domain=domain,
+        method=method,
     )
 
-    if torch.is_tensor(
+    return operator(
         values
-    ):
-        return _torch_gradient_from_geometry(
-            values,
-            geometry,
-            neighbour_positions,
-            center_positions,
-        )
-
-    return _numpy_gradient_from_geometry(
-        np.asarray(
-            values
-        ),
-        geometry,
-        neighbour_positions,
-        center_positions,
     )
 
 
@@ -922,15 +1219,7 @@ def gradient_magnitude(
         method=method,
     )
 
-    if torch.is_tensor(
-        grad_east
-    ):
-        return torch.hypot(
-            grad_east,
-            grad_north,
-        )
-
-    return np.hypot(
+    return _hypot(
         grad_east,
         grad_north,
     )
@@ -968,45 +1257,16 @@ def directional_derivative(
         method=method,
     )
 
-    if torch.is_tensor(
-        grad_east
-    ):
-        azimuth = torch.as_tensor(
-            azimuth_rad,
-            dtype=grad_east.dtype,
-            device=grad_east.device,
-        )
-
-        return (
-            grad_east
-            * torch.sin(
-                azimuth
-            )
-            + grad_north
-            * torch.cos(
-                azimuth
-            )
-        )
-
-    azimuth = np.asarray(
+    return _directional(
+        grad_east,
+        grad_north,
         azimuth_rad,
-        dtype=grad_east.dtype,
-    )
-
-    return (
-        grad_east
-        * np.sin(
-            azimuth
-        )
-        + grad_north
-        * np.cos(
-            azimuth
-        )
     )
 
 
 __all__ = [
     "GradientMethod",
+    "HealPixGradient",
     "directional_derivative",
     "gradient",
     "gradient_magnitude",
