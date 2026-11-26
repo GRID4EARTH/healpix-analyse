@@ -76,7 +76,7 @@
   code, a "which block for which architecture" table, a page on data
   (domains, NaN and masks, augmentation, batching), and runnable recipes
   (ResNet classifier, U-Net, ViT / MAE with `HealPixPatches` tokens, training
-  loop with masks and bf16 autocast, Swin-like transformer with
+  loop with `HealPixAugment`, masks and bf16 autocast, Swin-like transformer with
   `HealPixWindowAttention`, neighbourhood-attention segmenter, GAN critic
   with a gradient penalty; the U-Net uses `HealPixConv(stride=2)` and
   `HealPixConvTranspose`, or `HealPixDown` / `HealPixUp`) run by

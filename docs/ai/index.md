@@ -2,8 +2,8 @@
 
 The building blocks of neural networks on HEALPix data: learned
 convolutions, resolution changes, masked normalisation, pooling and
-positional encodings, window and neighbourhood attention, and
-differential operators. Each is a `torch.nn.Module` (or a function) that works
+positional encodings, patch tokens, window and neighbourhood attention,
+batched augmentation and differential operators. Each is a `torch.nn.Module` (or a function) that works
 on `[B, C, N]` tensors over the full sphere or a regional domain, runs on
 the GPU and is differentiable. Combine them with `torch.nn` to build a
 ResNet, a U-Net, a ViT or a masked autoencoder; the {doc}`recipes
@@ -39,13 +39,6 @@ on one regional patch), and {doc}`GetDINOV3SAT </other/dino>` (frozen foundation
 
 ```{include} ../_generated/ai_architectures.md
 ```
-
-## Coming with the open [#109](https://github.com/GRID4EARTH/healpix-analyse/issues/109) pull requests
-
-These blocks are in review and get their line in the table, an API card and
-a recipe when they are merged:
-
-- batched geometric augmentations on the GPU ([#111](https://github.com/GRID4EARTH/healpix-analyse/pull/111)).
 
 ```{toctree}
 ---

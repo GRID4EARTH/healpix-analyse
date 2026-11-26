@@ -61,7 +61,7 @@ dependencies) with the answer.
 - Pooling and unpooling layers → `HealPixDown`, `HealPixUp` (family D).
 - A whole model (ResNet, U-Net, ViT / MAE): start from
   {doc}`/ai/index`, the list of the AI building blocks (masked norms,
-  pooling, positional encodings, patch tokens, window and neighbourhood
+  pooling, positional encodings, patch tokens, augmentation, window and neighbourhood
   attention) with runnable recipes.
 
 **I want a statistic, a derivative or objects** (family B, {doc}`/stats/index`)

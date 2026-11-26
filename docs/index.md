@@ -64,7 +64,7 @@ interpolation at points, tiles, DINOv3 embeddings.
 
 The building blocks of neural networks on HEALPix data (convolutions,
 resolution changes, masked norms, pooling, positional encodings,
-attention, patch tokens) and runnable ResNet, U-Net, MAE and Swin-like
+attention, patch tokens, augmentation) and runnable ResNet, U-Net, MAE and Swin-like
 recipes.
 :::
 ::::

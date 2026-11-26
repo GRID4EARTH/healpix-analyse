@@ -29,6 +29,15 @@ values, augmentation and batching.
   mean (`missing="local_mean"`); `HealPixDown` / `HealPixUp` in the Gaussian
   modes see only the cells of the domain. Add a halo of cells around the region of
   interest when the edge matters, and leave it out of the loss.
+- **Stencil geometry.** `HealPixConv` (with its strided and transposed
+  forms and `missing="local_mean"`), `HealPixNeighbourhoodAttention` and the
+  gauge mode of `HealPixPatches` build their stencil in float64 whatever the
+  dtype of the layer. A bilinear neighbour inside the domain counts only if
+  its weight is at least 1e-6 of the full weight of its stencil point;
+  below that the weight is rounding noise. A point left with no neighbour
+  that counts falls back to the centre (0 for `HealPixPatches`), as when all
+  its neighbours are outside the domain. So the cells a layer reads do not
+  depend on rounding.
 
 ## Missing values (NaN) and masks
 
@@ -51,12 +60,30 @@ reference path, which keeps the gathered stencil in memory.
 
 ## Augmentation
 
-No HEALPix augmentation module is merged yet (batched geometric
-augmentations on the GPU are in review,
-[#111](https://github.com/GRID4EARTH/healpix-analyse/pull/111)). Meanwhile,
-augment in value space (noise, channel dropout, random NaN masks such as
-synthetic clouds), or draw random token masks as in the
-{doc}`MAE recipe <recipes/mae>`.
+`HealPixAugment` ({doc}`/other/augment`) augments a whole batch at once,
+with its own random parameters per sample from a seeded `torch.Generator`,
+on the device of the data: `RandomShift`, `RandomRotation`, `RandomZoom`,
+`RandomFlip`, `RandomSO3` (full sphere), `AdditiveNoise`, `RandomMask`
+(cells or NESTED tokens, MAE style) and `RandomCrop`. Consecutive geometric
+transforms are fused into one gather (one Triton kernel on CUDA).
+
+- **Input and target together.** Draw the plan once and apply it to both:
+  `plan = aug.sample(B, generator=g)`, then `plan.apply(x).x` and
+  `plan.apply(y).x` (bilinear). `aug(x, labels=...)` transforms labels and
+  masks with the same draw, by nearest neighbour.
+- **Outside the domain.** On a regional domain, an output cell whose source
+  falls outside the domain gets `fill` (NaN by default) and `valid=False`:
+  it is a gap like any other, left out of the input mask and of the loss.
+- **Synthetic gaps.** `RandomMask(ratio, block=..., fill=float("nan"))` on
+  the input only turns masked cells or blocks into NaN; the model handles
+  them as clouds.
+- **Precision of the geometry.** The augmentation geometry is float64 by
+  default (`geom_dtype`): the identity is exact, and the CUDA kernel matches
+  the CPU reference bit for bit. `geom_dtype=torch.float32` is opt-in:
+  faster, but near a cell or face boundary its rounding can pick another
+  bilinear neighbour, more often at high levels.
+
+See the {doc}`training recipe <recipes/training>`.
 
 ## Batching
 

@@ -12,13 +12,10 @@ picks CUDA when it is available).
 | {doc}`resnet` | pre-activation ResNet block, small classifier with a masked readout | `HealPixConv`, `HealPixGroupNorm`, `HealPixDown`, `global_pool` |
 | {doc}`unet` | U-Net with skip connections on a regional domain with gaps; strided conv / transpose or Down / Up | `HealPixConv(stride=2)`, `HealPixConvTranspose`, `HealPixGroupNorm`, `HealPixDown`, `HealPixUp` |
 | {doc}`mae` | masked autoencoder (ViT / MAE): patch tokens, masked token sampling, fold decoder | `HealPixPatches`, `HealPixPositionalEncoding`, `torch.nn.TransformerEncoder` |
-| {doc}`training` | training loop: NaN masks, masked loss, bf16 autocast, `DataLoader` | `HealPixConv`, `HealPixGroupNorm`, `HealPixUp` |
+| {doc}`training` | training loop: batched augmentation (shift, rotation, zoom, flip, masking), NaN masks, masked loss, bf16 autocast | `HealPixAugment`, `HealPixConv`, `HealPixGroupNorm`, `HealPixUp` |
 | {doc}`gradient_penalty` | GAN critic with a gradient penalty (double backward) | `HealPixConv`, `HealPixConv(stride=2)`, `global_pool` |
 | {doc}`swin` | Swin-like hierarchical transformer (window attention, patch merging, masked readout) | `HealPixWindowAttention`, `HealPixLayerNorm`, `HealPixDown`, `global_pool` |
 | {doc}`neighbourhood_attention` | neighbourhood-attention transformer for per-cell segmentation | `HealPixNeighbourhoodAttention`, `HealPixLayerNorm`, `HealPixConv` |
-
-Recipes for the blocks still in review (strided and transposed convolutions,
-augmentations) are added when they are merged.
 
 ```{toctree}
 ---

@@ -172,3 +172,9 @@ cases:
   - id: ai-gradient-penalty
     question: I train a WGAN-GP critic built from HEALPix convolutions; the gradient penalty needs second-order gradients through the convolution layers on the GPU.
     expected: [HealPixConv]
+  - id: ai-augment-batch
+    question: I train a cloud-segmentation network on regional Sentinel-2 HEALPix domains and want random rotations, shifts and zooms with different parameters for every sample of the batch, on the GPU, with the label masks transformed the same way.
+    expected: [HealPixAugment]
+  - id: ai-synthetic-gaps
+    question: To make my model robust to clouds I want to blank random NESTED blocks of 64 cells in each training sample.
+    expected: [RandomMask, HealPixAugment]
