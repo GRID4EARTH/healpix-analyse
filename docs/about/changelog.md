@@ -26,6 +26,35 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `HealPixDown` / `HealPixUp(backend="auto" | "triton" | "torch" | "csr")`
+  (#109, section 1). `"mean"` and `"maxpool"` Down on contiguous NESTED data
+  (the full sphere, or sorted `cell_ids` whose parents are complete, detected
+  at construction) reduce a `[B, N/4, 4]` view of the input, with no index
+  array; an Up paired with such a `"mean"` Down is an `expand` of the
+  coarse values, with no matrix. Both are bit-identical to the previous
+  implementation. The Gaussian modes, and every other Up, store their matrix
+  and its transpose in ELL form (fixed fan-in, int32 indices) and apply it
+  with a Triton gather-reduce kernel on CUDA (float32, float16, bfloat16;
+  float32 accumulation, so 16-bit data is no longer copied to float32). The
+  backward is a gather with the stored transpose: no atomics,
+  deterministic, twice differentiable. Where the Triton kernel does not run
+  (CPU, float64, CUDA without Triton), `"auto"` keeps the CSR product,
+  which is faster there; `backend="torch"` runs the ELL product with
+  `embedding_bag`.
+  On CUDA the other paths are fused Triton kernels too, forward and
+  backward: `maxpool` (int8 argmax, one-pass backward), the expand Up, and
+  `smooth_conservative` (float64 row sums in Triton; the backward is one ELL
+  gather with the mean correction fused in).
+  `backend="csr"` keeps the previous CSR / `torch.sparse.mm` implementation
+  as the reference. `forward` now accepts `[..., N]` inputs (a `[B, C, N]`
+  feature map is flattened by a view, without a copy) and returns a
+  contiguous `[..., N_out]`. New benchmark `benchmarks/benchmark_updown.py`.
+  Checkpoints: the child indices of `"mean"` / `"maxpool"` are no longer
+  written to the `state_dict` (they are rebuilt by the constructor), so
+  `"auto"` and `"csr"` checkpoints are the same. Checkpoints of earlier
+  versions still load with `strict=True` (their `_children_idx` /
+  `_children_valid` keys are dropped); a checkpoint written by this version
+  loads into an earlier version only with `strict=False`.
 - Neighbourhood reductions and the local gradient run as vectorised stencil
   operations (#109, section 4). `HealPixNeighbourReducer` no longer loops
   over the output cells in Python: its neighbourhoods are built once with

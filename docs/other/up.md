@@ -49,6 +49,7 @@ HealPixUp(
     device      = None,
     dtype       = torch.float32,
     paired_down = None,
+    backend     = "auto",
 )
 ```
 
@@ -65,6 +66,7 @@ HealPixUp(
 | `device` | device or `None` | auto | Torch device. Defaults to CUDA if available, else CPU. |
 | `dtype` | `torch.dtype` | `float32` | Dtype for the sparse matrix values. |
 | `paired_down` | `HealPixDown` or `None` | `None` | Reuse the exact matrix and fine-cell domain of an existing Down operator in mode `"smooth"`, `"smooth_conservative"` or `"mean"` (not `"maxpool"`); its `ellipsoid` and `weight_norm` are used. With a `"mean"` Down and `col_l1`, every child receives its parent's value. `cell_ids` must be omitted; `level` identifies the coarse output level. |
+| `backend` | `str` | `"auto"` | `"auto"`, `"triton"`, `"torch"` or `"csr"` (the reference); see [Compute backends](#compute-backends). |
 
 ---
 
@@ -76,12 +78,37 @@ y, cell_ids_out = up(x)
 
 | Argument | Type | Shape | Description |
 |---|---|---|---|
-| `x` | numpy or torch | `[N]` or `[B, N]` | Input map(s) at **coarse** resolution `nside_in`. `N` must equal `len(cell_ids)` on a regional domain, or `12 * nside_in²` otherwise. |
+| `x` | numpy or torch | `[N]`, `[B, N]` or `[..., N]` | Input map(s) at **coarse** resolution `nside_in`. `N` must equal `len(cell_ids)` on a regional domain, or `12 * nside_in²` otherwise. |
 
 | Return | Type | Shape | Description |
 |---|---|---|---|
-| `y` | same as `x` | `[N_out]` or `[B, N_out]` | Upsampled map(s) at fine resolution `nside_out = nside_in * 2`. |
+| `y` | same as `x` | `[N_out]`, `[B, N_out]` or `[..., N_out]` | Upsampled map(s) at fine resolution `nside_out = nside_in * 2`. |
 | `cell_ids_out` | `np.ndarray` | `[N_out]` | NESTED pixel indices of the output fine pixels at `nside_out`. |
+
+---
+
+## Compute backends
+
+As for [`HealPixDown`](down.md#compute-backends); every backend gives the
+same result.
+
+- `"auto"` *(default)*: when every fine cell takes its parent's value
+  (`paired_down` a `"mean"` Down on the full sphere, or on sorted `cell_ids`
+  with complete parents), the forward is an `expand` of the normalised coarse
+  values: no matrix and no index array are stored, and the result is
+  bit-identical to the reference. Otherwise the transpose matrix is stored
+  in ELL form and applied by the Triton gather-reduce kernel on CUDA
+  (float32, float16, bfloat16; float32 accumulation, no float32 copy of
+  16-bit data); without it (CPU, float64, no Triton) by the CSR product
+  (`torch.sparse.mm`), which is faster there. The
+  `up_norm` division is applied in the kernel, and folded into the stored
+  transpose used by the backward pass, which is a gather too: no atomics,
+  the same result at every run.
+- `"triton"` / `"torch"`: force that kernel.
+- `"csr"`: the reference, a CSR matrix and `torch.sparse.mm`.
+
+`forward` accepts `[..., N]` (a `[B, C, N]` feature map goes through
+without a copy) and returns a contiguous `[..., N_out]`.
 
 ---
 
@@ -242,16 +269,10 @@ dec1 = HealPixConv(level, 64 + 32, 32, kernel_sz=3, use_norm=True)
 up2  = HealPixUp(level - 2, up_norm="col_l1")
 dec2 = HealPixConv(level - 1, 128 + 64, 64, kernel_sz=3, use_norm=True)
 
-def up_channels(up, f):
-    # HealPixUp takes [N] or [B, N]: fold the channels into the batch
-    B, C, N = f.shape
-    y, _ = up(f.reshape(B * C, N))
-    return y.reshape(B, C, -1)
-
 # bottleneck: [B, 128, N/16] from the encoder; s1, s2: skip connections
-xu2 = up_channels(up2, bottleneck)                 # [B, 128, N/4]
+xu2, _ = up2(bottleneck)                           # [B, 128, N/4]
 xd2 = dec2(torch.cat([xu2, s2], dim=1))            # [B,  64, N/4]
-xu1 = up_channels(up1, xd2)                        # [B,  64, N]
+xu1, _ = up1(xd2)                                  # [B,  64, N]
 xd1 = dec1(torch.cat([xu1, s1], dim=1))            # [B,  32, N]
 ```
 

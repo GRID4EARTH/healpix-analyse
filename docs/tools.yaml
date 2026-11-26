@@ -1162,18 +1162,21 @@ tools:
   domain: whole sphere or regional set of cell ids at construction
   ordering: NESTED
   ellipsoid: '"WGS84"'
-  io: "[N] or [B, N] only -> tuple (y, cell_ids_out); cast to dtype (float32 by default)"
+  io: "[N], [B, N] or [..., N] (leading dims flattened by a view) -> tuple (y, cell_ids_out); cast to dtype (float32 by default)"
   differentiable: yes (maxpool almost everywhere, the gradient goes to the largest child)
   gpu: yes (CUDA by default when available)
   nan: '"smooth" spreads NaN; "mean" keeps it to the parent, or ignores it with skipna=True'
-  cost: a sparse matrix built once at construction (about 1.5 s at level 8 for smooth in the documented benchmark), then one sparse product
+  cost: >-
+    "mean" / "maxpool" on contiguous NESTED data (full sphere, sorted complete regional domain): a view and a reduction, no stored index.
+    "smooth": a sparse matrix built once at construction (about 1.5 s at level 8 in the documented benchmark), applied as an ELL gather
+    (Triton kernel on CUDA, embedding_bag elsewhere; backend="csr" for the CSR reference)
   pros:
     - Four modes, with a table of what each conserves.
     - Whole sphere or regional domain; NumPy or Torch.
   cons:
     - "`\"smooth\"` does not conserve the global mean."
     - "Known issue: `\"maxpool\"` on a regional domain gives a parent with missing children the value of the first input cell."
-    - Only [N] or [B, N] inputs; returns a tuple.
+    - Returns a tuple.
   use_instead:
     - when: several levels at once, or another output domain
       use: resample_healpix
@@ -1198,11 +1201,11 @@ tools:
   domain: whole sphere or regional set of coarse cell ids
   ordering: NESTED
   ellipsoid: '"WGS84" (or that of paired_down)'
-  io: "[N] or [B, N] only -> tuple (y, cell_ids_out)"
+  io: "[N], [B, N] or [..., N] (leading dims flattened by a view) -> tuple (y, cell_ids_out)"
   differentiable: yes
   gpu: yes
   nan: not handled
-  cost: sparse matrix built once, then one sparse product
+  cost: sparse matrix built once, then one ELL gather (Triton kernel on CUDA); an expand with no stored matrix when paired with a "mean" Down on contiguous NESTED data
   pros:
     - "`col_l1` with `weight_norm=\"l1\"` preserves constants; `paired_down` reuses the exact Down matrix."
   cons:
