@@ -700,7 +700,7 @@ for f in fns:
         xx = x.to(dt).clone().requires_grad_()
         y = f(xx)
         (g,) = torch.autograd.grad((y.float() * 1.7).sin().sum(), xx)
-        h.update(y.float().cpu().numpy().tobytes()); h.update(g.float().cpu().numpy().tobytes())
+        h.update(y.detach().float().cpu().numpy().tobytes()); h.update(g.float().cpu().numpy().tobytes())
 print(h.hexdigest())
 """
 
