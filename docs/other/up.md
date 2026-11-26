@@ -99,7 +99,8 @@ same result.
   bit-identical to the reference. Otherwise the transpose matrix is stored
   in ELL form and applied by the Triton gather-reduce kernel on CUDA
   (float32, float16, bfloat16; float32 accumulation, no float32 copy of
-  16-bit data) or by `torch.nn.functional.embedding_bag` elsewhere. The
+  16-bit data); without it (CPU, float64, no Triton) by the CSR product
+  (`torch.sparse.mm`), which is faster there. The
   `up_norm` division is applied in the kernel, and folded into the stored
   transpose used by the backward pass, which is a gather too: no atomics,
   the same result at every run.

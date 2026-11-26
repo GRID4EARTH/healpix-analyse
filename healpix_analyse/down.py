@@ -189,6 +189,7 @@ class _SparseOperatorMixin:
         probe = fn(torch.zeros((), dtype=self.dtype, device=self.device))
         out = super()._apply(fn, *args, **kwargs)
         self.dtype, self.device = probe.dtype, probe.device
+        self.__dict__.pop("_csr_cache", None)
         for n, old in keep.items():
             new = self._buffers[n]
             if new.dtype in _HALF_DTYPES and old.dtype not in _HALF_DTYPES:
@@ -204,6 +205,23 @@ class _SparseOperatorMixin:
             if b is not None:
                 return b.dtype
         return torch.float32
+
+    def _use_csr(self) -> bool:
+        """
+        Whether the linear modes use the CSR product (``torch.sparse.mm``).
+
+        ``backend="csr"`` always; ``"auto"`` everywhere the Triton kernel does
+        not run (CPU, float64, CUDA without Triton), because the MKL /
+        cuSPARSE product is faster there than the PyTorch ELL gather.  The
+        CSR arrays are then built from the ELL ones at the first call and
+        cached (they follow ``.to()``).
+        """
+        if self.backend == "csr":
+            return True
+        if self.backend != "auto":
+            return False
+        return not (_ub._HAS_TRITON and self.device.type == "cuda"
+                    and self._compute_dtype() in _ub._TRITON_DTYPES)
 
     def _register_sparse(
         self, M: torch.Tensor, div: Optional[torch.Tensor] = None
@@ -248,7 +266,17 @@ class _SparseOperatorMixin:
                 _ub.Ell(self._ellT_idx, self._ellT_w, R))
 
     def _csr(self, transpose: bool = False) -> torch.Tensor:
-        """The stored matrix (or its transpose) as a CSR tensor, no copy."""
+        """The stored matrix (or its transpose) as a CSR tensor, no copy.
+
+        With an ELL backend, the CSR tensor is built from the ELL arrays at
+        the first call and cached (same entries, same order: the product is
+        the one of ``backend="csr"``)."""
+        if self.backend != "csr":
+            cache = self.__dict__.setdefault("_csr_cache", {})
+            if transpose not in cache:
+                cache[transpose] = _ub.ell_to_csr(
+                    self._ell_idx, self._ell_w, self._M_size[1], transpose=transpose)
+            return cache[transpose]
         name = "_MT" if transpose else "_M"
         R, C = self._M_size
         return torch.sparse_csr_tensor(
@@ -263,15 +291,20 @@ class _SparseOperatorMixin:
         t: torch.Tensor,
         div: Optional[torch.Tensor] = None,
         out_dtype: Optional[torch.dtype] = None,
+        csr: bool = False,
     ) -> torch.Tensor:
         """
         ``M @ t`` for a batch ``t`` of shape ``[B, C]``; returns ``[B, R]``.
 
-        ELL backends only: ``div`` divides the output (it must be the ``div``
-        given to :meth:`_register_sparse`), and the output has ``out_dtype``
-        (``t.dtype`` by default), with at least float32 accumulation.
+        ``csr=True``: the CSR product (no ``div``, output in ``t.dtype``).
+        Otherwise the ELL product: ``div`` divides the output (it must be the
+        ``div`` given to :meth:`_register_sparse`), and the output has
+        ``out_dtype`` (``t.dtype`` by default), with at least float32
+        accumulation.
         """
-        if self.backend == "csr":
+        if csr:
+            # [B, R] as a transposed view of the [R, B] product, as before:
+            # a contiguous copy costs more than the CSR product on the CPU
             return _CsrMatmul.apply(t.T, self._csr(), self._csr(transpose=True)).T
         fwd, bwd = self._ell_ops()
         return _ub.ell_matmul(t, fwd, bwd, div=div, out_dtype=out_dtype,
@@ -293,7 +326,8 @@ class _SparseOperatorMixin:
         return self._sparse_coo().values()
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        for key in ("_M_indices", "_M_values"):
+        # keys of older versions; all are rebuilt by the constructor
+        for key in ("_M_indices", "_M_values", "_children_idx", "_children_valid"):
             state_dict.pop(prefix + key, None)
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
@@ -392,13 +426,14 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         contiguous NESTED data (the full sphere, or sorted ``cell_ids``
         whose parents are complete) reduce a view of the input, with no
         index array; otherwise they gather the children.  The Gaussian
-        modes apply their matrix in ELL form, with a Triton kernel on CUDA
+        modes apply their matrix in ELL form with a Triton kernel on CUDA
         (float32, float16, bfloat16; fp32 accumulation, so 16-bit data is
-        not copied to float32) when Triton is installed and a PyTorch
-        gather otherwise.  The backward is a gather with the stored
-        transpose: deterministic, no atomics.  *triton* / *torch* force
-        that kernel for the Gaussian modes (*triton* raises if it cannot
-        run).  *csr*: the reference implementation (CSR matrix and
+        not copied to float32) when Triton is installed; the backward is a
+        gather with the stored transpose (deterministic, no atomics).
+        Without the Triton kernel (CPU, float64, no Triton) they use the
+        CSR product, which is faster there.  *triton* / *torch* force the
+        Triton kernel or the PyTorch ELL gather (``embedding_bag``) for
+        the Gaussian modes (*triton* raises if it cannot run).  *csr*: the reference implementation (CSR matrix and
         ``torch.sparse.mm``, child gather in every case).  All backends give
         the same result: bit-identical for ``mean`` / ``maxpool``, equal to
         rounding for the Gaussian modes.
@@ -785,6 +820,7 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         self.register_buffer(
             "_children_idx",
             torch.as_tensor(children_idx, dtype=torch.long, device=self.device),
+            persistent=False,
         )
 
     def _build_mean_children(self) -> None:
@@ -815,10 +851,12 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         self.register_buffer(
             "_children_idx",
             torch.as_tensor(children_idx, dtype=torch.long, device=self.device),
+            persistent=False,
         )
         self.register_buffer(
             "_children_valid",
             torch.as_tensor(valid, dtype=torch.bool, device=self.device),
+            persistent=False,
         )
 
     # ------------------------------------------------------------------
@@ -1011,9 +1049,10 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
         # CSR reference casts the input to it, the ELL kernels read 16-bit
         # data as it is and accumulate in float32.
         linear = self.mode in ("smooth", "smooth_conservative")
+        use_csr = linear and self._use_csr()
         dtype = self._compute_dtype() if linear else self.dtype
         keep = ()
-        if linear and self.backend != "csr" and self.dtype in _HALF_DTYPES:
+        if linear and not use_csr and self.dtype in _HALF_DTYPES:
             keep = (self.dtype,)
         t, is_numpy, lead = _prepare_input(x, self.device, dtype, keep)
         B, N = t.shape
@@ -1023,9 +1062,9 @@ class HealPixDown(_SparseOperatorMixin, nn.Module):
                 f"Expected input with {self.N_in} pixels, got {N}."
             )
 
-        if linear and self.backend == "csr":
+        if use_csr:
             # M: [N_out, N_in] CSR, built once;  t: [B, N_in]
-            y = self._apply_sparse(t)       # [B, N_out]
+            y = self._apply_sparse(t, csr=True)       # [B, N_out]
             if self.mode == "smooth_conservative":
                 y = self._conserve_mean(t, y)
             y = y.to(self.dtype)

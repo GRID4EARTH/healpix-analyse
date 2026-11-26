@@ -118,9 +118,10 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
         every fine cell takes its parent's value (``paired_down`` a ``mean``
         Down on the full sphere, or on sorted ``cell_ids`` with complete
         parents), an ``expand`` of the coarse values with no stored index;
-        otherwise the transpose matrix in ELL form, with the Triton kernel
-        on CUDA and a PyTorch gather elsewhere.  *csr*: the reference (CSR
-        matrix and ``torch.sparse.mm``).
+        otherwise the transpose matrix in ELL form with the Triton kernel
+        on CUDA, and the CSR product without it (CPU, float64, no Triton).
+        *triton* / *torch*: force the Triton kernel or the PyTorch ELL
+        gather.  *csr*: the reference (CSR matrix and ``torch.sparse.mm``).
 
     Examples
     --------
@@ -394,8 +395,9 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
         # the stored precision (float32) and casts the output.  The ELL
         # kernels read 16-bit data as it is (fp32 accumulation).
         comp = self._compute_dtype()
+        use_csr = not self._expand and self._use_csr()
         keep = ()
-        if self.backend != "csr" and self.dtype in _HALF_DTYPES:
+        if not use_csr and self.dtype in _HALF_DTYPES:
             keep = (self.dtype,)
         t, is_numpy, lead = _prepare_input(x, self.device, comp, keep)
         B, N = t.shape
@@ -421,7 +423,7 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
                             None if self._fast_d is None else self._fast_d.to(device=t.device),
                             self.eps, self.dtype, self.backend)
 
-        elif self.backend != "csr":
+        elif not use_csr:
             div = None
             if denom is not None:
                 div = denom.to(device=t.device, dtype=comp).clamp_min(self.eps)
@@ -429,7 +431,7 @@ class HealPixUp(_SparseOperatorMixin, nn.Module):
 
         else:
             # M^T: [N_out, N_in] CSR, built once;  t: [B, N_in]
-            y = self._apply_sparse(t)         # [B, N_out]
+            y = self._apply_sparse(t, csr=True)         # [B, N_out]
             if denom is not None:
                 d = denom.to(device=t.device, dtype=t.dtype).clamp_min(self.eps)
                 y = y / d.unsqueeze(0)

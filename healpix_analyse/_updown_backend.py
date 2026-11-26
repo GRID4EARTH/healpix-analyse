@@ -28,8 +28,11 @@ runs as:
 * one Triton gather-reduce kernel on CUDA (float32 / float16 / bfloat16
   data, fp32 accumulation, so 16-bit data is never copied to float32); the
   padding is masked out of the loads;
-* ``torch.nn.functional.embedding_bag`` (weighted sum of gathered rows)
-  elsewhere: CPU, float64, CUDA without Triton.  It gathers rows, so it reads
+* ``torch.nn.functional.embedding_bag`` (weighted sum of gathered rows),
+  the PyTorch reference of the gather (``backend="torch"``).  With
+  ``backend="auto"`` the layers use the CSR product instead wherever the
+  Triton kernel does not run (CPU, float64, CUDA without Triton): MKL /
+  cuSPARSE are faster there.  ``embedding_bag`` gathers rows, so it reads
   a transposed copy of ``x`` with one extra row of zeros at index ``N_in``,
   where the padding points (a NaN in ``x`` therefore never meets a padding
   weight), in at least float32.
@@ -149,6 +152,34 @@ def ell_to_coo(idx: torch.Tensor, w: torch.Tensor, n_cols: int) -> torch.Tensor:
         torch.stack([rows, idx[valid].long()]), w[valid], size=(n, n_cols),
         device=idx.device, dtype=w.dtype,
     ).coalesce()
+
+
+def ell_to_csr(idx: torch.Tensor, w: torch.Tensor, n_cols: int,
+               transpose: bool = False) -> torch.Tensor:
+    """The CSR tensor of an ELL operator (or of its transpose), with int32
+    indices when they fit; built directly, without a COO tensor.
+
+    The entries keep their order (increasing columns within a row; for the
+    transpose, increasing rows within a column), as in the coalesced matrix.
+    """
+    n, R = idx.shape
+    valid = idx < n_cols
+    rows = torch.arange(n, device=idx.device)[:, None].expand(n, R)[valid]
+    cols = idx[valid].long()
+    vals = w[valid]
+    if transpose:
+        order = torch.argsort(cols * max(n, 1) + rows)
+        rows, cols, vals = cols[order], rows[order], vals[order]
+        n, n_cols = n_cols, n
+    counts = torch.bincount(rows, minlength=n)
+    crow = torch.zeros(n + 1, dtype=torch.int64, device=idx.device)
+    crow[1:] = torch.cumsum(counts, 0)
+    itype = torch.int32 if max(n, n_cols, cols.numel()) < 2**31 else torch.int64
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*Sparse CSR tensor support")
+        return torch.sparse_csr_tensor(crow.to(itype), cols.to(itype), vals.contiguous(),
+                                       size=(n, n_cols))
 
 
 # ===========================================================================

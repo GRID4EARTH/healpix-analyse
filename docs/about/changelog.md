@@ -35,10 +35,12 @@
   implementation. The Gaussian modes, and every other Up, store their matrix
   and its transpose in ELL form (fixed fan-in, int32 indices) and apply it
   with a Triton gather-reduce kernel on CUDA (float32, float16, bfloat16;
-  float32 accumulation, so 16-bit data is no longer copied to float32) or
-  with `embedding_bag` elsewhere (on a transposed float32 or float64 copy of
-  the input). The backward is a gather with the stored
-  transpose: no atomics, deterministic, twice differentiable.
+  float32 accumulation, so 16-bit data is no longer copied to float32). The
+  backward is a gather with the stored transpose: no atomics,
+  deterministic, twice differentiable. Where the Triton kernel does not run
+  (CPU, float64, CUDA without Triton), `"auto"` keeps the CSR product,
+  which is faster there; `backend="torch"` runs the ELL product with
+  `embedding_bag`.
   On CUDA the other paths are fused Triton kernels too, forward and
   backward: `maxpool` (int8 argmax, one-pass backward), the expand Up, and
   `smooth_conservative` (float64 row sums in Triton; the backward is one ELL
@@ -47,6 +49,12 @@
   as the reference. `forward` now accepts `[..., N]` inputs (a `[B, C, N]`
   feature map is flattened by a view, without a copy) and returns a
   contiguous `[..., N_out]`. New benchmark `benchmarks/benchmark_updown.py`.
+  Checkpoints: the child indices of `"mean"` / `"maxpool"` are no longer
+  written to the `state_dict` (they are rebuilt by the constructor), so
+  `"auto"` and `"csr"` checkpoints are the same. Checkpoints of earlier
+  versions still load with `strict=True` (their `_children_idx` /
+  `_children_valid` keys are dropped); a checkpoint written by this version
+  loads into an earlier version only with `strict=False`.
 - `HealPixConv(backend="auto" | "triton" | "torch", deterministic=True)`
   (#90). On CUDA, for float32, float16 and bfloat16, the forward and backward
   passes run as fused Triton kernels when the optional `triton` package is
