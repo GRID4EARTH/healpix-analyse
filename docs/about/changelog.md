@@ -70,6 +70,29 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `healpix_analyse.augment` (#109, section 8): batched data augmentation on
+  the GPU. `HealPixAugment` applies a list of transforms to a whole batch
+  with per-sample random parameters from a seeded `torch.Generator`:
+  `RandomRotation` (any angle about the domain centre), `RandomSO3` (global
+  rotation of a full-sphere field), `RandomShift` (translation on the
+  sphere), `RandomZoom` (any scale, with `antialias="supersample"` or
+  `"pyramid"` for zooms out), `RandomFlip`, `RandomGaugeRotation` (gauge axis
+  of `HealPixConv` outputs), `AdditiveNoise`, `RandomMask` (MAE cell or
+  NESTED-token masking) and `RandomCrop` (NESTED prefixes). Consecutive
+  shift / rotation / zoom / flip transforms compose into one source map and
+  one gather. On CUDA with the optional `triton` package, one fused kernel
+  computes the bilinear weights from the per-sample parameters and gathers in
+  the same pass (float32, float16, bfloat16; fp32 accumulation), and the
+  backward pass recomputes them and scatters into an int64 fixed-point
+  accumulator (deterministic, no map stored). Labels and masks follow with
+  nearest neighbour; cells read outside the domain get NaN and
+  `valid=False`, also across two gathers of one plan (a cell that reads a
+  cell made invalid by an earlier gather is invalid). The geometry is float64
+  by default (exact identity, kernel bit-identical to the torch reference);
+  `geom_dtype=torch.float32` is opt-in and faster, but can pick a different
+  bilinear neighbour near cell boundaries, with a weight that grows with the
+  level; `neighbour_mismatch` measures it.
+  `benchmarks/benchmark_augment.py` measures the throughput.
 - `HealPixConv(stride=2)`, the strided gauge convolution of an encoder, and
   `HealPixConvTranspose`, its adjoint for a decoder (#109, 1c). The strided
   layer evaluates the stencil only at the centres of the parent cells (fine
@@ -322,6 +345,10 @@
   `anafast_latlon` (it was 24).
 
 ### Fixed
+- `get_interp_weights` (sphere): a longitude a hair below 0 (e.g.
+  `-6.28e-15` degrees) gave `phi = 2 pi` exactly after the modulo, which put
+  the weight on a cell of the wrong position on the ring; `phi` is now folded
+  back into `[0, 2 pi)` as in the C++ reference.
 - `alm2map_latlon` returned the m > 0 terms at half amplitude: the synthesis
   of a real field now carries the factor 2 of the pair ±m, and
   `alm2map_latlon(map2alm_latlon(f))` returns a band-limited `f` to rounding

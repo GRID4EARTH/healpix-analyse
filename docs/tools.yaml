@@ -1407,6 +1407,52 @@ tools:
       page: conv/compare_wide
   optional_deps: "termcolor (dino extra, torch-hub route) or transformers (dino-hf extra)"
 
+- id: augment
+  title: Batched data augmentation on the GPU (HealPixAugment)
+  family: D
+  page: other/augment
+  status: experimental
+  symbols: [HealPixAugment, AugmentPlan, AugmentResult, RandomRotation, RandomSO3, RandomShift, RandomZoom, RandomFlip, Rotation3D, TangentLinear, RandomGaugeRotation, AdditiveNoise, RandomMask, RandomCrop, gauge_rotate, neighbour_mismatch]
+  also: [sample, apply, antialias, min_support, labels, geom_dtype]
+  summary: >-
+    Random augmentation of a whole batch at once, with its own parameters per
+    sample from a seeded generator: rotation (about the domain centre, global
+    SO(3), gauge axis), shift on the sphere, zoom of any factor, mirror,
+    MAE masking, noise and NESTED crops. Consecutive geometric transforms are
+    fused into one gather.
+  tasks:
+    - do: augment a batch of regional domains or full-sphere fields for training a neural network
+      use: [HealPixAugment]
+    - do: mask random cells or NESTED tokens for a masked autoencoder (MAE)
+      use: [RandomMask]
+    - do: rotate, shift or zoom a field on the sphere with labels transformed the same way
+      use: [HealPixAugment]
+  keywords: [augmentation, data augmentation, rotation, SO(3), shift, zoom, homothety, flip, MAE, masking, random crop, deep learning]
+  domain: whole sphere (cell_ids=None) or a regional set of NESTED cell ids (any order); tangent-plane transforms need a regional domain within a hemisphere
+  ordering: NESTED
+  ellipsoid: sphere (cell centres from healpix-geo, bilinear weights of get_interp_weights)
+  io: "[B, N], [B, C, N] or [B, ..., N] -> AugmentResult(x, labels, valid, mask, ids_keep, ids_restore, cell_ids)"
+  differentiable: yes, with respect to the data (not the random parameters)
+  gpu: yes; on CUDA one fused Triton kernel per geometric group (weights + gather) and a fused deterministic backward, for float32, float16 and bfloat16; torch ops elsewhere
+  nan: NaN propagates through non-zero weights; cells read outside the domain get fill (NaN) and valid=False
+  cost: >-
+    One gather per fused group: 4 taps per output cell, 4 n^2 with
+    antialias="supersample" for a zoom out by 1/n. On CUDA no map is stored
+    (only one scale per cell); benchmarks/benchmark_augment.py measures the
+    throughput.
+  pros:
+    - Per-sample random parameters for the whole batch in one kernel launch per fused group; no CPU geometry per draw.
+    - Exact composition of shift, rotation, zoom and flip into one gather; identity exact in float64.
+    - Labels and masks follow with nearest neighbour; deterministic gradients.
+  cons:
+    - A 3-D map (shift, SO(3)) after a tangent-plane map needs a second gather.
+    - The SO(3) rotation interpolates bilinearly (no spherical-harmonic rotation); small-scale power is smoothed.
+  use_instead:
+    - when: change of resolution rather than zoom about a centre
+      use: HealPixDown / HealPixUp
+      page: other/down
+  optional_deps: triton (fused CUDA kernels)
+
 - id: masked_norm
   title: Masked normalisation layers (HealPixGroupNorm, HealPixLayerNorm, HealPixBatchNorm)
   family: D
