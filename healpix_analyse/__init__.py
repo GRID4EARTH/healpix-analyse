@@ -159,6 +159,7 @@ from healpix_analyse.neighbour_reduce import (
 )
 
 from healpix_analyse.gradient import (
+    HealPixGradient,
     directional_derivative,
     gradient,
     gradient_magnitude,
@@ -354,6 +355,7 @@ __all__ = [
     "gradient",
     "gradient_magnitude",
     "directional_derivative",
+    "HealPixGradient",
 
     # ------------------------------------------------------------------
     # HEALPix connected components

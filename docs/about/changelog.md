@@ -26,6 +26,38 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- Neighbourhood reductions and the local gradient run as vectorised stencil
+  operations (#109, section 4). `HealPixNeighbourReducer` no longer loops
+  over the output cells in Python: its neighbourhoods are built once with
+  vectorised NumPy and stored padded, and a call is a gather-reduce, a loop
+  over the neighbours on CPU and fused Triton kernels on CUDA for `sum`,
+  `mean`, `min`, `max` and `median` of floating-point data (the median by
+  ranking the neighbours in registers). Their backward passes are written by
+  hand and deterministic (a gather on the transposed neighbourhoods on
+  CUDA); `min`, `max` and `median` keep the subgradient of torch, with ties
+  going to the first cell in the order of `cell_ids`. `std`, `mode`, `any`,
+  `all` and integer reductions are vectorised too. New keyword
+  `backend="auto" | "triton" | "torch"` of `HealPixNeighbourReducer.__call__`.
+  Values are unchanged (exact for `min`, `max`, `median`, `count`, `mode`,
+  `any`, `all`; to rounding for the sums). One difference in the gradient:
+  on ties, the median's subgradient now goes to the first cell in the order
+  of `cell_ids` (a stable sort), where it depended on the unstable
+  `torch.sort` before.
+- `HealPixGradient`: the least-squares East/North gradient as a reusable
+  operator. The WGS84 geometry is built once, a call takes values
+  `[..., N]`. On CUDA with Triton, tensors run fused kernels with a
+  deterministic hand-written backward, without building the `[..., N, 8]`
+  gathered tensor (float16 / bfloat16 with fp32 accumulation); elsewhere the
+  reference implementation runs. `gradient()` delegates to it (same values
+  to about 1e-12 relative in float64).
+- `HealPixDivCurl` (and `HealPixMultiScaleDivCurl`): on CUDA with Triton,
+  the embedding of (u, v) in a Cartesian tangent vector and the contraction
+  of the `HealPixConv` derivatives to divergence and curl (with the gauge
+  mean) are fused kernels, forward and backward, instead of about ten
+  PyTorch operations and their intermediate tensors. Values unchanged to
+  rounding. `benchmarks/benchmark_reductions.py` measures the reductions,
+  the gradient and `HealPixDivCurl` (time, peak memory, and bandwidth against
+  the HBM peak of the GPU).
 - `HealPixWindowAttention` and `HealPixNeighbourhoodAttention` (#109,
   section 3), new page "Attention layers". Window attention runs full
   multi-head attention inside NESTED blocks of `4**window_level` cells, by a
