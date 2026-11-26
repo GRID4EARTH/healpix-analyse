@@ -1,52 +1,42 @@
-"""Masked autoencoder (ViT / MAE) with NESTED-block tokens.
+"""Masked autoencoder (ViT / MAE) with HealPixPatches tokens.
 
-In NESTED order the 4**k cells of one parent at level ``level - k`` are
-consecutive, so a plain reshape turns a field [B, C, N] into tokens
-[B, T, C * 4**k], one per parent cell (the "patch"). Each token gets the
-HealPixPositionalEncoding of its parent cell. Encoder and decoder are
-torch.nn.TransformerEncoder layers (scaled dot-product attention). The
-loss is computed on the masked tokens only, and only on valid cells.
+HealPixPatches cuts a field [B, C, K] into M square N x N patches centred on
+the cells of level ``level - log2(N)``, oriented by the gauge (the same
+orientation everywhere on the sphere). Each token gets the
+HealPixPositionalEncoding of its centre cell. The encoder (torch.nn
+transformer layers) sees the kept tokens only, gathered with
+``patches(x, index=keep)``; the decoder predicts every patch, and
+``patches.fold`` puts the prediction back onto the cells. The loss counts
+the masked tokens and the valid pixels only.
 
-The domain must be sorted and made of complete parents (the full sphere,
-or every descendant of a set of coarse cells). Runs on CPU in about a
-second at level 4.
+Runs on CPU in about a second at level 4; raise the level and the widths
+on a GPU, where extraction and fold run Triton kernels.
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from healpix_analyse import HealPixPositionalEncoding
+from healpix_analyse import HealPixPatches, HealPixPositionalEncoding
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def to_tokens(x, k):
-    """[B, C, N] -> [B, N // 4**k, C * 4**k] (one token per parent cell)."""
-    B, C, N = x.shape
-    return x.reshape(B, C, N // 4 ** k, 4 ** k).permute(0, 2, 1, 3).reshape(B, N // 4 ** k, -1)
-
-
-def from_tokens(t, C, k):
-    """Inverse of to_tokens: [B, T, C * 4**k] -> [B, C, T * 4**k]."""
-    B, T, _ = t.shape
-    return t.reshape(B, T, C, 4 ** k).permute(0, 2, 1, 3).reshape(B, C, T * 4 ** k)
-
-
 class HealPixMAE(nn.Module):
-    def __init__(self, level, cell_ids, channels, k=2, dim=64, depth=2, heads=4,
-                 dec_dim=32, dec_depth=1, mask_ratio=0.75):
+    def __init__(self, level, channels, cell_ids=None, patch_size=4, dim=64, depth=2,
+                 heads=4, dec_dim=32, dec_depth=1, mask_ratio=0.75):
         super().__init__()
-        cell_ids = np.asarray(cell_ids)
-        assert np.all(np.diff(cell_ids) > 0) and len(cell_ids) % 4 ** k == 0
-        token_ids = cell_ids[:: 4 ** k] // 4 ** k          # parent of each token
-        self.k, self.C, self.mask_ratio = k, channels, mask_ratio
-        patch = channels * 4 ** k
+        # patches [B, C, K] -> [B, M, G, C, N, N]; G = 1 gauge here
+        self.patches = HealPixPatches(level, patch_size=patch_size, cell_ids=cell_ids,
+                                      device=DEVICE)
+        self.C, self.N, self.mask_ratio = channels, patch_size, mask_ratio
+        token = 2 * channels * patch_size ** 2               # values + validity channel
 
-        # positional encoding of the token cells: [F, T], a constant buffer
-        self.pe = HealPixPositionalEncoding(level - k, token_ids, device=DEVICE)
+        # positional encoding of the patch centres: [F, M], a constant buffer
+        self.pe = HealPixPositionalEncoding(self.patches.centre_level,
+                                            self.patches.centre_ids, device=DEVICE)
         F_ = self.pe.num_features
-        self.embed = nn.Linear(2 * patch, dim)              # values + validity
+        self.embed = nn.Linear(token, dim)
         self.pos = nn.Linear(F_, dim)
         layer = lambda d: nn.TransformerEncoderLayer(d, heads, 2 * d, dropout=0.0,
                                                      batch_first=True, norm_first=True)
@@ -55,47 +45,49 @@ class HealPixMAE(nn.Module):
         self.dec_pos = nn.Linear(F_, dec_dim)
         self.mask_token = nn.Parameter(torch.zeros(dec_dim))
         self.decoder = nn.TransformerEncoder(layer(dec_dim), dec_depth)
-        self.out = nn.Linear(dec_dim, patch)
+        self.out = nn.Linear(dec_dim, channels * patch_size ** 2)
 
-    def forward(self, x):                      # x [B, C, N], NaN = missing
-        B = x.shape[0]
+    def forward(self, x):                      # x [B, C, K], NaN = missing
+        B, M = x.shape[0], self.patches.M
         valid = torch.isfinite(x)
-        tok = to_tokens(torch.cat([torch.nan_to_num(x), valid.to(x.dtype)], 1), self.k)
-        T = tok.shape[1]
-        pe = self.pe().T.to(x.dtype)           # [T, F]
+        x0 = torch.nan_to_num(x)
+        pe = self.pe().T.to(x.dtype)           # [M, F]
 
-        # random masking: keep n_keep tokens per sample
-        n_keep = max(1, int(T * (1 - self.mask_ratio)))
-        order = torch.rand(B, T, device=x.device).argsort(dim=1)
-        keep = order[:, :n_keep]                                  # [B, n_keep]
-        h = self.embed(tok) + self.pos(pe)                        # [B, T, dim]
-        h = torch.gather(h, 1, keep[..., None].expand(-1, -1, h.shape[-1]))
-        h = self.encoder(h)                                       # visible tokens only
+        # masked token sampling: one draw per sample, only kept patches are gathered
+        n_keep = max(1, int(M * (1 - self.mask_ratio)))
+        keep = torch.rand(B, M, device=x.device).argsort(dim=1)[:, :n_keep]   # [B, n_keep]
+        vis = self.patches(torch.cat([x0, valid.to(x.dtype)], 1), index=keep)  # [B, n_keep, 1, 2C, N, N]
+        h = self.embed(vis.flatten(2)) + self.pos(pe[keep])                    # [B, n_keep, dim]
+        h = self.encoder(h)
 
-        # decoder: mask tokens everywhere, encoded tokens scattered back
-        d = self.mask_token.expand(B, T, -1).clone()
+        # decoder: mask tokens everywhere, encoded tokens scattered back to their place
+        d = self.mask_token.expand(B, M, -1).clone()
         d = d.scatter(1, keep[..., None].expand(-1, -1, d.shape[-1]), self.to_dec(h))
         d = self.decoder(d + self.dec_pos(pe))
-        pred = from_tokens(self.out(d), self.C, self.k)           # [B, C, N]
+        pred = self.out(d).view(B, M, 1, self.C, self.N, self.N)              # all patches
 
-        masked = torch.ones(B, T, dtype=torch.bool, device=x.device)
+        # loss on the masked tokens, valid pixels only, in patch space
+        target = self.patches(x0)                                             # [B, M, 1, C, N, N]
+        w = self.patches(valid.to(x.dtype)) > 0.999                           # pixel fully valid
+        masked = torch.ones(B, M, dtype=torch.bool, device=x.device)
         masked[torch.arange(B, device=x.device)[:, None], keep] = False
-        masked_cells = masked.repeat_interleave(4 ** self.k, dim=1)[:, None]   # [B, 1, N]
-        w = (valid & masked_cells).to(x.dtype)
-        loss = ((pred - torch.nan_to_num(x)) ** 2 * w).sum() / w.sum().clamp_min(1)
-        return loss, pred
+        w = w & masked[:, :, None, None, None, None]
+        loss = ((pred - target) ** 2 * w).sum() / w.sum().clamp_min(1)
+
+        # reconstruction on the cells: fold the predicted patches ([B, C, K])
+        return loss, self.patches.fold(pred)
 
 
 def main(level=4):
     torch.manual_seed(0)
-    N = 12 * 4 ** level                         # full sphere, NESTED order
-    model = HealPixMAE(level, np.arange(N), channels=2).to(DEVICE)
-    x = torch.randn(4, 2, N, device=DEVICE)
+    K = 12 * 4 ** level                         # full sphere, NESTED order
+    model = HealPixMAE(level, channels=2).to(DEVICE)
+    x = torch.randn(4, 2, K, device=DEVICE)
     x[:, :, 1000:1300] = float("nan")
-    loss, pred = model(x)
+    loss, rec = model(x)
     loss.backward()
-    assert pred.shape == x.shape and torch.isfinite(loss)
-    print(f"N = {N} cells, {N // 16} tokens, loss {loss.item():.3f}")
+    assert rec.shape == x.shape and torch.isfinite(loss)
+    print(f"K = {K} cells, {model.patches.M} tokens of 4x4, loss {loss.item():.3f}")
 
 
 if __name__ == "__main__":

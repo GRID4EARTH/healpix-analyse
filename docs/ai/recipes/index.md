@@ -11,13 +11,13 @@ picks CUDA when it is available).
 |---|---|---|
 | {doc}`resnet` | pre-activation ResNet block, small classifier with a masked readout | `HealPixConv`, `HealPixGroupNorm`, `HealPixDown`, `global_pool` |
 | {doc}`unet` | U-Net with skip connections on a regional domain with gaps | `HealPixConv`, `HealPixGroupNorm`, `HealPixDown`, `HealPixUp` |
-| {doc}`mae` | masked autoencoder (ViT / MAE) with NESTED-block tokens | `HealPixPositionalEncoding`, `torch.nn.TransformerEncoder` |
+| {doc}`mae` | masked autoencoder (ViT / MAE): patch tokens, masked token sampling, fold decoder | `HealPixPatches`, `HealPixPositionalEncoding`, `torch.nn.TransformerEncoder` |
 | {doc}`training` | training loop: NaN masks, masked loss, bf16 autocast, `DataLoader` | `HealPixConv`, `HealPixGroupNorm`, `HealPixUp` |
 | {doc}`swin` | Swin-like hierarchical transformer (window attention, patch merging, masked readout) | `HealPixWindowAttention`, `HealPixLayerNorm`, `HealPixDown`, `global_pool` |
 | {doc}`neighbourhood_attention` | neighbourhood-attention transformer for per-cell segmentation | `HealPixNeighbourhoodAttention`, `HealPixLayerNorm`, `HealPixConv` |
 
 Recipes for the blocks still in review (strided and transposed convolutions,
-square patches, augmentations) are added when they are merged.
+augmentations) are added when they are merged.
 
 ```{toctree}
 ---

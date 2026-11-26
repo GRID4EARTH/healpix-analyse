@@ -22,8 +22,8 @@ values, augmentation and batching.
   ```
 
   Then `HealPixDown(mode="mean")` is the exact mean of 4 children at every
-  level, `HealPixUp` gives back the same cells, and a reshape groups the
-  cells of one parent into a token (see {doc}`recipes/mae`).
+  level, `HealPixUp` gives back the same cells, and `HealPixPatches(mode=
+  "nested")` is a view of the data (see {doc}`recipes/mae`).
 - **Edges.** `HealPixConv` completes stencil points outside the domain with
   the value of the centre (`missing="centre"`, the default) or with the local
   mean (`missing="local_mean"`); `HealPixDown` / `HealPixUp` in the Gaussian

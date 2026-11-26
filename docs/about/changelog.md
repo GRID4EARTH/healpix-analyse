@@ -31,7 +31,7 @@
   backward), an API card per block with signatures read from the source
   code, a "which block for which architecture" table, a page on data
   (domains, NaN and masks, augmentation, batching), and runnable recipes
-  (ResNet classifier, U-Net, ViT / MAE with NESTED-block tokens, training
+  (ResNet classifier, U-Net, ViT / MAE with `HealPixPatches` tokens, training
   loop with masks and bf16 autocast, Swin-like transformer with
   `HealPixWindowAttention`, neighbourhood-attention segmenter) run by
   `tests/test_ai_recipes.py`. The window and neighbourhood attention,

@@ -115,10 +115,10 @@ ai:
       script: ai/recipes/unet.py
       uses: [HealPixConv, HealPixGroupNorm, HealPixDown, HealPixUp]
     - id: mae
-      title: Masked autoencoder (ViT / MAE) with NESTED-block tokens
+      title: Masked autoencoder (ViT / MAE) with HealPixPatches tokens
       page: ai/recipes/mae
       script: ai/recipes/mae.py
-      uses: [HealPixPositionalEncoding]
+      uses: [HealPixPatches, HealPixPatches.fold, HealPixPositionalEncoding]
     - id: training
       title: Training loop with NaN masks and bf16 autocast
       page: ai/recipes/training
@@ -142,7 +142,7 @@ ai:
       blocks: "encoder HealPixConv + HealPixGroupNorm, HealPixDown; decoder HealPixUp, skip concatenation, HealPixConv; LargeConv for a wide receptive field at one level"
       recipe: unet
     - name: ViT / MAE
-      blocks: "NESTED-block tokens (reshape) + HealPixPositionalEncoding of the token cells + torch.nn.TransformerEncoder (scaled dot-product attention); random token masking; linear decoder back to the blocks"
+      blocks: "HealPixPatches tokens (gauge-oriented, or mode=\"nested\" tiles) + HealPixPositionalEncoding of patches.centre_ids + torch.nn.TransformerEncoder; masked token sampling with patches(x, index=keep); linear decoder and HealPixPatches.fold back onto the cells"
       recipe: mae
     - name: Swin-like (windowed attention)
       blocks: "HealPixWindowAttention in pre-norm transformer blocks (HealPixLayerNorm, per-cell MLP); shift=\"coarse_centred\" (default) lets windows reach across block borders; HealPixDown + a pointwise linear layer as patch merging"
@@ -151,7 +151,7 @@ ai:
       blocks: "HealPixNeighbourhoodAttention (3x3 gauge-oriented stencil, relative position bias) in pre-norm transformer blocks; HealPixConv embedding; per-cell head"
       recipe: neighbourhood_attention
     - name: JEPA / DINO-style self-supervised learning
-      blocks: "the ViT / MAE encoder as context and target encoders (EMA copy in torch), HealPixPositionalEncoding for the predictor queries; masks drawn on NESTED blocks; geometric augmentations are not available yet"
+      blocks: "the ViT / MAE encoder on HealPixPatches tokens as context and target encoders (EMA copy in torch), HealPixPositionalEncoding of the masked centres as predictor queries, context and target tokens drawn with patches(x, index=...); geometric augmentations are not available yet"
       recipe: mae
     - name: Spectral or physics-aware loss
       blocks: "HealPixWaveletSpectrum (differentiable, NaN-aware band powers), HealPixGradient or HealPixDivCurl (gradients, divergence and curl of the prediction) next to a pixel loss"
@@ -486,6 +486,19 @@ tools:
       use: HealPixConv
       page: conv/convol
   optional_deps: triton (triton extra), only for the fused CUDA kernels
+  ai:
+    role: tokenizer
+    does: square N x N patch tokens (gauge-oriented or NESTED tiles), masked token sampling and the fold back onto the cells
+    api: [healpix_analyse.patches.HealPixPatches]
+    shapes: "[B, C, K] -> [B, M, G, C, N, N] (y.flatten(2): M tokens of G*C*N*N); index [B, Ms] -> [B, Ms, G, C, N, N]; fold: back to [B, C, K]"
+    grad: yes (extraction and fold, to any order)
+    gpu_kernel: Triton (float32, float16, bfloat16; nested mode on complete domains is a view plus one gather)
+    deterministic: "yes on the Triton path (fold and backward gather on the transposed map, no atomics)"
+    notes:
+      - Patch centres are patches.centre_ids at level patches.centre_level (M = patches.M); use them for HealPixPositionalEncoding.
+      - patch_size N = 2**p with p <= level; centres="coarse" (default) gives one patch per cell of level - p, centres="all" one per cell.
+      - "With centres=\"coarse\" and mode=\"gauge\", fold misses up to 16 cells next to the poles at N = 4 and the diamond tips from N = 8; use mode=\"nested\" or centres=\"all\" when every cell must be reconstructed."
+      - NaN propagates; zero-fill and extract a validity channel, or use patches.coverage for the edge of a regional domain.
 
 - id: window_attention
   title: Window attention on NESTED blocks (HealPixWindowAttention)

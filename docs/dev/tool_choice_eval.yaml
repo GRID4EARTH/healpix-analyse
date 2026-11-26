@@ -160,3 +160,9 @@ cases:
   - id: ai-gradient-feature
     question: Add the east and north gradients of sea level anomaly as extra input channels of my network, computed on the GPU at every batch over a fixed regional domain.
     expected: [HealPixGradient]
+  - id: ai-patch-tokens
+    question: I need 16x16 patch tokens of a global HEALPix field for a ViT, with the same orientation of the patches everywhere on the sphere.
+    expected: [HealPixPatches]
+  - id: ai-mae-masked-sampling
+    question: My MAE keeps 25 % of the tokens per sample; how do I extract only the kept patches on the GPU and fold the decoder output back onto the HEALPix cells?
+    expected: [HealPixPatches, HealPixPatches.fold]

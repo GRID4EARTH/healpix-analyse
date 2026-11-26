@@ -47,8 +47,7 @@ a recipe when they are merged:
 
 - strided `HealPixConv` and `HealPixConvTranspose`, for U-Net encoders and
   decoders without Down / Up ([#110](https://github.com/GRID4EARTH/healpix-analyse/pull/110));
-- batched geometric augmentations on the GPU ([#111](https://github.com/GRID4EARTH/healpix-analyse/pull/111));
-- `HealPixPatches` and `fold`, square patches as ViT tokens ([#113](https://github.com/GRID4EARTH/healpix-analyse/pull/113)).
+- batched geometric augmentations on the GPU ([#111](https://github.com/GRID4EARTH/healpix-analyse/pull/111)).
 
 ```{toctree}
 ---
