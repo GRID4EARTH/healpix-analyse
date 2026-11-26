@@ -539,3 +539,86 @@ def test_legacy_regional_pickle_cell_ids_out():
     old = HealPixConv.__new__(HealPixConv)
     old.__setstate__(state)
     np.testing.assert_array_equal(old.cell_ids_out, np.arange(full.K))
+
+
+# ---------------------------------------------------------------------------
+# Neighbours below 1e-6 of the bilinear weight do not count (#109)
+# ---------------------------------------------------------------------------
+
+def test_min_weight_removes_the_rounding_case(monkeypatch):
+    """Cell 4694 of the ragged domain: a stencil point whose neighbours inside
+    the domain have zero exact weight.  A float32 build gave one of them a
+    rounding weight (~1e-5 of a cell) that the renormalisation raised to 1
+    (~20 % output change).  With the 1e-6 rule both builds agree."""
+    import healpix_analyse.convol as hc
+
+    cs = CASES["regional"]
+    ref = make(cs, 1)                                     # float64 geometry
+    monkeypatch.setattr(hc, "_geometry_dtype", lambda dtype: torch.float32)
+    f32 = make(cs, 1)
+    monkeypatch.setattr(hc, "_STENCIL_MIN_WEIGHT", 0.0)   # the rule before #109
+    f32_old = make(cs, 1)
+    monkeypatch.undo()
+    k = int(np.nonzero(np.asarray(cs["cell_ids"]) == 4694)[0][0])
+    x = torch.randn(cs["B"], cs["C"], ref.K, dtype=torch.float64)
+    with torch.no_grad():
+        a, b, c = ref(x), f32(x), f32_old(x)
+    scale = float(a.abs().max())
+    # cell 4694 itself: wrong before the rule, right with it
+    assert float((a[..., k] - c[..., k]).abs().max()) > 1e-2 * scale
+    assert float((a[..., k] - b[..., k]).abs().max()) < 1e-4 * scale
+    assert float((a - b).abs().max()) < 1e-4 * scale
+
+
+def test_min_weight_full_sphere_changes_only_rounding(monkeypatch):
+    """On the full sphere every neighbour is present: the rule only drops
+    weights below 1e-6, so the output moves by less than 1e-6 (2.6e-7 at
+    level 6, measured)."""
+    import healpix_analyse.convol as hc
+
+    cs = dict(CASES["full"], level=4, gauge="projected_ref")
+    new = make(cs, 1)
+    monkeypatch.setattr(hc, "_STENCIL_MIN_WEIGHT", 0.0)
+    old = make(cs, 1)
+    monkeypatch.undo()
+    x = torch.randn(cs["B"], cs["C"], new.K, dtype=torch.float64)
+    with torch.no_grad():
+        a, b = new(x), old(x)
+    assert float((a - b).abs().max() / b.abs().max()) < 1e-6
+    w = new._tap_w
+    assert bool(((w == 0) | (w >= 1e-6 * 0.999)).all())   # no tiny weight left
+
+
+def test_min_weight_patches_follow_the_rule():
+    """HealPixPatches (gauge mode) bind with the same rule, in float64."""
+    from healpix_analyse.patches import HealPixPatches
+
+    ids = ragged_patch(5, 4)
+    a = HealPixPatches(5, patch_size=4, mode="gauge", cell_ids=ids, device="cpu",
+                       dtype=torch.float32)
+    b = HealPixPatches(5, patch_size=4, mode="gauge", cell_ids=ids, device="cpu",
+                       dtype=torch.float64)
+    torch.testing.assert_close(a._w.double(), b._w, rtol=0, atol=1e-7)
+    assert torch.equal(a._idx, b._idx)
+    w = b._w
+    assert bool(((w == 0) | (w >= 1e-6 * 0.999)).all())
+
+
+def test_old_cache_format_is_not_reused(tmp_path, monkeypatch):
+    """Geometry cached before the 1e-6 rule (format 3) is not read back: the
+    layer rebuilds it with the rule and writes a new entry."""
+    import healpix_analyse.convol as hc
+
+    kw = dict(n_gauges=1, cell_ids=ragged_patch(6, 4), device="cpu", dtype=torch.float32,
+              cache_dir=tmp_path)
+    monkeypatch.setattr(hc, "_CACHE_FORMAT", 3)
+    monkeypatch.setattr(hc, "_STENCIL_MIN_WEIGHT", 0.0)
+    old = HealPixConv(6, 1, 1, **kw)                      # written by the old rule
+    monkeypatch.undo()
+    assert hc._CACHE_FORMAT >= 4
+    assert len(list(tmp_path.glob("healpixconv_*.pt"))) == 1
+    new = HealPixConv(6, 1, 1, **kw)
+    fresh = HealPixConv(6, 1, 1, **{**kw, "cache_dir": None})
+    assert len(list(tmp_path.glob("healpixconv_*.pt"))) == 2
+    assert torch.equal(new._tap_idx, fresh._tap_idx) and torch.equal(new._tap_w, fresh._tap_w)
+    assert not torch.equal(old._tap_w, fresh._tap_w)       # the rule changes this domain

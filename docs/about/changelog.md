@@ -3,6 +3,35 @@
 ## Unreleased
 
 ### Changed
+- Stencil binding (`HealPixConv`, its strided and transposed forms,
+  `missing="local_mean"`, `HealPixNeighbourhoodAttention`, and the gauge mode
+  of `HealPixPatches`): a bilinear neighbour inside the domain counts only if
+  its weight is at least 1e-6 of the full 4-neighbour weight of its point
+  (#109). A point left with no neighbour that counts falls back to the centre,
+  as when all its neighbours are outside the domain (for `HealPixPatches`, it
+  is 0, as before). Two kinds of points change:
+  - a neighbour inside the domain with a rounding-size weight, which the
+    renormalisation raised to 1, so the point read a far cell; it is dropped;
+  - a point whose only neighbours inside the domain have an exact 0 weight:
+    before, its weights summed to 0 and it contributed nothing; it now falls
+    back to the centre, like a point with no neighbour inside.
+
+  **Outputs change only at such degenerate points, mostly on regional
+  domains with the `"phi"` gauge**, and the size of the change depends on the
+  kernel and the data. Measured against the previous version (kernel 3, 2
+  channels, maximum over 5 random kernels and inputs, change relative to
+  max |y|):
+  - `"phi"` gauge, ragged regional domain of 226 cells at level 6: 3 cells
+    (G = 1 or 2), 20 cells (G = 4), by up to 43–73 %; ragged domain of 864
+    cells at level 7: 5 cells (G = 1 or 2), 50 cells (G = 4), by up to
+    31–53 %;
+  - `"projected_ref"` gauge, the same domains: no change above 1e-6;
+  - full sphere, levels 6 and 7, G = 4: 16 to 264 cells move by at most
+    6e-7 (by up to 3e-6 with `missing="local_mean"`, in other runs).
+
+  `HealPixPatches` now also builds its gauge grid in float64 for every dtype,
+  as `HealPixConv`. The disk-cache format is bumped (4), so geometry cached by
+  earlier versions is rebuilt once instead of being reused.
 - `HealPixConv` builds its stencil geometry in float64 for every layer
   dtype and casts only the final weights (#109). **This changes the outputs
   of existing float32 layers at a few degenerate points, mostly on regional
@@ -58,6 +87,29 @@
   `llms.txt` and `llms-full.txt` gain an "AI building blocks" section (API
   cards and the code of the recipes); new AI cases in the tool-choice
   evaluation set.
+- `healpix_analyse.augment` (#109, section 8): batched data augmentation on
+  the GPU. `HealPixAugment` applies a list of transforms to a whole batch
+  with per-sample random parameters from a seeded `torch.Generator`:
+  `RandomRotation` (any angle about the domain centre), `RandomSO3` (global
+  rotation of a full-sphere field), `RandomShift` (translation on the
+  sphere), `RandomZoom` (any scale, with `antialias="supersample"` or
+  `"pyramid"` for zooms out), `RandomFlip`, `RandomGaugeRotation` (gauge axis
+  of `HealPixConv` outputs), `AdditiveNoise`, `RandomMask` (MAE cell or
+  NESTED-token masking) and `RandomCrop` (NESTED prefixes). Consecutive
+  shift / rotation / zoom / flip transforms compose into one source map and
+  one gather. On CUDA with the optional `triton` package, one fused kernel
+  computes the bilinear weights from the per-sample parameters and gathers in
+  the same pass (float32, float16, bfloat16; fp32 accumulation), and the
+  backward pass recomputes them and scatters into an int64 fixed-point
+  accumulator (deterministic, no map stored). Labels and masks follow with
+  nearest neighbour; cells read outside the domain get NaN and
+  `valid=False`, also across two gathers of one plan (a cell that reads a
+  cell made invalid by an earlier gather is invalid). The geometry is float64
+  by default (exact identity, kernel bit-identical to the torch reference);
+  `geom_dtype=torch.float32` is opt-in and faster, but can pick a different
+  bilinear neighbour near cell boundaries, with a weight that grows with the
+  level; `neighbour_mismatch` measures it.
+  `benchmarks/benchmark_augment.py` measures the throughput.
 - `HealPixConv(stride=2)`, the strided gauge convolution of an encoder, and
   `HealPixConvTranspose`, its adjoint for a decoder (#109, 1c). The strided
   layer evaluates the stencil only at the centres of the parent cells (fine
@@ -305,6 +357,10 @@
   `anafast_latlon` (it was 24).
 
 ### Fixed
+- `get_interp_weights` (sphere): a longitude a hair below 0 (e.g.
+  `-6.28e-15` degrees) gave `phi = 2 pi` exactly after the modulo, which put
+  the weight on a cell of the wrong position on the ring; `phi` is now folded
+  back into `[0, 2 pi)` as in the C++ reference.
 - `alm2map_latlon` returned the m > 0 terms at half amplitude: the synthesis
   of a real field now carries the factor 2 of the pair ±m, and
   `alm2map_latlon(map2alm_latlon(f))` returns a band-limited `f` to rounding
