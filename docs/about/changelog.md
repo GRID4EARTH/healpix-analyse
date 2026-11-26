@@ -26,6 +26,23 @@
   `healpix-geo` direction order with one copy instead of two.
 
 ### Added
+- `HealPixWindowAttention` and `HealPixNeighbourhoodAttention` (#109,
+  section 3), new page "Attention layers". Window attention runs full
+  multi-head attention inside NESTED blocks of `4**window_level` cells, by a
+  reshape and `scaled_dot_product_attention` on the full sphere and on sorted
+  domains of complete blocks, with padded and masked windows otherwise. The
+  replacement of Swin's shifted windows is the option
+  `shift="coarse_centred" | "alternate_level" | "none"`: the default,
+  chosen in #109, is `"coarse_centred"` (windows centred on the cells of a
+  coarser level, overlapping across block borders), set by the module
+  constant `DEFAULT_WINDOW_SHIFT`. Neighbourhood attention lets each cell
+  attend to the taps of the gauge-oriented `HealPixConv` stencil, with one
+  relative position bias per head and tap. On CUDA both layers run fused
+  Triton kernels (flash-style online softmax, 16-bit data with fp32
+  accumulation, autotuned tiles, deterministic backward without atomics,
+  the packed projection read and its gradient written in place); a
+  PyTorch path runs elsewhere and serves as the reference. `benchmarks/benchmark_attention.py` compares them
+  with dense attention and with a naive gather.
 - Masked, coverage-aware normalisation and pooling for AI models (#109,
   section 5): `HealPixGroupNorm`, `HealPixLayerNorm` (over the channels of
   each cell) and `HealPixBatchNorm` (running statistics) take a validity
