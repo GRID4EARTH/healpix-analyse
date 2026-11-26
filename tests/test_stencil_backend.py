@@ -217,6 +217,31 @@ def test_gradient_matches_reference(reducers, name, reduction):
     torch.testing.assert_close(g, g_ref, rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("name", ["full", "regional_domain", "no_self_cone"])
+def test_std_gradient_matches_reference(reducers, name):
+    """std: constant neighbourhoods have a zero gradient (as torch.std), not NaN."""
+    r = reducers[name]
+    rng = np.random.default_rng(9)
+    x = torch.as_tensor(rng.normal(size=(3, r.cell_ids.size)))
+    x[1] = 2.5                                   # constant row: zero variance everywhere
+    x[2, : r.cell_ids.size // 2] = -1.0          # constant patches
+    x[0, rng.integers(0, r.cell_ids.size, 3)] = float("nan")
+    gy = torch.as_tensor(rng.normal(size=(3, r.domain.size)))
+    y_ref, g_ref = _grads(lambda t: r._reference_reduce(t, "std"), x, gy)
+    y, g = _grads(lambda t: r(t, reduction="std"), x, gy)
+    torch.testing.assert_close(y, y_ref, rtol=1e-12, atol=1e-12, equal_nan=True)
+    assert torch.equal(torch.isnan(g), torch.isnan(g_ref))
+    assert torch.isfinite(g[1]).all() and torch.isfinite(g[2]).all()
+    torch.testing.assert_close(g, g_ref, rtol=1e-10, atol=1e-12, equal_nan=True)
+
+
+def test_std_constant_field_review_case():
+    r = HealPixNeighbourReducer(np.arange(48), 1, radius_m=2e6)
+    x = torch.ones(1, 48, dtype=torch.float64, requires_grad=True)
+    r(x, reduction="std").sum().backward()
+    assert torch.equal(x.grad, torch.zeros_like(x))
+
+
 def test_ties_go_to_first_cell(reducers):
     r = reducers["full"]
     x = torch.zeros(1, r.cell_ids.size, dtype=torch.float64, requires_grad=True)

@@ -39,7 +39,10 @@
   `all` and integer reductions are vectorised too. New keyword
   `backend="auto" | "triton" | "torch"` of `HealPixNeighbourReducer.__call__`.
   Values are unchanged (exact for `min`, `max`, `median`, `count`, `mode`,
-  `any`, `all`; to rounding for the sums).
+  `any`, `all`; to rounding for the sums). One difference in the gradient:
+  on ties, the median's subgradient now goes to the first cell in the order
+  of `cell_ids` (a stable sort), where it depended on the unstable
+  `torch.sort` before.
 - `HealPixGradient`: the least-squares East/North gradient as a reusable
   operator. The WGS84 geometry is built once, a call takes values
   `[..., N]`. On CUDA with Triton, tensors run fused kernels with a

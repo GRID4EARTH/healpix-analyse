@@ -563,8 +563,15 @@ def _generic_reduce(
             m = mask.to(gathered.dtype)
             mean = (gathered * m).sum(dim=-1) / c
             centred = (gathered - mean[..., None]) * m
-            result = torch.sqrt(
-                (centred * centred).sum(dim=-1) / c
+            variance = (centred * centred).sum(dim=-1) / c
+            # sqrt has an infinite derivative at 0 (NaN gradient on a
+            # constant neighbourhood); torch.std, the reference, gives 0.
+            # (NaN still propagates: only an exact zero is special-cased.)
+            zero = variance == 0
+            result = torch.where(
+                zero,
+                torch.zeros_like(variance),
+                torch.sqrt(torch.where(zero, torch.ones_like(variance), variance)),
             )
         elif reduction == "mode":
             result = _vectorised_mode(gathered, mask)

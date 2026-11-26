@@ -318,10 +318,7 @@ tools:
   ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
   io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out"
   differentiable: yes, in the input and in the kernel weights
-  gpu: >-
-    yes (CUDA by default when available); with the optional triton extra the
-    HealPixConv stencil and the embedding / contraction around it run as fused
-    kernels, forward and backward; fused Triton kernels for float32, float16 and bfloat16 with the optional triton package
+  gpu: yes (CUDA by default when available); fused Triton kernels for float32, float16 and bfloat16 with the optional triton package
   nan: not handled by default (NaN propagates); missing="local_mean" completes NaN like pixels outside the domain
   cost: >-
     Geometry built once (about 0.8 s at nside 64, G = 4, per the code
@@ -903,10 +900,14 @@ tools:
   ordering: NESTED
   ellipsoid: hard-coded "WGS84" (no argument)
   io: "gradient(): 1-D values; HealPixGradient: values [..., N] -> (grad_east, grad_north) [..., len(domain)] in units per metre; NumPy in -> NumPy out"
-  differentiable: yes (Torch); deterministic hand-written backward for float32 / float64
+  differentiable: >-
+    yes (Torch); on CUDA with the optional triton extra a deterministic
+    hand-written backward (fused kernels), elsewhere autograd through the
+    reference fit
   gpu: >-
-    the fit runs on the input device (fused Triton kernel on CUDA for float32 /
-    float64 with the optional triton extra); geometry built on CPU
+    the fit runs on the input device: fused Triton kernels on CUDA with the
+    optional triton extra (float32, float64, and float16 / bfloat16 with fp32
+    accumulation); geometry built on CPU
   nan: NaN neighbours are dropped; a cell gets NaN when its value is not finite or fewer than 2 valid neighbours remain or the fit is degenerate
   cost: >-
     gradient() rebuilds the WGS84 geometry at every call (most of its time);
@@ -948,7 +949,11 @@ tools:
   ellipsoid: '"sphere" (HealPixDivCurl); inherited from the HealPixDecomp ("WGS84" by default) for HealPixMultiScaleDivCurl'
   io: "[..., 2, N] (u, v) -> [..., 2, N] (div, curl) in 1/s for m/s input; NumPy in -> NumPy out"
   differentiable: yes, in the input
-  gpu: yes (CUDA by default when available)
+  gpu: >-
+    yes (CUDA by default when available); with the optional triton extra the
+    embedding of (u, v) and the contraction to divergence / curl around the
+    HealPixConv stencil are fused kernels, forward and backward (float32 and
+    float64, the dtypes of the module)
   nan: not handled; NaN propagates
   cost: one HealPixConv per scale; geometry cached on disk by HealPixConv
   pros:
