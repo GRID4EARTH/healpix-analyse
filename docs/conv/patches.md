@@ -167,7 +167,12 @@ With `index`, the Triton fold reads the selected patches through an inverse
 map (the position of each centre in the selection, or −1), so nothing is
 written for the patches left out.
 
-It visits only the cells that the selected patches read:
+When the patches have at least 64 pixels (`N ≥ 8`) and at most 37.5 % of the
+centres are selected, it visits only the cells that the selected patches
+read. Smaller patches spread the cells read over every tile of the kernel,
+and larger selections leave little to skip, so there the mark would only
+cost time (A100 measurements, `_patches_backend.MASKED_FOLD_SKIP`). It works
+in three steps:
 - at construction, each centre stores its footprint, the list of the blocks
   of cells its patch reads (single cells for `N = 4`, blocks of 4 cells for
   `N = 8`, of 16 cells for `N = 16`);

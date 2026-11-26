@@ -604,9 +604,25 @@ def _extract(x, geom, sel, use_tri):
 
 
 # Masked fold (Triton): visit only the cell blocks that the selected patches
-# read, instead of every cell of the transposed map.  False restores the walk
-# over the whole map (same result, bit for bit; kept for tests and benchmarks).
-MASKED_FOLD_SKIP = True
+# read, instead of every cell of the transposed map.  The result is the same,
+# bit for bit; only the cost changes.
+#   "auto": when the patches have at least MARK_MIN_P pixels and at most
+#           MARK_MAX_KEEP of the centres are selected (both known without a
+#           device sync).  A100, float32 (job 4503131): at level 10, N = 16,
+#           25 % kept, the masked fold took 3.7 ms with the mark and 5.3 ms
+#           without; with N = 4 the marked cells are spread over every tile of
+#           the kernel, nothing is skipped and the mark only costs time; at
+#           50 % kept the training step was slower with it.
+#   True / False: always / never (tests and benchmarks).
+MASKED_FOLD_SKIP = "auto"
+MARK_MIN_P = 64
+MARK_MAX_KEEP = 0.375
+
+
+def _use_mark(geom, sel):
+    if MASKED_FOLD_SKIP == "auto":
+        return geom.P >= MARK_MIN_P and sel.shape[1] <= MARK_MAX_KEEP * geom.M
+    return bool(MASKED_FOLD_SKIP)
 
 
 def _fold(y, geom, sel, norm, use_tri, want_scale):
@@ -619,7 +635,7 @@ def _fold(y, geom, sel, norm, use_tri, want_scale):
             if inv is None:
                 # a repeated centre: the copies are summed in a full tensor
                 y = _expand_selected(y, sel, geom.M)
-            elif MASKED_FOLD_SKIP:
+            elif _use_mark(geom, sel):
                 mark = selection_mark(geom, sel)
         return _triton_fold(y, geom, inv=inv, norm=norm, want_scale=want_scale, mark=mark)
     scale = fold_scale(geom, norm, sel, y.shape[0], y.device, y.dtype)

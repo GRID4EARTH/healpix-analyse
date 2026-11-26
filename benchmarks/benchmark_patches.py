@@ -130,9 +130,10 @@ def cmd_run(args):
             else:
                 # the module defaults (set from the A100 measurements)
                 pb.GATHER_CL_MIN_C, pb.FOLD_CL_MIN_C = default_cl
-            # "noskip": the masked fold walks the whole transposed map
+            # "noskip" / "skip": the masked fold never / always skips the cells
+            # that no selected patch reads (default: the module rule)
             if hasattr(pb, "MASKED_FOLD_SKIP"):
-                pb.MASKED_FOLD_SKIP = opt != "noskip"
+                pb.MASKED_FOLD_SKIP = {"noskip": False, "skip": True}.get(opt, "auto")
             rec = dict(config=cfg["name"], backend=variant, device=str(device),
                        dtype=args.dtype, torch=torch.__version__)
             try:

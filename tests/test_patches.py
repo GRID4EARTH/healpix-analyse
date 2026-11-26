@@ -472,7 +472,7 @@ def test_masked_fold_skip_is_bitwise_identical(dtype, mode, centres):
             torch.testing.assert_close(hp.fold(y, index=index, norm="none"),
                                        hp.fold(full, norm="none"), atol=0, rtol=0)
     finally:
-        pb.MASKED_FOLD_SKIP = True
+        pb.MASKED_FOLD_SKIP = "auto"
 
 
 @CUDA_TRITON
