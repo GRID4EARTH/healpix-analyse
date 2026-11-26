@@ -80,6 +80,12 @@ from healpix_analyse.resample import (
 )
 from healpix_analyse.healpix_interp import get_interp_val, get_interp_weights
 from healpix_analyse.convol import HealPixConv
+from healpix_analyse.attention import (
+    DEFAULT_WINDOW_SHIFT,
+    WINDOW_SHIFTS,
+    HealPixNeighbourhoodAttention,
+    HealPixWindowAttention,
+)
 from healpix_analyse.morphology import binary_dilation, binary_erosion
 
 
@@ -153,6 +159,7 @@ from healpix_analyse.neighbour_reduce import (
 )
 
 from healpix_analyse.gradient import (
+    HealPixGradient,
     directional_derivative,
     gradient,
     gradient_magnitude,
@@ -267,6 +274,10 @@ __all__ = [
     "get_interp_val",
     "get_interp_weights",
     "HealPixConv",
+    "HealPixWindowAttention",
+    "HealPixNeighbourhoodAttention",
+    "WINDOW_SHIFTS",
+    "DEFAULT_WINDOW_SHIFT",
     "binary_dilation",
     "binary_erosion",
 
@@ -344,6 +355,7 @@ __all__ = [
     "gradient",
     "gradient_magnitude",
     "directional_derivative",
+    "HealPixGradient",
 
     # ------------------------------------------------------------------
     # HEALPix connected components
