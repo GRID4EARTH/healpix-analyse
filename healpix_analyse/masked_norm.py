@@ -894,6 +894,41 @@ if _HAS_TRITON:
         dx = w * g
         tl.store(dx_ptr + bc * N + offs, dx.to(dx_ptr.dtype.element_ty), mask=inb)
 
+    @triton.autotune(configs=_warp_configs(), key=["R", "L"])
+    @triton.jit
+    def _region_ident_kernel(
+        x_ptr, m_ptr, s0_ptr, y_ptr, arg_ptr,
+        C, N, R, L, smb, smc,
+        HAS_M: tl.constexpr, IS_MAX: tl.constexpr,
+        BLOCK_G: tl.constexpr, BLOCK_L: tl.constexpr,
+    ):
+        """Sorted, contiguous regions of L cells: region r of row bc is the
+        slice x[bc, r*L:(r+1)*L].  One program reads a contiguous
+        [BLOCK_G, L] tile (coalesced, no index list)."""
+        pid = tl.program_id(0).to(tl.int64)
+        ng = tl.cdiv(R, BLOCK_G)
+        bc = pid // ng
+        g0 = (pid % ng) * BLOCK_G
+        b = bc // C
+        c = bc % C
+        rg = g0 + tl.arange(0, BLOCK_G)
+        kk = tl.arange(0, BLOCK_L)
+        cell = rg[:, None] * L + kk[None, :]
+        inb = (rg[:, None] < R) & (kk[None, :] < L)
+        x = tl.load(x_ptr + bc * N + cell, mask=inb, other=0.0).to(tl.float32)
+        w = _load_w(x, m_ptr, b, c, cell, inb, smb, smc, HAS_M)
+        out = bc * R + rg
+        om = rg < R
+        tl.store(s0_ptr + out, tl.sum(w, 1), mask=om)
+        if IS_MAX:
+            xv = tl.where(w > 0, x, -float("inf"))
+            mx = tl.max(xv, 1)
+            first = tl.min(tl.where(xv == mx[:, None], cell, 2147483647), 1)
+            tl.store(y_ptr + out, mx, mask=om)
+            tl.store(arg_ptr + out, first.to(tl.int32), mask=om)
+        else:
+            tl.store(y_ptr + out, tl.sum(w * tl.where(w > 0, x, 0.0), 1), mask=om)
+
     @triton.autotune(configs=_warp_configs(), key=["R", "BC"])
     @triton.jit
     def _region_part_kernel(
@@ -1269,7 +1304,7 @@ class _RegionPoolFunction(torch.autograd.Function):
     cell (no atomics)."""
 
     @staticmethod
-    def forward(ctx, x, m, mode, perm, offs, labels):
+    def forward(ctx, x, m, mode, perm, offs, labels, ident_len=0):
         B, C, N = x.shape
         R = offs.numel() - 1
         x_in = x
@@ -1282,12 +1317,20 @@ class _RegionPoolFunction(torch.autograd.Function):
         arg = torch.empty(BC, R, device=x.device, dtype=torch.int32) if is_max else s0
         # BLOCK_K covers a typical region (no masked lanes for regions of
         # 4**k cells); BLOCK_R fills a 4 K-element tile with rows.
-        lmax = _max_region(offs)
-        block_k = min(128, max(16, triton.next_power_of_2(lmax)))
-        block_r = min(max(1, triton.next_power_of_2(BC)), max(1, 4096 // block_k))
-        _region_part_kernel[(R, triton.cdiv(BC, block_r))](
-            x, mt, perm, offs, s0, y, arg, C, N, R, BC, smb, smc,
-            HAS_M=has_m, IS_MAX=is_max, BLOCK_R=block_r, BLOCK_K=block_k)
+        if ident_len:
+            L = int(ident_len)
+            block_l = max(1, triton.next_power_of_2(L))
+            block_g = max(1, min(256, 4096 // block_l))
+            _region_ident_kernel[(BC * triton.cdiv(R, block_g),)](
+                x, mt, s0, y, arg, C, N, R, L, smb, smc,
+                HAS_M=has_m, IS_MAX=is_max, BLOCK_G=block_g, BLOCK_L=block_l)
+        else:
+            lmax = _max_region(offs)
+            block_k = min(128, max(16, triton.next_power_of_2(lmax)))
+            block_r = min(max(1, triton.next_power_of_2(BC)), max(1, 4096 // block_k))
+            _region_part_kernel[(R, triton.cdiv(BC, block_r))](
+                x, mt, perm, offs, s0, y, arg, C, N, R, BC, smb, smc,
+                HAS_M=has_m, IS_MAX=is_max, BLOCK_R=block_r, BLOCK_K=block_k)
         ctx.save_for_backward(x_in, m if m is not None else torch.empty(0), s0, labels,
                               arg if is_max else torch.empty(0))
         ctx.meta = (mode, has_m, R)
@@ -1305,20 +1348,20 @@ class _RegionPoolFunction(torch.autograd.Function):
             with torch.enable_grad():
                 y = _torch_region_pool(x, m, mode, labels.long(), R)[0]
                 (dx,) = torch.autograd.grad(y, x, dy, create_graph=True)
-            return dx, None, None, None, None, None
+            return dx, None, None, None, None, None, None
         if mode == "max":
             dx = torch.zeros(B * C, N, device=x.device, dtype=torch.float32)
             ok = s0 > 0
             rows = torch.arange(B * C, device=x.device)[:, None].expand(B * C, R)
             dx[rows[ok], arg.long()[ok]] = dyf[ok]
-            return dx.view(B, C, N).to(x.dtype), None, None, None, None, None
+            return dx.view(B, C, N).to(x.dtype), None, None, None, None, None, None
         g = torch.where(s0 > 0, dyf, torch.zeros_like(dyf)).contiguous()
         x = x.contiguous()
         mt, smb, smc, _ = _mask_args(m, x)
         dx = torch.empty_like(x)
         _pool_bwd_kernel[_ew_grid(B * C, N)](
             x, mt, labels, g, dx, C, N, R, smb, smc, HAS_M=has_m, HAS_LAB=True)
-        return dx, None, None, None, None, None
+        return dx, None, None, None, None, None, None
 
 
 def _reference_backward(ctx, x, m, weight, dy, kind, G, eps, fill):
@@ -1751,8 +1794,9 @@ def _region_pool_run(x, lay, mask, mode, fill, return_weight, backend):
     m = _mask_3d(mask, x)
     R = lay["idx"].shape[0]
     if _use_triton(x, backend) and R > 0:
+        ident_len = lay["idx"].shape[1] if (lay["ident"] and lay["idx"].shape[1] <= 4096) else 0
         y, s0 = _RegionPoolFunction.apply(x, m, "max" if mode == "max" else "sum",
-                                          lay["perm"], lay["offs"], lay["labels"])
+                                          lay["perm"], lay["offs"], lay["labels"], ident_len)
     else:
         src, wt = _pool_sources(x, m, mode)
         cdt = src.dtype

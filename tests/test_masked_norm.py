@@ -627,3 +627,24 @@ def test_triton_large_grids():
         (ga,) = torch.autograd.grad(ya.sum(), xa)
         (gr,) = torch.autograd.grad(yr.sum(), xr)
         torch.testing.assert_close(ga, gr, atol=1e-3, rtol=1e-3)
+
+
+@needs_triton
+@pytest.mark.parametrize("mode", ["mean", "max"])
+def test_triton_region_pool_contiguous_regions(mode):
+    """Sorted equal regions (full sphere): the contiguous-slice kernel."""
+    dev = TRITON_DEVICE
+    level = 4
+    ids = np.arange(12 * 4 ** level)
+    pool_t = HealPixRegionPool.from_cell_ids(ids, level, 2, mode=mode, backend="triton").to(dev)
+    pool_r = HealPixRegionPool.from_cell_ids(ids, level, 2, mode=mode, backend="torch").to(dev)
+    assert pool_t._ident
+    x = _rand(2, 3, ids.size, torch.float32, device=dev)
+    m = torch.rand(2, ids.size, device=dev) > 0.3
+    xt, xr = x.clone().requires_grad_(), x.clone().requires_grad_()
+    yt, yr = pool_t(xt, m), pool_r(xr, m)
+    torch.testing.assert_close(yt, yr, atol=1e-5, rtol=1e-5)
+    g = torch.randn_like(yt)
+    (a,) = torch.autograd.grad(yt, xt, g)
+    (c,) = torch.autograd.grad(yr, xr, g)
+    torch.testing.assert_close(a, c, atol=1e-6, rtol=1e-5)
