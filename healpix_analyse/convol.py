@@ -50,7 +50,27 @@ _DEFAULT_CACHE_DIR = Path(
 # ===========================================================================
 
 # Bump when the meaning or layout of any cached buffer changes.
-_CACHE_FORMAT = 3
+# 4: neighbours below _STENCIL_MIN_WEIGHT no longer count (#109).
+_CACHE_FORMAT = 4
+
+# A bilinear neighbour inside the domain counts only if its weight is at
+# least this fraction of the full 4-neighbour weight of its stencil point
+# (#109, maintainer's decision).  Below it, the weight is rounding noise of the
+# interpolation: renormalised, it would make a point at a cell or face boundary
+# read a far cell with weight 1, depending on the last bits of the build.
+_STENCIL_MIN_WEIGHT = 1e-6
+
+
+def _significant(w, present, dim):
+    """Neighbours that count: present and with at least ``_STENCIL_MIN_WEIGHT``
+    of the full bilinear weight (summed over ``dim``, the 4 neighbours).
+    Works on torch tensors and NumPy arrays."""
+    if isinstance(w, np.ndarray):
+        full = w.sum(axis=dim, keepdims=True)
+    else:
+        full = w.sum(dim=dim, keepdim=True)
+    return present & (w >= _STENCIL_MIN_WEIGHT * full)
+
 
 # Stencil points (output cells x gauges x taps) per chunk of the geometry
 # build: bounds its float64 temporaries to a few hundred MB.
@@ -454,6 +474,12 @@ def _bind_support_batched(
     """
     Vectorised binding of stencil neighbours for ALL G gauges at once.
 
+    A neighbour counts when it is in the domain and its bilinear weight is
+    at least ``_STENCIL_MIN_WEIGHT`` (1e-6) of the full weight of its point;
+    a point with no neighbour that counts takes the neighbours of the centre
+    tap of the same cell.  The weights are renormalised over the neighbours
+    that count.
+
     Returns
     -------
     pos_safe : [G, 4, K*P]   column indices in ids_sorted (0 for absent)
@@ -473,7 +499,8 @@ def _bind_support_batched(
     in_range = pos < N_sorted
     cmp_vals = torch.full_like(idx_t, -1)
     cmp_vals[in_range] = ids_sorted[pos[in_range]]
-    present  = cmp_vals == idx_t          # [G, 4, M]
+    # neighbours inside the domain with a weight that counts
+    present  = _significant(w_t, cmp_vals == idx_t, dim=1)   # [G, 4, M]
     support  = (w_t * present).sum(dim=1) if return_support else None
 
     p_ref  = (kernel_sz // 2) * (kernel_sz + 1)
@@ -499,7 +526,8 @@ def _bind_support_batched(
             valid_e = pos_e < N_sorted
             pos_e_c = pos_e.clamp(0, max(N_sorted - 1, 0))
             pres_e  = valid_e & (ids_sorted[pos_e_c] == idx_e)
-            present[g, :, empty_g] = pres_e.view(4, -1)
+            present[g, :, empty_g] = _significant(
+                w_t[g, :, empty_g], pres_e.view(4, -1), dim=0)
             pos    [g, :, empty_g] = pos_e_c.view(4, -1)
 
     w      = w_t * present

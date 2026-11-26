@@ -3,6 +3,35 @@
 ## Unreleased
 
 ### Changed
+- Stencil binding (`HealPixConv`, its strided and transposed forms,
+  `missing="local_mean"`, `HealPixNeighbourhoodAttention`, and the gauge mode
+  of `HealPixPatches`): a bilinear neighbour inside the domain counts only if
+  its weight is at least 1e-6 of the full 4-neighbour weight of its point
+  (#109). A point left with no neighbour that counts falls back to the centre,
+  as when all its neighbours are outside the domain (for `HealPixPatches`, it
+  is 0, as before). Two kinds of points change:
+  - a neighbour inside the domain with a rounding-size weight, which the
+    renormalisation raised to 1, so the point read a far cell; it is dropped;
+  - a point whose only neighbours inside the domain have an exact 0 weight:
+    before, its weights summed to 0 and it contributed nothing; it now falls
+    back to the centre, like a point with no neighbour inside.
+
+  **Outputs change only at such degenerate points, mostly on regional
+  domains with the `"phi"` gauge**, and the size of the change depends on the
+  kernel and the data. Measured against the previous version (kernel 3, 2
+  channels, maximum over 5 random kernels and inputs, change relative to
+  max |y|):
+  - `"phi"` gauge, ragged regional domain of 226 cells at level 6: 3 cells
+    (G = 1 or 2), 20 cells (G = 4), by up to 43–73 %; ragged domain of 864
+    cells at level 7: 5 cells (G = 1 or 2), 50 cells (G = 4), by up to
+    31–53 %;
+  - `"projected_ref"` gauge, the same domains: no change above 1e-6;
+  - full sphere, levels 6 and 7, G = 4: 16 to 264 cells move by at most
+    6e-7 (by up to 3e-6 with `missing="local_mean"`, in other runs).
+
+  `HealPixPatches` now also builds its gauge grid in float64 for every dtype,
+  as `HealPixConv`. The disk-cache format is bumped (4), so geometry cached by
+  earlier versions is rebuilt once instead of being reused.
 - `HealPixConv` builds its stencil geometry in float64 for every layer
   dtype and casts only the final weights (#109). **This changes the outputs
   of existing float32 layers at a few degenerate points, mostly on regional
