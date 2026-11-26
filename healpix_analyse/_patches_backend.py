@@ -354,6 +354,15 @@ if _HAS_TRITON:
         for bs, nw in ((64, 2), (64, 4), (128, 4))
     ]
 
+    def _prune_fold_configs(configs, named_args, **kwargs):
+        """The 64 x 2-warp tile only for the unrolled loop: without unrolling
+        the kernel is the one of #113 and keeps its tiles (nested patches at
+        50 % kept were 8-10 % slower with the extra tile, A100)."""
+        unroll = kwargs.get("UNROLL", named_args.get("UNROLL", True))
+        if unroll:
+            return configs
+        return [cf for cf in configs if cf.num_warps != 2]
+
     @triton.jit
     def _fold_entry(e_ok, e, rows_ptr, tw_ptr, y_base, inv_base, c, c_ok, C, G, P,
                     HAS_INV: tl.constexpr, CL: tl.constexpr):
@@ -377,7 +386,8 @@ if _HAS_TRITON:
         v = tl.load(y_base + off, mask=ok[:, None] & c_ok[None, :], other=0.0)
         return wv, v.to(tl.float32), ok
 
-    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "HAS_MARK", "CL", "UNROLL", "SIZE"])
+    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "HAS_MARK", "CL", "UNROLL", "SIZE"],
+                     prune_configs_by={"early_config_prune": _prune_fold_configs})
     @triton.jit
     def _fold_kernel(y_ptr, inv_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr, mark_ptr,
                      C, K, NY, G, P, INV_SB, MARK_SB, SIZE,
@@ -422,37 +432,38 @@ if _HAS_TRITON:
         start = tl.load(ptr_ptr + s, mask=act, other=0)
         n = tl.load(ptr_ptr + s + 1, mask=act, other=0) - start
         n_max = tl.max(n, axis=0)
-        if UNROLL:
-            n_four = (n_max // 4) * 4
-        else:   # wide channel tiles: one entry at a time (occupancy)
-            n_four = n_max * 0
         y_base = y_ptr + b * NY * G * C * P
         inv_base = inv_ptr + b * INV_SB
         acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
         nacc = tl.zeros((BLOCK_S,), dtype=tl.float32)
-        for jj in range(0, n_four, 4):
-            w0, v0, o0 = _fold_entry(s_ok & (jj < n), start + jj, rows_ptr, tw_ptr, y_base,
-                                     inv_base, c, c_ok, C, G, P, HAS_INV, CL)
-            w1, v1, o1 = _fold_entry(s_ok & (jj + 1 < n), start + jj + 1, rows_ptr, tw_ptr,
-                                     y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
-            w2, v2, o2 = _fold_entry(s_ok & (jj + 2 < n), start + jj + 2, rows_ptr, tw_ptr,
-                                     y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
-            w3, v3, o3 = _fold_entry(s_ok & (jj + 3 < n), start + jj + 3, rows_ptr, tw_ptr,
-                                     y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
-            if NORM == 1:
-                nacc += w0
-                nacc += w1
-                nacc += w2
-                nacc += w3
-            if NORM == 2:
-                nacc += tl.where(o0, 1.0, 0.0)
-                nacc += tl.where(o1, 1.0, 0.0)
-                nacc += tl.where(o2, 1.0, 0.0)
-                nacc += tl.where(o3, 1.0, 0.0)
-            acc += w0[:, None] * v0
-            acc += w1[:, None] * v1
-            acc += w2[:, None] * v2
-            acc += w3[:, None] * v3
+        # Without UNROLL (wide channel tiles, one entry per cell) the unrolled
+        # loop is not compiled at all: the kernel is the plain loop of #113.
+        n_four = n_max * 0
+        if UNROLL:
+            n_four = (n_max // 4) * 4
+            for jj in range(0, n_four, 4):
+                w0, v0, o0 = _fold_entry(s_ok & (jj < n), start + jj, rows_ptr, tw_ptr, y_base,
+                                         inv_base, c, c_ok, C, G, P, HAS_INV, CL)
+                w1, v1, o1 = _fold_entry(s_ok & (jj + 1 < n), start + jj + 1, rows_ptr, tw_ptr,
+                                         y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
+                w2, v2, o2 = _fold_entry(s_ok & (jj + 2 < n), start + jj + 2, rows_ptr, tw_ptr,
+                                         y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
+                w3, v3, o3 = _fold_entry(s_ok & (jj + 3 < n), start + jj + 3, rows_ptr, tw_ptr,
+                                         y_base, inv_base, c, c_ok, C, G, P, HAS_INV, CL)
+                if NORM == 1:
+                    nacc += w0
+                    nacc += w1
+                    nacc += w2
+                    nacc += w3
+                if NORM == 2:
+                    nacc += tl.where(o0, 1.0, 0.0)
+                    nacc += tl.where(o1, 1.0, 0.0)
+                    nacc += tl.where(o2, 1.0, 0.0)
+                    nacc += tl.where(o3, 1.0, 0.0)
+                acc += w0[:, None] * v0
+                acc += w1[:, None] * v1
+                acc += w2[:, None] * v2
+                acc += w3[:, None] * v3
         for jj in range(n_four, n_max):
             w0, v0, o0 = _fold_entry(s_ok & (jj < n), start + jj, rows_ptr, tw_ptr, y_base,
                                      inv_base, c, c_ok, C, G, P, HAS_INV, CL)
@@ -491,6 +502,8 @@ FOLD_CL_MIN_C = 1
 # The fold keeps four entries of each cell in flight when its channel tile
 # has at most this many channels: 1.4x faster at C = 3 on an A100, but 12 %
 # slower for the masked fold at C = 16 (four [64, 16] tiles in registers).
+# Never for a map with one entry per cell (mode="nested"): there the kernel
+# is the one of #113.
 FOLD_UNROLL_MAX_C = 8
 
 
@@ -558,7 +571,7 @@ def _triton_fold(y, geom, inv=None, norm="none", want_scale=False, mark=None):
             C, K, NY, G, P, inv_sb, mark_sb, _size_class(K),
             HAS_INV=inv is not None, NORM=mode, WRITE_SCALE=scale is not None, CL=cl,
             HAS_MARK=mark_t is not None, MARK_SHIFT=shift,
-            UNROLL=BLOCK_C <= FOLD_UNROLL_MAX_C, BLOCK_C=BLOCK_C,
+            UNROLL=(BLOCK_C <= FOLD_UNROLL_MAX_C and geom.J > 1), BLOCK_C=BLOCK_C,
         )
     return x, scale
 
