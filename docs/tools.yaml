@@ -1286,7 +1286,7 @@ tools:
     - Coverage weights (cells have equal area); deterministic Triton kernels with a PyTorch reference.
   cons:
     - Experimental. LayerNorm normalises over the channels of each cell only (for channels and cells use HealPixGroupNorm(1, C)).
-    - In evaluation, HealPixBatchNorm runs a PyTorch expression, not a fused kernel.
+    - The masked PyTorch path (CPU, float64, CUDA without Triton) is 2-15x slower than the unmasked torch.nn layer.
   use_instead:
     - when: every cell is valid and speed is all that matters
       use: torch.nn.GroupNorm / LayerNorm / BatchNorm1d
@@ -1316,8 +1316,10 @@ tools:
   gpu: yes; Triton kernels (one read of x, CSR int32 regions, no atomics) with the optional triton package
   nan: NaN cells are invalid; a region without valid cells gets 0 or NaN (fill=)
   cost: >-
-    One reduction; region_pool gathers the cells into a padded [B, C, R, L]
-    tensor (L = size of the largest region).
+    One read of x on both backends. Triton: region_pool reads contiguous
+    sorted regions as one tile, other regions through a CSR (int32) gather.
+    PyTorch: region_pool gathers the cells into a padded [B, C, R, L] tensor
+    (L = size of the largest region).
   pros:
     - Area weighting is exact (equal-area cells); deterministic forward and backward.
   cons:
@@ -1361,7 +1363,7 @@ tools:
   use_instead:
     - when: a learned position embedding per token
       use: a torch.nn.Parameter of shape [F, N]
-  optional_deps: none
+  optional_deps: triton (triton extra), only for the CUDA kernel
 
 - id: validation
   title: Reference convolution for tests (validation)

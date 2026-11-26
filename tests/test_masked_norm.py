@@ -648,3 +648,77 @@ def test_triton_region_pool_contiguous_regions(mode):
     (a,) = torch.autograd.grad(yt, xt, g)
     (c,) = torch.autograd.grad(yr, xr, g)
     torch.testing.assert_close(a, c, atol=1e-6, rtol=1e-5)
+
+
+def test_batch_norm_momentum_none_skips_empty_batches():
+    """A batch without valid cells does not count in the cumulative average,
+    per channel; the per-channel count is rebuilt from a loaded state_dict."""
+    torch.manual_seed(0)
+    C, N = 2, 50
+    bn = HealPixBatchNorm(C, momentum=None, dtype=torch.float64)
+    x1 = _rand(2, C, N, seed=1) + 5.0
+    bn(x1, torch.zeros(N, dtype=torch.bool))          # nothing valid
+    assert int(bn.num_batches_tracked) == 0
+    bn(x1)
+    torch.testing.assert_close(bn.running_mean, x1.mean((0, 2)), atol=1e-12, rtol=0)
+    assert int(bn.num_batches_tracked) == 1
+    # channel 1 masked in the next batch: channel 0 averages 2 batches, channel 1 one
+    x2 = _rand(2, C, N, seed=2) - 3.0
+    m = torch.ones(1, C, N)
+    m[0, 1] = 0
+    bn(x2, m)
+    assert bn.num_batches_tracked_per_channel.tolist() == [2, 1]
+    torch.testing.assert_close(bn.running_mean[0], (x1[:, 0].mean() + x2[:, 0].mean()) / 2,
+                               atol=1e-12, rtol=0)
+    torch.testing.assert_close(bn.running_mean[1], x1[:, 1].mean(), atol=1e-12, rtol=0)
+    bn2 = HealPixBatchNorm(C, momentum=None, dtype=torch.float64)
+    bn2.load_state_dict(bn.state_dict())
+    assert bn2.num_batches_tracked_per_channel.tolist() == [2, 2]
+    assert set(bn.state_dict()) == set(nn.BatchNorm1d(C).state_dict())
+
+
+_XPROC_SCRIPT = r"""
+import hashlib, sys, numpy as np, torch
+from healpix_analyse import (HealPixGroupNorm, HealPixLayerNorm, HealPixBatchNorm,
+                             HealPixRegionPool, global_pool)
+torch.manual_seed(0)
+dev = "cuda"
+B, C, N = 3, 16, 300_000
+x = torch.randn(B, C, N, device=dev)
+m = torch.rand(B, N, device=dev) > 0.3
+ids = np.random.default_rng(0).permutation(np.arange(N))
+h = hashlib.sha256()
+layers = [HealPixGroupNorm(4, C), HealPixLayerNorm(C), HealPixBatchNorm(C)]
+fns = [lambda xx, l=l.to(dev): l(xx, m) for l in layers]
+fns.append(lambda xx: global_pool(xx, m))
+pool_u = HealPixRegionPool(ids // 16).to(dev)
+pool_s = HealPixRegionPool(np.arange(N) // 16).to(dev)
+fns.append(lambda xx: pool_u(xx, m))
+fns.append(lambda xx: pool_s(xx, m))
+for f in fns:
+    for dt in (torch.float32, torch.bfloat16):
+        xx = x.to(dt).clone().requires_grad_()
+        y = f(xx)
+        (g,) = torch.autograd.grad((y.float() * 1.7).sin().sum(), xx)
+        h.update(y.float().cpu().numpy().tobytes()); h.update(g.float().cpu().numpy().tobytes())
+print(h.hexdigest())
+"""
+
+
+@pytest.mark.skipif(not (HAS_CUDA and mn._HAS_TRITON), reason="needs CUDA and Triton")
+def test_triton_bitwise_reproducible_across_processes(tmp_path):
+    """Two fresh processes (separate Triton caches, so the element-wise
+    kernels re-tune) give bit-identical outputs and gradients."""
+    import subprocess
+    import sys
+
+    script = tmp_path / "run.py"
+    script.write_text(_XPROC_SCRIPT)
+    digests = []
+    for k in range(2):
+        env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / f"cache{k}"))
+        out = subprocess.run([sys.executable, str(script)], env=env, capture_output=True,
+                             text=True, timeout=600)
+        assert out.returncode == 0, out.stderr[-2000:]
+        digests.append(out.stdout.strip().splitlines()[-1])
+    assert digests[0] == digests[1]

@@ -279,7 +279,7 @@ def healpix_positional_encoding(
     Returns
     -------
     torch.Tensor, shape [F, N]
-        Row k of the encoding is cell ``cell_ids[k]``.  The geometry (unit
+        Column k of the encoding is cell ``cell_ids[k]``.  The geometry (unit
         vectors and gauge angle, float64 on the CPU) is cached per domain,
         keyed by a hash of ``cell_ids``, with one copy per device it was
         used on; the features themselves are computed on ``device``.

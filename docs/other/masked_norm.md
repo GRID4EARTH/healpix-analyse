@@ -93,8 +93,10 @@ bn = HealPixBatchNorm(64)                  # running statistics, as BatchNorm1d
   mean and variance are updated with the weighted mean and the unbiased
   variance `var · S0 / (S0 − 1)` (`S0` = number of valid cells for a binary
   mask); a channel with `S0 ≤ 1` in a batch keeps its running statistics.
-  `momentum=None` (cumulative average), `track_running_stats` and the
-  `state_dict` behave as in `torch.nn.BatchNorm1d`. In evaluation the running
+  A batch counts only for the channels that had valid cells, so with
+  `momentum=None` (cumulative average) each channel averages its own valid
+  batches. `track_running_stats` and the `state_dict` behave as in
+  `torch.nn.BatchNorm1d`. In evaluation the running
   statistics are applied cell by cell.
 
 With an all-valid mask (or `mask=None` and no NaN), each layer gives the
@@ -124,9 +126,10 @@ The Triton kernels and their memory traffic (T = one pass over `x`):
 
 `torch.nn.GroupNorm` and `BatchNorm` also read `x` twice in the forward.
 The mask is read through broadcast strides: an `[N]` or `[B, N]` mask is
-never expanded to `[B, C, N]`. No kernel uses atomics; the reductions keep
-a fixed tile and a fixed chunking (only the element-wise kernels autotune
-their tile), so outputs and gradients are bitwise reproducible.
+never expanded to `[B, C, N]`. No kernel uses atomics. Every kernel that
+reduces runs with a fixed tile, a fixed chunking and a fixed number of
+warps (only the element-wise kernels autotune their tile), so outputs and
+gradients are bitwise reproducible, across processes as well.
 
 The backward formula, for the cells of weight w > 0 and `g = ∂L/∂y · γ`:
 

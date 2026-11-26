@@ -43,7 +43,8 @@ Backends
     (``create_graph=True``) falls back to the PyTorch reference.
 
 ``backend="auto"`` (default) uses Triton when it can and PyTorch otherwise.
-The pooling functions are plain PyTorch (one reduction each, deterministic).
+The pooling functions follow the same rule: Triton kernels on CUDA (one read
+of ``x``, no atomics), plain PyTorch elsewhere; both are deterministic.
 """
 
 from __future__ import annotations
@@ -426,10 +427,10 @@ def _batch_norm_eval(x, m, rm, rv, weight, bias, eps, fill):
 #
 # torch.nn.GroupNorm / BatchNorm also make two passes (3 T forward).  The
 # mask is read through broadcast strides, so an [N] or [B, N] mask adds
-# almost nothing.  Reductions use a fixed tile (_RED_BLOCK) and a fixed
-# chunking, so their summation order, hence the result, does not depend on
-# the autotuned configuration: the outputs and gradients are bitwise
-# reproducible.  Only the element-wise kernels autotune their tile.
+# almost nothing.  Every kernel that reduces runs with a fixed tile, a fixed
+# chunking and a fixed num_warps, so the order of its sums does not depend
+# on the run: the outputs and gradients are bitwise reproducible, across
+# processes too.  Only the element-wise kernels (no reduction) autotune.
 
 def triton_available() -> bool:
     """True when Triton is installed and a CUDA device is visible."""
@@ -454,30 +455,11 @@ def _ew_configs():
             triton.Config({"BLOCK": 4096}, num_warps=8)]
 
 
-def _warp_configs(extra=None):
-    extra = extra or {}
-    if _INTERPRET:
-        return [triton.Config(dict(extra), num_warps=4)]
-    return [triton.Config(dict(extra), num_warps=w)
-            for w in ((2, 4, 8) if _FULL_TUNE else (4, 8))]
-
-
-def _ln_fwd_configs():
-    if _INTERPRET:
-        return [triton.Config({"BLOCK_N": 32}, num_warps=4)]
-    if _FULL_TUNE:
-        return [triton.Config({"BLOCK_N": bn}, num_warps=w)
-                for bn in (16, 32, 64, 128) for w in (4, 8)]
-    return [triton.Config({"BLOCK_N": 16}, num_warps=4),
-            triton.Config({"BLOCK_N": 32}, num_warps=4),
-            triton.Config({"BLOCK_N": 64}, num_warps=8)]
-
-
-def _prune_ln(configs, named_args, **kw):
-    """Keep the tiles of at most 16 K elements of the one-tile LayerNorm."""
-    bc = kw.get("BLOCK_C", named_args.get("BLOCK_C", 64))
-    ok = [c for c in configs if c.kwargs["BLOCK_N"] * bc <= 16384]
-    return ok or configs[:1]
+# Kernels that reduce run with a fixed tile and a fixed num_warps: the order
+# of every sum, hence each bit of the result, is the same in every process.
+_RED_WARPS = 4
+_TILE_WARPS = 8             # [rows, cells] tiles of up to 16 K elements
+_LN_FWD_BLOCK_N = 32        # cells per program of the LayerNorm forward (fixed)
 
 
 if _HAS_TRITON:
@@ -506,7 +488,6 @@ if _HAS_TRITON:
 
     # ---------------------------------------------------------------- group / batch
 
-    @triton.autotune(configs=_warp_configs(), key=["N", "CHUNK"])
     @triton.jit
     def _rows_stats_kernel(
         x_ptr, m_ptr, part_ptr,
@@ -575,7 +556,6 @@ if _HAS_TRITON:
         y = _fill_out(x * scale + shift, x, w, FILL)
         tl.store(y_ptr + base + offs, y.to(y_ptr.dtype.element_ty), mask=inb)
 
-    @triton.autotune(configs=_warp_configs(), key=["N", "CHUNK"])
     @triton.jit
     def _rows_bwd_part_kernel(
         x_ptr, m_ptr, dy_ptr, mean_ptr, rstd_ptr, part_ptr,
@@ -646,8 +626,6 @@ if _HAS_TRITON:
 
     # ---------------------------------------------------------------- layer, one tile
 
-    @triton.autotune(configs=_ln_fwd_configs(), key=["C", "N"],
-                     prune_configs_by={"early_config_prune": _prune_ln})
     @triton.jit
     def _ln_tile_fwd_kernel(
         x_ptr, m_ptr, y_ptr, g_ptr, b_ptr, mean_ptr, rstd_ptr,
@@ -684,7 +662,6 @@ if _HAS_TRITON:
         tl.store(mean_ptr + b * N + offs, mu, mask=nm)
         tl.store(rstd_ptr + b * N + offs, r, mask=nm)
 
-    @triton.autotune(configs=_warp_configs(), key=["C", "N"])
     @triton.jit
     def _ln_tile_bwd_kernel(
         x_ptr, m_ptr, dy_ptr, dx_ptr, g_ptr, mean_ptr, rstd_ptr, pg_ptr, pb_ptr,
@@ -824,7 +801,6 @@ if _HAS_TRITON:
 
     # ---------------------------------------------------------------- pooling
 
-    @triton.autotune(configs=_warp_configs(), key=["N", "CHUNK"])
     @triton.jit
     def _pool_part_kernel(
         x_ptr, m_ptr, part_ptr, arg_ptr,
@@ -894,7 +870,6 @@ if _HAS_TRITON:
         dx = w * g
         tl.store(dx_ptr + bc * N + offs, dx.to(dx_ptr.dtype.element_ty), mask=inb)
 
-    @triton.autotune(configs=_warp_configs(), key=["R", "L"])
     @triton.jit
     def _region_ident_kernel(
         x_ptr, m_ptr, s0_ptr, y_ptr, arg_ptr,
@@ -929,7 +904,6 @@ if _HAS_TRITON:
         else:
             tl.store(y_ptr + out, tl.sum(w * tl.where(w > 0, x, 0.0), 1), mask=om)
 
-    @triton.autotune(configs=_warp_configs(), key=["R", "BC"])
     @triton.jit
     def _region_part_kernel(
         x_ptr, m_ptr, perm_ptr, offs_ptr, s0_ptr, y_ptr, arg_ptr,
@@ -993,7 +967,7 @@ def _mask_args(m, x):
 
 def _chunks(rows: int, N: int, device) -> tuple[int, int]:
     """(CHUNK, NCH): enough programs to fill the GPU.  Depends only on the
-    shape and the device, never on the autotuned configuration."""
+    shape and the device, never on a tuned configuration."""
     try:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
     except Exception:  # pragma: no cover - CPU under the interpreter
@@ -1046,7 +1020,7 @@ def _rows_backward_kernels(x, mt, smb, smc, has_m, dy, mu, rstd, s0, weight, aff
         parts = torch.empty(B * C, nch, 2, device=x.device, dtype=torch.float32)
         _rows_bwd_part_kernel[(B * C, nch)](
             x, mt, dy, mu, rstd, parts, C, N, chunk, nch, smb, smc, SB, CG,
-            HAS_M=has_m, BLOCK=_RED_BLOCK)
+            HAS_M=has_m, BLOCK=_RED_BLOCK, num_warps=_RED_WARPS)
         P = parts.sum(1).view(B, C, 2)
         P1, P2 = P[..., 0], P[..., 1]
     if with_stats:
@@ -1086,7 +1060,7 @@ class _RowsNormFunction(torch.autograd.Function):
             parts = torch.empty(B * C, nch, 3, device=x.device, dtype=torch.float32)
             _rows_stats_kernel[(B * C, nch)](
                 x, mt, parts, C, N, chunk, nch, smb, smc,
-                HAS_M=has_m, BLOCK=_RED_BLOCK)
+                HAS_M=has_m, BLOCK=_RED_BLOCK, num_warps=_RED_WARPS)
             s0, mu, var = _combine_parts(parts, kind, B, C, G)
         else:
             mu = stats[0].float().contiguous()
@@ -1171,8 +1145,10 @@ class _LayerNormFunction(torch.autograd.Function):
                 C, N, smb, smc, eps)
         if C <= _LN_TILE_MAX_C:
             bc = max(16, triton.next_power_of_2(C))
-            _ln_tile_fwd_kernel[lambda meta: (B * triton.cdiv(N, meta["BLOCK_N"]),)](
-                *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill], BLOCK_C=bc)
+            bn = max(8, min(_LN_FWD_BLOCK_N, 16384 // bc))
+            _ln_tile_fwd_kernel[(B * triton.cdiv(N, bn),)](
+                *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill], BLOCK_C=bc,
+                BLOCK_N=bn, num_warps=_TILE_WARPS if bc * bn > 2048 else _RED_WARPS)
         else:
             _ln_fwd_kernel[(B * triton.cdiv(N, 128),)](
                 *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
@@ -1212,7 +1188,7 @@ class _LayerNormFunction(torch.autograd.Function):
         if tile:
             _ln_tile_bwd_kernel[(B * nblk,)](
                 *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
-                BLOCK_C=bc, BLOCK_N=bn)
+                BLOCK_C=bc, BLOCK_N=bn, num_warps=_TILE_WARPS)
         else:
             _ln_bwd_kernel[(B * nblk,)](
                 *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
@@ -1243,7 +1219,7 @@ class _GlobalPoolFunction(torch.autograd.Function):
         arg = torch.empty(B * C, nch, device=x.device, dtype=torch.int32) if is_max else parts
         _pool_part_kernel[(B * C, nch)](
             x, mt, parts, arg, C, N, chunk, nch, smb, smc,
-            HAS_M=has_m, IS_MAX=is_max, BLOCK=_RED_BLOCK)
+            HAS_M=has_m, IS_MAX=is_max, BLOCK=_RED_BLOCK, num_warps=_RED_WARPS)
         s0 = parts[..., 0].sum(1)
         if is_max:
             y, j = parts[..., 1].max(1)
@@ -1323,14 +1299,16 @@ class _RegionPoolFunction(torch.autograd.Function):
             block_g = max(1, min(256, 4096 // block_l))
             _region_ident_kernel[(BC * triton.cdiv(R, block_g),)](
                 x, mt, s0, y, arg, C, N, R, L, smb, smc,
-                HAS_M=has_m, IS_MAX=is_max, BLOCK_G=block_g, BLOCK_L=block_l)
+                HAS_M=has_m, IS_MAX=is_max, BLOCK_G=block_g, BLOCK_L=block_l,
+                num_warps=_TILE_WARPS)
         else:
             lmax = _max_region(offs)
             block_k = min(128, max(16, triton.next_power_of_2(lmax)))
             block_r = min(max(1, triton.next_power_of_2(BC)), max(1, 4096 // block_k))
             _region_part_kernel[(R, triton.cdiv(BC, block_r))](
                 x, mt, perm, offs, s0, y, arg, C, N, R, BC, smb, smc,
-                HAS_M=has_m, IS_MAX=is_max, BLOCK_R=block_r, BLOCK_K=block_k)
+                HAS_M=has_m, IS_MAX=is_max, BLOCK_R=block_r, BLOCK_K=block_k,
+                num_warps=_TILE_WARPS)
         ctx.save_for_backward(x_in, m if m is not None else torch.empty(0), s0, labels,
                               arg if is_max else torch.empty(0))
         ctx.meta = (mode, has_m, R)
@@ -1526,20 +1504,25 @@ class HealPixBatchNorm(_MaskedNormMixin, nn.BatchNorm1d):
     variance are updated with the weighted mean and the unbiased variance
     ``var * S0 / (S0 - 1)``, ``S0`` being the sum of the weights of the
     channel (the number of valid cells for a binary mask).  A channel with
-    ``S0 <= 1`` in a batch keeps its running statistics.  In evaluation the
-    running statistics are used, unless ``track_running_stats=False`` (then
-    the batch statistics, as ``torch.nn``).  With an all-valid mask
-    the layer matches ``torch.nn.BatchNorm1d`` on ``[B, C, N]``: outputs,
-    running statistics, ``momentum=None`` (cumulative average) and
-    ``state_dict``.
+    ``S0 <= 1`` in a batch keeps its running statistics, and that batch does
+    not count for it: with ``momentum=None`` (cumulative average) each
+    channel averages the batches in which it had valid cells (a per-channel
+    count, the non-persistent buffer ``num_batches_tracked_per_channel``,
+    rebuilt from ``num_batches_tracked`` when a ``state_dict`` is loaded).
+    ``num_batches_tracked`` counts the batches in which at least one channel
+    had valid cells.  In evaluation the running statistics are used, unless
+    ``track_running_stats=False`` (then the batch statistics, as
+    ``torch.nn``).  With an all-valid mask the layer matches
+    ``torch.nn.BatchNorm1d`` on ``[B, C, N]``: outputs, running statistics,
+    ``momentum=None`` and ``state_dict``.
 
     Parameters
     ----------
     num_features, eps, momentum, affine, track_running_stats, device, dtype
         As ``torch.nn.BatchNorm1d``.
     fill, backend
-        As :class:`HealPixGroupNorm`.  The Triton kernels serve the training
-        statistics; evaluation is an element-wise PyTorch expression.
+        As :class:`HealPixGroupNorm`.  On Triton, evaluation runs one fused
+        element-wise kernel (forward) and the matching backward.
     """
 
     def __init__(self, num_features: int, eps: float = 1e-5, momentum: Optional[float] = 0.1,
@@ -1548,21 +1531,24 @@ class HealPixBatchNorm(_MaskedNormMixin, nn.BatchNorm1d):
         super().__init__(num_features, eps, momentum, affine, track_running_stats,
                          device=device, dtype=dtype)
         self._init_masked(fill, backend)
+        if self.track_running_stats:
+            self.register_buffer(
+                "num_batches_tracked_per_channel",
+                torch.zeros(num_features, dtype=torch.long, device=device), persistent=False)
+        else:
+            self.num_batches_tracked_per_channel = None
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        if self.num_batches_tracked_per_channel is not None and self.num_batches_tracked is not None:
+            self.num_batches_tracked_per_channel.fill_(int(self.num_batches_tracked))
 
     def forward(self, x, mask=None):
         _check_x(x, self.num_features)
         m = _mask_3d(mask, x)
         C = self.num_features
-
-        # Same decision as torch.nn.modules.batchnorm._BatchNorm.forward.
-        if self.momentum is None:
-            factor = 0.0
-        else:
-            factor = self.momentum
-        if self.training and self.track_running_stats and self.num_batches_tracked is not None:
-            self.num_batches_tracked.add_(1)
-            if self.momentum is None:
-                factor = 1.0 / float(self.num_batches_tracked)
+        track = (self.training and self.track_running_stats
+                 and self.num_batches_tracked is not None)
         use_batch = self.training or (self.running_mean is None and self.running_var is None)
 
         if not use_batch:
@@ -1590,6 +1576,19 @@ class HealPixBatchNorm(_MaskedNormMixin, nn.BatchNorm1d):
                 var = var.reshape(C).to(sdt)
                 s0 = s0.reshape(C).to(sdt)
                 ok = s0 > 1
+                # As torch.nn.modules.batchnorm._BatchNorm.forward, but a batch
+                # counts only for the channels that had valid cells (no sync).
+                if track:
+                    self.num_batches_tracked.add_(ok.any().to(self.num_batches_tracked.dtype))
+                    cnt = self.num_batches_tracked_per_channel
+                    cnt.add_(ok.to(cnt.dtype))
+                if self.momentum is None:
+                    if track:
+                        factor = 1.0 / cnt.clamp_min(1).to(sdt)
+                    else:
+                        factor = 0.0
+                else:
+                    factor = self.momentum
                 unbiased = var * s0 / (s0 - 1).clamp_min(1e-30)
                 new_m = (1 - factor) * rm.to(sdt) + factor * mu
                 new_v = (1 - factor) * rv.to(sdt) + factor * unbiased
