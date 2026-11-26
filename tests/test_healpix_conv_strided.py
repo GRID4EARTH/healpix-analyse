@@ -385,12 +385,9 @@ def test_triton_strided_and_transpose(case, stride, deterministic):
     ref_conv = make(cs, stride)
     A, _ = dense_operator(ref_conv, cs["cell_ids"])
     A = A.float().to(dev)
-    # geometry built in float64, like the reference: a float32 build rounds
-    # stencil points at the edge of the ragged domain onto other neighbours
-    conv = make(cs, stride, torch.float64, dev, backend="triton",
-                deterministic=deterministic).float()
-    convT = make(cs, stride, torch.float64, dev, transpose=True, backend="triton",
-                 deterministic=deterministic).float()
+    conv = make(cs, stride, torch.float32, dev, backend="triton", deterministic=deterministic)
+    convT = make(cs, stride, torch.float32, dev, transpose=True, backend="triton",
+                 deterministic=deterministic)
     x0 = torch.randn(cs["B"], cs["C"], conv.K, device=dev)
     errs = rel_errs(grads(conv, conv, x0),
                     grads(lambda x: ref_s(A, conv.weight, conv.bias, x), conv, x0))
@@ -420,7 +417,7 @@ def test_torch_backend_on_cuda_is_deterministic_by_default(stride):
     """No use_deterministic_algorithms needed: S^T is a gather on CUDA."""
     cs = dict(CASES["regional"], C=16, Co=16)
     dev = torch.device("cuda")
-    conv = make(cs, stride, torch.float64, dev, backend="torch").float()   # float64 geometry
+    conv = make(cs, stride, torch.float32, dev, backend="torch")
     assert not torch.are_deterministic_algorithms_enabled()
     x0 = torch.randn(cs["B"], 16, conv.K, device=dev)
     a, b = grads(conv, conv, x0), grads(conv, conv, x0)
@@ -453,3 +450,38 @@ def test_triton_torch_func(transpose):
                                    jacfwd(g, argnums=arg)(x[:1], W, b), **tol)
     t = (torch.randn_like(x), torch.randn_like(W), torch.randn_like(b))
     torch.testing.assert_close(jvp(f, (x, W, b), t)[1], jvp(g, (x, W, b), t)[1], **tol)
+
+
+@needs_cuda
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("stride", [1, 2])
+def test_float32_geometry_is_the_same_on_cpu_and_cuda(stride, transpose):
+    """A float32 layer built on CPU and on CUDA reads the same cells with the
+    same weights (to float32 rounding), and gives the same output: the
+    geometry is built in float64 on both.  Built in float32, one stencil point
+    of this ragged domain (cell 4694), whose neighbours are outside the
+    domain, kept a present neighbour with a rounding-size weight that the
+    renormalisation raised to 1, where the float64 build falls back to the
+    centre: ~20 % output differences."""
+    cs = CASES["regional"]
+    a = make(cs, stride, torch.float32, "cpu", transpose=transpose, backend="torch")
+    b = make(cs, stride, torch.float32, "cuda", transpose=transpose)
+    # the same cells with the same weights for every stencil point; the 4
+    # neighbour slots may come in another order, so compare the dense stencil
+    def dense(c):
+        P, _, G, K = c._tap_idx.shape
+        D = torch.zeros(P, G, K, c.K, dtype=torch.float64)
+        D.scatter_add_(3, c._tap_idx.cpu().long().permute(0, 2, 3, 1),
+                       c._tap_w.cpu().double().permute(0, 2, 3, 1))
+        return D
+    torch.testing.assert_close(dense(a), dense(b), rtol=0, atol=1e-6)
+    assert torch.equal(a._sort_order, b._sort_order.cpu())
+    np.testing.assert_array_equal(a.cell_ids_out, b.cell_ids_out)
+    with torch.no_grad():
+        b.weight.copy_(a.weight)
+        b.bias.copy_(a.bias)
+    n_in = a.G * a.in_channels if transpose else a.in_channels
+    x = torch.randn(cs["B"], n_in, a.K_out if transpose else a.K)
+    with torch.no_grad():
+        ya, yb = a(x), b(x.cuda()).cpu()
+    assert float((ya - yb).abs().max() / ya.abs().max()) < 1e-5

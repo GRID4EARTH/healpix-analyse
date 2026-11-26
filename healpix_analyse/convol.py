@@ -54,9 +54,18 @@ _CACHE_FORMAT = 3
 
 
 def _geometry_dtype(dtype: torch.dtype) -> torch.dtype:
-    """Precision of the geometry build: float64 layers get float64 geometry,
-    every other dtype float32 (16-bit rotations would be meaningless)."""
-    return torch.float64 if dtype == torch.float64 else torch.float32
+    """Precision of the geometry build: float64, whatever the layer dtype.
+
+    The rotations, the stencil projection, ``get_interp_weights`` and the
+    binding decide which 4 cells each stencil point reads.  Built in float32,
+    a point that lies near a cell or face boundary can pick other cells on
+    another device or with another float32 implementation (CPU and CUDA
+    differ in the last bits of ``cos`` / ``matmul``), which changes the
+    output by tens of percent on a regional domain.  In float64 the choice is
+    stable; only the final weights are cast to the layer dtype.  The cost is
+    one-off (construction, or once per disk-cache entry).
+    """
+    return torch.float64
 
 
 def _geometry_cache_key(
@@ -75,7 +84,7 @@ def _geometry_cache_key(
     Return a hex digest that uniquely identifies a set of geometry parameters.
 
     Only the fields that affect _get_interp_weights / _bind_support_batched
-    are included, plus the precision of the build (float32 or float64), which
+    are included, plus the precision of the build (float64 since #109), which
     is also the dtype of the cached weights.  The device is excluded.  The
     ``cell_ids`` enter as their raw int64 bytes, in the input order: the
     cached geometry depends on that order, and hashing the bytes costs far
@@ -694,7 +703,8 @@ class HealPixConv(nn.Module):
         ``dtype``: the choice between the two rules depends on the valid
         fraction of each stencil point, and a float32 build (``acos`` near
         the poles) gives points just outside the domain spurious fractions
-        (5e-4 at level 6).  Its cache entry is the one of float64 layers.
+        (5e-4 at level 6).  Every layer builds its geometry in float64
+        (see :func:`_geometry_dtype`), so the cache entry is shared.
     local_mean_weights : array-like [P] or None
         Non-negative weights of the stencil points in the local mean of
         ``missing="local_mean"``.  None = uniform.

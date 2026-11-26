@@ -635,9 +635,13 @@ G = 4, against about 5 ms to reload (figures from the code comments). The
 cache directory is `cache_dir`, by default `$HEALPIXCONV_CACHE` or
 `~/.cache/healpixconv`; `cache_dir=None` disables it. The key holds nside,
 `kernel_sz`, G, the gauge type and reference directions, the ellipsoid, the
-cell ids (their raw bytes, in order) and the precision of the build: a
-float64 layer caches and reloads float64 weights. `set_kernel` copies the
-kernel in the layer dtype.
+cell ids (their raw bytes, in order) and the precision of the build. The
+geometry is always built in float64, whatever the layer dtype, and only the
+final weights are cast to it: a float32 build lets a stencil point near a cell
+or face boundary pick other neighbours on another device (CPU and CUDA round
+`cos` and `matmul` differently), which changed the output of a regional layer
+by tens of percent between CPU and CUDA. Layers of every dtype therefore share
+one cache entry. `set_kernel` copies the kernel in the layer dtype.
 
 #### Edges of a regional domain
 

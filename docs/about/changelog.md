@@ -45,6 +45,13 @@
   `deterministic=True` (the default) computes the input gradient by a gather
   on the transposed stencil map instead of `index_add_`, so it gives the same
   bits at every run without `torch.use_deterministic_algorithms` (#109, 9).
+- `HealPixConv` builds its stencil geometry in float64 for every layer
+  dtype, and casts only the final weights (#109). A float32 build let a
+  stencil point near a cell or face boundary pick other bilinear neighbours
+  depending on the device: a float32 layer on a regional domain built on CUDA
+  and on CPU differed by about 20 % in its output. The build is one-off;
+  float32 layers now share the disk-cache entry of float64 layers, and
+  existing float32 cache entries are rebuilt once.
 - `benchmarks/benchmark_healpix_conv.py encoder`: an encoder block,
   `HealPixConv` + `HealPixDown` against `HealPixConv(stride=2)`, and the
   transposed convolution; `conv` variants `torch_det` and `penalty`
