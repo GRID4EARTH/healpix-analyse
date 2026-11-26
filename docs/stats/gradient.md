@@ -294,8 +294,27 @@ The relative geometry contains:
 - East offset;
 - North offset.
 
-There is no public API to keep this geometry between calls: `gradient`
-rebuilds it at every call, and takes one 1-D field at a time.
+`gradient` rebuilds this geometry at every call and takes one 1-D field at a
+time. To keep it between calls, and to process batches, build the operator
+once with `HealPixGradient`:
+
+```python
+from healpix_analyse import HealPixGradient
+
+grad = HealPixGradient(cell_ids, refinement_level)   # geometry built once
+grad_east, grad_north = grad(values)                 # values [..., N]
+speed = grad.magnitude(values)
+d_north = grad.directional_derivative(values, azimuth_rad=0.0)
+```
+
+A call returns arrays of shape `[..., len(domain)]` with the same semantics
+as `gradient`. On CUDA, when the optional `triton` package is installed,
+torch tensors run fused Triton kernels: they do not build the `[..., N, K]`
+gathered tensor, float16 / bfloat16 data accumulate in fp32, and the backward
+pass is written by hand (a gather on the transposed neighbourhoods, without
+atomics, so the result is the same at every run). The values agree with the
+reference implementation to rounding (about 1e-12 relative in float64).
+Elsewhere (CPU, NumPy, `backend="torch"`) the reference implementation runs.
 
 The same generic relative-geometry primitive can also support other local
 operators such as radial and directional filters.

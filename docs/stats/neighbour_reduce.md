@@ -244,13 +244,28 @@ reducer.output_cell_ids          # the domain, in output order
   `min`, `max` and `median` of that cell NaN. If you need NaN-aware
   averaging, use `radial_filter` with a top-hat kernel
   ({doc}`compare_neighbourhood`).
-- **Cost**: the neighbourhoods are built once per call on the CPU (healpix-geo
-  and pyproj); the reduction is then a Python loop over the output cells, on
-  the device of the input tensor. It is therefore not the cheapest local
-  operator: in one CPU measurement (20 000 cells at level 12, 3 km radius),
-  `mean_filter` took about 0.5 s per call, against 0.15 s for the first call
-  of `radial_filter` with a top-hat kernel and 0.012 s once its geometry is
-  cached. To be confirmed by a benchmark in `benchmarks/`.
+- **Gradients** of `sum`, `mean`, `min`, `max` and `median` are written by
+  hand. `min`, `max` and `median` use the subgradient of torch: the whole
+  gradient goes to the selected value (half to each of the two central
+  values of an even median); ties go to the first cell in the order of
+  `cell_ids`; a NaN row of `median` gets no gradient, and `min` / `max` pass
+  it to the first NaN.
+- **Cost**: the neighbourhoods are built once per call of `neighbour_reduce`
+  (once in total with `HealPixNeighbourReducer`), on the CPU with healpix-geo
+  and pyproj, and stored padded (`[N, K]` int32 positions). A reduction is
+  then a gather-reduce on the device of the input, with no loop over the
+  cells:
+  - on CPU (and for integer data), a loop over the K neighbours that keeps
+    running sums or extrema, so no `[..., N, K]` tensor is built; the median
+    ranks the K values of each row in chunks of bounded size;
+  - on CUDA, for floating-point data, one fused Triton kernel when the
+    optional `triton` package is installed: the K values of a cell are
+    gathered and reduced in registers, the median by comparing them with one
+    another. The backward pass is a gather on the transposed neighbourhoods,
+    without atomics, so its result is the same at every run.
+
+  `backend="torch"` forces the PyTorch path. Timings are produced by
+  `benchmarks/benchmark_reductions.py`.
 
 ## Spatial semantics
 

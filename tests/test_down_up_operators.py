@@ -216,7 +216,7 @@ def test_buffers_follow_to_and_state_dict():
 
     down.double()
     up.double()
-    assert down._M_val.dtype == torch.float64
+    assert down._ell_w.dtype == torch.float64
     y64, _ = down(x)
     assert y64.dtype == np.float64
     np.testing.assert_allclose(y64, y32, rtol=1e-6, atol=1e-6)
@@ -262,7 +262,7 @@ def test_half_precision_cast(half, regional):
         y_np, _ = op(x[0].numpy())
         assert y_np.dtype == (np.float32 if half == torch.bfloat16 else np.float16)
         if mode in ("smooth", "smooth_conservative"):
-            assert op._M_val.dtype == torch.float32
+            assert op._ell_w.dtype == torch.float32
         # gradient flows back to the 16-bit input
         if mode != "maxpool":
             xh = x.to(half).requires_grad_(True)
@@ -288,7 +288,7 @@ def test_half_precision_cast(half, regional):
 def test_half_precision_constructor(half):
     down = HealPixDown(2, device="cpu", dtype=half)
     up = HealPixUp(1, device="cpu", dtype=half)
-    assert down._M_val.dtype == torch.float32 and up._M_val.dtype == torch.float32
+    assert down._ell_w.dtype == torch.float32 and up._ell_w.dtype == torch.float32
     x = torch.randn(down.N_in).to(half)
     y, _ = down(x)
     assert y.dtype == half and up(y)[0].dtype == half

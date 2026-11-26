@@ -51,6 +51,7 @@ convol
 large_conv
 fft_conv
 patches
+attention
 ```
 
 ```{toctree}

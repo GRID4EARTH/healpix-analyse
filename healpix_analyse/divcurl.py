@@ -26,6 +26,7 @@ from healpix_analyse.convol import (
 )
 from healpix_analyse.decomp import HealPixDecomp, HealPixPyramid
 from healpix_analyse._ellipsoid import canonicalize_ellipsoid
+from healpix_analyse._stencil_backend import divcurl_contract, divcurl_embed
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -352,32 +353,22 @@ class HealPixDivCurl(nn.Module):
     def forward(self, velocity: ArrayLike) -> ArrayLike:
         """Return divergence/curl for eastward/northward velocity channels."""
         tensor, leading_shape, is_numpy = self._prepare_velocity(velocity)
-        u = tensor[:, 0, :]
-        v = tensor[:, 1, :]
-        cartesian = (
-            u[:, None, :] * self._east[None, :, :]
-            + v[:, None, :] * self._north[None, :, :]
-        )
-
+        # embed -> HealPixConv -> contract; on CUDA with Triton the embedding
+        # and the contraction are fused kernels (forward and backward), see
+        # healpix_analyse._stencil_backend.
+        cartesian = divcurl_embed(tensor, self._east, self._north)
         derivatives = self.conv(cartesian)
         derivatives = derivatives.reshape(
             tensor.shape[0], self.n_gauges, 6, self.n_pixels
         )
-        derivative_a = derivatives[:, :, :3, :]
-        derivative_b = derivatives[:, :, 3:, :]
-        axis_a = self._axis_a[None, :, :, :]
-        axis_b = self._axis_b[None, :, :, :]
-
-        divergence = (axis_a * derivative_a).sum(dim=2) + (
-            axis_b * derivative_b
-        ).sum(dim=2)
-        curl = (axis_b * derivative_a).sum(dim=2) - (
-            axis_a * derivative_b
-        ).sum(dim=2)
-        output = torch.stack((divergence, curl), dim=2)  # [B,G,2,N]
+        output = divcurl_contract(
+            derivatives,
+            self._axis_a,
+            self._axis_b,
+            mean=self.gauge_reduce == "mean",
+        )
 
         if self.gauge_reduce == "mean":
-            output = output.mean(dim=1)
             output = output.reshape(*leading_shape, 2, self.n_pixels)
         else:
             output = output.reshape(
