@@ -345,12 +345,16 @@ def test_triton_reduction_matches_reference(reducers, name, dtype, reduction):
 
     xd = torch.as_tensor(rng.permutation(3 * r.cell_ids.size).reshape(3, -1) * 0.01).to(dtype)
     gy = torch.as_tensor(rng.normal(size=(3, r.domain.size))).to(dtype)
-    _, g_ref = _grads(lambda t: r._reference_reduce(t, reduction), xd, gy)
+    # Reference gradient in float64 on the same (rounded) inputs: in 16 bits the
+    # reference itself rounds at every accumulation, and rounding the inputs
+    # creates ties, which both sides give to the first cell of the
+    # neighbourhood (torch's CPU rule).
+    _, g_ref = _grads(lambda t: r._reference_reduce(t, reduction), xd.double(), gy.double())
     _, g1 = _grads(lambda t: r(t, reduction=reduction, backend="triton"), xd.cuda(), gy.cuda())
     _, g2 = _grads(lambda t: r(t, reduction=reduction, backend="triton"), xd.cuda(), gy.cuda())
     assert torch.equal(g1, g2)                        # deterministic
-    tol = {torch.float64: 1e-12, torch.float32: 1e-5}.get(dtype, 2e-2)
-    torch.testing.assert_close(g1.cpu(), g_ref, rtol=tol, atol=tol)
+    tol = {torch.float64: 1e-12, torch.float32: 1e-5}.get(dtype, 1.6e-2)
+    torch.testing.assert_close(g1.cpu().double(), g_ref, rtol=tol, atol=tol)
 
 
 @pytest.mark.skipif(not TRITON, reason="needs CUDA and Triton")
@@ -384,7 +388,10 @@ def test_triton_lsq_gradient_matches_reference(gradient_ops, name, dtype):
     new = run(lambda t: op(t, backend="triton"), x.cuda(), gu.cuda(), gw.cuda())
     again = run(lambda t: op(t, backend="triton"), x.cuda(), gu.cuda(), gw.cuda())
     assert torch.equal(new[2], again[2])
-    tol = dict(rtol=1e-12, atol=1e-15) if dtype == torch.float64 else dict(rtol=2e-4, atol=1e-6)
+    # float64: 5e-12 of the field scale. A few boundary cells of a regional domain
+    # have nearly degenerate fits, where the summation order of the kernel
+    # moves the last digits (1.35e-12 measured on an A100); elsewhere 1e-12.
+    tol = dict(rtol=5e-12, atol=1e-15) if dtype == torch.float64 else dict(rtol=2e-4, atol=1e-6)
     for a, e in zip(new[:2], ref[:2]):
         assert torch.equal(torch.isnan(a), torch.isnan(e))
         s = torch.nan_to_num(e).abs().max()
