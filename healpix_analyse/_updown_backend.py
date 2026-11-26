@@ -205,15 +205,15 @@ if _HAS_TRITON:
 
     # ---- ELL gather-reduce ------------------------------------------------
 
-    @triton.autotune(configs=_ELL_CONFIGS, key=["R_PAD", "B_CLASS", "SIZE", "HAS_PRO", "HAS_EPI"])
+    @triton.autotune(configs=_ELL_CONFIGS, key=["R_PAD", "B_CLASS", "SIZE", "HAS_EPI"])
     @triton.jit
     def _ell_kernel(x_ptr, idx_ptr, w_ptr, div_ptr, out_ptr,
-                    pro_y_ptr, pro_c_ptr, pro_s_ptr, epi_x_ptr, epi_s_ptr,
+                    epi_x_ptr, epi_s_ptr,
                     B, N_in, N_out, R, B_CLASS, SIZE,
                     R_PAD: tl.constexpr,
-                    HAS_DIV: tl.constexpr, HAS_PRO: tl.constexpr, HAS_EPI: tl.constexpr,
+                    HAS_DIV: tl.constexpr, HAS_EPI: tl.constexpr,
                     BLOCK_I: tl.constexpr, BLOCK_B: tl.constexpr):
-        """out[b, i] = (sum_r w[i, r] * x'[b, idx[i, r]]) / div[i] + epi[b, i].
+        """out[b, i] = (sum_r w[i, r] * x[b, idx[i, r]]) / div[i] + epi[b, i].
 
         One program: BLOCK_I rows of the operator for BLOCK_B rows of x.  The
         whole ``[BLOCK_I, R]`` tile of indices and weights is loaded once, in
@@ -223,9 +223,8 @@ if _HAS_TRITON:
         accumulation; the reduction order over the slots is fixed by the
         compiled kernel, so the result is the same at every run.
 
-        Optional prologue (backward of ``smooth_conservative``):
-        ``x'[b, k] = x[b, k] - s[b] * c[k] * finite(y[b, k])``.
-        Optional epilogue: ``epi[b, i] = s2[b] * finite(z[b, i])``.
+        Optional epilogue (backward of ``smooth_conservative``):
+        ``epi[b, i] = s2[b] * finite(z[b, i])``.
         """
         pid_i = tl.program_id(0)
         pid_b = tl.program_id(1)
@@ -238,8 +237,6 @@ if _HAS_TRITON:
         wt = tl.load(w_ptr + eoff, mask=e_ok, other=0.0).to(tl.float32)
         ok = col < N_in
         col64 = col.to(tl.int64)
-        if HAS_PRO:
-            cv = tl.load(pro_c_ptr + col, mask=ok, other=0.0).to(tl.float32)
         if HAS_DIV:
             d = tl.load(div_ptr + i, mask=i_ok, other=1.0).to(tl.float32)
         for bb in tl.static_range(BLOCK_B):
@@ -248,10 +245,6 @@ if _HAS_TRITON:
             m2 = ok & b_ok
             off = b.to(tl.int64) * N_in + col64
             xv = tl.load(x_ptr + off, mask=m2, other=0.0).to(tl.float32)
-            if HAS_PRO:
-                yv = tl.load(pro_y_ptr + off, mask=m2, other=0.0)
-                s_pro = tl.load(pro_s_ptr + b, mask=b_ok, other=0.0)
-                xv = xv - tl.where(_finite(yv), s_pro * cv, 0.0)
             acc = tl.sum(xv * wt, axis=1)                                 # [BI]
             if HAS_DIV:
                 acc = tl.math.div_rn(acc, d)
@@ -317,17 +310,20 @@ if _HAS_TRITON:
 
     @triton.autotune(configs=_EW_CONFIGS, key=["SIZE"])
     @triton.jit
-    def _mean4_fwd_kernel(x_ptr, y_ptr, M, SIZE, PAIRWISE: tl.constexpr, BLOCK: tl.constexpr):
-        """y[p] = mean(x[4p:4p+4]), summed in fp32 in the order of torch.mean."""
+    def _mean4_fwd_kernel(x_ptr, y_ptr, M, SIZE, ORDER: tl.constexpr, BLOCK: tl.constexpr):
+        """y[p] = mean(x[4p:4p+4]), summed in fp32 in the order of torch.mean
+        (ORDER 0: ((a+b)+c)+d, 1: (a+b)+(c+d), 2: (a+c)+(b+d))."""
         p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         ok = p < M
         v0, v1, v2, v3 = _quad(x_ptr, p, ok)
         v0, v1 = v0.to(tl.float32), v1.to(tl.float32)
         v2, v3 = v2.to(tl.float32), v3.to(tl.float32)
-        if PAIRWISE:
+        if ORDER == 0:
+            s = ((v0 + v1) + v2) + v3
+        elif ORDER == 1:
             s = (v0 + v1) + (v2 + v3)
         else:
-            s = ((v0 + v1) + v2) + v3
+            s = (v0 + v2) + (v1 + v3)
         tl.store(y_ptr + p, (s * 0.25).to(y_ptr.dtype.element_ty), mask=ok)
 
     @triton.autotune(configs=_EW_CONFIGS, key=["SIZE"])
@@ -422,9 +418,9 @@ if _HAS_TRITON:
         tl.store(out_ptr + p, (y + d.to(y.dtype)).to(out_ptr.dtype.element_ty), mask=ok)
 
 
-def _ell_triton(x, idx, w, div, out_dtype, pro=None, epi=None):
-    """ELL product on CUDA; ``pro = (y, c, s)`` and ``epi = (z, s2)`` are the
-    optional prologue / epilogue of :func:`_ell_kernel`."""
+def _ell_triton(x, idx, w, div, out_dtype, epi=None):
+    """ELL product on CUDA; ``epi = (z, s2)`` is the optional epilogue of
+    :func:`_ell_kernel`."""
     B, n_in = x.shape
     n_out, R = idx.shape
     y = torch.empty((B, n_out), dtype=out_dtype, device=x.device)
@@ -434,17 +430,16 @@ def _ell_triton(x, idx, w, div, out_dtype, pro=None, epi=None):
     if div is not None:
         div = div.contiguous()
     dummy = w
-    py, pc, ps = pro if pro is not None else (dummy, dummy, dummy)
     ez, es = epi if epi is not None else (dummy, dummy)
 
     def grid(meta):
         return (triton.cdiv(n_out, meta["BLOCK_I"]), triton.cdiv(B, meta["BLOCK_B"]))
 
     _ell_kernel[grid](x, idx, w, div if div is not None else dummy, y,
-                      py, pc, ps, ez, es,
+                      ez, es,
                       B, n_in, n_out, R, _size_class(B), _size_class(n_out),
                       R_PAD=max(2, 1 << (R - 1).bit_length()),
-                      HAS_DIV=div is not None, HAS_PRO=pro is not None,
+                      HAS_DIV=div is not None,
                       HAS_EPI=epi is not None)
     return y
 
@@ -584,9 +579,28 @@ def max4(x, backend="auto"):
     return x.reshape(x.shape[0], -1, 4).max(dim=-1).values
 
 
-# Order of the 4-term sum, chosen to match torch.mean on CUDA so that the fused
-# kernel is bit-identical to the reference (checked by the CUDA tests).
-_MEAN_PAIRWISE = False
+# Order of the 4-term sum of torch.mean on CUDA, per (device, dtype): the
+# fused kernel uses the same one, so that it is bit-identical to the
+# reference.  Found once by a probe; None means no order matches, and the
+# forward then stays torch.mean (the backward is still fused).
+_MEAN_ORDER = {}
+
+
+def _mean_order(x):
+    key = (x.device, x.dtype)
+    if key not in _MEAN_ORDER:
+        _MEAN_ORDER[key] = None
+        gen = torch.Generator(device=x.device).manual_seed(0)
+        probe = torch.randn(4096, 4, generator=gen, device=x.device).to(x.dtype)
+        ref = probe.mean(-1)
+        m = probe.shape[0]
+        for order in (0, 1, 2):
+            y = torch.empty(m, dtype=x.dtype, device=x.device)
+            _mean4_fwd_kernel[_ew_grid(m)](probe, y, m, _size_class(m), ORDER=order)
+            if torch.equal(y, ref):
+                _MEAN_ORDER[key] = order
+                break
+    return _MEAN_ORDER[key]
 
 
 class _Mean4(torch.autograd.Function):
@@ -598,10 +612,13 @@ class _Mean4(torch.autograd.Function):
     def forward(ctx, x):  # noqa: D102
         B, N = x.shape
         m = B * (N // 4)
+        ctx.n = N
+        order = _mean_order(x)
+        if order is None:
+            return x.reshape(B, N // 4, 4).mean(dim=-1)
         y = torch.empty((B, N // 4), dtype=x.dtype, device=x.device)
         if m:
-            _mean4_fwd_kernel[_ew_grid(m)](x, y, m, _size_class(m), PAIRWISE=_MEAN_PAIRWISE)
-        ctx.n = N
+            _mean4_fwd_kernel[_ew_grid(m)](x, y, m, _size_class(m), ORDER=order)
         return y
 
     @staticmethod
@@ -693,8 +710,9 @@ class _ConservativeEll(torch.autograd.Function):
     Forward: the ELL kernel (float32 output), two Triton row reductions in
     float64 (finite values only, coverage weights) and one add-and-cast pass.
     Backward, with ``S = sum(g)`` per row and ``delta`` finite:
-    ``grad x = M^T (g - S/W_y * cov * finite(y)) + S/n_x * finite(x)``: one ELL
-    gather of ``M^T`` with the correction fused as prologue and epilogue.
+    ``grad x = M^T (g - S/W_y * cov * finite(y)) + S/n_x * finite(x)``: the
+    correction of ``g`` on the (4x smaller) output grid, then one ELL gather
+    of ``M^T`` with the ``x`` term fused as epilogue.
     """
 
     @staticmethod
@@ -728,8 +746,13 @@ class _ConservativeEll(torch.autograd.Function):
         zero = torch.zeros_like(S)
         s_y = torch.where(ok, S / wy, zero).to(torch.float32)
         s_x = torch.where(ok, S / nx, zero).to(torch.float32)
-        gx = _ell_triton(g, ctx.bwd.idx, ctx.bwd.w, None, ctx.in_dtype,
-                         pro=(y, cov.to(torch.float32), s_y), epi=(x, s_x))
+        # the correction of g lives on the (4x smaller) output grid: one
+        # elementwise pass there, then a plain ELL gather with the x term
+        # fused as epilogue
+        c = torch.where(torch.isfinite(y), cov.to(torch.float32),
+                        torch.zeros((), device=y.device))
+        g2 = g.float() - s_y[:, None] * c
+        gx = _ell_triton(g2, ctx.bwd.idx, ctx.bwd.w, None, ctx.in_dtype, epi=(x, s_x))
         return gx, None, None, None, None
 
 
