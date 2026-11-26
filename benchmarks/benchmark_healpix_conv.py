@@ -8,6 +8,7 @@ checkout to measure first on ``PYTHONPATH`` and label the run, e.g.::
     PYTHONPATH=/path/to/branch python benchmarks/benchmark_healpix_conv.py conv --device cuda --configs gpu --label branch \\
         --variants layer layer_atomic
     python benchmarks/benchmark_healpix_conv.py table main.jsonl branch.jsonl     # Markdown gain table
+    python benchmarks/benchmark_healpix_conv.py encoder --device cuda --configs gpu
 
 Subcommands
 -----------
@@ -26,6 +27,14 @@ conv
 geometry
     Build time of the geometry, stage by stage, for regional domains at
     several levels (no disk cache).
+encoder
+    An encoder block (issue #109): ``HealPixConv`` followed by
+    ``HealPixDown`` (``mode="mean"`` and ``"smooth"``) against the strided
+    convolution ``HealPixConv(stride=2)``, which computes the same N/4
+    outputs directly; and the transposed convolution of the decoder
+    (``HealPixConvTranspose``, back to the input channels and cells).  Same
+    measures as ``conv``; ``speedup_*`` are the fwd+bwd ratios against the
+    strided layer.  Needs a version with ``stride``.
 table
     Reads JSON lines of a "before" and an "after" run and prints the gain table.
 
@@ -36,7 +45,15 @@ layer        ``conv(x)`` with the defaults of the installed version
 layer_det    ``deterministic=True`` (versions with a Triton backend)
 layer_atomic ``deterministic=False``: fp32 atomics in the input gradient
              (versions with a Triton backend)
-torch        ``backend="torch"``: the PyTorch tap loop (versions with backends)
+torch        ``backend="torch"``, ``deterministic=False``: the PyTorch tap loop,
+             input gradient by ``index_add_`` (versions with backends)
+torch_det    ``backend="torch"``, ``deterministic=True``: on CUDA, the input
+             gradient by a gather on the transposed map (since #109; the
+             same as ``torch`` before)
+penalty      the defaults, and a gradient-penalty step instead of fwd+bwd:
+             ``loss = mean(y**2)``, ``g = d loss / d x`` with
+             ``create_graph=True``, then ``(loss + sum(g**2)).backward()``.
+             Before #109 its backward ran the PyTorch backend on every device.
 """
 from __future__ import annotations
 
@@ -67,6 +84,10 @@ CONFIGS = {
         dict(name="L8 full k3 G8 B4 32->32", level=8, m=None, k=3, G=8, B=4, C=32, Co=32),
         dict(name="L10 regional 262144 k5 G4 B8 32->32", level=10, m=9, k=5, G=4, B=8, C=32, Co=32),
         dict(name="L7 full k5 G4 B8 64->64", level=7, m=None, k=5, G=4, B=8, C=64, Co=64),
+    ],
+    "reduced": [  # representative subset for short GPU jobs: level 8 full sphere, level 10 regional
+        dict(name="L8 full k3 G4 B4 16->16", level=8, m=None, k=3, G=4, B=4, C=16, Co=16),
+        dict(name="L10 regional 262144 k5 G4 B8 32->32", level=10, m=9, k=5, G=4, B=8, C=32, Co=32),
     ],
     "tiny": [  # smoke test of the script itself
         dict(name="L3 full k3 G2 B2 4->4", level=3, m=None, k=3, G=2, B=2, C=4, Co=4),
@@ -172,7 +193,7 @@ def _set_variant(conv, variant):
     """Configure the layer for a variant; False if this version does not have it."""
     if not hasattr(conv, "backend"):
         return variant == "layer"
-    if variant == "layer":
+    if variant in ("layer", "penalty"):
         conv.backend = "auto"     # deterministic keeps its default
     elif variant == "layer_atomic":
         conv.backend, conv.deterministic = "auto", False
@@ -180,6 +201,8 @@ def _set_variant(conv, variant):
         conv.backend, conv.deterministic = "auto", True
     elif variant == "torch":
         conv.backend, conv.deterministic = "torch", False
+    elif variant == "torch_det":
+        conv.backend, conv.deterministic = "torch", True
     else:
         raise ValueError(variant)
     return True
@@ -232,7 +255,12 @@ def cmd_conv(args):
             def fwdbwd():
                 xr = x.detach().requires_grad_(True)
                 conv.zero_grad(set_to_none=True)
-                conv(xr).square().mean().backward()
+                if variant == "penalty":
+                    loss = conv(xr).square().mean()
+                    gx, = torch.autograd.grad(loss, xr, create_graph=True)
+                    (loss + gx.square().sum()).backward()
+                else:
+                    conv(xr).square().mean().backward()
 
             r = {}
             try:
@@ -252,6 +280,95 @@ def cmd_conv(args):
             rec["results"][variant] = r
         print(json.dumps(rec), flush=True)
         del conv, x
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def _measure(fwd, fwdbwd, device, reps):
+    r = {}
+    try:
+        r["fwd_ms"] = 1e3 * timeit(fwd, device, reps)
+        r["fwd_peak_GiB"], r["fwd_total_GiB"] = peak_mem(fwd, device)
+        r["fwdbwd_ms"] = 1e3 * timeit(fwdbwd, device, reps)
+        r["fwdbwd_peak_GiB"], r["fwdbwd_total_GiB"] = peak_mem(fwdbwd, device)
+    except OOM:
+        r["error"] = "OOM"
+    except Exception as exc:  # noqa: BLE001
+        r["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return r
+
+
+def cmd_encoder(args):
+    from healpix_analyse.convol import HealPixConv, HealPixConvTranspose
+    from healpix_analyse.down import HealPixDown
+
+    device = torch.device(args.device)
+    dtype = getattr(torch, args.dtype)
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    path, commit = _package_info()
+    commit = args.commit or commit
+    torch.manual_seed(0)
+    configs = CONFIGS[args.configs]
+    if args.only:
+        configs = [c for c in configs if any(s in c["name"] for s in args.only)]
+    for cfg in configs:
+        ids = None if cfg["m"] is None else nested_patch(cfg["level"], cfg["m"])
+        rec = dict(label=args.label, commit=commit, package=path, config=cfg["name"],
+                   device=str(device), dtype=args.dtype, torch=torch.__version__,
+                   gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+                   results={})
+        kw = dict(kernel_sz=cfg["k"], n_gauges=cfg["G"], cell_ids=ids, device=device,
+                  dtype=dtype, cache_dir=args.cache_dir)
+        B, C, Co, G = cfg["B"], cfg["C"], cfg["Co"], cfg["G"]
+        try:
+            conv = HealPixConv(cfg["level"], C, Co, **kw)
+            strided = HealPixConv(cfg["level"], C, Co, stride=2, **kw)
+            convT = HealPixConvTranspose(cfg["level"], Co, C, **kw)
+            downs = {m: HealPixDown(cfg["level"], mode=m, cell_ids=ids, device=device, dtype=dtype)
+                     for m in ("mean", "smooth")}
+        except OOM:
+            rec["build_error"] = "OOM"
+            print(json.dumps(rec), flush=True)
+            continue
+        rec["K"], rec["K_out"] = conv.K, strided.K_out
+        x = torch.randn(B, C, conv.K, device=device, dtype=dtype)
+        h = torch.randn(B, G * Co, strided.K_out, device=device, dtype=dtype)
+
+        def conv_down(xr, down):
+            y = conv(xr)
+            return down(y.reshape(B * G * Co, -1))[0].view(B, G * Co, -1)
+
+        blocks = {
+            "conv+down_mean": (lambda xr: conv_down(xr, downs["mean"]), x, conv),
+            "conv+down_smooth": (lambda xr: conv_down(xr, downs["smooth"]), x, conv),
+            "strided": (strided, x, strided),
+            "transpose": (convT, h, convT),
+        }
+        for name, (fn, inp, mod) in blocks.items():
+            mod.weight.requires_grad_(True)
+
+            def fwd():
+                with torch.no_grad():
+                    fn(inp)
+
+            def fwdbwd():
+                xr = inp.detach().requires_grad_(True)
+                mod.zero_grad(set_to_none=True)
+                fn(xr).square().mean().backward()
+
+            rec["results"][name] = _measure(fwd, fwdbwd, device, args.reps)
+        s = rec["results"]["strided"].get("fwdbwd_ms")
+        for base in ("conv+down_mean", "conv+down_smooth"):
+            b = rec["results"][base].get("fwdbwd_ms")
+            if s and b:
+                rec[f"speedup_{base}"] = b / s
+        print(json.dumps(rec), flush=True)
+        del conv, strided, convT, downs, x, h
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -357,13 +474,24 @@ def main():
     c.add_argument("--device", default="cpu")
     c.add_argument("--configs", default="cpu", choices=sorted(CONFIGS))
     c.add_argument("--only", nargs="*", help="substrings of the configuration names to run")
-    c.add_argument("--variants", nargs="+", default=["layer"], choices=["layer", "layer_det", "layer_atomic", "torch"])
+    c.add_argument("--variants", nargs="+", default=["layer"],
+                   choices=["layer", "layer_det", "layer_atomic", "torch", "torch_det", "penalty"])
     c.add_argument("--dtype", default="float32")
     c.add_argument("--reps", type=int, default=5)
     c.add_argument("--threads", type=int, default=0)
     c.add_argument("--cache-dir", default=None)
     c.add_argument("--label", default="")
     c.add_argument("--commit", default="", help="recorded in the output (default: git HEAD)")
+    e = sub.add_parser("encoder")
+    e.add_argument("--device", default="cpu")
+    e.add_argument("--configs", default="cpu", choices=sorted(CONFIGS))
+    e.add_argument("--only", nargs="*")
+    e.add_argument("--dtype", default="float32")
+    e.add_argument("--reps", type=int, default=5)
+    e.add_argument("--threads", type=int, default=0)
+    e.add_argument("--cache-dir", default=None)
+    e.add_argument("--label", default="")
+    e.add_argument("--commit", default="")
     g = sub.add_parser("geometry")
     g.add_argument("--device", default="cpu")
     g.add_argument("--levels", type=int, nargs="+", default=[8, 10, 12])
@@ -376,7 +504,8 @@ def main():
     t.add_argument("--variant-after", default="layer")
     args = ap.parse_args()
     torch.set_grad_enabled(True)
-    {"conv": cmd_conv, "geometry": cmd_geometry, "table": cmd_table}[args.cmd](args)
+    {"conv": cmd_conv, "encoder": cmd_encoder, "geometry": cmd_geometry,
+     "table": cmd_table}[args.cmd](args)
 
 
 if __name__ == "__main__":
