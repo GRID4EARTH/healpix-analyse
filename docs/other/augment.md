@@ -135,10 +135,14 @@ ya = plan.apply(y).x          # same rotation, shift, zoom, noise and mask
 - `geom_dtype=torch.float32` is opt-in. Near a cell or face boundary, its
   rounding (about 1e-7 rad) can pick a different bilinear neighbour than
   float64 does, or than the same transform does on another device. The
-  swapped neighbour carries a weight of order 1e-4 at level 10. In the
-  benchmark cases, 0.36–0.68 % of the output cells are concerned, and the
-  validity mask differs at 0–4 cells in 3×10⁵. `neighbour_mismatch(map_a,
-  map_b)` measures this for a given draw.
+  swapped neighbour carries a small weight, but that weight grows with the
+  level, because the cells shrink while the rounding stays the same: about
+  1.5×10⁻⁴ at level 8, 2×10⁻⁴ at level 10 and up to 2.2×10⁻³ at level 12.
+  In the benchmark cases, 0.36–0.68 % of the output cells are concerned, and
+  the validity mask differs at 0–4 cells in 3×10⁵. From level 10 on,
+  float32 also makes the identity inexact: rounding can flag border cells as
+  outside the domain. `neighbour_mismatch(map_a, map_b)` measures this for a
+  given draw.
 - A rotation by 0.7 rad followed by its inverse (two gathers) brings back a
   field that varies over the scale of the domain to 6×10⁻⁵ of its range.
 - An SO(3) rotation of a full-sphere ℓ ≤ 3 field at level 6 preserves its

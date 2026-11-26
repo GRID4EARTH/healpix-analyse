@@ -945,7 +945,7 @@ if _HAS_TRITON:
             ij = tl.load(idx_ptr + base + offs_n, mask=mn, other=-1)
             wj = tl.load(w_ptr + base + offs_n, mask=mn, other=0.0).to(tl.float32)
             ok = (ij >= 0) & (wj != 0.0)
-            v = tl.load(src_b + ij.to(tl.int64)[None, :], mask=mc[:, None] & ok[None, :], other=0.0)
+            val = tl.load(src_b + ij.to(tl.int64)[None, :], mask=mc[:, None] & ok[None, :], other=0.0)
             acc += wj[None, :] * val.to(tl.float32)
             wsum += tl.abs(wj)
         res = tl.where((wsum > 0.0)[None, :], acc, fill)

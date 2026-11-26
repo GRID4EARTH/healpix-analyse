@@ -275,6 +275,10 @@ def get_interp_weights(
         nside = 2 ** depth
         theta = np.radians(90.0 - lat_flat)
         phi = np.radians(lon_flat) % (2.0 * np.pi)
+        # x % 2pi returns exactly 2pi for a tiny negative x (e.g. -6.28e-15):
+        # fold it back, as the C++ code does, or a cell of the wrong ring gets
+        # the weight.
+        phi[phi >= 2.0 * np.pi] -= 2.0 * np.pi
 
         pix_ring, weights = _get_interpol_ring(theta, phi, nside)
         pixels = _hg_ring.to_nested(pix_ring.ravel(), depth).reshape(pix_ring.shape)

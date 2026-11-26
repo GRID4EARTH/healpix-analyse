@@ -42,7 +42,13 @@
   backward pass recomputes them and scatters into an int64 fixed-point
   accumulator (deterministic, no map stored). Labels and masks follow with
   nearest neighbour; cells read outside the domain get NaN and
-  `valid=False`. `benchmarks/benchmark_augment.py` measures the throughput.
+  `valid=False`, also across two gathers of one plan (a cell that reads a
+  cell made invalid by an earlier gather is invalid). The geometry is float64
+  by default (exact identity, kernel bit-identical to the torch reference);
+  `geom_dtype=torch.float32` is opt-in and faster, but can pick a different
+  bilinear neighbour near cell boundaries, with a weight that grows with the
+  level; `neighbour_mismatch` measures it.
+  `benchmarks/benchmark_augment.py` measures the throughput.
 - `HealPixDown` / `HealPixUp(backend="auto" | "triton" | "torch" | "csr")`
   (#109, section 1). `"mean"` and `"maxpool"` Down on contiguous NESTED data
   (the full sphere, or sorted `cell_ids` whose parents are complete, detected
@@ -261,6 +267,10 @@
   `anafast_latlon` (it was 24).
 
 ### Fixed
+- `get_interp_weights` (sphere): a longitude a hair below 0 (e.g.
+  `-6.28e-15` degrees) gave `phi = 2 pi` exactly after the modulo, which put
+  the weight on a cell of the wrong position on the ring; `phi` is now folded
+  back into `[0, 2 pi)` as in the C++ reference.
 - `alm2map_latlon` returned the m > 0 terms at half amplitude: the synthesis
   of a real field now carries the factor 2 of the pair ±m, and
   `alm2map_latlon(map2alm_latlon(f))` returns a band-limited `f` to rounding

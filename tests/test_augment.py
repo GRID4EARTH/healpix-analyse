@@ -578,3 +578,105 @@ def test_float32_neighbours_differ_only_at_boundaries(tr):
     n_diff, max_w = neighbour_mismatch(m32, m64)
     assert max_w < 1e-4, max_w
     assert n_diff <= 0.01 * 4 * BLOCK.size, n_diff
+
+
+@pytest.mark.parametrize("fill", [float("nan"), 0.0])
+def test_validity_across_two_gathers(fill):
+    """A 3-D map after a tangent-plane map: a cell that reads, with a non-zero
+    weight, a cell made invalid by the first gather must be invalid (review of
+    #111: valid=True with x=NaN, or x=fill off by up to 1.44)."""
+    level = 7
+    lon, lat = healpix_geo.nested.healpix_to_lonlat(np.arange(12 * 4**level, dtype=np.uint64), level)
+    lon, lat = np.radians(np.asarray(lon)), np.radians(np.asarray(lat))
+    c = np.array([0.6, 0.3, 0.74]) / np.linalg.norm([0.6, 0.3, 0.74])
+    xyz = np.stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], -1)
+    ids = np.nonzero(xyz @ c > np.cos(0.25))[0]                      # a regional disc
+    f = _smooth(_xyz(ids, level) * 4.0)
+    x = torch.as_tensor(f).view(1, 1, -1).expand(4, 1, -1).clone()
+    aug = HealPixAugment([RandomRotation(), RandomShift(0.05)], level, ids, fill=fill)
+    plan = aug.sample(4, torch.Generator().manual_seed(3))
+    assert len(plan.groups) == 2
+    out = plan.apply(x)
+    v = out.valid.unsqueeze(1)
+    assert not torch.isnan(out.x[v]).any()
+    # reference: the two gathers one after the other, validity tracked exactly
+    a = HealPixAugment([plan.aug.transforms[0]], level, ids, fill=float("nan"))
+    m1 = plan.groups[0].gather_map("torch")
+    m2 = plan.groups[1].gather_map("torch")
+    inv1 = (~m1.valid).double().unsqueeze(1)
+    from healpix_analyse._augment_backend import gather_torch
+    read_inv = gather_torch(inv1, m2, 1.0)[:, 0]
+    expect_valid = m2.valid & (read_inv == 0)
+    assert torch.equal(out.valid, expect_valid)
+    if fill == fill:  # 0.0: invalid cells carry the fill, valid ones are interpolated
+        assert (out.x[~v] == 0).all()
+
+
+def _triton_device():
+    """CUDA with Triton, or the CPU under TRITON_INTERPRET=1, else None."""
+    if ab.triton_available():
+        return torch.device("cuda")
+    if ab._HAS_TRITON and os.environ.get("TRITON_INTERPRET", "0") == "1":
+        return torch.device("cpu")
+    return None
+
+
+needs_triton_any = pytest.mark.skipif(_triton_device() is None,
+                                      reason="needs CUDA + triton, or TRITON_INTERPRET=1")
+
+
+@needs_triton_any
+@pytest.mark.parametrize("mode", ["ringtab", "nest2", "r2n", "full"])
+def test_fused_lookup_modes(mode, monkeypatch):
+    """Every cell -> position mode of the fused kernel against the torch path."""
+    import healpix_analyse.augment as am
+
+    dev = _triton_device()
+    if mode == "nest2":
+        monkeypatch.setattr(am, "_RINGTAB_FACTOR", 0)
+        monkeypatch.setattr(am, "_RINGTAB_MIN", 0)
+    if mode == "full":
+        monkeypatch.setattr(am, "_R2N_MAX", 0)
+    if mode in ("ringtab", "nest2"):
+        level = 6
+        ids = 9 * 4**4 + np.random.default_rng(1).choice(4**4 * 4, 700, replace=False)  # scattered
+        tr = [RandomShift(0.03), RandomRotation(), RandomZoom((0.7, 1.3))]
+    else:
+        level, ids, tr = 4, None, [RandomSO3()]
+    aug = HealPixAugment(tr, level, ids, fill=0.0).to(dev)
+    assert aug.grid.nest_table(0, dev)[0] == mode
+    plan = aug.sample(3, torch.Generator().manual_seed(2))
+    n = aug.grid.N
+    x = torch.randn(3, 2, n, device=dev)
+    y = plan.apply(x).x
+    aug.backend = "torch"
+    r = plan.apply(x).x
+    if dev.type == "cpu":
+        assert torch.equal(y, r)
+    else:
+        torch.testing.assert_close(y, r, rtol=1e-5, atol=1e-5)
+
+
+@needs_triton_any
+def test_triton_gather_kernel_on_stored_map():
+    """apply_gather with a stored map (the non-fused Triton gather)."""
+    dev = _triton_device()
+    aug = HealPixAugment([RandomShift(0.03), RandomRotation(), RandomZoom((0.6, 1.2))], LEVEL, BLOCK,
+                         fill=0.0).to(dev)
+    gm = aug.sample(2, torch.Generator().manual_seed(4)).gather_maps[0]
+    x = torch.randn(2, 3, BLOCK.size, device=dev)
+    y = ab.apply_gather(x, gm, 0.0, backend="triton")
+    r = ab.gather_torch(x, gm, 0.0)
+    torch.testing.assert_close(y, r, rtol=1e-5, atol=1e-5)
+
+
+def test_large_domain_without_tangent_transforms():
+    """Only the tangent-plane transforms need the domain within a hemisphere."""
+    level = 4
+    lon, lat = healpix_geo.nested.healpix_to_lonlat(np.arange(12 * 4**level, dtype=np.uint64), level)
+    ids = np.nonzero(np.asarray(lat) > -30)[0]
+    aug = HealPixAugment([RandomShift(0.05), AdditiveNoise(0.1)], level, ids)
+    out = aug(torch.randn(2, ids.size, dtype=torch.float64), generator=torch.Generator().manual_seed(0))
+    assert out.valid.float().mean() > 0.9
+    with pytest.raises(ValueError, match="hemisphere"):
+        HealPixAugment([RandomRotation()], level, ids)

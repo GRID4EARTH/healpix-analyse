@@ -241,6 +241,7 @@ from healpix_analyse.augment import (
     RandomMask,
     RandomCrop,
     gauge_rotate,
+    neighbour_mismatch,
 )
 
 # ---------------------------------------------------------------------------
@@ -415,6 +416,7 @@ __all__ = [
     "RandomMask",
     "RandomCrop",
     "gauge_rotate",
+    "neighbour_mismatch",
 
     # ------------------------------------------------------------------
     # AI layers: masked normalisation, pooling, positional encodings

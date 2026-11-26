@@ -116,6 +116,8 @@ _MAX_POINTS = {"cuda": 1 << 22, "cpu": 1 << 15}
 # most _RINGTAB_FACTOR times its number of cells (or _RINGTAB_MIN entries).
 _RINGTAB_FACTOR = 64
 _RINGTAB_MIN = 1 << 22
+# Full sphere: RING -> NESTED table up to this many cells, closed form above.
+_R2N_MAX = 1 << 28
 
 
 # ===========================================================================
@@ -490,7 +492,7 @@ def _permute_gauges(x, perm, G):
 # ===========================================================================
 
 class _Grid(nn.Module):
-    def __init__(self, level, cell_ids, geom_dtype):
+    def __init__(self, level, cell_ids, geom_dtype, tangent=True):
         super().__init__()
         self.level = int(level)
         self.full = cell_ids is None
@@ -522,18 +524,23 @@ class _Grid(nn.Module):
             uv = np.zeros((self.N, 2))
         else:
             c = xyz.mean(0)
-            c /= np.linalg.norm(c)
+            nc = np.linalg.norm(c)
+            c = c / nc if nc > 1e-9 else np.array([0.0, 0.0, 1.0])
             ref = np.array([0.0, 0.0, 1.0]) if abs(c[2]) < 0.99 else np.array([1.0, 0.0, 0.0])
             e1 = np.cross(ref, c)
             e1 /= np.linalg.norm(e1)
             e2 = np.cross(c, e1)
             dot = xyz @ c
-            if dot.min() <= 0.05:
-                raise ValueError(
-                    "the regional domain must lie within a hemisphere (cells up to "
-                    "~87 degrees from its centre) for the tangent-plane transforms"
-                )
-            uv = np.stack([xyz @ e1, xyz @ e2], -1) / dot[:, None]
+            if tangent:  # the gnomonic projection needs the domain in a hemisphere
+                if dot.min() <= 0.05:
+                    raise ValueError(
+                        "the regional domain must lie within a hemisphere (cells up to "
+                        "~87 degrees from its centre) for the tangent-plane transforms "
+                        "(RandomRotation, RandomZoom, RandomFlip, TangentLinear)"
+                    )
+                uv = np.stack([xyz @ e1, xyz @ e2], -1) / dot[:, None]
+            else:
+                uv = np.zeros((self.N, 2))
             frame = np.stack([c, e1, e2])
         self.register_buffer("frame", torch.as_tensor(frame, dtype=geom_dtype), persistent=False)
         self.register_buffer("uv", torch.as_tensor(uv, dtype=geom_dtype), persistent=False)
@@ -570,7 +577,7 @@ class _Grid(nn.Module):
             order = self.level - k
             npix = 12 * 4 ** order
             if self.full and k == 0:
-                if npix <= (1 << 28):
+                if npix <= _R2N_MAX:
                     r2n = np.asarray(healpix_geo.ring.to_nested(
                         np.arange(npix, dtype=np.uint64), order)).astype(np.int32)
                     self._pyr[key] = ("r2n", torch.as_tensor(r2n, device=device))
@@ -763,17 +770,32 @@ class AugmentPlan:
             kind = step[0]
             if kind == "gather":
                 grp = step[1]
-                src = aug._source(x3, grp.kmax)
-                need_nn = lab is not None or not valid_all or mask is not None
-                x3, valid_g, gmap = grp.run(src, need_nn)
-                if need_nn:
-                    nn_c = gmap.nn.clamp_min(0)
-                    valid = valid_g & torch.gather(valid, 1, nn_c)
-                    if mask is not None:
-                        mask = torch.gather(mask, 1, nn_c) & valid_g
-                    lab = _map_labels(lab, lambda t, nn=gmap.nn: _nearest(t, nn, aug.label_fill))
+                # Earlier invalid / masked cells travel through the same
+                # weights as extra channels: an output cell is valid only if
+                # every source it reads with a non-zero weight is valid, and
+                # masked if it reads any masked source.
+                extra = []
+                if not valid_all:
+                    extra.append((~valid).to(x3.dtype))
+                if mask is not None:
+                    extra.append(mask.to(x3.dtype))
+                C = x3.shape[1]
+                x_in = torch.cat([x3, torch.stack(extra, 1)], 1) if extra else x3
+                src = aug._source(x_in, grp.kmax)
+                y, valid_g, gmap = grp.run(src, lab is not None)
+                x3 = y[:, :C]
+                k = C
+                if not valid_all:
+                    valid = valid_g & (y[:, k] == 0)
+                    k += 1
+                    x3 = torch.where(valid.unsqueeze(1), x3,
+                                     torch.full((), aug.fill, dtype=x3.dtype, device=x3.device))
                 else:
                     valid = valid_g
+                if mask is not None:
+                    mask = valid_g & (y[:, k] > 0)
+                if lab is not None:
+                    lab = _map_labels(lab, lambda t, nn=gmap.nn: _nearest(t, nn, aug.label_fill))
                 valid_all = False
             elif kind == "gauge":
                 x3 = _permute_gauges(x3, step[1], step[2])
@@ -887,9 +909,12 @@ class HealPixAugment(nn.Module):
         rounding distance of a cell or face boundary it can pick a different
         bilinear neighbour than float64 (or than the same transform on
         another device).  Bilinear interpolation is continuous, so the
-        swapped neighbour carries a weight of order 1e-4 at level 10; at
-        level 10, 0.4-0.7 % of the output cells are concerned (see
-        :func:`neighbour_mismatch`).
+        swapped neighbour carries a small weight, but that weight grows with
+        the level (cells shrink while the rounding stays): about 1.5e-4 at
+        level 8, 2e-4 at level 10 and up to 2.2e-3 at level 12, at 0.4-0.7 %
+        of the output cells (see :func:`neighbour_mismatch`).  From level 10
+        on, float32 also makes the identity inexact: rounding can flag
+        border cells as outside the domain.
     backend : {"auto", "triton", "torch"}
         Gather backend: Triton on CUDA for float32 / float16 / bfloat16 data
         when available, the PyTorch reference otherwise.
@@ -918,7 +943,10 @@ class HealPixAugment(nn.Module):
         if antialias not in ("supersample", "pyramid", None):
             raise ValueError("antialias must be 'supersample', 'pyramid' or None")
         self.transforms = list(transforms)
-        self.grid = _Grid(level, cell_ids, geom_dtype)
+        full = cell_ids is None
+        probe = type("_Probe", (), {"full": full})()
+        tangent = any(t.kind_for(probe) == "A" for t in self.transforms)
+        self.grid = _Grid(level, cell_ids, geom_dtype, tangent=tangent)
         self.fill = float(fill)
         self.label_fill = int(label_fill)
         self.min_support = float(min_support)

@@ -1365,8 +1365,8 @@ tools:
   family: D
   page: other/augment
   status: experimental
-  symbols: [HealPixAugment, AugmentPlan, AugmentResult, RandomRotation, RandomSO3, RandomShift, RandomZoom, RandomFlip, Rotation3D, TangentLinear, RandomGaugeRotation, AdditiveNoise, RandomMask, RandomCrop, gauge_rotate]
-  also: [sample, apply, antialias, min_support, labels, GeometricGroup]
+  symbols: [HealPixAugment, AugmentPlan, AugmentResult, RandomRotation, RandomSO3, RandomShift, RandomZoom, RandomFlip, Rotation3D, TangentLinear, RandomGaugeRotation, AdditiveNoise, RandomMask, RandomCrop, gauge_rotate, neighbour_mismatch]
+  also: [sample, apply, antialias, min_support, labels, geom_dtype]
   summary: >-
     Random augmentation of a whole batch at once, with its own parameters per
     sample from a seeded generator: rotation (about the domain centre, global
