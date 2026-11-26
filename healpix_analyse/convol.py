@@ -52,6 +52,10 @@ _DEFAULT_CACHE_DIR = Path(
 # Bump when the meaning or layout of any cached buffer changes.
 _CACHE_FORMAT = 3
 
+# Stencil points (output cells x gauges x taps) per chunk of the geometry
+# build: bounds its float64 temporaries to a few hundred MB.
+_GEOMETRY_CHUNK_POINTS = 1 << 21
+
 
 def _geometry_dtype(dtype: torch.dtype) -> torch.dtype:
     """Precision of the geometry build: float64, whatever the layer dtype.
@@ -725,8 +729,7 @@ class HealPixConv(nn.Module):
         bilinearly from the fine cells as at stride 1.  The receptive field
         and the learned kernel are therefore those of the stride-1 layer at
         level ``level``, and weights move between ``stride=1`` and
-        ``stride=2`` layers unchanged (``kernel_sz=1`` is the bilinear
-        interpolation of the fine cells at the parent centre).  For a smooth
+        ``stride=2`` layers unchanged.  For a smooth
         field it differs from the stride-1 layer followed by
         ``HealPixDown(mode="mean")`` (the mean of the 4 children) at first
         order in the cell size: 3e-2 of the amplitude at level 4, halved at
@@ -734,8 +737,12 @@ class HealPixConv(nn.Module):
         spacing of two fine cells would skip fine cells between the stencil
         points (aliasing), and a stencil centred on one child would shift
         each output by half a fine cell in a direction that changes from
-        one base face to the next.  Needs ``level >= 1`` and
-        ``missing="centre"``.
+        one base face to the next.  Needs ``level >= 1``, ``kernel_sz >= 3``
+        and ``missing="centre"``: with ``kernel_sz=1`` the only stencil
+        point is the parent centre, which lies on the ring of its East and
+        West children, so its bilinear weights are about 0.5 / 0.5 on those
+        two and the layer would not be the mean of the 4 children
+        (``HealPixDown(mode="mean")`` is).
 
     Examples
     --------
@@ -800,6 +807,14 @@ class HealPixConv(nn.Module):
         self.stride = int(stride)
         if self.stride == 2 and missing != "centre":
             raise ValueError("stride=2 supports missing='centre' only.")
+        if self.stride == 2 and int(kernel_sz) == 1:
+            raise ValueError(
+                "stride=2 needs kernel_sz >= 3: with kernel_sz=1 the only "
+                "stencil point is the parent centre, which lies on the ring of "
+                "its East and West children, so the bilinear weights are about "
+                "0.5 / 0.5 on those two children and ignore the other two. Use "
+                "HealPixDown(mode='mean') for the mean of the 4 children."
+            )
         if backend not in BACKENDS:
             raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
         self.backend = backend
@@ -1019,35 +1034,11 @@ class HealPixConv(nn.Module):
             )
             th = np.deg2rad(90.0 - np.asarray(lat, dtype=np.float64))
             ph = np.deg2rad(np.asarray(lon, dtype=np.float64))
-
-            R_tot = _build_rotation_matrices(
-                th, ph, self.G, self.gauge_type, self.device, geom_dtype,
-                ref_direction=self.ref_direction,
-            )  # [K, G, 3, 3]
-
             vec_t = torch.as_tensor(
                 _local_kernel_grid(self.kernel_sz, self.nside),
                 device=self.device, dtype=geom_dtype,
             )  # [P, 3]
-
-            rotated = torch.einsum("kgij,pj->kgpi", R_tot, vec_t)
-            flat    = rotated.reshape(-1, 3)   # [K*G*P, 3]
-
-            idx_flat, w_flat = _get_interp_weights(
-                self.nside, flat, self.nest, self.device, geom_dtype
-            )  # [4, K*G*P]
-
-            K_out = self.K_out
-            idx_all = (
-                idx_flat.view(4, K_out, self.G, self.P)
-                        .permute(2, 0, 1, 3)
-                        .reshape(self.G, 4, K_out * self.P)
-            )
-            w_all = (
-                w_flat.view(4, K_out, self.G, self.P)
-                      .permute(2, 0, 1, 3)
-                      .reshape(self.G, 4, K_out * self.P)
-            )
+            K_out, G, P = self.K_out, self.G, self.P
 
             # Stage B: binding
             ids_sorted   = np.sort(ids_np)
@@ -1065,21 +1056,53 @@ class HealPixConv(nn.Module):
                 inv_order, dtype=torch.long, device=self.device
             )
 
-            pos_all, w_all_norm, _support = _bind_support_batched(
-                idx_all.clone(), w_all.clone(),
-                ids_sorted_t, self.kernel_sz, K_out, self.P, self.device,
-                return_support=True,
-            )  # [G, 4, K*P] each, [G, K*P]
-            del idx_all, w_all, idx_flat, w_flat, rotated, flat, R_tot
-
-            # Tap-major layout [P, 4, G, K], positions in the input order:
-            # the sort permutation is folded into the indices once here, so
-            # the forward gathers the input as it comes, with no copy.
-            tap_idx, tap_w = tap_geometry(
-                pos_all.permute(1, 0, 2), w_all_norm.permute(1, 0, 2),
-                sort_order_t, self.G, K_out, self.P,
-            )
-            del pos_all, w_all_norm
+            # Stages A and B by chunks of output cells, written into the
+            # final tap-major buffers: the float64 temporaries of the build
+            # (rotations, rotated stencil, interpolation, binding) are
+            # bounded by the chunk, so the peak memory is the final geometry
+            # plus one chunk.  Every stencil point depends only on its own
+            # centre (the fallback of an empty point reads the centre tap of
+            # the same cell), so the chunking changes the result only by the
+            # rounding of the batched rotation matmul (dense stencil to 1e-13).
+            tap_idx = torch.empty(P, 4, G, K_out, dtype=torch.int32, device=self.device)
+            tap_w = torch.empty(P, 4, G, K_out, dtype=geom_dtype, device=self.device)
+            _support = torch.empty(G, K_out, P, dtype=geom_dtype, device=self.device)
+            chunk = max(1, _GEOMETRY_CHUNK_POINTS // (G * P))
+            for k0 in range(0, K_out, chunk):
+                k1 = min(K_out, k0 + chunk)
+                kc = k1 - k0
+                # Stage A: rotation matrices + stencil projection
+                R_tot = _build_rotation_matrices(
+                    th[k0:k1], ph[k0:k1], G, self.gauge_type, self.device, geom_dtype,
+                    ref_direction=self.ref_direction,
+                )  # [kc, G, 3, 3]
+                flat = torch.einsum("kgij,pj->kgpi", R_tot, vec_t).reshape(-1, 3)
+                del R_tot
+                idx_flat, w_flat = _get_interp_weights(
+                    self.nside, flat, self.nest, self.device, geom_dtype
+                )  # [4, kc*G*P]
+                del flat
+                idx_c = idx_flat.view(4, kc, G, P).permute(2, 0, 1, 3).reshape(G, 4, kc * P)
+                w_c = w_flat.view(4, kc, G, P).permute(2, 0, 1, 3).reshape(G, 4, kc * P)
+                del idx_flat, w_flat
+                # Stage B: binding (idx_c / w_c are fresh copies, modified in place)
+                pos_c, wn_c, sup_c = _bind_support_batched(
+                    idx_c, w_c, ids_sorted_t, self.kernel_sz, kc, P, self.device,
+                    return_support=True,
+                )  # [G, 4, kc*P] each, [G, kc*P]
+                del idx_c, w_c
+                # Tap-major layout [P, 4, G, K], positions in the input
+                # order: the sort permutation is folded into the indices once
+                # here, so the forward gathers the input as it comes.
+                ti, tw = tap_geometry(
+                    pos_c.permute(1, 0, 2), wn_c.permute(1, 0, 2),
+                    sort_order_t, G, kc, P,
+                )
+                tap_idx[..., k0:k1] = ti
+                tap_w[..., k0:k1] = tw
+                _support[:, k0:k1] = sup_c.view(G, kc, P)
+                del pos_c, wn_c, sup_c, ti, tw
+            _support = _support.view(G, K_out * P)
 
             # Persist to disk for the next run
             if _cache_dir_resolved is not None:
@@ -1164,6 +1187,14 @@ class HealPixConv(nn.Module):
         The input cells (``cell_ids`` in their order, or every cell) for
         ``stride=1``; the parent cells, sorted, for ``stride=2``.
         """
+        if self._cell_ids_out is None:
+            # not AttributeError: nn.Module.__getattr__ would hide the message
+            raise RuntimeError(
+                "this regional layer was pickled before #109 and does not hold "
+                "its cell ids (earlier versions kept only their sort "
+                "permutation). Rebuild it with the same arguments, or load its "
+                "state_dict into a new layer, to get cell_ids_out."
+            )
         return self._cell_ids_out
 
     # ------------------------------------------------------------------
@@ -1219,7 +1250,10 @@ class HealPixConv(nn.Module):
             idx, tw = tap_geometry(pos, w, bufs["_sort_order"], self.G, self.K, self.P)
             self.register_buffer("_tap_idx", idx, persistent=False)
             self.register_buffer("_tap_w", tw, persistent=False)
-        # a layer pickled whole before stride existed is a stride-1 layer
+        # a layer pickled whole before stride existed is a stride-1 layer.
+        # A regional one did not store its cell ids (only their sort
+        # permutation), so they cannot be rebuilt here: cell_ids_out then
+        # raises with an explanation; everything else works as before.
         if "K_out" not in self.__dict__:
             self.K_out = self.K
             self.level_out = self.level

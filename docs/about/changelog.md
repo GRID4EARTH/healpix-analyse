@@ -3,6 +3,21 @@
 ## Unreleased
 
 ### Changed
+- `HealPixConv` builds its stencil geometry in float64 for every layer
+  dtype and casts only the final weights (#109). **This changes the outputs
+  of existing float32 layers at a few degenerate points, mostly on regional
+  domains: float32 models trained on regional domains shift there.** A
+  float32 build let a stencil point whose bilinear neighbours lie outside the
+  domain keep a present neighbour with a rounding-size weight, which the
+  renormalisation raised to 1, so the choice depended on rounding (device,
+  float32 implementation, library version). Measured on float32 layers:
+  regional domain at level 6 (`"phi"` gauge), 5 of 226 cells change, by up to
+  43 % of max |y|; regional domain at level 7, 3 of 864 cells; full sphere at
+  level 6 with `"projected_ref"`, about 1e-4 on 2 cells. float64 layers are
+  unchanged. The build now runs by chunks of output cells, so its peak memory
+  is lower than before despite float64: 2.5 GB instead of 10.0 GB at level 8,
+  G = 4, kernel 3, full sphere (CPU, maximum resident set); float32 layers share the disk-cache entry of float64 layers,
+  and existing float32 entries are rebuilt once.
 - `HEALPixSHT.uv_to_curl_div` now returns the divergence and the relative
   vorticity, in s⁻¹ for u, v in m/s (#94): the spin-1 E/B coefficients are
   multiplied by −√(ℓ(ℓ+1))/R before the spin-0 synthesis, with the new
@@ -45,13 +60,6 @@
   `deterministic=True` (the default) computes the input gradient by a gather
   on the transposed stencil map instead of `index_add_`, so it gives the same
   bits at every run without `torch.use_deterministic_algorithms` (#109, 9).
-- `HealPixConv` builds its stencil geometry in float64 for every layer
-  dtype, and casts only the final weights (#109). A float32 build let a
-  stencil point near a cell or face boundary pick other bilinear neighbours
-  depending on the device: a float32 layer on a regional domain built on CUDA
-  and on CPU differed by about 20 % in its output. The build is one-off;
-  float32 layers now share the disk-cache entry of float64 layers, and
-  existing float32 cache entries are rebuilt once.
 - `benchmarks/benchmark_healpix_conv.py encoder`: an encoder block,
   `HealPixConv` + `HealPixDown` against `HealPixConv(stride=2)`, and the
   transposed convolution; `conv` variants `torch_det` and `penalty`

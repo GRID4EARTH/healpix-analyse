@@ -340,6 +340,12 @@ unchanged. Two other definitions were rejected:
 - a stencil centred on one of the 4 children would shift each output by half
   a fine cell, in a direction that changes from one base face to the next.
 
+`stride=2` needs `kernel_sz ≥ 3`: with `kernel_sz=1` the only stencil point
+is the parent centre, which lies on the ring of its East and West children, so
+its bilinear weights are about 0.5 / 0.5 on those two children and ignore the
+other two. That is not a mean of the 4 children, so the combination is
+rejected; `HealPixDown(mode="mean")` is the mean.
+
 `HealPixDown` has no mode that picks one value per parent, so the strided
 layer is not bit-identical to a convolution followed by a downsampling. On a
 smooth field it differs from the stride-1 layer followed by
@@ -428,7 +434,7 @@ HealPixConv(
 | `dtype` | `torch.dtype` | `torch.float32` | Floating-point precision for all buffers and parameters. `module.to(...)` moves and casts the layer afterwards. |
 | `backend` | `str` | `"auto"` | `"auto"`, `"triton"` or `"torch"`; see *Backends* below. |
 | `deterministic` | `bool` | `True` | On CUDA: input gradient by a gather on the transposed stencil map, without atomics, identical at every run (Triton kernels, and the PyTorch backend). `False`: fp32 atomics (Triton) or `index_add_` (PyTorch), no extra memory. |
-| `stride` | `int` | `1` | `2`: strided convolution, output on the parent cells (`cell_ids_out`); see *Strided and transposed convolutions*. Needs `level ≥ 1` and `missing="centre"`. |
+| `stride` | `int` | `1` | `2`: strided convolution, output on the parent cells (`cell_ids_out`); see *Strided and transposed convolutions*. Needs `level ≥ 1`, `kernel_sz ≥ 3` and `missing="centre"`. |
 | `missing` | `str` | `"centre"` | `"centre"`: today's behaviour (points outside the domain take the centre value; NaN propagates). `"local_mean"`: NaN and points outside the domain are completed by the renormalised interpolation of the valid neighbours, or the local mean of the valid stencil values. |
 | `local_mean_weights` | `array (P,)` or `None` | `None` | Non-negative weights of the stencil points in the local mean of `"local_mean"`; `None` = uniform. |
 

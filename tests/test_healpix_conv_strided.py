@@ -154,7 +154,7 @@ def test_strided_full_sphere_cells_and_down_order():
     np.testing.assert_array_equal(conv.cell_ids_out, down.cell_ids_out)
 
 
-@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("k", [3])
 def test_strided_converges_to_conv_then_down(k):
     """On a smooth field the strided layer and conv + HealPixDown(mean) agree
     at first order in the cell size (stencil at the parent centre vs the mean
@@ -186,6 +186,9 @@ def test_strided_arguments():
         HealPixConv(0, 1, 1, stride=2, device="cpu", cache_dir=None)
     with pytest.raises(ValueError, match="missing"):
         HealPixConv(2, 1, 1, stride=2, missing="local_mean", device="cpu", cache_dir=None)
+    with pytest.raises(ValueError, match="kernel_sz >= 3"):
+        HealPixConv(2, 1, 1, kernel_sz=1, stride=2, device="cpu", cache_dir=None)
+    HealPixConv(2, 1, 1, kernel_sz=1, device="cpu", cache_dir=None)      # stride 1: fine
     conv = HealPixConv(2, 1, 1, stride=2, device="cpu", cache_dir=None)
     assert "stride=2" in repr(conv)
     with pytest.raises(ValueError, match="pixels"):
@@ -485,3 +488,54 @@ def test_float32_geometry_is_the_same_on_cpu_and_cuda(stride, transpose):
     with torch.no_grad():
         ya, yb = a(x), b(x.cuda()).cpu()
     assert float((ya - yb).abs().max() / ya.abs().max()) < 1e-5
+
+
+def test_geometry_does_not_depend_on_the_chunk(monkeypatch):
+    """The build by chunks of output cells gives the same stencil to rounding.
+
+    The batched rotation matmul may round the last bit differently with
+    another batch size, which can swap two neighbours of equal weight between
+    slots: the dense stencil (cell -> weight of each stencil point) and the
+    output are compared, as between CPU and CUDA."""
+    import healpix_analyse.convol as hc
+
+    for stride in (1, 2):
+        ref = make(CASES["regional"], stride)
+        monkeypatch.setattr(hc, "_GEOMETRY_CHUNK_POINTS", 7 * ref.G * ref.P)   # 7 cells per chunk
+        got = make(CASES["regional"], stride)
+        monkeypatch.undo()
+        P, _, G, K = ref._tap_idx.shape
+
+        def dense(c):
+            D = torch.zeros(P, G, K, c.K, dtype=torch.float64)
+            D.scatter_add_(3, c._tap_idx.long().permute(0, 2, 3, 1), c._tap_w.permute(0, 2, 3, 1))
+            return D
+        torch.testing.assert_close(dense(got), dense(ref), rtol=0, atol=1e-12)
+        x = torch.randn(2, ref.in_channels, ref.K, dtype=torch.float64)
+        with torch.no_grad():
+            torch.testing.assert_close(got(x), ref(x), rtol=1e-12, atol=1e-12)
+
+
+def test_legacy_regional_pickle_cell_ids_out():
+    """A regional layer pickled before #109 has no cell ids: cell_ids_out explains it."""
+    import pickle
+
+    conv = HealPixConv(3, 1, 1, cell_ids=ragged_patch(3, 2), device="cpu", cache_dir=None)
+    state = conv.__getstate__()
+    for name in ("K_out", "level_out", "_cell_ids_out", "_cell_ids_in"):
+        state.pop(name, None)
+    old = HealPixConv.__new__(HealPixConv)
+    old.__setstate__(state)
+    old = pickle.loads(pickle.dumps(old))
+    assert old.K_out == old.K and old.level_out == old.level
+    x = torch.randn(1, 1, old.K)
+    assert torch.equal(old(x), conv(x))
+    with pytest.raises(RuntimeError, match="pickled before"):
+        old.cell_ids_out
+    full = HealPixConv(2, 1, 1, device="cpu", cache_dir=None)
+    state = full.__getstate__()
+    for name in ("K_out", "level_out", "_cell_ids_out", "_cell_ids_in"):
+        state.pop(name, None)
+    old = HealPixConv.__new__(HealPixConv)
+    old.__setstate__(state)
+    np.testing.assert_array_equal(old.cell_ids_out, np.arange(full.K))
