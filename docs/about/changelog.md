@@ -3,6 +3,21 @@
 ## Unreleased
 
 ### Changed
+- Stencil binding (`HealPixConv`, its strided and transposed forms,
+  `missing="local_mean"`, `HealPixNeighbourhoodAttention`, and the gauge mode
+  of `HealPixPatches`): a bilinear neighbour inside the domain counts only if
+  its weight is at least 1e-6 of the full 4-neighbour weight of its point
+  (#109). Smaller weights are rounding noise of the interpolation; before,
+  the renormalisation could raise such a weight to 1, so a point at a cell or
+  face boundary read a far cell. A point left with no neighbour falls back to
+  the centre, as when all its neighbours are outside the domain (for
+  `HealPixPatches`, it is 0, as before). **Outputs change only at such
+  degenerate points:** against the previous float64 geometry, 3 of 226 cells
+  on a ragged regional domain at level 6 (`"phi"`, kernel 3; up to 14 % of
+  max |y|), 1 of 864 cells on one at level 7 (3e-10), none on cone-shaped
+  regional domains at levels 6 and 7; on the full sphere, 48 to 64 cells
+  move by at most 2.6e-7 of max |y| (levels 6 and 7). `HealPixPatches` now
+  also builds its gauge grid in float64 for every dtype, as `HealPixConv`.
 - `HealPixConv` builds its stencil geometry in float64 for every layer
   dtype and casts only the final weights (#109). **This changes the outputs
   of existing float32 layers at a few degenerate points, mostly on regional

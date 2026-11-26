@@ -34,7 +34,11 @@ import torch
 import torch.nn as nn
 
 import healpix_geo
-from healpix_analyse.convol import _build_rotation_matrices, _get_interp_weights
+from healpix_analyse.convol import (
+    _build_rotation_matrices,
+    _get_interp_weights,
+    _significant,
+)
 from healpix_analyse.dino import xy_to_nested
 from healpix_analyse._patches_backend import (
     BACKENDS,
@@ -329,15 +333,22 @@ class HealPixPatches(nn.Module):
                 centre_ids, self.centre_level, ellipsoid="sphere")
             th = np.deg2rad(90.0 - np.asarray(lat, dtype=np.float64))
             ph = np.deg2rad(np.asarray(lon, dtype=np.float64))
-            R = _build_rotation_matrices(th, ph, self.G, gauge_type, "cpu", gdtype,
+            # built in float64 whatever the dtype, as HealPixConv: which cells a
+            # grid point reads must not depend on rounding
+            R = _build_rotation_matrices(th, ph, self.G, gauge_type, "cpu", torch.float64,
                                          ref_direction=self.ref_direction)   # [M, G, 3, 3]
-            vec = torch.as_tensor(_patch_grid(N, self.nside), dtype=gdtype)
+            vec = torch.as_tensor(_patch_grid(N, self.nside), dtype=torch.float64)
             rot = torch.einsum("mgij,pj->mgpi", R, vec).reshape(-1, 3)
             del R
-            i4, w4 = _get_interp_weights(self.nside, rot, True, "cpu", gdtype)   # [4, R]
+            i4, w4 = _get_interp_weights(self.nside, rot, True, "cpu", torch.float64)   # [4, R]
             del rot
             pos, present = _bind(i4.numpy(), ids_np, not self.partial)
-            w = w4.numpy() * present
+            w4 = w4.numpy()
+            # the rule of HealPixConv: a neighbour with less than 1e-6 of the
+            # full bilinear weight does not count
+            present = _significant(w4, present, 0)
+            pos = np.where(present, pos, 0)
+            w = w4 * present
             coverage = w.sum(0)
             w = np.where(coverage > 0, w / np.where(coverage > 0, coverage, 1.0), 0.0)
             if not self.partial:
