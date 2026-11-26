@@ -34,7 +34,9 @@
   the adjoint `fold` (normalised by the weights, the overlap count or not at
   all), masked token sampling (`index=`, one draw per sample), and fused
   Triton kernels on CUDA whose backward is a gather on the transposed map
-  (deterministic). Experimental.
+  (deterministic). Experimental. With `index`, the Triton fold (and the
+  backward of a masked extraction) visits only the cells that the selected
+  patches read, with the same result bit for bit.
 - `HealPixDown` / `HealPixUp(backend="auto" | "triton" | "torch" | "csr")`
   (#109, section 1). `"mean"` and `"maxpool"` Down on contiguous NESTED data
   (the full sphere, or sorted `cell_ids` whose parents are complete, detected

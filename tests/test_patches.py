@@ -404,6 +404,65 @@ def test_triton_fold_deterministic_all_layouts(C):
         torch.testing.assert_close(a, hr.fold(y, norm=norm), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("mode,centres,regional", [
+    ("gauge", "coarse", False), ("gauge", "all", False), ("nested", "coarse", True)])
+def test_footprint_marks_exactly_the_cells_read(mode, centres, regional):
+    """The mark of a selection covers every cell its patches read (so the
+    masked fold may skip the others), and with MARK_SHIFT = 0 nothing more."""
+    ids = _regional_ids(3)[:500] if regional else None
+    hp = HealPixPatches(3, 2, mode=mode, centres=centres, cell_ids=ids, n_gauges=2, **F64)
+    g = hp._geometry()
+    sel = torch.stack([torch.randperm(hp.M)[: hp.M // 4] for _ in range(2)]).int()
+    mark = pb.selection_mark(g, sel)[:, :-1].bool()
+    for b in range(2):
+        rows = (sel[b].long()[:, None] * g.G * g.P + torch.arange(g.G * g.P)).reshape(-1)
+        read = torch.zeros(g.K, dtype=torch.bool)
+        nz = (g.w[:, rows] != 0).reshape(-1)
+        read[g.idx[:, rows].long().reshape(-1)[nz]] = True
+        cells = read.view(-1)
+        blocks = torch.zeros_like(mark[b])
+        blocks[torch.nonzero(cells).view(-1) >> pb.MARK_SHIFT] = True
+        assert torch.equal(mark[b], blocks)
+
+
+@CUDA_TRITON
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("mode,centres", [("gauge", "coarse"), ("gauge", "all"),
+                                          ("nested", "coarse")])
+def test_masked_fold_skip_is_bitwise_identical(dtype, mode, centres):
+    """Skipping the cells no selected patch reads changes nothing, bit for bit:
+    the fold, its normalisation (through the backward) and the extraction
+    backward, for a shared and a per-sample selection."""
+    ids = _regional_ids(6)[:20000] if mode == "nested" else None
+    hp = HealPixPatches(6, 4, mode=mode, centres=centres, cell_ids=ids, n_gauges=2,
+                        device="cuda")
+    G = hp.G
+    shared = torch.randperm(hp.M, device="cuda")[: hp.M // 4]
+    per = torch.stack([torch.randperm(hp.M, device="cuda")[: hp.M // 2] for _ in range(2)])
+    x = torch.randn(2, 5, hp.K, device="cuda", dtype=dtype)
+    try:
+        for index in (shared, per):
+            y = torch.randn(2, index.shape[-1], G, 5, 4, 4, device="cuda", dtype=dtype)
+            out = {}
+            for skip in (False, True):
+                pb.MASKED_FOLD_SKIP = skip
+                folds = []
+                for norm in ("none", "weight", "count"):
+                    yy = y.clone().requires_grad_()
+                    f = hp.fold(yy, index=index, norm=norm)
+                    gy, = torch.autograd.grad(f, yy, torch.ones_like(f))
+                    folds += [f, gy]
+                xx = x.clone().requires_grad_()
+                gx, = torch.autograd.grad(hp(xx, index=index), xx,
+                                          torch.ones(2, index.shape[-1], G, 5, 4, 4,
+                                                     device="cuda", dtype=dtype))
+                out[skip] = folds + [gx]
+            for a, b in zip(out[False], out[True]):
+                assert torch.equal(a, b)
+    finally:
+        pb.MASKED_FOLD_SKIP = True
+
+
 @CUDA_TRITON
 def test_triton_double_backward():
     hp = HealPixPatches(5, 4, device="cuda")

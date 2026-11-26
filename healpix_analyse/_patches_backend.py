@@ -79,6 +79,17 @@ class PatchGeometry:
     _norms: dict = field(default_factory=dict, repr=False)
     _idx64: Optional[torch.Tensor] = field(default=None, repr=False)
     _wcast: dict = field(default_factory=dict, repr=False)
+    _footprint: Optional[torch.Tensor] = field(default=None, repr=False)
+
+    def footprint(self):
+        """``[M, F]`` int32: the blocks of ``2**MARK_SHIFT`` cells that the patch
+        of each centre reads (entries with a non-zero weight), padded with
+        the sentinel ``n_blocks``.  Built once, on the device of the geometry;
+        the masked fold uses it to skip the cells that no selected patch reads.
+        """
+        if self._footprint is None or self._footprint.device != self.idx.device:
+            self._footprint = build_footprint(self.idx, self.w, self.K, self.M)
+        return self._footprint
 
     def idx64(self):
         """int64 copy of ``idx`` for the PyTorch backend (``index_select`` and
@@ -130,6 +141,64 @@ class PatchGeometry:
                 n = n.to(device=self.w.device, dtype=self.w.dtype)
             self._norms[key] = n
         return self._norms[key]
+
+
+# Granularity of the masked fold: a cell is visited when a selected patch reads
+# a cell of its block of 2**MARK_SHIFT consecutive (NESTED) cells.  0 marks the
+# cells themselves, so the fold visits exactly the cells the selection reads.
+# Measured at 25 % / 50 % kept tokens (level 6 N 4, level 8 N 8 and 16): blocks
+# of 16 cells visited 37-96 % of the cells, against 27-63 % for single cells.
+# The footprint then costs at most a quarter of the memory of the geometry.
+MARK_SHIFT = 0
+
+
+def n_mark_blocks(K):
+    return (K + (1 << MARK_SHIFT) - 1) >> MARK_SHIFT
+
+
+def build_footprint(idx, w, K, M, chunk_entries=1 << 24):
+    """Per-centre list of the cell blocks its patch reads (see
+    :meth:`PatchGeometry.footprint`).  Processed in chunks of centres to
+    bound the temporary memory."""
+    J, R = idx.shape
+    GP = R // M
+    nblk = n_mark_blocks(K)
+    per = max(1, chunk_entries // max(1, J * GP))
+    parts, F = [], 1
+    for m0 in range(0, M, per):
+        m1 = min(M, m0 + per)
+        v = (idx[:, m0 * GP:m1 * GP].long() >> MARK_SHIFT)
+        v = torch.where(w[:, m0 * GP:m1 * GP] != 0, v, torch.full_like(v, nblk))
+        v = v.view(J, m1 - m0, GP).permute(1, 0, 2).reshape(m1 - m0, J * GP)
+        v = torch.sort(v, dim=1).values
+        first = torch.ones_like(v, dtype=torch.bool)
+        first[:, 1:] = v[:, 1:] != v[:, :-1]
+        first &= v != nblk
+        cnt = first.sum(1)
+        f = int(cnt.max()) if cnt.numel() else 0
+        F = max(F, f)
+        pos = torch.where(first, torch.cumsum(first, 1) - 1, torch.full_like(v, f))
+        out = torch.full((m1 - m0, f + 1), nblk, dtype=torch.int64, device=idx.device)
+        out.scatter_(1, pos, torch.where(first, v, torch.full_like(v, nblk)))
+        parts.append(out[:, :f])
+    fp = torch.full((M, F), nblk, dtype=torch.int32, device=idx.device)
+    m0 = 0
+    for part in parts:
+        fp[m0:m0 + part.shape[0], :part.shape[1]] = part.to(torch.int32)
+        m0 += part.shape[0]
+    return fp
+
+
+def selection_mark(geom, sel):
+    """``[Bs, n_blocks + 1]`` uint8: 1 for the cell blocks that a selected patch
+    of row b of ``sel`` reads.  Every block receives the same value, so the
+    scatter is deterministic."""
+    fp = geom.footprint()
+    nblk = n_mark_blocks(geom.K)
+    blocks = fp[sel.long()].reshape(sel.shape[0], -1).long()          # [Bs, Ms*F]
+    mark = torch.zeros(sel.shape[0], nblk + 1, dtype=torch.uint8, device=sel.device)
+    mark.scatter_(1, blocks, 1)
+    return mark
 
 
 def build_transposed_map(idx, w, K):
@@ -268,12 +337,12 @@ if _HAS_TRITON:
         for bs, nw in ((64, 4), (128, 4))
     ]
 
-    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "CL", "SIZE"])
+    @triton.autotune(configs=_FOLD_CONFIGS, key=["C", "P", "HAS_INV", "HAS_MARK", "CL", "SIZE"])
     @triton.jit
-    def _fold_kernel(y_ptr, inv_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr,
-                     C, K, NY, G, P, INV_SB, SIZE,
+    def _fold_kernel(y_ptr, inv_ptr, ptr_ptr, rows_ptr, tw_ptr, x_ptr, scale_ptr, mark_ptr,
+                     C, K, NY, G, P, INV_SB, MARK_SB, SIZE,
                      HAS_INV: tl.constexpr, NORM: tl.constexpr, WRITE_SCALE: tl.constexpr,
-                     CL: tl.constexpr,
+                     CL: tl.constexpr, HAS_MARK: tl.constexpr, MARK_SHIFT: tl.constexpr,
                      BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr):
         """x[b, c, s] = sum_e tw[e] y[b, i(e), g(e), c, p(e)] / norm[b, s], no atomics.
 
@@ -283,6 +352,12 @@ if _HAS_TRITON:
         entry is skipped).  ``NORM``: 0 none, 1 sum of the weights read, 2 their
         number; computed on the fly from the same entries (written to ``scale``
         with ``WRITE_SCALE``, for the backward pass).
+
+        ``HAS_MARK``: ``mark[b, s >> MARK_SHIFT]`` is 0 for the cells that no
+        selected patch reads; their entries are not visited (they would all be
+        skipped by ``inv``), and they get 0, as without the mark.  The cells
+        that are visited run the same loop in the same order, so the result
+        is bitwise the same with and without the mark.
         """
         pid_s = tl.program_id(0)
         b = tl.program_id(1).to(tl.int64)
@@ -291,8 +366,13 @@ if _HAS_TRITON:
         s_ok = s < K
         c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         c_ok = c < C
-        start = tl.load(ptr_ptr + s, mask=s_ok, other=0)
-        n = tl.load(ptr_ptr + s + 1, mask=s_ok, other=0) - start
+        if HAS_MARK:
+            mk = tl.load(mark_ptr + b * MARK_SB + (s >> MARK_SHIFT), mask=s_ok, other=0)
+            act = s_ok & (mk != 0)
+        else:
+            act = s_ok
+        start = tl.load(ptr_ptr + s, mask=act, other=0)
+        n = tl.load(ptr_ptr + s + 1, mask=act, other=0) - start
         n_max = tl.max(n, axis=0)
         y_base = y_ptr + b * NY * G * C * P
         acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
@@ -380,7 +460,7 @@ def _triton_extract(x, geom, sel):
     return y
 
 
-def _triton_fold(y, geom, inv=None, norm="none", want_scale=False):
+def _triton_fold(y, geom, inv=None, norm="none", want_scale=False, mark=None):
     """y [B, NY, G, C, P] -> (x [B, C, K], scale [B, K] or None).
 
     ``inv`` [Bs, M] int32: position of each centre in the selection (-1: not
@@ -397,6 +477,7 @@ def _triton_fold(y, geom, inv=None, norm="none", want_scale=False):
     if x.numel() == 0:
         return x, scale
     inv_sb = inv.stride(0) if (inv is not None and inv.shape[0] > 1) else 0
+    mark_sb = mark.stride(0) if (mark is not None and mark.shape[0] > 1) else 0
     cl = C >= FOLD_CL_MIN_C
     y = y.transpose(3, 4).contiguous() if cl else y.contiguous()
     BLOCK_C = _block_c(C)
@@ -407,10 +488,10 @@ def _triton_fold(y, geom, inv=None, norm="none", want_scale=False):
     with _device_ctx(y):
         _fold_kernel[grid](
             y, inv if inv is not None else ptr, ptr, rows, tw, x,
-            scale if scale is not None else tw,
-            C, K, NY, G, P, inv_sb, _size_class(K),
+            scale if scale is not None else tw, mark if mark is not None else ptr,
+            C, K, NY, G, P, inv_sb, mark_sb, _size_class(K),
             HAS_INV=inv is not None, NORM=mode, WRITE_SCALE=scale is not None, CL=cl,
-            BLOCK_C=BLOCK_C,
+            HAS_MARK=mark is not None, MARK_SHIFT=MARK_SHIFT, BLOCK_C=BLOCK_C,
         )
     return x, scale
 
@@ -463,16 +544,24 @@ def _extract(x, geom, sel, use_tri):
     return _torch_extract(x, geom, sel)
 
 
+# Masked fold (Triton): visit only the cell blocks that the selected patches
+# read, instead of every cell of the transposed map.  False restores the walk
+# over the whole map (same result, bit for bit; kept for tests and benchmarks).
+MASKED_FOLD_SKIP = True
+
+
 def _fold(y, geom, sel, norm, use_tri, want_scale):
     """Normalised fold; returns (x, scale) with scale [K] or [B, K] or None."""
     if use_tri:
         y = y.contiguous()
-        inv = None
+        inv = mark = None
         if sel is not None:
             inv = inverse_selection(sel, geom.M)
             if inv is None:
                 y = _expand_selected(y, sel, geom.M)
-        return _triton_fold(y, geom, inv=inv, norm=norm, want_scale=want_scale)
+            elif MASKED_FOLD_SKIP:
+                mark = selection_mark(geom, sel)
+        return _triton_fold(y, geom, inv=inv, norm=norm, want_scale=want_scale, mark=mark)
     scale = fold_scale(geom, norm, sel, y.shape[0], y.device, y.dtype)
     yy = _expand_selected(y, sel, geom.M) if sel is not None else y
     out = _torch_fold(yy, geom)

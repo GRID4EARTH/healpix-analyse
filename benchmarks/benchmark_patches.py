@@ -65,6 +65,16 @@ CONFIGS = {
         dict(name="L10 full N16 gauge B4 C3 keep 25%", level=10, N=16, B=4, C=3, keep=0.25),
         dict(name="L10 regional 262144 N8 coarse gauge B16 C16", level=10, N=8, B=16, C=16, m=9),
     ],
+    "gpu_masked": [  # MAE masking: the masked fold and the training step at 25 % / 50 % kept
+        dict(name="L10 full N16 gauge B4 C3 keep 25%", level=10, N=16, B=4, C=3, keep=0.25),
+        dict(name="L10 full N16 gauge B4 C3 keep 50%", level=10, N=16, B=4, C=3, keep=0.5),
+        dict(name="L8 full N4 gauge B8 C16 keep 25%", level=8, N=4, B=8, C=16, keep=0.25),
+        dict(name="L8 full N4 gauge B8 C16 keep 50%", level=8, N=4, B=8, C=16, keep=0.5),
+        dict(name="L10 full N16 nested B4 C3 keep 25%", level=10, N=16, B=4, C=3,
+             mode="nested", keep=0.25),
+        dict(name="L10 full N16 nested B4 C3 keep 50%", level=10, N=16, B=4, C=3,
+             mode="nested", keep=0.5),
+    ],
     "tiny": [
         dict(name="L3 full N2 coarse gauge B2 C2", level=3, N=2, B=2, C=2),
         dict(name="L4 regional 256 N4 nested keep 25%", level=4, N=4, B=2, C=2, m=4,
@@ -120,6 +130,9 @@ def cmd_run(args):
             else:
                 # the module defaults (set from the A100 measurements)
                 pb.GATHER_CL_MIN_C, pb.FOLD_CL_MIN_C = default_cl
+            # "noskip": the masked fold walks the whole transposed map
+            if hasattr(pb, "MASKED_FOLD_SKIP"):
+                pb.MASKED_FOLD_SKIP = opt != "noskip"
             rec = dict(config=cfg["name"], backend=variant, device=str(device),
                        dtype=args.dtype, torch=torch.__version__)
             try:

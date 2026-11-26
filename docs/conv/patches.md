@@ -165,10 +165,14 @@ fold is an extraction, and both are differentiable again
 
 With `index`, the Triton fold reads the selected patches through an inverse
 map (the position of each centre in the selection, or −1), so nothing is
-written for the patches left out; it still walks every entry of the
-transposed map, so its cost is close to that of a full fold. The PyTorch
-backend writes the selected patches into a zero tensor of all `M` patches,
-then folds it. A normalised fold needs distinct centres in each row of
+written for the patches left out. It visits only the cells that the selected
+patches read: at construction, each centre stores the list of cells its patch
+reads (its footprint), and each call marks the cells of the selected
+footprints. Its cost follows the number of selected patches, and the result
+is the same, bit for bit, as a walk over the whole transposed map. With
+overlapping patches (`centres="all"`) every cell is read by many patches, so
+there is little to skip. The PyTorch backend writes the selected patches into
+a zero tensor of all `M` patches, then folds it. A normalised fold needs distinct centres in each row of
 `index`.
 
 `benchmarks/benchmark_patches.py` measures the extraction, its backward and
