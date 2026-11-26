@@ -165,11 +165,33 @@ fold is an extraction, and both are differentiable again
 
 With `index`, the Triton fold reads the selected patches through an inverse
 map (the position of each centre in the selection, or −1), so nothing is
-written for the patches left out; it still walks every entry of the
-transposed map, so its cost is close to that of a full fold. The PyTorch
-backend writes the selected patches into a zero tensor of all `M` patches,
-then folds it. A normalised fold needs distinct centres in each row of
-`index`.
+written for the patches left out.
+
+When the patches have at least 64 pixels (`N ≥ 8`) and at most 37.5 % of the
+centres are selected, it visits only the cells that the selected patches
+read. Smaller patches spread the cells read over every tile of the kernel,
+and larger selections leave little to skip, so there the mark would only
+cost time (A100 measurements, `_patches_backend.MASKED_FOLD_SKIP`). It works
+in three steps:
+- at construction, each centre stores its footprint, the list of the blocks
+  of cells its patch reads (single cells for `N = 4`, blocks of 4 cells for
+  `N = 8`, of 16 cells for `N = 16`);
+- each call marks the blocks of the selected footprints;
+- the kernel skips the cells of the blocks left unmarked.
+
+The result is the same, bit for bit, as the fold of the patches expanded with
+zeros. With overlapping patches (`centres="all"`) every cell is read by many
+patches, so there is little to skip.
+
+The fold kernel is bound by the latency of its dependent loads (the row of
+each entry, then the inverse map, then the patch value), not by memory
+bandwidth. It therefore keeps four entries of each cell in flight at a time.
+The sums are still made one entry at a time, in the order of the map, so the
+result does not depend on this.
+
+The PyTorch backend writes the selected patches into a zero tensor of all `M`
+patches, then folds it. A normalised fold needs distinct centres in each row
+of `index`.
 
 `benchmarks/benchmark_patches.py` measures the extraction, its backward and
 the fold against a plain gather of the same size.
