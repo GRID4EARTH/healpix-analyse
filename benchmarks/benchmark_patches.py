@@ -106,17 +106,20 @@ def cmd_run(args):
     dtype = getattr(torch, args.dtype)
     if args.threads:
         torch.set_num_threads(args.threads)
+    import healpix_analyse._patches_backend as pb
+    default_cl = (pb.GATHER_CL_MIN_C, pb.FOLD_CL_MIN_C)
     for cfg in CONFIGS[args.configs]:
         if args.only and not any(s in cfg["name"] for s in args.only):
             continue
         ids = regional_ids(cfg["level"], cfg["m"]) if cfg.get("m") else None
         for variant in args.backends:
             backend, _, opt = variant.partition(":")
-            import healpix_analyse._patches_backend as pb
+
             if opt in ("cl0", "cl1"):
                 pb.GATHER_CL_MIN_C = pb.FOLD_CL_MIN_C = (1 << 30) if opt == "cl0" else 1
             else:
-                pb.GATHER_CL_MIN_C = pb.FOLD_CL_MIN_C = 8
+                # the module defaults (set from the A100 measurements)
+                pb.GATHER_CL_MIN_C, pb.FOLD_CL_MIN_C = default_cl
             rec = dict(config=cfg["name"], backend=variant, device=str(device),
                        dtype=args.dtype, torch=torch.__version__)
             try:
