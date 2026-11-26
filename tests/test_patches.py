@@ -404,16 +404,22 @@ def test_triton_fold_deterministic_all_layouts(C):
         torch.testing.assert_close(a, hr.fold(y, norm=norm), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("shift", [None, 0, 2])
 @pytest.mark.parametrize("mode,centres,regional", [
     ("gauge", "coarse", False), ("gauge", "all", False), ("nested", "coarse", True)])
-def test_footprint_marks_exactly_the_cells_read(mode, centres, regional):
-    """The mark of a selection covers every cell its patches read (so the
-    masked fold may skip the others), and with MARK_SHIFT = 0 nothing more."""
+def test_footprint_marks_exactly_the_blocks_read(mode, centres, regional, shift, monkeypatch):
+    """The mark of a selection is exactly the set of blocks of 2**shift cells
+    that its patches read: the masked fold may skip the others."""
+    monkeypatch.setattr(pb, "MARK_SHIFT", shift)
     ids = _regional_ids(3)[:500] if regional else None
     hp = HealPixPatches(3, 2, mode=mode, centres=centres, cell_ids=ids, n_gauges=2, **F64)
     g = hp._geometry()
     sel = torch.stack([torch.randperm(hp.M)[: hp.M // 4] for _ in range(2)]).int()
-    mark = pb.selection_mark(g, sel)[:, :-1].bool()
+    mark, used = pb.selection_mark(g, sel)
+    if shift is not None:
+        assert used == shift
+    assert g.footprint()[0].shape[1] <= pb.MARK_MAX_F or shift is not None
+    mark = mark[:, :-1].bool()
     for b in range(2):
         rows = (sel[b].long()[:, None] * g.G * g.P + torch.arange(g.G * g.P)).reshape(-1)
         read = torch.zeros(g.K, dtype=torch.bool)
@@ -421,7 +427,7 @@ def test_footprint_marks_exactly_the_cells_read(mode, centres, regional):
         read[g.idx[:, rows].long().reshape(-1)[nz]] = True
         cells = read.view(-1)
         blocks = torch.zeros_like(mark[b])
-        blocks[torch.nonzero(cells).view(-1) >> pb.MARK_SHIFT] = True
+        blocks[torch.nonzero(cells).view(-1) >> used] = True
         assert torch.equal(mark[b], blocks)
 
 
@@ -459,6 +465,12 @@ def test_masked_fold_skip_is_bitwise_identical(dtype, mode, centres):
                 out[skip] = folds + [gx]
             for a, b in zip(out[False], out[True]):
                 assert torch.equal(a, b)
+            # the masked fold equals the full fold of the patches expanded
+            # with zeros (the fold of #113), bit for bit
+            sel = index.view(1, -1) if index.dim() == 1 else index
+            full = pb._expand_selected(y, sel.int(), hp.M)
+            torch.testing.assert_close(hp.fold(y, index=index, norm="none"),
+                                       hp.fold(full, norm="none"), atol=0, rtol=0)
     finally:
         pb.MASKED_FOLD_SKIP = True
 

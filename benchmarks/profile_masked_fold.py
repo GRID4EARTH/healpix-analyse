@@ -51,26 +51,29 @@ def main():
             n = int(keep * hp.M)
             sel = torch.argsort(torch.rand(B, hp.M, device=dev), 1)[:, :n]
             y = torch.randn(B, n, hp.G, C, cfg["N"], cfg["N"], device=dev)
-            for shift in (None, 0, 2, 4):
-                if shift is None:
+            for shift in ("noskip", None, 0, 2, 4):
+                if shift == "noskip":
                     pb.MASKED_FOLD_SKIP = False
                     label = "noskip"
                 else:
                     pb.MASKED_FOLD_SKIP = True
                     pb.MARK_SHIFT = shift
                     geom._footprint = None
-                    label = f"shift {shift} (F = {geom.footprint().shape[1]})"
+                    fp, used = geom.footprint()
+                    label = f"shift {used}{' (auto)' if shift is None else ''} (F = {fp.shape[1]})"
                 rows = kernel_table(lambda: hp.fold(y, index=sel))
                 total = sum(r[0] for r in rows)
                 frac = ""
-                if shift is not None:
-                    mk = pb.selection_mark(geom, sel.int())
+                if shift != "noskip":
+                    mk, _ = pb.selection_mark(geom, sel.int())
                     frac = f", marked {float(mk[:, :-1].float().mean()):.2f}"
                 print(f"\n== L{cfg['level']} N{cfg['N']} B{B} C{C} keep {keep:.0%} {label}"
                       f": CUDA total {total:.3f} ms{frac}")
                 for t, k in rows[:8]:
                     print(f"   {t:8.3f} ms  {k}")
         pb.MASKED_FOLD_SKIP = True
+        pb.MARK_SHIFT = None
+        geom._footprint = None
         yf = torch.randn(B, hp.M, hp.G, C, cfg["N"], cfg["N"], device=dev)
         rows = kernel_table(lambda: hp.fold(yf))
         print(f"\n== L{cfg['level']} N{cfg['N']} full fold: CUDA total "
