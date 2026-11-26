@@ -347,7 +347,7 @@ if _HAS_TRITON:
         else:
             lo = tl.zeros(key.shape, dtype=tl.int64)
             hi = tl.zeros(key.shape, dtype=tl.int64) + n_rs
-            for _ in tl.static_range(LOG2):
+            for _ in range(LOG2):  # dynamic loop: no unrolling (compile time)
                 mid = (lo + hi) >> 1
                 v = tl.load(rs_ptr + tl.minimum(mid, n_rs - 1))
                 go = (v < key) & (mid < n_rs)
@@ -357,6 +357,78 @@ if _HAS_TRITON:
             present = tl.load(rs_ptr + p) == key
             pos = tl.load(rp_ptr + p)
         return pos, present
+
+    @triton.jit
+    def _tl_lookup(qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, snap, pos_off,
+                   MODE: tl.constexpr, LOG2: tl.constexpr):
+        """get_interpol (RING) at the points q, then the domain lookup.
+
+        Returns the 4 source positions, the 4 snapped bilinear weights and
+        the 4 presence flags.
+        """
+        rho = tl.sqrt(qx * qx + qy * qy)
+        rr = tl.sqrt(rho * rho + qz * qz)
+        z = tl.minimum(tl.maximum(qz / rr, -1.0), 1.0)
+        theta = _tl_atan2(rho, qz)
+        phi = _tl_atan2(qy, qx)
+        phi = tl.where(phi < 0, phi + 6.283185307179586, phi)
+        phi = tl.where(phi >= 6.283185307179586, phi - 6.283185307179586, phi)
+        az = tl.abs(z)
+        nsf = nside.to(z.dtype)
+        r_eq = tl.floor(nsf * (2.0 - 1.5 * z))
+        r_pol = tl.floor(nsf * tl.sqrt(tl.maximum(3.0 * (1.0 - az), 0.0)))
+        r_pol = tl.where(z > 0, r_pol, 4.0 * nsf - r_pol - 1.0)
+        ir1 = tl.where(az <= 2.0 / 3.0, r_eq, r_pol).to(tl.int64)
+        ir2 = ir1 + 1
+        ra = tl.minimum(tl.maximum(ir1, 1), 4 * nside - 1)
+        rb = tl.minimum(tl.maximum(ir2, 1), 4 * nside - 1)
+        sp1, nr1, sh1 = _tl_ring_int(ra, nside)
+        sp2, nr2, sh2 = _tl_ring_int(rb, nside)
+        th1 = tl.load(thr_ptr + ra)
+        th2 = tl.load(thr_ptr + rb)
+        p0, p1, w0, w1 = _tl_ring_row(phi, sp1, nr1, sh1)
+        p2, p3, w2, w3 = _tl_ring_row(phi, sp2, nr2, sh2)
+        north = ir1 == 0
+        south = (ir2 == 4 * nside) & (ir1 != 0)
+        wt_mid = (theta - th1) / (th2 - th1)
+        wt_n = theta / th2
+        fac_n = (1.0 - wt_n) * 0.25
+        wt_s = (theta - th1) / (3.141592653589793 - th1)
+        fac_s = wt_s * 0.25
+        g0 = tl.where(north, fac_n, tl.where(south, w0 * (1 - wt_s) + fac_s, w0 * (1 - wt_mid)))
+        g1 = tl.where(north, fac_n, tl.where(south, w1 * (1 - wt_s) + fac_s, w1 * (1 - wt_mid)))
+        g2 = tl.where(north, w2 * wt_n + fac_n, tl.where(south, fac_s, w2 * wt_mid))
+        g3 = tl.where(north, w3 * wt_n + fac_n, tl.where(south, fac_s, w3 * wt_mid))
+        k0 = tl.where(north, (p2 + 2) & 3, p0)
+        k1 = tl.where(north, (p3 + 2) & 3, p1)
+        k2 = tl.where(south, ((p0 + 2) & 3) + npix - 4, p2)
+        k3 = tl.where(south, ((p1 + 2) & 3) + npix - 4, p3)
+        g0 = tl.where(g0 < snap, 0.0, g0)
+        g1 = tl.where(g1 < snap, 0.0, g1)
+        g2 = tl.where(g2 < snap, 0.0, g2)
+        g3 = tl.where(g3 < snap, 0.0, g3)
+        q0, f0 = _tl_find(k0, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+        q1, f1 = _tl_find(k1, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+        q2, f2 = _tl_find(k2, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+        q3, f3 = _tl_find(k3, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
+        return (q0 + pos_off, q1 + pos_off, q2 + pos_off, q3 + pos_off,
+                g0, g1, g2, g3, f0, f1, f2, f3)
+
+    @triton.jit
+    def _tl_nearest(q0, q1, q2, q3, g0, g1, g2, g3, f0, f1, f2, f3, pos_off):
+        """Position (level-0 array) of the present neighbour of largest weight."""
+        ww0 = tl.where(f0, g0, -1.0)
+        ww1 = tl.where(f1, g1, -1.0)
+        ww2 = tl.where(f2, g2, -1.0)
+        ww3 = tl.where(f3, g3, -1.0)
+        best = ww0
+        nn = tl.where(ww0 >= 0, q0 - pos_off, -1)
+        nn = tl.where(ww1 > best, q1 - pos_off, nn)
+        best = tl.maximum(best, ww1)
+        nn = tl.where(ww2 > best, q2 - pos_off, nn)
+        best = tl.maximum(best, ww2)
+        nn = tl.where(ww3 > best, q3 - pos_off, nn)
+        return nn
 
     @triton.jit
     def _tl_scatter(ptrs, val, mask, FIXED: tl.constexpr):
@@ -460,15 +532,12 @@ if _HAS_TRITON:
         J: tl.constexpr = 4 * T
         out_b = b * J * N
         do_store = pid_c == 0
-        NT: tl.constexpr = T + 1 if T_NN == T else T
-        for t in tl.static_range(NT):
+        # Dynamic loop over the sampling taps (not unrolled: compile time and
+        # code size stay those of one tap whatever T is).
+        for t in range(T):
             if HAS_A:
-                if t < T:
-                    u = u0 + tl.load(off_ptr + 2 * t)
-                    v = v0 + tl.load(off_ptr + 2 * t + 1)
-                else:
-                    u = u0
-                    v = v0
+                u = u0 + tl.load(off_ptr + 2 * t)
+                v = v0 + tl.load(off_ptr + 2 * t + 1)
                 up = a00 * u + a01 * v
                 vp = a10 * u + a11 * v
                 qx = c0 + up * e10 + vp * e20
@@ -485,107 +554,70 @@ if _HAS_TRITON:
                 qx = px
                 qy = py
                 qz = pz
-            # --- get_interpol (RING) ---------------------------------------
-            rho = tl.sqrt(qx * qx + qy * qy)
-            rr = tl.sqrt(rho * rho + qz * qz)
-            z = tl.minimum(tl.maximum(qz / rr, -1.0), 1.0)
-            theta = _tl_atan2(rho, qz)
-            phi = _tl_atan2(qy, qx)
-            phi = tl.where(phi < 0, phi + 6.283185307179586, phi)
-            phi = tl.where(phi >= 6.283185307179586, phi - 6.283185307179586, phi)
-            az = tl.abs(z)
-            nsf = nside.to(z.dtype)
-            r_eq = tl.floor(nsf * (2.0 - 1.5 * z))
-            r_pol = tl.floor(nsf * tl.sqrt(tl.maximum(3.0 * (1.0 - az), 0.0)))
-            r_pol = tl.where(z > 0, r_pol, 4.0 * nsf - r_pol - 1.0)
-            ir1 = tl.where(az <= 2.0 / 3.0, r_eq, r_pol).to(tl.int64)
-            ir2 = ir1 + 1
-            ra = tl.minimum(tl.maximum(ir1, 1), 4 * nside - 1)
-            rb = tl.minimum(tl.maximum(ir2, 1), 4 * nside - 1)
-            sp1, nr1, sh1 = _tl_ring_int(ra, nside)
-            sp2, nr2, sh2 = _tl_ring_int(rb, nside)
-            th1 = tl.load(thr_ptr + ra)
-            th2 = tl.load(thr_ptr + rb)
-            p0, p1, w0, w1 = _tl_ring_row(phi, sp1, nr1, sh1)
-            p2, p3, w2, w3 = _tl_ring_row(phi, sp2, nr2, sh2)
-            north = ir1 == 0
-            south = (ir2 == 4 * nside) & (ir1 != 0)
-            wt_mid = (theta - th1) / (th2 - th1)
-            wt_n = theta / th2
-            fac_n = (1.0 - wt_n) * 0.25
-            wt_s = (theta - th1) / (3.141592653589793 - th1)
-            fac_s = wt_s * 0.25
-            g0 = tl.where(north, fac_n, tl.where(south, w0 * (1 - wt_s) + fac_s, w0 * (1 - wt_mid)))
-            g1 = tl.where(north, fac_n, tl.where(south, w1 * (1 - wt_s) + fac_s, w1 * (1 - wt_mid)))
-            g2 = tl.where(north, w2 * wt_n + fac_n, tl.where(south, fac_s, w2 * wt_mid))
-            g3 = tl.where(north, w3 * wt_n + fac_n, tl.where(south, fac_s, w3 * wt_mid))
-            k0 = tl.where(north, (p2 + 2) & 3, p0)
-            k1 = tl.where(north, (p3 + 2) & 3, p1)
-            k2 = tl.where(south, ((p0 + 2) & 3) + npix - 4, p2)
-            k3 = tl.where(south, ((p1 + 2) & 3) + npix - 4, p3)
-            g0 = tl.where(g0 < snap, 0.0, g0)
-            g1 = tl.where(g1 < snap, 0.0, g1)
-            g2 = tl.where(g2 < snap, 0.0, g2)
-            g3 = tl.where(g3 < snap, 0.0, g3)
-            # --- domain lookup ---------------------------------------------
-            q0, f0 = _tl_find(k0, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-            q1, f1 = _tl_find(k1, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-            q2, f2 = _tl_find(k2, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-            q3, f3 = _tl_find(k3, rs_ptr, rp_ptr, n_rs, MODE, LOG2)
-            q0 = q0 + pos_off
-            q1 = q1 + pos_off
-            q2 = q2 + pos_off
-            q3 = q3 + pos_off
-            if t < T:
-                h0 = tl.where(f0, g0, 0.0)
-                h1 = tl.where(f1, g1, 0.0)
-                h2 = tl.where(f2, g2, 0.0)
-                h3 = tl.where(f3, g3, 0.0)
-                s_in += h0 + h1 + h2 + h3
-                tot += g0 + g1 + g2 + g3
-                if GATHER:
-                    # raw (unnormalised) weights; one scale per cell at the end
-                    v = tl.load(src_b + q0[None, :], mask=mc[:, None] & (m & (h0 > 0))[None, :], other=0.0)
-                    acc += h0.to(tl.float32)[None, :] * v.to(tl.float32)
-                    v = tl.load(src_b + q1[None, :], mask=mc[:, None] & (m & (h1 > 0))[None, :], other=0.0)
-                    acc += h1.to(tl.float32)[None, :] * v.to(tl.float32)
-                    v = tl.load(src_b + q2[None, :], mask=mc[:, None] & (m & (h2 > 0))[None, :], other=0.0)
-                    acc += h2.to(tl.float32)[None, :] * v.to(tl.float32)
-                    v = tl.load(src_b + q3[None, :], mask=mc[:, None] & (m & (h3 > 0))[None, :], other=0.0)
-                    acc += h3.to(tl.float32)[None, :] * v.to(tl.float32)
-                if SCATTER:
-                    ma = mc[:, None] & (m & (h0 > 0))[None, :]
-                    _tl_scatter(gs_b + q0[None, :], h0[None, :] * coef, ma, FIXED)
-                    ma = mc[:, None] & (m & (h1 > 0))[None, :]
-                    _tl_scatter(gs_b + q1[None, :], h1[None, :] * coef, ma, FIXED)
-                    ma = mc[:, None] & (m & (h2 > 0))[None, :]
-                    _tl_scatter(gs_b + q2[None, :], h2[None, :] * coef, ma, FIXED)
-                    ma = mc[:, None] & (m & (h3 > 0))[None, :]
-                    _tl_scatter(gs_b + q3[None, :], h3[None, :] * coef, ma, FIXED)
-                if STORE_MAP:
-                    sm = m & do_store
-                    base = out_b + (4 * t) * N + o64
-                    tl.store(idx_ptr + base, tl.where(h0 > 0, q0, -1).to(tl.int32), mask=sm)
-                    tl.store(idx_ptr + base + N, tl.where(h1 > 0, q1, -1).to(tl.int32), mask=sm)
-                    tl.store(idx_ptr + base + 2 * N, tl.where(h2 > 0, q2, -1).to(tl.int32), mask=sm)
-                    tl.store(idx_ptr + base + 3 * N, tl.where(h3 > 0, q3, -1).to(tl.int32), mask=sm)
-                    tl.store(w_ptr + base, h0, mask=sm)
-                    tl.store(w_ptr + base + N, h1, mask=sm)
-                    tl.store(w_ptr + base + 2 * N, h2, mask=sm)
-                    tl.store(w_ptr + base + 3 * N, h3, mask=sm)
+            q0, q1, q2, q3, g0, g1, g2, g3, f0, f1, f2, f3 = _tl_lookup(
+                qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, snap, pos_off, MODE, LOG2)
+            h0 = tl.where(f0, g0, 0.0)
+            h1 = tl.where(f1, g1, 0.0)
+            h2 = tl.where(f2, g2, 0.0)
+            h3 = tl.where(f3, g3, 0.0)
+            s_in += h0 + h1 + h2 + h3
+            tot += g0 + g1 + g2 + g3
+            if GATHER:
+                # raw (unnormalised) weights; one scale per cell at the end
+                val = tl.load(src_b + q0[None, :], mask=mc[:, None] & (m & (h0 > 0))[None, :], other=0.0)
+                acc += h0.to(tl.float32)[None, :] * val.to(tl.float32)
+                val = tl.load(src_b + q1[None, :], mask=mc[:, None] & (m & (h1 > 0))[None, :], other=0.0)
+                acc += h1.to(tl.float32)[None, :] * val.to(tl.float32)
+                val = tl.load(src_b + q2[None, :], mask=mc[:, None] & (m & (h2 > 0))[None, :], other=0.0)
+                acc += h2.to(tl.float32)[None, :] * val.to(tl.float32)
+                val = tl.load(src_b + q3[None, :], mask=mc[:, None] & (m & (h3 > 0))[None, :], other=0.0)
+                acc += h3.to(tl.float32)[None, :] * val.to(tl.float32)
+            if SCATTER:
+                ma = mc[:, None] & (m & (h0 > 0))[None, :]
+                _tl_scatter(gs_b + q0[None, :], h0[None, :] * coef, ma, FIXED)
+                ma = mc[:, None] & (m & (h1 > 0))[None, :]
+                _tl_scatter(gs_b + q1[None, :], h1[None, :] * coef, ma, FIXED)
+                ma = mc[:, None] & (m & (h2 > 0))[None, :]
+                _tl_scatter(gs_b + q2[None, :], h2[None, :] * coef, ma, FIXED)
+                ma = mc[:, None] & (m & (h3 > 0))[None, :]
+                _tl_scatter(gs_b + q3[None, :], h3[None, :] * coef, ma, FIXED)
+            if STORE_MAP:
+                sm = m & do_store
+                base = out_b + (4 * t) * N + o64
+                tl.store(idx_ptr + base, tl.where(h0 > 0, q0, -1).to(tl.int32), mask=sm)
+                tl.store(idx_ptr + base + N, tl.where(h1 > 0, q1, -1).to(tl.int32), mask=sm)
+                tl.store(idx_ptr + base + 2 * N, tl.where(h2 > 0, q2, -1).to(tl.int32), mask=sm)
+                tl.store(idx_ptr + base + 3 * N, tl.where(h3 > 0, q3, -1).to(tl.int32), mask=sm)
+                tl.store(w_ptr + base, h0, mask=sm)
+                tl.store(w_ptr + base + N, h1, mask=sm)
+                tl.store(w_ptr + base + 2 * N, h2, mask=sm)
+                tl.store(w_ptr + base + 3 * N, h3, mask=sm)
             if STORE_NN:
-                if t == T_NN:
-                    ww0 = tl.where(f0, g0, -1.0)
-                    ww1 = tl.where(f1, g1, -1.0)
-                    ww2 = tl.where(f2, g2, -1.0)
-                    ww3 = tl.where(f3, g3, -1.0)
-                    best = ww0
-                    nn_pos = tl.where(ww0 >= 0, q0 - pos_off, -1)
-                    nn_pos = tl.where(ww1 > best, q1 - pos_off, nn_pos)
-                    best = tl.maximum(best, ww1)
-                    nn_pos = tl.where(ww2 > best, q2 - pos_off, nn_pos)
-                    best = tl.maximum(best, ww2)
-                    nn_pos = tl.where(ww3 > best, q3 - pos_off, nn_pos)
+                if T_NN < T:
+                    cand = _tl_nearest(q0, q1, q2, q3, g0, g1, g2, g3, f0, f1, f2, f3, pos_off)
+                    nn_pos = tl.where(t == T_NN, cand, nn_pos)
+        if STORE_NN:
+            if T_NN == T:  # even n x n supersampling: no centre tap, look the centre up
+                if HAS_A:
+                    up = a00 * u0 + a01 * v0
+                    vp = a10 * u0 + a11 * v0
+                    qx = c0 + up * e10 + vp * e20
+                    qy = c1 + up * e11 + vp * e21
+                    qz = c2 + up * e12 + vp * e22
+                else:
+                    qx = x0
+                    qy = y0
+                    qz = z0
+                if HAS_R:
+                    px = r00 * qx + r01 * qy + r02 * qz
+                    py = r10 * qx + r11 * qy + r12 * qz
+                    pz = r20 * qx + r21 * qy + r22 * qz
+                    qx = px
+                    qy = py
+                    qz = pz
+                q0, q1, q2, q3, g0, g1, g2, g3, f0, f1, f2, f3 = _tl_lookup(
+                    qx, qy, qz, nside, npix, thr_ptr, rs_ptr, rp_ptr, n_rs, snap, pos_off, MODE, LOG2)
+                nn_pos = _tl_nearest(q0, q1, q2, q3, g0, g1, g2, g3, f0, f1, f2, f3, pos_off)
         ok = (s_in >= min_support * tot - 1e-12) & (s_in > 0)
         scale = tl.where(ok, 1.0 / tl.where(ok, s_in, 1.0), 0.0)
         if GATHER:
@@ -818,13 +850,13 @@ if _HAS_TRITON:
         src_b = src_ptr + b * C * NS + offs_c.to(tl.int64)[:, None] * NS
         acc = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
         wsum = tl.zeros((BLOCK_N,), dtype=tl.float32)
-        for j in tl.static_range(J):
+        for j in range(J):
             base = (b * J + j) * N
             ij = tl.load(idx_ptr + base + offs_n, mask=mn, other=-1)
             wj = tl.load(w_ptr + base + offs_n, mask=mn, other=0.0).to(tl.float32)
             ok = (ij >= 0) & (wj != 0.0)
             v = tl.load(src_b + ij.to(tl.int64)[None, :], mask=mc[:, None] & ok[None, :], other=0.0)
-            acc += wj[None, :] * v.to(tl.float32)
+            acc += wj[None, :] * val.to(tl.float32)
             wsum += tl.abs(wj)
         res = tl.where((wsum > 0.0)[None, :], acc, fill)
         out_b = out_ptr + b * C * N + offs_c.to(tl.int64)[:, None] * N + offs_n[None, :]
@@ -849,7 +881,7 @@ if _HAS_TRITON:
             mask=mc[:, None] & mn[None, :], other=0.0,
         ).to(tl.float32)
         gs_b = gsrc_ptr + b * C * NS + offs_c.to(tl.int64)[:, None] * NS
-        for j in tl.static_range(J):
+        for j in range(J):
             base = (b * J + j) * N
             ij = tl.load(idx_ptr + base + offs_n, mask=mn, other=-1)
             wj = tl.load(w_ptr + base + offs_n, mask=mn, other=0.0).to(tl.float32)

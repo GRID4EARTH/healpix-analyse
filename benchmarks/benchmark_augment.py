@@ -11,16 +11,16 @@ then a Markdown table::
 
 Timed stages (median of ``--reps`` runs after one warm-up)
 ----------------------------------------------------------
-plan       ``aug.sample(B, generator)``: the per-sample draw (the geometry is
-           computed lazily, at the first apply).
+plan       ``aug.sample(B, generator)`` alone ("draw ms"): the per-sample
+           draw (the geometry is computed lazily, at the first apply).
 total      ``aug.sample(B, generator).apply(x)`` without gradient: one
-           augmented batch, geometry included, the number behind samples/s.
-apply      total - plan.
+           augmented batch, draw and geometry included ("batch ms" in the
+           table), the number behind samples/s.
 fwd_bwd    a fresh draw, apply and the backward pass with respect to the data.
 geometry   (Triton) the fused kernel without the gather: the cost of
            computing the bilinear weights alone.
 fwd GB/s   (Triton) minimal traffic of the fused forward (read the input
-           once, write the output and the per-cell scale) / apply time, and
+           once, write the output and the per-cell scale) / batch time, and
            its fraction of the GPU's peak DRAM bandwidth.
 
 The ``naive`` pipeline is the per-sample way of earlier libraries, for
@@ -191,7 +191,7 @@ def run(args):
                     row["geom_s"] = _time(lambda: fused_augment_triton(grp.geo(), None), dev, args.reps)
                     es = x.element_size()
                     nbytes = B * Ce * ncell * es * 2 + B * ncell * 8
-                    row["fwd_GBps"] = nbytes / t_apply / 1e9
+                    row["fwd_GBps"] = nbytes / t_total / 1e9
                     row["peak_GBps"] = _peak_bw(dev)
                     if t_fb is not None:
                         row["bwd_s"] = t_fb - t_total
@@ -223,7 +223,7 @@ def table(paths):
     def ms(v):
         return "—" if v is None else f"{1e3 * v:.1f}"
 
-    print("| device | dtype | pipeline | B x cells | backend | C | taps | plan ms | apply ms | geometry ms "
+    print("| device | dtype | pipeline | B x cells | backend | C | taps | draw ms | batch ms | geometry ms "
           "| fwd+bwd ms | samples/s | fwd GB/s (% peak) |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
@@ -233,7 +233,7 @@ def table(paths):
             bw = f"{r['fwd_GBps']:.0f}" + (f" ({100 * r['fwd_GBps'] / pk:.0f} %)" if pk else "")
         print(f"| {r['device']} | {r.get('dtype', '')} | {r['pipeline']} | {r['B']} x {r['cells']} | "
               f"{r['backend']} | {r['C']} | "
-              f"{r.get('taps', '—')} | {ms(r.get('plan_s'))} | {ms(r.get('apply_s'))} | "
+              f"{r.get('taps', '—')} | {ms(r.get('plan_s'))} | {ms(r.get('total_s'))} | "
               f"{ms(r.get('geom_s'))} | {ms(r.get('fwd_bwd_s'))} | {r['samples_per_s']:.0f} | {bw} |")
 
 
