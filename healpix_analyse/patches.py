@@ -12,8 +12,8 @@ token-based models, and its adjoint ``fold``.
 ``mode="gauge"`` (default)
     An ``N x N`` grid in the local tangent plane of each centre, oriented by
     the gauge exactly like a :class:`~healpix_analyse.convol.HealPixConv`
-    kernel (same rotation matrices, same bilinear interpolation) with the
-    spacing of one cell of level ``L``.  A shared patch embedding then sees
+    kernel built with ``ellipsoid="sphere"`` (same rotation matrices, same
+    bilinear interpolation) with the spacing of one cell of level ``L``.  A shared patch embedding then sees
     the same orientation everywhere on the sphere.
 ``mode="nested"``
     The ``4**p`` descendants of each level ``L - p`` cell, as a
@@ -167,14 +167,19 @@ class HealPixPatches(nn.Module):
     mode : {"gauge", "nested"}, default "gauge"
         ``"gauge"``: an ``N x N`` grid in the tangent plane of each centre,
         rotated by the gauge and sampled by bilinear interpolation, exactly
-        like a :class:`~healpix_analyse.convol.HealPixConv` kernel, with the
+        like a :class:`~healpix_analyse.convol.HealPixConv` kernel with
+        ``ellipsoid="sphere"`` (with WGS84, ``HealPixConv`` places its stencil
+        at geodetic latitudes, shifted from the cell centres), with the
         spacing of one cell of level ``L``.  ``"nested"``: the ``4**p``
         descendants of each centre as a ``2**p x 2**p`` image (row ``N-1-y``,
         column ``x`` in the face coordinates of HEALPix, the layout of
         :func:`~healpix_analyse.dino.nested_to_tiles`).
     n_gauges : int, default 1
         Number of gauge orientations G (``mode="gauge"``); gauge ``g`` rotates
-        the grid by ``g * pi / G``.  ``mode="nested"`` has ``G = 1``.
+        the grid by ``g * pi / G``: with ``G = 4``, gauge ``g + 2`` is
+        ``torch.rot90(patch_g, 1, (-2, -1))``.  With ``gauge_type="cosmo"`` the
+        rotation changes sign at southern centres (``k=3`` instead of 1).
+        ``mode="nested"`` has ``G = 1``.
     gauge_type : {"phi", "cosmo", "projected_ref", "two_ref"}, default "phi"
         Gauge convention, as in :class:`~healpix_analyse.convol.HealPixConv`.
     singularity_lonlat, ref_direction

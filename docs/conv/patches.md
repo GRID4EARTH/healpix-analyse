@@ -56,7 +56,13 @@ Two modes give the pixels of a patch:
   offsets are `i − (N − 1)/2`, so an even `N` is centred on the centre of the
   cell. A shared patch embedding sees the same orientation everywhere on the
   sphere, and with `G = 4` gauge `g + 2` is gauge `g` rotated by 90° (a
-  `torch.rot90` of the patch).
+  `torch.rot90` of the patch, `k=1`). With `gauge_type="cosmo"` the gauge
+  angle changes sign across the equator, so at southern centres the rotation
+  goes the other way: gauge `g + 2` is `torch.rot90(..., k=3)` of gauge `g`.
+  The grid matches the stencil of `HealPixConv(ellipsoid="sphere")`; with
+  the default `ellipsoid="WGS84"`, `HealPixConv` places its stencil at
+  geodetic latitudes, shifted from the cell centres of the grid, while
+  `HealPixPatches` always uses the sphere of the grid.
 
 `mode="nested"`
 : The `4**p` descendants of each coarse cell, as a `2**p × 2**p` image: row
@@ -157,8 +163,13 @@ fold is an extraction, and both are differentiable again
 `index_add_`; on CUDA, `index_add_` is deterministic only under
 `torch.use_deterministic_algorithms(True)`.
 
-With `index`, the fold first writes the selected patches into a zero tensor
-of all `M` patches, then gathers: its cost is that of a full fold.
+With `index`, the Triton fold reads the selected patches through an inverse
+map (the position of each centre in the selection, or −1), so nothing is
+written for the patches left out; it still walks every entry of the
+transposed map, so its cost is close to that of a full fold. The PyTorch
+backend writes the selected patches into a zero tensor of all `M` patches,
+then folds it. A normalised fold needs distinct centres in each row of
+`index`.
 
 `benchmarks/benchmark_patches.py` measures the extraction, its backward and
 the fold against a plain gather of the same size.

@@ -213,6 +213,17 @@ def test_gauge_shift_with_projected_ref():
     torch.testing.assert_close(y[:, 1], torch.rot90(y[:, 0], 1, (-2, -1)), atol=1e-10, rtol=0)
 
 
+def test_cosmo_gauge_rotates_the_other_way_in_the_south():
+    hp = HealPixPatches(4, 4, centres="all", n_gauges=4, gauge_type="cosmo", **F64)
+    y = hp(torch.randn(1, 1, hp.K, dtype=torch.float64))[0, :, :, 0]
+    _, lat = _lonlat(hp.centre_ids.numpy(), 4)
+    north, south = torch.as_tensor(lat > 0), torch.as_tensor(lat < 0)
+    torch.testing.assert_close(y[north, 2], torch.rot90(y[north, 0], 1, (-2, -1)),
+                               atol=1e-10, rtol=0)
+    torch.testing.assert_close(y[south, 2], torch.rot90(y[south, 0], 3, (-2, -1)),
+                               atol=1e-10, rtol=0)
+
+
 def test_nested_and_gauge_agree_on_coarse_centres():
     """Same centres, same area: equal patch means for a smooth field; in the
     equatorial belt the NESTED tile is the gauge patch at 45 degrees (G = 4,
@@ -355,6 +366,42 @@ def test_triton_backward_is_deterministic():
     g1, = torch.autograd.grad(hp(x), x, gy)
     g2, = torch.autograd.grad(hp(x), x, gy)
     assert torch.equal(g1, g2)
+
+
+@CUDA_TRITON
+@pytest.mark.parametrize("C", [3, 16])
+def test_nested_fast_path_cuda_deterministic(C):
+    """Full-sphere NESTED fast path on CUDA: extraction, backward and fold are
+    permutations (gathers), so two runs give the same bits and fold inverts
+    the extraction exactly."""
+    hp = HealPixPatches(7, 8, mode="nested", device="cuda")
+    assert hp.contiguous
+    x = torch.randn(2, C, hp.K, device="cuda", requires_grad=True)
+    gy = torch.randn(2, hp.M, 1, C, 8, 8, device="cuda")
+    y1 = hp(x)
+    g1, = torch.autograd.grad(y1, x, gy)
+    y2 = hp(x)
+    g2, = torch.autograd.grad(y2, x, gy)
+    assert torch.equal(y1, y2) and torch.equal(g1, g2)
+    assert torch.equal(hp.fold(y1.detach()), x.detach())
+    assert torch.equal(g1, hp.fold(gy))
+    hr = HealPixPatches(7, 8, mode="nested", device="cuda", backend="torch")
+    torch.testing.assert_close(g1, hr.fold(gy, index=torch.arange(hp.M, device="cuda"),
+                                           norm="none"), atol=0, rtol=0)
+
+
+@CUDA_TRITON
+@pytest.mark.parametrize("C", [1, 3, 5, 16])
+def test_triton_fold_deterministic_all_layouts(C):
+    """The fold reads a channels-last copy for every C: two runs agree bitwise
+    and match the PyTorch fold."""
+    hp = HealPixPatches(6, 4, centres="all", n_gauges=2, device="cuda")
+    hr = HealPixPatches(6, 4, centres="all", n_gauges=2, device="cuda", backend="torch")
+    y = torch.randn(2, hp.M, 2, C, 4, 4, device="cuda")
+    for norm in ("none", "weight", "count"):
+        a, b = hp.fold(y, norm=norm), hp.fold(y, norm=norm)
+        assert torch.equal(a, b)
+        torch.testing.assert_close(a, hr.fold(y, norm=norm), atol=1e-5, rtol=1e-5)
 
 
 @CUDA_TRITON
