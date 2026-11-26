@@ -131,42 +131,79 @@ def _block_plan(ids, wl):
     return blocks, q_index, q_inv
 
 
+def _window_radius(blocks, level, wl, halo, ellipsoid, chunk_cells=1 << 22):
+    """Centres ``[nB, 3]`` and angular radii ``[nB]`` of the windows of ``shift="coarse_centred"``.
+
+    The radius of block ``c`` is ``(1 + halo) * r_c``, with ``r_c`` the
+    distance from the centre of ``c`` (its cell of level ``level - wl``) to
+    the farthest centre of its ``4**wl`` cells, plus one cell spacing of
+    ``level``.  The extra spacing makes ``r_c`` reach past the corners of the
+    block, so every window holds cells of the neighbouring blocks even with
+    ``halo = 0`` and ``wl = 1``.
+    """
+    T = 4 ** wl
+    centres = _unit_vectors(blocks, level - wl, ellipsoid)
+    r_far = np.empty(blocks.size)
+    per = max(1, chunk_cells // T)
+    for a in range(0, blocks.size, per):
+        b = blocks[a:a + per]
+        vec = _unit_vectors((b[:, None] * T + np.arange(T)).ravel(), level,
+                            ellipsoid).reshape(b.size, T, 3)
+        cosang = np.einsum("mkd,md->mk", vec, centres[a:a + per])
+        r_far[a:a + per] = np.arccos(np.clip(cosang, -1.0, 1.0)).max(axis=1)
+    spacing = math.sqrt(4.0 * math.pi / (12 * 4 ** level))
+    return centres, (1.0 + halo) * (r_far + spacing)
+
+
+def _two_ring(blocks, lc):
+    """The block, its neighbours and their neighbours at level ``lc``: ``[nB, W]`` (-1 = none)."""
+    nb1 = nested_neighbours(blocks, lc)                                  # [nB, 8]
+    flat = nb1.ravel()
+    nb2 = np.full((flat.size, 8), -1, dtype=np.int64)
+    ok = flat >= 0
+    if ok.any():
+        nb2[ok] = nested_neighbours(flat[ok], lc)
+    cand = np.concatenate([blocks[:, None], nb1, nb2.reshape(blocks.size, 64)], axis=1)
+    cand.sort(axis=1)
+    cand[:, 1:][cand[:, 1:] == cand[:, :-1]] = -1                         # duplicates
+    cand = -np.sort(-cand, axis=1)                                       # valid ids first
+    width = int((cand >= 0).sum(axis=1).max())
+    return cand[:, :width]
+
+
 def _centred_keys(ids, level, wl, blocks, halo, ellipsoid, chunk_cells=1 << 22):
     """Keys of the windows centred on the level-(L-wl) cells ``blocks``.
 
-    The window of block ``c`` holds the domain cells whose angular distance
-    to the centre of ``c`` is at most ``(1 + halo) * r_c``, with ``r_c`` the
-    largest distance from that centre to a cell of the complete block ``c``.
-    The candidates are the cells of ``c`` and of its (up to 8) neighbours at
-    the coarse level.  Returns positions ``[nB, Tk]`` (padding = N).
+    The window of block ``c`` holds the domain cells within the radius of
+    :func:`_window_radius` from the centre of ``c``.  The candidates are the
+    cells of ``c``, of its neighbours and of their neighbours at the coarse
+    level (a 2-ring: the radius reaches past the first ring near the corners
+    of the base cells, where a block has only 7 neighbours).  Returns
+    positions ``[nB, Tk]`` (padding = N), the keys of a window in its first
+    slots.
     """
     N = ids.size
     T = 4 ** wl
     lc = level - wl
     sorted_ids = np.sort(ids)
     sort_order = np.argsort(ids, kind="stable")
-    nb = nested_neighbours(blocks, lc)                                   # [nB, 8], -1 = none
-    cand_blocks = np.concatenate([blocks[:, None], nb], axis=1)          # [nB, 9]
-    centres = _unit_vectors(blocks, lc, ellipsoid)                       # [nB, 3]
-    per = max(1, chunk_cells // (9 * T))
+    vec_dom = _unit_vectors(sorted_ids, level, ellipsoid)               # [N, 3], sorted order
+    centres, radius = _window_radius(blocks, level, wl, halo, ellipsoid, chunk_cells)
+    cand_blocks = _two_ring(blocks, lc)                                 # [nB, W]
+    W = cand_blocks.shape[1]
+    per = max(1, chunk_cells // (W * T))
     rows = []
     for a in range(0, blocks.size, per):
-        cb = cand_blocks[a:a + per]                                      # [m, 9]
+        cb = cand_blocks[a:a + per]
         m = cb.shape[0]
         cells = (np.where(cb >= 0, cb, 0)[:, :, None] * T + np.arange(T)).reshape(m, -1)
-        ok = np.repeat(cb >= 0, T, axis=1)
-        vec = _unit_vectors(cells.ravel(), level, ellipsoid).reshape(m, 9 * T, 3)
-        cosang = np.einsum("mkd,md->mk", vec, centres[a:a + per])
+        pos = np.minimum(np.searchsorted(sorted_ids, cells), N - 1)
+        keep = np.repeat(cb >= 0, T, axis=1) & (sorted_ids[pos] == cells)
+        cosang = np.einsum("mkd,md->mk", vec_dom[pos], centres[a:a + per])
         ang = np.arccos(np.clip(cosang, -1.0, 1.0))
-        r_c = ang[:, :T].max(axis=1)
-        keep = ok & (ang <= (1.0 + halo) * r_c[:, None] * (1 + 1e-9) + 1e-15)
-        keep[:, :T] = True                                               # the block itself
-        pos = np.searchsorted(sorted_ids, cells)
-        pos_c = np.minimum(pos, N - 1)
-        inside = sorted_ids[pos_c] == cells
-        keep &= inside
+        keep &= ang <= radius[a:a + per, None] * (1 + 1e-9) + 1e-15
         for r in range(m):
-            rows.append(sort_order[pos_c[r][keep[r]]])
+            rows.append(sort_order[pos[r][keep[r]]])
     Tk = _round_up(max(r.size for r in rows))
     kv = np.full((len(rows), Tk), N, dtype=np.int64)
     for i, r in enumerate(rows):
@@ -179,7 +216,7 @@ def _colour_windows(kv_index, N):
 
     Returns the window ids sorted by colour (int32) and the start of each
     colour in that list.  With windows that overlap only their neighbours,
-    a handful of colours suffice (4 to 6 on HEALPix).
+    about ten colours suffice (7 to 11 on HEALPix).
     """
     NW, TK = kv_index.shape
     flat = kv_index.ravel()
@@ -247,11 +284,14 @@ class HealPixWindowAttention(nn.Module):
     ``"coarse_centred"``
         The queries are the cells of a block; the keys are the cells within
         an angular radius ``(1 + halo) r_c`` of the centre of the block (its
-        cell of level ``level - window_level``), with ``r_c`` the radius of
-        the block itself.  The windows overlap across the block borders, so
-        the receptive field grows at every layer, at the price of about
-        ``1.6 (1 + halo)**2`` times more keys and a key mask.  ``shifted`` is
-        ignored.
+        cell of level ``level - window_level``), with ``r_c`` the distance
+        from that centre to the farthest cell centre of the block plus one
+        cell spacing, so that the disc reaches past the corners of the
+        block.  Every window holds cells of the neighbouring blocks (also
+        with ``halo=0`` and ``window_level=1``), so the receptive field grows
+        at every layer.  The price is the number of keys: about 3.4–3.8 times the cells of the block at ``halo=0.25`` (``window_level`` 1: 3.8, 2: 3.7, 3: 3.5, 4: 3.4) and 2.2–3.1 times at ``halo=0`` (1: 3.1, 2: 2.3, 3: 2.2, 4: 2.2)
+        (mean over the full sphere; the windows near the base-cell corners
+        hold up to 1.5 times the mean).  ``shifted`` is ignored.
 
     ``shift=None`` takes :data:`DEFAULT_WINDOW_SHIFT`, ``"coarse_centred"``:
     the maintainer chose the overlapping windows centred on the cells of a
@@ -298,11 +338,19 @@ class HealPixWindowAttention(nn.Module):
 
     Examples
     --------
+    The default (overlapping windows, the same at every layer):
+
     >>> blocks = nn.Sequential(*[
-    ...     HealPixWindowAttention(level=6, embed_dim=64, num_heads=4,
-    ...                            window_level=3, shifted=bool(i % 2))
+    ...     HealPixWindowAttention(level=6, embed_dim=64, num_heads=4, window_level=3)
     ...     for i in range(4)])
     >>> y = blocks(torch.randn(2, 64, 12 * 4**6))
+
+    Alternating window levels instead (``shifted`` matters only here):
+
+    >>> blocks = nn.Sequential(*[
+    ...     HealPixWindowAttention(level=6, embed_dim=64, num_heads=4, window_level=3,
+    ...                            shift="alternate_level", shifted=bool(i % 2))
+    ...     for i in range(4)])
     """
 
     def __init__(

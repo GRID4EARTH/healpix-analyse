@@ -51,8 +51,7 @@ import torch
 from healpix_analyse import HealPixWindowAttention
 
 layers = torch.nn.Sequential(*[
-    HealPixWindowAttention(level=8, embed_dim=128, num_heads=4, window_level=3,
-                           shifted=bool(i % 2))
+    HealPixWindowAttention(level=8, embed_dim=128, num_heads=4, window_level=3)
     for i in range(4)
 ])
 y = layers(torch.randn(2, 128, 12 * 4**8))      # [2, 128, N]
@@ -69,7 +68,7 @@ stay available.
 
 | `shift` | windows | cost | receptive field |
 |---|---|---|---|
-| `"coarse_centred"` (default) | queries: a block of `4**w` cells; keys: the cells within `(1 + halo) r_c` of the block centre, `r_c` the radius of the block | about 2.3× more keys than `"none"` at `halo=0.25` | grows at every layer, across block borders |
+| `"coarse_centred"` (default) | queries: a block of `4**w` cells; keys: the cells within `(1 + halo) r_c` of the block centre, `r_c` the distance to the farthest cell centre of the block plus one cell spacing | keys per window, in block sizes, at `halo=0.25`: 3.8 (w = 1), 3.7 (2), 3.5 (3), 3.4 (4); at `halo=0`: 3.1, 2.3, 2.2, 2.2 | grows at every layer, across block borders |
 | `"none"` | blocks of `4**w` cells at every layer | the cheapest | one block, whatever the depth |
 | `"alternate_level"` | `shifted=False`: blocks of `4**w`; `shifted=True`: blocks of `4**(w+1)` | the shifted layers attend over 4× longer windows (4× the cost) | one block of `4**(w+1)` cells after 2 layers; it grows further only through Down/Up, as in the hierarchical stages of Swin |
 
@@ -81,7 +80,7 @@ cells (cell size 0.23°), as cells / radius in cell sizes:
 
 | `shift` | 1 layer | 2 layers | 3 layers | 4 layers | 6 layers |
 |---|---|---|---|---|---|
-| `"coarse_centred"` | 150 / 7.3 | 680 / 16.8 | 1594 / 26.8 | 2904 / 36.9 | 6723 / 57.2 |
+| `"coarse_centred"` | 210 / 8.8 | 974 / 20.9 | 2265 / 34.1 | 4142 / 49.6 | 9761 / 77.1 |
 | `"alternate_level"` | 64 / 6.3 | 256 / 17.8 | 256 / 17.8 | 256 / 17.8 | 256 / 17.8 |
 | `"none"` | 64 / 6.3 | 64 / 6.3 | 64 / 6.3 | 64 / 6.3 | 64 / 6.3 |
 
@@ -150,8 +149,9 @@ and the baseline of the benchmark.
 
 ## Cost
 
-- Window attention: `N * 4**w` scores per head (`"none"`; about 2.3 times
-  more with `"coarse_centred"`), memory linear in `N`. The Triton backward
+- Window attention: `N * 4**w` scores per head with `"none"`; with
+  `"coarse_centred"` 3.4–3.8 times more at `halo=0.25` and 2.2–3.1 times
+  more at `halo=0` (see the table above), memory linear in `N`. The Triton backward
   of overlapping windows keeps one fp32 partial sum per key slot (twice the
   size of k and v per slot). On the PyTorch path, the backward of the
   gathers accumulates with `index_put_`, whose order on CUDA is fixed only

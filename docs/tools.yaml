@@ -373,8 +373,9 @@ tools:
   gpu: yes; fused flash-style Triton kernels (float32, float16, bfloat16, autocast) with the optional triton package, deterministic backward
   nan: not handled (NaN propagates)
   cost: >-
-    N * 4**w scores per head with shift="none", about 2.3 times more with the
-    default shift="coarse_centred" (halo=0.25); memory linear in N.
+    N * 4**w scores per head with shift="none"; with the default
+    shift="coarse_centred", 3.4-3.8 times more at halo=0.25 and 2.2-3.1 times
+    more at halo=0 (window_level 1 to 4); memory linear in N.
     benchmarks/benchmark_attention.py measures it against dense attention.
   pros:
     - Fused Triton kernels on every kind of window (padded, unsorted, overlapping), with a deterministic backward.

@@ -433,7 +433,7 @@ def test_window_triton_double_backward():
 def test_window_colouring(domain):
     """Windows of one colour share no key cell; non-overlapping windows need none."""
     m = _window("coarse_centred", domain)
-    assert m._colours is not None and 2 <= m.n_colours <= 8
+    assert m._colours is not None and 2 <= m.n_colours <= 16
     kv = m._kv_index.numpy()
     order = m._colours.numpy()
     b = m._colour_bounds
@@ -447,3 +447,36 @@ def test_window_colouring(domain):
     if m._kv_len is not None:
         lens = m._kv_len.numpy()
         assert np.all((kv < m.N).sum(1) == lens) and m.mean_keys < m.key_len
+
+
+@pytest.mark.parametrize("wl", [1, 2, 3, 4])
+@pytest.mark.parametrize("halo", [0.25, 0.0])
+def test_coarse_centred_windows_overlap(wl, halo):
+    """Every window of the default shift holds keys outside its own block."""
+    m = HealPixWindowAttention(5, 8, 2, wl, halo=halo, device="cpu")
+    T = 4 ** wl
+    kv = m._kv_index.numpy()
+    for i in range(m.n_windows):
+        keys = kv[i][kv[i] < m.N]
+        assert (keys // T == i).sum() == T           # the whole block
+        assert (keys // T != i).any(), i            # and cells of other blocks
+
+
+@pytest.mark.parametrize("domain", ["full", "regional"])
+@pytest.mark.parametrize("wl,halo", [(2, 1.0), (2, 0.25), (1, 0.0)])
+def test_coarse_centred_keys_are_the_disc(domain, wl, halo):
+    """The keys of a window are exactly the domain cells within its radius
+    (brute force over all the cells: nothing is missed near the base-cell corners)."""
+    level = 4
+    ids = None if domain == "full" else _regional_ids(level)
+    m = HealPixWindowAttention(level, 8, 2, wl, cell_ids=ids, halo=halo, device="cpu")
+    dom = np.arange(m.N) if ids is None else np.asarray(ids)
+    vec = att._unit_vectors(dom, level, "WGS84")
+    blocks = m.window_cells.numpy()
+    centres, radius = att._window_radius(blocks, level, wl, halo, "WGS84")
+    ang = np.arccos(np.clip(centres @ vec.T, -1.0, 1.0))           # [nW, N]
+    kv = m._kv_index.numpy()
+    for i in range(m.n_windows):
+        want = np.nonzero(ang[i] <= radius[i] * (1 + 1e-9) + 1e-15)[0]
+        got = np.sort(kv[i][kv[i] < m.N])
+        np.testing.assert_array_equal(got, want, err_msg=f"window {i}")
