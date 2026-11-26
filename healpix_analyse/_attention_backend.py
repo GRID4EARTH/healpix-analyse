@@ -957,7 +957,9 @@ def _win_triton_forward(qkv, plan, scale):
     return out, lse
 
 
-_ACC_CONFIG = (64, 64)       # BLOCK_Q, BLOCK_K of the accumulating (coloured) launches
+# BLOCK_Q, BLOCK_K of the accumulating (coloured) launches; 1 pipeline stage in
+# fp32 (2 stages measured 20x slower on an A100 with fp32 gathered rows)
+_ACC_CONFIG = (64, 64)
 
 
 def _win_triton_backward(qkv, plan, scale, out, lse, gout):
@@ -1001,7 +1003,7 @@ def _win_triton_backward(qkv, plan, scale, out, lse, gout):
                 _win_bwd_kv_kernel.fn[((hi - lo) * triton.cdiv(plan.TK, BK), B * H)](
                     qkv, SB, SN, qi, ki, kl, wl, gout, lse, delta, acc, ASB, ASN, H, N, D,
                     plan.TQ, plan.TK, scale, ACCUMULATE=True, BLOCK_Q=BQ, BLOCK_K=BK,
-                    num_warps=4, num_stages=2, **flags)
+                    num_warps=4, num_stages=1 if qkv.dtype == torch.float32 else 2, **flags)
             if acc is not dkv:
                 dkv.copy_(acc)
     return dqkv
