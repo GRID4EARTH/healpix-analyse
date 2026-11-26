@@ -386,7 +386,7 @@ tools:
     - "`mode=\"nested\"` is a view plus one gather on complete domains (`zorder=True`: zero-copy)."
   cons:
     - "Experimental. With coarse centres, the gauge squares do not tile the diamond-shaped cells: from N = 8, the fold misses the tips of the diamonds."
-    - "With `index`, the fold costs as much as a full fold."
+    - "With `index`, the fold visits only the cells the selected patches read; with overlapping patches (`centres=\"all\"`) that is nearly every cell."
   use_instead:
     - when: NumPy tiles for the DINOv3 pipeline, with mean filling of the gaps
       use: nested_to_tiles
