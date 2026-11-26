@@ -468,7 +468,8 @@ def _ln_fwd_configs():
     if _FULL_TUNE:
         return [triton.Config({"BLOCK_N": bn}, num_warps=w)
                 for bn in (16, 32, 64, 128) for w in (4, 8)]
-    return [triton.Config({"BLOCK_N": 32}, num_warps=4),
+    return [triton.Config({"BLOCK_N": 16}, num_warps=4),
+            triton.Config({"BLOCK_N": 32}, num_warps=4),
             triton.Config({"BLOCK_N": 64}, num_warps=8)]
 
 
@@ -554,11 +555,13 @@ if _HAS_TRITON:
     ):
         """y = (x - mean) * rstd * gamma + beta at the valid cells, fill
         elsewhere: normalisation, affine step and fill in one pass."""
-        bc = tl.program_id(0).to(tl.int64)
+        pid = tl.program_id(0).to(tl.int64)
+        nblk = tl.cdiv(N, BLOCK)
+        bc = pid // nblk
         b = bc // C
         c = bc % C
         s = b * SB + c // CG
-        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        offs = (pid % nblk) * BLOCK + tl.arange(0, BLOCK)
         inb = offs < N
         base = bc * N
         x = tl.load(x_ptr + base + offs, mask=inb, other=0.0).to(tl.float32)
@@ -614,11 +617,13 @@ if _HAS_TRITON:
         BLOCK: tl.constexpr,
     ):
         """dx = rstd * (gamma * dy - w * (A + xhat * B)) at the valid cells."""
-        bc = tl.program_id(0).to(tl.int64)
+        pid = tl.program_id(0).to(tl.int64)
+        nblk = tl.cdiv(N, BLOCK)
+        bc = pid // nblk
         b = bc // C
         c = bc % C
         s = b * SB + c // CG
-        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        offs = (pid % nblk) * BLOCK + tl.arange(0, BLOCK)
         inb = offs < N
         base = bc * N
         x = tl.load(x_ptr + base + offs, mask=inb, other=0.0).to(tl.float32)
@@ -652,8 +657,10 @@ if _HAS_TRITON:
     ):
         """LayerNorm of BLOCK_N cells: the [C, BLOCK_N] tile is read once,
         reduced over C in registers, and written once."""
-        b = tl.program_id(0).to(tl.int64)
-        offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        pid = tl.program_id(0).to(tl.int64)
+        nblk = tl.cdiv(N, BLOCK_N)
+        b = pid // nblk
+        offs = (pid % nblk) * BLOCK_N + tl.arange(0, BLOCK_N)
         cc = tl.arange(0, BLOCK_C)
         inb = (cc[:, None] < C) & (offs[None, :] < N)
         base = b * C * N
@@ -687,8 +694,9 @@ if _HAS_TRITON:
     ):
         """dx of BLOCK_N cells from one read of the x and dy tiles; partial
         dgamma / dbeta of the program (fixed BLOCK_N: deterministic)."""
-        b = tl.program_id(0).to(tl.int64)
-        pb = tl.program_id(1)
+        pid = tl.program_id(0).to(tl.int64)
+        b = pid // NBLK
+        pb = pid % NBLK
         offs = pb * BLOCK_N + tl.arange(0, BLOCK_N)
         cc = tl.arange(0, BLOCK_C)
         cm = cc < C
@@ -731,8 +739,10 @@ if _HAS_TRITON:
         BLOCK: tl.constexpr,
     ):
         """LayerNorm for wide C: loops over the channels (3 reads of x)."""
-        b = tl.program_id(0).to(tl.int64)
-        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        pid = tl.program_id(0).to(tl.int64)
+        nblk = tl.cdiv(N, BLOCK)
+        b = pid // nblk
+        offs = (pid % nblk) * BLOCK + tl.arange(0, BLOCK)
         inb = offs < N
         base = b * C * N
         s0 = tl.zeros([BLOCK], tl.float32)
@@ -768,8 +778,9 @@ if _HAS_TRITON:
         HAS_M: tl.constexpr, AFFINE: tl.constexpr, FILL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        b = tl.program_id(0).to(tl.int64)
-        pb = tl.program_id(1)
+        pid = tl.program_id(0).to(tl.int64)
+        b = pid // NBLK
+        pb = pid % NBLK
         offs = pb * BLOCK + tl.arange(0, BLOCK)
         inb = offs < N
         base = b * C * N
@@ -864,10 +875,12 @@ if _HAS_TRITON:
     ):
         """dx = w * G[bc, region(n)] at the valid cells (G = dy / S0 for a
         mean, dy for a sum): a gather from the [B*C, R] gradient, no atomics."""
-        bc = tl.program_id(0).to(tl.int64)
+        pid = tl.program_id(0).to(tl.int64)
+        nblk = tl.cdiv(N, BLOCK)
+        bc = pid // nblk
         b = bc // C
         c = bc % C
-        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        offs = (pid % nblk) * BLOCK + tl.arange(0, BLOCK)
         inb = offs < N
         x = tl.load(x_ptr + bc * N + offs, mask=inb, other=0.0).to(tl.float32)
         w = _load_w(x, m_ptr, b, c, offs, inb, smb, smc, HAS_M)
@@ -959,7 +972,8 @@ def _chunks(rows: int, N: int, device) -> tuple[int, int]:
 
 
 def _ew_grid(rows, N):
-    return lambda meta: (rows, triton.cdiv(N, meta["BLOCK"]))
+    """Flat 1-D grid (rows x blocks of cells): no 65 535 limit on an axis."""
+    return lambda meta: (rows * triton.cdiv(N, meta["BLOCK"]),)
 
 
 def _rows_layout(kind, B, C, G):
@@ -1122,10 +1136,10 @@ class _LayerNormFunction(torch.autograd.Function):
                 C, N, smb, smc, eps)
         if C <= _LN_TILE_MAX_C:
             bc = max(16, triton.next_power_of_2(C))
-            _ln_tile_fwd_kernel[lambda meta: (B, triton.cdiv(N, meta["BLOCK_N"]))](
+            _ln_tile_fwd_kernel[lambda meta: (B * triton.cdiv(N, meta["BLOCK_N"]),)](
                 *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill], BLOCK_C=bc)
         else:
-            _ln_fwd_kernel[(B, triton.cdiv(N, 128))](
+            _ln_fwd_kernel[(B * triton.cdiv(N, 128),)](
                 *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
                 BLOCK=128, num_warps=4)
         ctx.save_for_backward(x_in, m if m is not None else torch.empty(0),
@@ -1161,11 +1175,11 @@ class _LayerNormFunction(torch.autograd.Function):
             pg = pb = mu
         args = (x, mt, dy, dx, weight if affine else x, mu, rstd, pg, pb, C, N, nblk, smb, smc)
         if tile:
-            _ln_tile_bwd_kernel[(B, nblk)](
+            _ln_tile_bwd_kernel[(B * nblk,)](
                 *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
                 BLOCK_C=bc, BLOCK_N=bn)
         else:
-            _ln_bwd_kernel[(B, nblk)](
+            _ln_bwd_kernel[(B * nblk,)](
                 *args, HAS_M=has_m, AFFINE=affine, FILL=_FILL_CODE[fill],
                 BLOCK=bn, num_warps=4)
         dw = pg.sum(0).to(weight.dtype) if affine and ctx.needs_input_grad[2] else None
@@ -1235,6 +1249,19 @@ class _GlobalPoolFunction(torch.autograd.Function):
         return dx, None, None
 
 
+_MAX_REGION_CACHE: dict = {}
+
+
+def _max_region(offs):
+    """Size of the largest region (cached per offsets tensor)."""
+    key = (offs.data_ptr(), offs.numel(), str(offs.device))
+    if key not in _MAX_REGION_CACHE:
+        if len(_MAX_REGION_CACHE) > 64:
+            _MAX_REGION_CACHE.clear()
+        _MAX_REGION_CACHE[key] = int((offs[1:] - offs[:-1]).max()) if offs.numel() > 1 else 1
+    return _MAX_REGION_CACHE[key]
+
+
 class _RegionPoolFunction(torch.autograd.Function):
     """Masked pooling over CSR regions: one program per (region, block of
     rows) gathers the region's cells (int32 indices) in a fixed order;
@@ -1253,10 +1280,14 @@ class _RegionPoolFunction(torch.autograd.Function):
         s0 = torch.empty(BC, R, device=x.device, dtype=torch.float32)
         y = torch.empty_like(s0)
         arg = torch.empty(BC, R, device=x.device, dtype=torch.int32) if is_max else s0
-        block_r = 16 if BC >= 16 else max(1, triton.next_power_of_2(BC))
+        # BLOCK_K covers a typical region (no masked lanes for regions of
+        # 4**k cells); BLOCK_R fills a 4 K-element tile with rows.
+        lmax = _max_region(offs)
+        block_k = min(128, max(16, triton.next_power_of_2(lmax)))
+        block_r = min(max(1, triton.next_power_of_2(BC)), max(1, 4096 // block_k))
         _region_part_kernel[(R, triton.cdiv(BC, block_r))](
             x, mt, perm, offs, s0, y, arg, C, N, R, BC, smb, smc,
-            HAS_M=has_m, IS_MAX=is_max, BLOCK_R=block_r, BLOCK_K=64)
+            HAS_M=has_m, IS_MAX=is_max, BLOCK_R=block_r, BLOCK_K=block_k)
         ctx.save_for_backward(x_in, m if m is not None else torch.empty(0), s0, labels,
                               arg if is_max else torch.empty(0))
         ctx.meta = (mode, has_m, R)

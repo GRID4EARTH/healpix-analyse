@@ -609,3 +609,21 @@ def test_triton_region_pool_module_and_determinism():
         (gx,) = torch.autograd.grad(y.square().sum(), xt)
         outs.append((y, gx))
     assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+
+
+@pytest.mark.skipif(not (HAS_CUDA and mn._HAS_TRITON), reason="needs CUDA and Triton")
+def test_triton_large_grids():
+    """More than 65 535 cell blocks per sample: the grids are 1-D."""
+    dev = "cuda"
+    N = 2_100_000
+    x = torch.randn(1, 8, N, device=dev)
+    m = torch.rand(N, device=dev) > 0.3
+    for cls, args in ((HealPixLayerNorm, (8,)), (HealPixGroupNorm, (2, 8))):
+        a = cls(*args, device=dev)
+        r = cls(*args, device=dev, backend="torch")
+        xa, xr = x.clone().requires_grad_(), x.clone().requires_grad_()
+        ya, yr = a(xa, m), r(xr, m)
+        torch.testing.assert_close(ya, yr, atol=1e-4, rtol=1e-4)
+        (ga,) = torch.autograd.grad(ya.sum(), xa)
+        (gr,) = torch.autograd.grad(yr.sum(), xr)
+        torch.testing.assert_close(ga, gr, atol=1e-3, rtol=1e-3)
