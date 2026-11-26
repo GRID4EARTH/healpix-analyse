@@ -16,7 +16,7 @@ SCRIPTS = sorted(p.name for p in RECIPES.glob("*.py"))
 
 
 def test_recipes_found():
-    assert {"resnet.py", "unet.py", "mae.py", "training.py", "swin.py",
+    assert {"resnet.py", "unet.py", "mae.py", "training.py", "swin.py", "gradient_penalty.py",
             "neighbourhood_attention.py"} <= set(SCRIPTS)
 
 

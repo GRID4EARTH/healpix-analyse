@@ -48,7 +48,9 @@
   (domains, NaN and masks, augmentation, batching), and runnable recipes
   (ResNet classifier, U-Net, ViT / MAE with `HealPixPatches` tokens, training
   loop with masks and bf16 autocast, Swin-like transformer with
-  `HealPixWindowAttention`, neighbourhood-attention segmenter) run by
+  `HealPixWindowAttention`, neighbourhood-attention segmenter, GAN critic
+  with a gradient penalty; the U-Net uses `HealPixConv(stride=2)` and
+  `HealPixConvTranspose`, or `HealPixDown` / `HealPixUp`) run by
   `tests/test_ai_recipes.py`. The window and neighbourhood attention,
   `HealPixGradient`, `HealPixNeighbourReducer` and `HealPixDivCurl` have AI
   cards too.

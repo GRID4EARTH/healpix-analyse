@@ -113,7 +113,7 @@ ai:
       title: U-Net on a regional domain with gaps
       page: ai/recipes/unet
       script: ai/recipes/unet.py
-      uses: [HealPixConv, HealPixGroupNorm, HealPixDown, HealPixUp]
+      uses: [HealPixConv, HealPixConvTranspose, HealPixGroupNorm, HealPixDown, HealPixUp]
     - id: mae
       title: Masked autoencoder (ViT / MAE) with HealPixPatches tokens
       page: ai/recipes/mae
@@ -124,6 +124,11 @@ ai:
       page: ai/recipes/training
       script: ai/recipes/training.py
       uses: [HealPixConv, HealPixGroupNorm, HealPixUp]
+    - id: gradient_penalty
+      title: GAN critic with a gradient penalty (double backward)
+      page: ai/recipes/gradient_penalty
+      script: ai/recipes/gradient_penalty.py
+      uses: [HealPixConv, global_pool]
     - id: swin
       title: Swin-like hierarchical transformer with window attention
       page: ai/recipes/swin
@@ -139,7 +144,7 @@ ai:
       blocks: "HealPixConv + HealPixGroupNorm (masked) + residual; HealPixDown(mode=\"mean\") between stages; global_pool or region_pool readout"
       recipe: resnet
     - name: U-Net (segmentation, denoising, downscaling)
-      blocks: "encoder HealPixConv + HealPixGroupNorm, HealPixDown; decoder HealPixUp, skip concatenation, HealPixConv; LargeConv for a wide receptive field at one level"
+      blocks: "encoder HealPixConv + HealPixGroupNorm and HealPixConv(stride=2); decoder HealPixConvTranspose, skip concatenation, HealPixConv (or HealPixDown / HealPixUp for fixed resampling); LargeConv for a wide receptive field at one level"
       recipe: unet
     - name: ViT / MAE
       blocks: "HealPixPatches tokens (gauge-oriented, or mode=\"nested\" tiles) + HealPixPositionalEncoding of patches.centre_ids + torch.nn.TransformerEncoder; masked token sampling with patches(x, index=keep); linear decoder and HealPixPatches.fold back onto the cells"
@@ -153,6 +158,9 @@ ai:
     - name: JEPA / DINO-style self-supervised learning
       blocks: "the ViT / MAE encoder on HealPixPatches tokens as context and target encoders (EMA copy in torch), HealPixPositionalEncoding of the masked centres as predictor queries, context and target tokens drawn with patches(x, index=...); geometric augmentations are not available yet"
       recipe: mae
+    - name: GAN critic with a gradient penalty (WGAN-GP)
+      blocks: "HealPixConv and HealPixConv(stride=2) layers, global_pool readout; the penalty differentiates the critic gradient (create_graph=True), supported by the HealPixConv kernels"
+      recipe: gradient_penalty
     - name: Spectral or physics-aware loss
       blocks: "HealPixWaveletSpectrum (differentiable, NaN-aware band powers), HealPixGradient or HealPixDivCurl (gradients, divergence and curl of the prediction) next to a pixel loss"
 
@@ -430,14 +438,16 @@ tools:
   optional_deps: triton (triton extra), only for the fused CUDA kernels
   ai:
     role: layer
-    does: learned 3x3 / 5x5 convolution, equivariant to the grid orientation
-    api: [healpix_analyse.convol.HealPixConv]
-    shapes: "[B, C_in, N] -> [B, G*C_out, N] (G = n_gauges, 1 by default)"
-    grad: yes (input and weights; double backward through the PyTorch path)
+    does: learned 3x3 / 5x5 convolution, equivariant to the grid orientation; stride=2 for an encoder, HealPixConvTranspose (its adjoint) for a decoder
+    api: [healpix_analyse.convol.HealPixConv, healpix_analyse.convol.HealPixConvTranspose]
+    shapes: "[B, C_in, N] -> [B, G*C_out, N] (G = n_gauges, 1 by default); stride=2: -> [B, G*C_out, N/4] on conv.cell_ids_out; HealPixConvTranspose: [B, G*C_in, N/4] -> [B, C_out, N]"
+    grad: yes (input and weights); double backward (create_graph=True, gradient penalty) and torch.func (vmap, jacrev, jacfwd, jvp) on the same kernels
     gpu_kernel: Triton (float32, float16, bfloat16)
     deterministic: yes by default (deterministic=True; CPU always)
     notes:
       - The domain is fixed at construction (cell_ids, or the full sphere); N must equal len(cell_ids) and row k is cell_ids[k].
+      - stride=2 writes on the parent cells conv.cell_ids_out (sorted, np.unique(cell_ids // 4)); the next level builds its layers with those ids.
+      - HealPixConvTranspose(level, in_channels, out_channels, cell_ids=fine ids) mirrors HealPixConv(level, out_channels, in_channels, stride=2, cell_ids=fine ids); it reads n_gauges*in_channels channels on the parents and sums over the gauges.
       - The input is cast to the layer dtype (float32 by default), also inside torch.autocast; build with dtype=torch.bfloat16 for 16-bit kernels.
       - NaN propagates by default; zero-fill and pass a validity channel, or use missing="local_mean" (PyTorch reference path, more memory).
       - Pass device= at construction (default CUDA when available); the geometry is cached on disk (cache_dir).

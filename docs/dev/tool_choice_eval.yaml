@@ -166,3 +166,9 @@ cases:
   - id: ai-mae-masked-sampling
     question: My MAE keeps 25 % of the tokens per sample; how do I extract only the kept patches on the GPU and fold the decoder output back onto the HEALPix cells?
     expected: [HealPixPatches, HealPixPatches.fold]
+  - id: ai-strided-encoder
+    question: In my HEALPix U-Net encoder I want a learned downsampling (a strided convolution) instead of a fixed pooling, and its transposed counterpart in the decoder.
+    expected: [HealPixConv, HealPixConvTranspose]
+  - id: ai-gradient-penalty
+    question: I train a WGAN-GP critic built from HEALPix convolutions; the gradient penalty needs second-order gradients through the convolution layers on the GPU.
+    expected: [HealPixConv]

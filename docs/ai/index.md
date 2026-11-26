@@ -45,8 +45,6 @@ on one regional patch), and {doc}`GetDINOV3SAT </other/dino>` (frozen foundation
 These blocks are in review and get their line in the table, an API card and
 a recipe when they are merged:
 
-- strided `HealPixConv` and `HealPixConvTranspose`, for U-Net encoders and
-  decoders without Down / Up ([#110](https://github.com/GRID4EARTH/healpix-analyse/pull/110));
 - batched geometric augmentations on the GPU ([#111](https://github.com/GRID4EARTH/healpix-analyse/pull/111)).
 
 ```{toctree}
