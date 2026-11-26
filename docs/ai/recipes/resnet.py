@@ -44,7 +44,7 @@ class ResBlock(nn.Module):
 
 
 class Pool(nn.Module):
-    """HealPixDown(mode="mean") on [B, C, N] values and on the mask."""
+    """HealPixDown(mode="mean") on the values [B, C, N] and on the mask [B, N]."""
 
     def __init__(self, level, cell_ids):
         super().__init__()
@@ -52,11 +52,9 @@ class Pool(nn.Module):
         self.cell_ids_out = np.unique(np.asarray(cell_ids) // 4)  # the output cells
 
     def forward(self, x, mask):
-        B, C, N = x.shape
-        # HealPixDown takes [N] or [B, N]: fold the channels into the batch
-        y, _ = self.down(x.reshape(B * C, N))
+        y, _ = self.down(x)                    # [B, C, N] -> [B, C, N / 4]
         m, _ = self.down(mask.to(x.dtype))     # fraction of valid children
-        return y.reshape(B, C, -1), m > 0
+        return y, m > 0
 
 
 class Classifier(nn.Module):

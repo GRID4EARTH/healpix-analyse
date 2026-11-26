@@ -2,7 +2,8 @@
 
 The building blocks of neural networks on HEALPix data: learned
 convolutions, resolution changes, masked normalisation, pooling and
-positional encodings. Each is a `torch.nn.Module` (or a function) that works
+positional encodings, window and neighbourhood attention, and
+differential operators. Each is a `torch.nn.Module` (or a function) that works
 on `[B, C, N]` tensors over the full sphere or a regional domain, runs on
 the GPU and is differentiable. Combine them with `torch.nn` to build a
 ResNet, a U-Net, a ViT or a masked autoencoder; the {doc}`recipes
@@ -32,9 +33,7 @@ alternatives) is on its page.
 Not on this list but often useful in a model:
 {doc}`HealPixPyramidConv </conv/pyramid_conv>` (NaN-aware multiscale
 filtering), {doc}`HealPixFFTConv </conv/fft_conv>` (one large learned kernel
-on one regional patch), {doc}`gradient </stats/gradient>` and
-{doc}`HealPixDivCurl </stats/divcurl>` (physics-aware features and losses),
-and {doc}`GetDINOV3SAT </other/dino>` (frozen foundation-model embeddings).
+on one regional patch), and {doc}`GetDINOV3SAT </other/dino>` (frozen foundation-model embeddings).
 
 ## Which block for which architecture
 
@@ -46,10 +45,6 @@ and {doc}`GetDINOV3SAT </other/dino>` (frozen foundation-model embeddings).
 These blocks are in review and get their line in the table, an API card and
 a recipe when they are merged:
 
-- GPU fast paths of `HealPixDown` / `HealPixUp`, `[B, C, N]` inputs ([#112](https://github.com/GRID4EARTH/healpix-analyse/pull/112));
-- window and neighbourhood attention, for Swin-like models ([#114](https://github.com/GRID4EARTH/healpix-analyse/pull/114));
-- GPU kernels for neighbourhood reductions, the gradient and divergence /
-  curl ([#116](https://github.com/GRID4EARTH/healpix-analyse/pull/116));
 - strided `HealPixConv` and `HealPixConvTranspose`, for U-Net encoders and
   decoders without Down / Up ([#110](https://github.com/GRID4EARTH/healpix-analyse/pull/110));
 - batched geometric augmentations on the GPU ([#111](https://github.com/GRID4EARTH/healpix-analyse/pull/111));

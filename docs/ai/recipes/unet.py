@@ -1,7 +1,7 @@
 """U-Net on a regional HEALPix domain with gaps (NaN).
 
 Encoder: HealPixConv + HealPixGroupNorm (masked), HealPixDown(mode="mean").
-Decoder: HealPixUp, concatenation with the skip connection, HealPixConv.
+Decoder: HealPixUp (paired with the Down), concatenation with the skip connection, HealPixConv.
 Output: one value per cell of the input domain, [B, C_out, N].
 Runs on CPU in a few seconds at level 5; set LEVEL higher on a GPU.
 """
@@ -33,13 +33,6 @@ class ConvNormAct(nn.Module):
         return self.act(self.norm(self.conv(x), mask))
 
 
-def _bcn(op, x):
-    """Apply HealPixDown / HealPixUp (inputs [N] or [B, N]) to [B, C, N]."""
-    B, C, N = x.shape
-    y, _ = op(x.reshape(B * C, N))
-    return y.reshape(B, C, -1)
-
-
 class UNet(nn.Module):
     def __init__(self, level, cell_ids, c_in, c_out, widths=(16, 32, 64)):
         super().__init__()
@@ -60,8 +53,10 @@ class UNet(nn.Module):
                 self.down.append(HealPixDown(lv[i], mode="mean", cell_ids=ids[i],
                                              device=DEVICE))
         for i in reversed(range(len(widths) - 1)):
-            # HealPixUp(level=coarse level, cell_ids=coarse cells) -> cells ids[i]
-            self.up.append(HealPixUp(lv[i + 1], cell_ids=ids[i + 1], device=DEVICE))
+            # paired with the mean Down of the same level: every child gets the
+            # value of its parent (HealPixUp(lv[i + 1], cell_ids=ids[i + 1])
+            # would interpolate with the Gaussian transpose instead)
+            self.up.append(HealPixUp(lv[i + 1], paired_down=self.down[i], device=DEVICE))
             self.dec.append(ConvNormAct(lv[i], ids[i], widths[i + 1] + widths[i], widths[i]))
         self.head = HealPixConv(level, widths[0], c_out, kernel_sz=3,
                                 cell_ids=ids[0], device=DEVICE)
@@ -75,11 +70,11 @@ class UNet(nn.Module):
             if i < len(self.down):
                 skips.append(h)
                 masks.append(mask)
-                h = _bcn(self.down[i], h)
+                h, _ = self.down[i](h)                 # [B, C, N] -> [B, C, N / 4]
                 frac, _ = self.down[i](mask.to(h.dtype))   # valid fraction of the 4 children
                 mask = frac > 0
         for up, dec in zip(self.up, self.dec):
-            h = _bcn(up, h)
+            h, _ = up(h)
             mask = masks.pop()
             h = dec(torch.cat([h, skips.pop()], dim=1), mask)
         return self.head(h)                     # [B, C_out, N]

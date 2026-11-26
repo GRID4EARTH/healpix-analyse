@@ -235,6 +235,8 @@ def _signatures(srcdir, qual):
                 out.append(f"{name}({_fmt_args(methods['__init__'], True)})")
             if "forward" in methods:
                 out.append(f"{name}.forward({_fmt_args(methods['forward'], True)})")
+            elif "__call__" in methods:  # plain callable operators (not nn.Module)
+                out.append(f"{name}.__call__({_fmt_args(methods['__call__'], True)})")
             return out or [f"{name}(...)"]
     raise LookupError(f"{name} not defined in {'/'.join(parts[:2])}.py")
 
@@ -526,9 +528,11 @@ def _llms_full_ai(cat, base, srcdir):
     out = ["\n\n# AI building blocks\n\n",
            f"Landing page: {_url(base, ai['page'])}\n\n",
            "To build a neural network on HEALPix data, combine these blocks with "
-           "torch.nn. Signatures below are read from the source code. All of them "
+           "torch.nn. Signatures below are read from the source code. The layers "
            "take [B, C, N] tensors on a domain fixed at construction (cell_ids, "
-           "NESTED), except HealPixDown / HealPixUp ([B, N], return a tuple).\n\n"
+           "NESTED); HealPixDown / HealPixUp return a tuple (values, cell_ids_out); "
+           "HealPixGradient and HealPixNeighbourReducer are plain callables "
+           "without parameters.\n\n"
            "Roles:\n"]
     out += [f"  - {k}: {v}\n" for k, v in ai["roles"].items()]
     out.append("\n## Which block for which architecture\n\n")

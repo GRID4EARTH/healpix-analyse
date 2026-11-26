@@ -10,8 +10,8 @@ Points to copy:
 
 - the regional domain is built from complete parents, so the pooled level
   has exactly `N / 4` cells, `np.unique(cell_ids // 4)`;
-- `HealPixDown` takes `[B, N]`: the channels are folded into the batch, and
-  the same operator pools the validity mask;
+- `HealPixDown` takes `[B, C, N]` (any leading dimensions) and returns
+  `(values, cell_ids_out)`; the same operator pools the validity mask;
 - NaN never enters a layer: zero-fill plus a mask channel, then the mask goes
   to every norm and to the readout.
 

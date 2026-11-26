@@ -148,3 +148,15 @@ cases:
   - id: ai-wide-receptive-unet
     question: The bottleneck of my spherical U-Net needs a receptive field of about 30 cells at level 9 without a huge stencil.
     expected: [LargeConv]
+  - id: ai-swin-windows
+    question: I want a Swin-like transformer on global HEALPix fields at level 8, with attention restricted to local windows that still exchange information across window borders.
+    expected: [HealPixWindowAttention]
+  - id: ai-local-attention-stencil
+    question: Each cell of my regional Sentinel-1 domain should attend only to its 3x3 neighbours, with a learned relative position bias, for a per-pixel segmentation transformer.
+    expected: [HealPixNeighbourhoodAttention]
+  - id: ai-physics-loss-divergence
+    question: My model predicts ocean surface currents (u, v) on HEALPix cells and I want to penalise the divergence of the prediction in the loss, on the GPU.
+    expected: [HealPixDivCurl]
+  - id: ai-gradient-feature
+    question: Add the east and north gradients of sea level anomaly as extra input channels of my network, computed on the GPU at every batch over a fixed regional domain.
+    expected: [HealPixGradient]

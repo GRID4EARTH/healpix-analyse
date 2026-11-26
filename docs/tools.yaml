@@ -124,6 +124,16 @@ ai:
       page: ai/recipes/training
       script: ai/recipes/training.py
       uses: [HealPixConv, HealPixGroupNorm, HealPixUp]
+    - id: swin
+      title: Swin-like hierarchical transformer with window attention
+      page: ai/recipes/swin
+      script: ai/recipes/swin.py
+      uses: [HealPixWindowAttention, HealPixLayerNorm, HealPixDown, HealPixConv, global_pool]
+    - id: neighbourhood_attention
+      title: Neighbourhood-attention transformer for per-cell segmentation
+      page: ai/recipes/neighbourhood_attention
+      script: ai/recipes/neighbourhood_attention.py
+      uses: [HealPixNeighbourhoodAttention, HealPixLayerNorm, HealPixConv]
   architectures:
     - name: CNN / ResNet classifier or regressor
       blocks: "HealPixConv + HealPixGroupNorm (masked) + residual; HealPixDown(mode=\"mean\") between stages; global_pool or region_pool readout"
@@ -135,12 +145,16 @@ ai:
       blocks: "NESTED-block tokens (reshape) + HealPixPositionalEncoding of the token cells + torch.nn.TransformerEncoder (scaled dot-product attention); random token masking; linear decoder back to the blocks"
       recipe: mae
     - name: Swin-like (windowed attention)
-      blocks: "NESTED-block windows (reshape) + torch scaled_dot_product_attention inside each window; windows shifted across parents are not available yet"
+      blocks: "HealPixWindowAttention in pre-norm transformer blocks (HealPixLayerNorm, per-cell MLP); shift=\"coarse_centred\" (default) lets windows reach across block borders; HealPixDown + a pointwise linear layer as patch merging"
+      recipe: swin
+    - name: Neighbourhood-attention transformer (dense prediction at one level)
+      blocks: "HealPixNeighbourhoodAttention (3x3 gauge-oriented stencil, relative position bias) in pre-norm transformer blocks; HealPixConv embedding; per-cell head"
+      recipe: neighbourhood_attention
     - name: JEPA / DINO-style self-supervised learning
       blocks: "the ViT / MAE encoder as context and target encoders (EMA copy in torch), HealPixPositionalEncoding for the predictor queries; masks drawn on NESTED blocks; geometric augmentations are not available yet"
       recipe: mae
     - name: Spectral or physics-aware loss
-      blocks: "HealPixWaveletSpectrum (differentiable, NaN-aware band powers) next to a pixel loss"
+      blocks: "HealPixWaveletSpectrum (differentiable, NaN-aware band powers), HealPixGradient or HealPixDivCurl (gradients, divergence and curl of the prediction) next to a pixel loss"
 
 families:
   A:
@@ -466,6 +480,18 @@ tools:
       use: HealPixNeighbourhoodAttention
       page: conv/attention
   optional_deps: triton (triton extra), only for the fused CUDA kernels
+  ai:
+    role: attention
+    does: multi-head self-attention inside NESTED windows of 4**window_level cells (Swin-like), windows overlapping across block borders by default
+    api: [healpix_analyse.attention.HealPixWindowAttention]
+    shapes: "[B, C, N] -> [B, C, N] (C = embed_dim)"
+    grad: yes (input and projections)
+    gpu_kernel: Triton flash-style kernels (float32, float16, bfloat16, autocast)
+    deterministic: "yes on the Triton path (no atomics); PyTorch path on CUDA only under torch.use_deterministic_algorithms(True)"
+    notes:
+      - "shift: \"coarse_centred\" (default, DEFAULT_WINDOW_SHIFT) = query blocks with keys in a disc around the block, the receptive field grows at every layer; \"none\"; \"alternate_level\" with shifted=True on every second layer."
+      - It is the attention only (qkv and output projections): add the residual, the norm and the MLP around it, as in a transformer block.
+      - Fastest on the full sphere or on sorted cell_ids made of complete blocks of 4**window_level cells.
 
 - id: neighbourhood_attention
   title: Neighbourhood attention on the gauge stencil (HealPixNeighbourhoodAttention)
@@ -509,6 +535,17 @@ tools:
       use: HealPixConv
       page: conv/convol
   optional_deps: triton (triton extra), only for the fused CUDA kernels
+  ai:
+    role: attention
+    does: each cell attends to the kernel_sz x kernel_sz taps of its gauge-oriented HealPixConv stencil, with a relative position bias
+    api: [healpix_analyse.attention.HealPixNeighbourhoodAttention]
+    shapes: "[B, C, N] -> [B, G*C, N] (G = n_gauges, 1 by default)"
+    grad: yes (input, projections, position bias)
+    gpu_kernel: Triton (float32, float16, bfloat16, autocast)
+    deterministic: "yes on the Triton path (transposed stencil map, no atomics)"
+    notes:
+      - It is the attention only: add the residual, the norm and the MLP around it.
+      - On a regional domain, taps fully outside are left out of the softmax (outside="mask", default).
 
 - id: large_conv
   title: Wide receptive field (LargeConv) and its Gaussian recipe
@@ -560,7 +597,7 @@ tools:
     api: [healpix_analyse.large_conv.LargeConv]
     shapes: as HealPixConv
     grad: yes (input and compact kernel)
-    gpu_kernel: HealPixConv Triton kernels plus sparse Down / Up products
+    gpu_kernel: HealPixConv Triton kernels plus the HealPixDown / HealPixUp kernels
     deterministic: as HealPixConv and HealPixDown / HealPixUp
     notes:
       - NESTED only; a regional domain needs a halo (Down and Up pad with zeros).
@@ -1058,6 +1095,16 @@ tools:
       use: binary_dilation / binary_erosion
       page: stats/morphology
   optional_deps: none
+  ai:
+    role: reduction
+    does: mean / sum / min / max / median over a radius in metres, with the neighbourhoods built once
+    api: [healpix_analyse.neighbour_reduce.HealPixNeighbourReducer]
+    shapes: "values [..., N] -> [..., len(domain)]"
+    grad: for mean, sum, min, max, median, std (Torch)
+    gpu_kernel: Triton for sum, mean, min, max, median
+    deterministic: "yes for sum, mean, min, max, median (gather on the transposed neighbourhoods on CUDA)"
+    notes:
+      - Not an nn.Module; reduction= is chosen at call time.
 
 - id: gradient
   title: East/North gradient of a scalar field (gradient)
@@ -1107,6 +1154,16 @@ tools:
       use: HealPixDivCurl
       page: stats/divcurl
   optional_deps: none
+  ai:
+    role: reduction
+    does: least-squares gradient (east, north) per metre with the geometry built once, as a feature or inside a physics loss
+    api: [healpix_analyse.gradient.HealPixGradient]
+    shapes: "values [..., N] -> (grad_east, grad_north), each [..., len(domain)]"
+    grad: yes (Torch)
+    gpu_kernel: Triton (float32, float64, float16 / bfloat16 with fp32 accumulation)
+    deterministic: "yes on the Triton path (hand-written backward, gather on the transposed neighbourhoods)"
+    notes:
+      - Not an nn.Module (no parameters); call it inside forward. Constructor arguments are cell_ids then refinement_level.
 
 - id: divcurl
   title: Divergence and curl of a flow, at one or every scale (HealPixDivCurl)
@@ -1146,6 +1203,14 @@ tools:
       use: "HEALPixSHT.uv_to_curl_div (spin-1 alm times -sqrt(l(l+1))/R, in 1/s)"
       page: stats/compare_divcurl
   optional_deps: none
+  ai:
+    role: reduction
+    does: divergence and curl of a (u, v) vector field, as features or in a physics-aware loss
+    api: [healpix_analyse.divcurl.HealPixDivCurl]
+    shapes: "[..., 2, N] (u, v) -> [..., 2, N] (div, curl)"
+    grad: yes (input)
+    gpu_kernel: Triton (embedding, HealPixConv stencil and contraction fused; float32, float64)
+    deterministic: "no atomics in the fused Triton kernels"
 
 - id: morphology
   title: Binary dilation and erosion by a radius (morphology)
@@ -1285,14 +1350,14 @@ tools:
     role: resample
     does: one level coarser (pooling layer of an encoder); mean, max, Gaussian or mean-conserving Gaussian
     api: [healpix_analyse.down.HealPixDown]
-    shapes: "[B, N] -> ([B, N_out], cell_ids_out); fold channels into the batch for [B, C, N]"
+    shapes: "[..., N] (e.g. [B, C, N]) -> ([..., N_out], cell_ids_out)"
     grad: yes (maxpool almost everywhere)
-    gpu_kernel: "no custom kernel: torch.sparse.mm (smooth modes) or a gather (mean, maxpool)"
-    deterministic: "mean / maxpool: each child has one parent; smooth: product with the stored CSR transpose (torch.sparse.mm)"
+    gpu_kernel: "mean / maxpool: a view and a reduction on contiguous NESTED data; Gaussian modes: ELL gather, Triton on CUDA"
+    deterministic: "yes (gathers with the stored transpose, no atomics)"
     notes:
       - Returns a tuple (values, cell_ids_out); cell_ids_out = np.unique(cell_ids // 4) on a regional domain.
-      - Only [N] or [B, N] inputs; reshape [B, C, N] to [B*C, N] and back.
-      - On a regional domain, build it from complete parents (every descendant of coarse cells); maxpool with incomplete parents has a known issue.
+      - "Build a regional domain from complete parents (every descendant of coarse cells): mean / maxpool then take the fast path (a view), and maxpool has a known issue with incomplete parents."
+      - The same operator pools a validity mask (pass mask.float(): the output is the valid fraction of the 4 children).
 
 - id: up
   title: One level finer (HealPixUp)
@@ -1330,13 +1395,13 @@ tools:
     role: resample
     does: one level finer (upsampling layer of a decoder)
     api: [healpix_analyse.up.HealPixUp]
-    shapes: "[B, N] -> ([B, 4*N], cell_ids_out) on complete parents; fold channels into the batch"
+    shapes: "[..., N] -> ([..., 4*N], cell_ids_out) on complete parents"
     grad: "yes"
-    gpu_kernel: "no custom kernel: torch.sparse.mm"
-    deterministic: "product with the stored CSR transpose (torch.sparse.mm)"
+    gpu_kernel: "ELL gather, Triton on CUDA; an expand with no matrix when paired with a mean Down on contiguous NESTED data"
+    deterministic: "yes (gather with the stored transpose, no atomics)"
     notes:
       - level is the coarse (input) level; cell_ids are the coarse cells; returns (values, cell_ids_out).
-      - paired_down= reuses the matrix of an existing HealPixDown (then omit cell_ids).
+      - paired_down= reuses an existing HealPixDown (then omit cell_ids); paired with a mode="mean" Down it is a nearest-parent copy.
 
 - id: decomp
   title: Exactly invertible multiscale pyramid (HealPixDecomp)
@@ -1379,7 +1444,7 @@ tools:
     api: [healpix_analyse.decomp.HealPixDecomp]
     shapes: "[..., N] -> HealPixPyramid (one band per level)"
     grad: "yes"
-    gpu_kernel: "no custom kernel: HealPixDown / HealPixUp products"
+    gpu_kernel: "no kernel of its own: the HealPixDown / HealPixUp kernels"
     deterministic: as HealPixDown / HealPixUp
 
 - id: resample

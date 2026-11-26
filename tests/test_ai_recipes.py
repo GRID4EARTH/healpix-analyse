@@ -16,7 +16,8 @@ SCRIPTS = sorted(p.name for p in RECIPES.glob("*.py"))
 
 
 def test_recipes_found():
-    assert {"resnet.py", "unet.py", "mae.py", "training.py"} <= set(SCRIPTS)
+    assert {"resnet.py", "unet.py", "mae.py", "training.py", "swin.py",
+            "neighbourhood_attention.py"} <= set(SCRIPTS)
 
 
 @pytest.mark.parametrize("script", SCRIPTS)

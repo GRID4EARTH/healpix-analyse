@@ -13,10 +13,11 @@ picks CUDA when it is available).
 | {doc}`unet` | U-Net with skip connections on a regional domain with gaps | `HealPixConv`, `HealPixGroupNorm`, `HealPixDown`, `HealPixUp` |
 | {doc}`mae` | masked autoencoder (ViT / MAE) with NESTED-block tokens | `HealPixPositionalEncoding`, `torch.nn.TransformerEncoder` |
 | {doc}`training` | training loop: NaN masks, masked loss, bf16 autocast, `DataLoader` | `HealPixConv`, `HealPixGroupNorm`, `HealPixUp` |
+| {doc}`swin` | Swin-like hierarchical transformer (window attention, patch merging, masked readout) | `HealPixWindowAttention`, `HealPixLayerNorm`, `HealPixDown`, `global_pool` |
+| {doc}`neighbourhood_attention` | neighbourhood-attention transformer for per-cell segmentation | `HealPixNeighbourhoodAttention`, `HealPixLayerNorm`, `HealPixConv` |
 
 Recipes for the blocks still in review (strided and transposed convolutions,
-square patches, window attention, augmentations) are added when they are
-merged.
+square patches, augmentations) are added when they are merged.
 
 ```{toctree}
 ---
@@ -27,4 +28,6 @@ resnet
 unet
 mae
 training
+swin
+neighbourhood_attention
 ```

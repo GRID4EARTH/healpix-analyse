@@ -32,7 +32,11 @@
   code, a "which block for which architecture" table, a page on data
   (domains, NaN and masks, augmentation, batching), and runnable recipes
   (ResNet classifier, U-Net, ViT / MAE with NESTED-block tokens, training
-  loop with masks and bf16 autocast) run by `tests/test_ai_recipes.py`.
+  loop with masks and bf16 autocast, Swin-like transformer with
+  `HealPixWindowAttention`, neighbourhood-attention segmenter) run by
+  `tests/test_ai_recipes.py`. The window and neighbourhood attention,
+  `HealPixGradient`, `HealPixNeighbourReducer` and `HealPixDivCurl` have AI
+  cards too.
   `docs/tools.yaml` gains an `ai:` field per block and an `ai:` section;
   `llms.txt` and `llms-full.txt` gain an "AI building blocks" section (API
   cards and the code of the recipes); new AI cases in the tool-choice

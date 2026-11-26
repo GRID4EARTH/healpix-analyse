@@ -71,7 +71,8 @@ synthetic clouds), or draw random token masks as in the
 - The geometry is built at construction and cached (`HealPixConv` on disk,
   `HealPixPositionalEncoding` in memory), so building layers for a few
   domains is cheap after the first time.
-- Mixed precision: inside `torch.autocast`, `torch.nn.Linear` and attention
-  run in bfloat16; `HealPixConv` casts its input to its own dtype (build it
+- Mixed precision: inside `torch.autocast`, `torch.nn.Linear`,
+  `HealPixWindowAttention` and `HealPixNeighbourhoodAttention` run in
+  bfloat16; `HealPixConv` casts its input to its own dtype (build it
   with `dtype=torch.bfloat16` for 16-bit kernels); the masked norms keep the
   dtype of their input. See {doc}`recipes/training`.
