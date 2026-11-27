@@ -26,7 +26,9 @@ from healpix_analyse.convol import (
     _geometry_cache_key,
     _get_interp_weights,
     _local_kernel_grid,
+    _stretch_to_ellipsoid,
 )
+from healpix_analyse._ellipsoid import authalic_scale
 from healpix_analyse.down import HealPixDown
 
 needs_triton = pytest.mark.skipif(
@@ -76,14 +78,20 @@ def dense_operator(conv, cell_ids):
     else:
         centres, lev_c = ids_in, level
     K_out, K_in = centres.size, ids_in.size
+    # centres on the authalic sphere, metric of the ellipsoid
     lon, lat = healpix_geo.nested.healpix_to_lonlat(centres.tolist(), lev_c,
-                                                   ellipsoid=conv.ellipsoid)
+                                                   ellipsoid="sphere")
     th = np.deg2rad(90.0 - np.asarray(lat, dtype=np.float64))
     ph = np.deg2rad(np.asarray(lon, dtype=np.float64))
     R = _build_rotation_matrices(th, ph, G, conv.gauge_type, "cpu", torch.float64,
                                  ref_direction=conv.ref_direction)
     vec = torch.as_tensor(_local_kernel_grid(k, 2**level), dtype=torch.float64)
     flat = torch.einsum("kgij,pj->kgpi", R, vec).reshape(-1, 3)
+    if conv.ellipsoid != "sphere" and k > 1:
+        _, lat_g = healpix_geo.nested.healpix_to_lonlat(centres.tolist(), lev_c,
+                                                       ellipsoid=conv.ellipsoid)
+        flat = _stretch_to_ellipsoid(flat, th, ph, authalic_scale(lat_g, conv.ellipsoid),
+                                     G, P)
     idx, w = _get_interp_weights(2**level, flat, True, "cpu", torch.float64)
     idx = idx.view(4, K_out, G, P).permute(2, 0, 1, 3).reshape(G, 4, K_out * P)
     w = w.view(4, K_out, G, P).permute(2, 0, 1, 3).reshape(G, 4, K_out * P)

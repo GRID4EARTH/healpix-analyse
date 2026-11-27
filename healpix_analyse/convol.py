@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import healpix_geo
 from healpix_analyse.healpix_interp import get_interp_weights
-from healpix_analyse._ellipsoid import canonicalize_ellipsoid
+from healpix_analyse._ellipsoid import authalic_scale, canonicalize_ellipsoid
 from healpix_analyse._conv_backend import (
     BACKENDS,
     build_gather_map,
@@ -51,7 +51,9 @@ _DEFAULT_CACHE_DIR = Path(
 
 # Bump when the meaning or layout of any cached buffer changes.
 # 4: neighbours below _STENCIL_MIN_WEIGHT no longer count (#109).
-_CACHE_FORMAT = 4
+# 5: on an ellipsoid the stencil is centred on the cell (authalic sphere),
+#    not at the geodetic latitude, and is square in metres on the ellipsoid.
+_CACHE_FORMAT = 5
 
 # A bilinear neighbour inside the domain counts only if its weight is at
 # least this fraction of the full 4-neighbour weight of its stencil point
@@ -424,6 +426,41 @@ def _local_kernel_grid(kernel_sz, nside):
     return np.stack([x, y, z], axis=-1).astype(np.float64)
 
 
+def _stretch_to_ellipsoid(rot, th, ph, k, G, P):
+    """Map a grid that is isotropic on the ground onto the authalic sphere.
+
+    ``rot`` [M*G*P, 3] are the grid points rotated to the centres (colatitude
+    ``th``, longitude ``ph`` on the authalic sphere, in the order centre,
+    gauge, point); ``k`` [M] is the scale of
+    :func:`~healpix_analyse._ellipsoid.authalic_scale`.  Every offset from
+    the centre (azimuthal equidistant) is multiplied by ``k`` along the
+    meridian and divided by ``k`` along the parallel, so that the grid keeps
+    its shape in metres on the ellipsoid.  Modified in place and returned.
+    """
+    M = th.shape[0]
+    v = rot.view(M, G * P, 3)
+    th_t = torch.as_tensor(th, dtype=v.dtype, device=v.device)[:, None]
+    ph_t = torch.as_tensor(ph, dtype=v.dtype, device=v.device)[:, None]
+    ct, st, cp, sp = th_t.cos(), th_t.sin(), ph_t.cos(), ph_t.sin()
+    n = torch.stack([st * cp, st * sp, ct], -1)                    # [M, 1, 3]
+    e_s = torch.stack([ct * cp, ct * sp, -st], -1)                 # south
+    e_e = torch.stack([-sp, cp, torch.zeros_like(st)], -1)         # east
+    t_s = (v * e_s).sum(-1)
+    t_e = (v * e_e).sum(-1)
+    up = (v * n).sum(-1)
+    t = torch.hypot(t_s, t_e)
+    d = torch.atan2(t, up)
+    one = torch.ones_like(t)
+    scale = torch.where(t > 0, d / torch.where(t > 0, t, one), one)
+    kk = torch.as_tensor(k, dtype=v.dtype, device=v.device)[:, None]
+    o_s, o_e = t_s * scale * kk, t_e * scale / kk
+    r = torch.hypot(o_s, o_e)
+    sinc = torch.where(r > 0, r.sin() / torch.where(r > 0, r, one), one)
+    v.copy_(r.cos()[..., None] * n
+            + sinc[..., None] * (o_s[..., None] * e_s + o_e[..., None] * e_e))
+    return rot
+
+
 # ===========================================================================
 # Helper 1 — _get_interp_weights  (unchanged)
 # ===========================================================================
@@ -684,8 +721,14 @@ class HealPixConv(nn.Module):
         NESTED pixel ordering.
     use_norm : bool, default False
         Apply GroupNorm + ReLU after convolution.
-    ellipsoid : str, default "WGS84"
-        Reference ellipsoid for healpix_geo coordinate conversions.
+    ellipsoid : str or dict, default "WGS84"
+        Reference ellipsoid of the HEALPix grid.  A HEALPix grid on an
+        ellipsoid is the grid of its authalic sphere: the stencil is centred
+        on each cell and interpolated there whatever the ellipsoid.  The
+        ellipsoid only sets the metric: the stencil is square in metres on
+        the ellipsoid instead of on the authalic sphere (on WGS84 its
+        offsets change by at most 0.11 %).  ``"sphere"`` gives the isotropic stencil of the
+        authalic sphere.
     device, dtype : torch device / dtype.
         Initial placement; ``module.to(...)`` moves and casts the layer
         afterwards like any other module.
@@ -1059,11 +1102,23 @@ class HealPixConv(nn.Module):
 
             # Stage A: rotation matrices + stencil projection, centred on
             # the output cells (the parents for stride 2); the stencil keeps
-            # the spacing of the input level
+            # the spacing of the input level.  A HEALPix grid on an
+            # ellipsoid is the grid of its authalic sphere, where
+            # _get_interp_weights reads it: the centres are taken there
+            # (geodetic latitudes would shift the stencil by phi - beta, up
+            # to 0.13 degree).  The ellipsoid only sets the metric, through
+            # the scale k of the authalic map.
             lon, lat = healpix_geo.nested.healpix_to_lonlat(
-                ids_out.tolist(), self.level_out,
-                ellipsoid=self.ellipsoid,
+                ids_out.tolist(), self.level_out, ellipsoid="sphere",
             )
+            k_ell = None
+            if self.ellipsoid != "sphere" and self.kernel_sz > 1:
+                _, lat_g = healpix_geo.nested.healpix_to_lonlat(
+                    ids_out.tolist(), self.level_out, ellipsoid=self.ellipsoid,
+                )
+                k_ell = authalic_scale(
+                    np.asarray(lat_g, dtype=np.float64), self.ellipsoid
+                )
             th = np.deg2rad(90.0 - np.asarray(lat, dtype=np.float64))
             ph = np.deg2rad(np.asarray(lon, dtype=np.float64))
             vec_t = torch.as_tensor(
@@ -1110,6 +1165,10 @@ class HealPixConv(nn.Module):
                 )  # [kc, G, 3, 3]
                 flat = torch.einsum("kgij,pj->kgpi", R_tot, vec_t).reshape(-1, 3)
                 del R_tot
+                if k_ell is not None:
+                    flat = _stretch_to_ellipsoid(
+                        flat, th[k0:k1], ph[k0:k1], k_ell[k0:k1], G, P
+                    )
                 idx_flat, w_flat = _get_interp_weights(
                     self.nside, flat, self.nest, self.device, geom_dtype
                 )  # [4, kc*G*P]

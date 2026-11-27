@@ -172,8 +172,9 @@ class HealPixPatches(nn.Module):
         ``"gauge"``: an ``N x N`` grid in the tangent plane of each centre,
         rotated by the gauge and sampled by bilinear interpolation, exactly
         like a :class:`~healpix_analyse.convol.HealPixConv` kernel with
-        ``ellipsoid="sphere"`` (with WGS84, ``HealPixConv`` places its stencil
-        at geodetic latitudes, shifted from the cell centres), with the
+        ``ellipsoid="sphere"`` (with WGS84, ``HealPixConv`` centres its
+        stencil on the same cells and makes it square in metres on the
+        ellipsoid, offsets changed by at most 0.11 %), with the
         spacing of one cell of level ``L``.  ``"nested"``: the ``4**p``
         descendants of each centre as a ``2**p x 2**p`` image (row ``N-1-y``,
         column ``x`` in the face coordinates of HEALPix, the layout of
