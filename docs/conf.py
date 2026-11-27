@@ -4,6 +4,9 @@ import shutil
 import sys
 
 sys.path.insert(0, os.path.abspath(".."))
+# local extensions (docs/_ext): the tool catalogue generator
+# (tools.yaml -> decision tables, "At a glance" boxes, API by family, llms.txt)
+sys.path.insert(0, os.path.abspath("_ext"))
 
 # ---------------------------------------------------------------------------
 # Notebooks live in ``<repo root>/Notebooks`` so they can be run/edited
@@ -60,6 +63,7 @@ extensions = [
     "sphinx.ext.mathjax",
     "sphinx_design",
     "myst_nb",
+    "tool_catalogue",
 ]
 
 # ---------------------------------------------------------------------------
@@ -110,9 +114,6 @@ suppress_warnings = [
     "ref.class",
     "ref.func",
     "ref.obj",
-    # Supplementary/dev notebooks in Notebooks/ that are intentionally not
-    # linked from any toctree.
-    "toc.not_included",
     # Notebooks (.ipynb) don't always start with a Markdown H1 cell, so
     # myst-nb can't derive a page title from them; we always give them an
     # explicit title in the toctree entry itself.
@@ -154,6 +155,12 @@ intersphinx_mapping = {
 # ---------------------------------------------------------------------------
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
+# llms.txt and llms-full.txt (generated from tools.yaml) go to the site root
+# (with the redirect stubs of the pages moved by the docs overhaul, #89)
+html_extra_path = ["_generated/extra"]
+html_baseurl = "https://grid4earth.eu/healpix-analyse/"
+# Every public symbol must be in tools.yaml (see docs/_ext/tool_catalogue.py)
+tool_catalogue_complete = True
 html_title = "healpix-analyse"
 html_theme_options = {
     "navigation_depth": 4,
@@ -169,6 +176,10 @@ html_theme_options = {
 # myst_nb (in extensions) registers .md and .ipynb automatically.
 # Listing .md first avoids Sphinx resolving root_doc to index.rst.
 # ---------------------------------------------------------------------------
+# Generated fragments (docs/_generated) are included by other pages, never
+# built on their own.
+exclude_patterns = ["_build", "_generated"]
+
 source_suffix = {
     ".md": "myst-nb",
     ".ipynb": "myst-nb",

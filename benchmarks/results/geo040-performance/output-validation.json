@@ -1,0 +1,68 @@
+[
+  {
+    "case": "19-3600-4",
+    "comparison": "integration_scalar",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4",
+    "comparison": "release040_scalar",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-3600-4",
+    "comparison": "main",
+    "bit_equal": false,
+    "max_abs_error": 4.440892098500626e-16
+  },
+  {
+    "case": "19-600-4",
+    "comparison": "integration_scalar",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4",
+    "comparison": "release040_scalar",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "19-600-4",
+    "comparison": "main",
+    "bit_equal": false,
+    "max_abs_error": 4.440892098500626e-16
+  },
+  {
+    "case": "20-1200-5",
+    "comparison": "integration_scalar",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-1200-5",
+    "comparison": "release040_scalar",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5",
+    "comparison": "integration_scalar",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5",
+    "comparison": "release040_scalar",
+    "bit_equal": true,
+    "max_abs_error": 0.0
+  },
+  {
+    "case": "20-600-5",
+    "comparison": "main",
+    "bit_equal": false,
+    "max_abs_error": 4.440892098500626e-16
+  }
+]

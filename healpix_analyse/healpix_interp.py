@@ -34,6 +34,7 @@ Auteurs : Claude (Anthropic)
 import numpy as np
 from healpix_geo import ring as _hg_ring
 from healpix_geo.nested import bilinear_interpolation as _nested_bilinear_interpolation
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +260,7 @@ def get_interp_weights(
     ValueError
         Si lon et lat n'ont pas la même forme.
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     lon = np.asarray(lon, dtype=np.float64)
     lat = np.asarray(lat, dtype=np.float64)
     if lon.shape != lat.shape:
@@ -273,6 +275,10 @@ def get_interp_weights(
         nside = 2 ** depth
         theta = np.radians(90.0 - lat_flat)
         phi = np.radians(lon_flat) % (2.0 * np.pi)
+        # x % 2pi returns exactly 2pi for a tiny negative x (e.g. -6.28e-15):
+        # fold it back, as the C++ code does, or a cell of the wrong ring gets
+        # the weight.
+        phi[phi >= 2.0 * np.pi] -= 2.0 * np.pi
 
         pix_ring, weights = _get_interpol_ring(theta, phi, nside)
         pixels = _hg_ring.to_nested(pix_ring.ravel(), depth).reshape(pix_ring.shape)
@@ -356,6 +362,7 @@ def get_interp_val(
         import healpy as hp
         hpx_map_nested = hp.reorder(hpx_map_ring, r2n=True)
     """
+    ellipsoid = canonicalize_ellipsoid(ellipsoid)
     lon = np.asarray(lon, dtype=np.float64)
     lat = np.asarray(lat, dtype=np.float64)
     scalar_input = lon.ndim == 0

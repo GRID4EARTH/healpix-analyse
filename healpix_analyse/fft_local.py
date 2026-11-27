@@ -12,15 +12,71 @@ bilinear gridding in both directions.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Union
 
 import healpix_geo
 import numpy as np
 import torch
 import torch.nn as nn
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
+
+
+#: Width (standard deviation per axis, in grid pixels) of the blur added by one
+#: bilinear projection followed by one bilinear back-projection, for cell
+#: centres at random positions inside the grid cells: two passes of linear
+#: interpolation, each of variance 1/6 pixel^2 per axis.  The exact value of a
+#: given patch is :meth:`healpix_analyse.fft_local.LocalFFT.blur_floor_px`.
+PROJECTION_BLUR_FLOOR_PX = math.sqrt(1.0 / 3.0)
+
+
+def check_kernel_width(
+    sigma_px: float,
+    floor_px: float = PROJECTION_BLUR_FLOOR_PX,
+    *,
+    on_below: str = "warn",
+    stacklevel: int = 2,
+) -> bool:
+    """Check a Gaussian width against the blur floor of the projection pair.
+
+    Parameters
+    ----------
+    sigma_px : float
+        Requested standard deviation per axis, in grid pixels.
+    floor_px : float
+        Blur floor in grid pixels.
+    on_below : {"warn", "error", "ignore"}
+        What to do when ``sigma_px < floor_px``.
+    stacklevel : int, default=2
+        Passed to :func:`warnings.warn`; the default points the warning at the
+        caller of this function.
+
+    Returns
+    -------
+    bool
+        True when the width can be represented (``sigma_px >= floor_px``).
+    """
+    if on_below not in ("warn", "error", "ignore"):
+        raise ValueError("on_below must be 'warn', 'error' or 'ignore'")
+    if not math.isfinite(sigma_px) or sigma_px < 0:
+        raise ValueError("sigma_px must be finite and non-negative")
+    if sigma_px >= floor_px:
+        return True
+    message = (
+        f"Requested width {sigma_px:.4g} pixel is below the blur floor "
+        f"{floor_px:.4g} pixel of the HEALPix -> grid -> HEALPix projection "
+        f"pair; the effective width is at least "
+        f"{math.hypot(sigma_px, floor_px):.4g} pixel. Use "
+        "gaussian_filter(..., width_rule='matched') for such small widths."
+    )
+    if on_below == "error":
+        raise ValueError(message)
+    if on_below == "warn":
+        warnings.warn(message, UserWarning, stacklevel=stacklevel)
+    return False
 
 
 def _is_complex_input(value: ArrayLike) -> bool:
@@ -158,6 +214,20 @@ class LocalFFT(nn.Module):
     device : torch.device or str, optional
         Device of the cached projection geometry.  CUDA is selected when it
         is available, otherwise CPU.
+    projection : {"average", "conservative"}, default="average"
+        Convention of the HEALPix <-> grid pair.  ``"average"`` divides every
+        grid point by its accumulated interpolation weight after scattering,
+        so a constant field stays constant, but the sum over the cells is not
+        kept by a convolution.  ``"conservative"`` scatters without that
+        division and divides the grid by that weight just before the
+        back-projection gather, so each grid point hands its whole content to
+        the cells around it: the sum over the cells is kept by a convolution
+        with a normalised kernel (a probability map stays normalised), and
+        mass that the convolution moves to grid points not covered by the
+        patch is lost.  The two steps are not transposes of one another; the
+        round trip is symmetric and its column sums are one.  A constant field is kept by
+        the pair alone but not by a convolution in this mode.  Both options
+        have exactly the same blur floor, see :meth:`blur_floor_px`.
 
     Notes
     -----
@@ -182,8 +252,14 @@ class LocalFFT(nn.Module):
         norm: str = "ortho",
         dtype: torch.dtype = torch.float32,
         device: Optional[Union[str, torch.device]] = None,
+        projection: str = "average",
     ) -> None:
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         super().__init__()
+
+        if projection not in ("average", "conservative"):
+            raise ValueError("projection must be 'average' or 'conservative'")
+        self.projection = projection
 
         if dtype not in (torch.float32, torch.float64):
             raise ValueError("dtype must be torch.float32 or torch.float64")
@@ -396,7 +472,8 @@ class LocalFFT(nn.Module):
             device=flat_data.device,
         )
         projected.scatter_add_(1, indices, sources)
-        projected = projected * self._grid_inverse_density
+        if self.projection == "average":
+            projected = projected * self._grid_inverse_density
         return projected.reshape(*leading_shape, self.grid_size, self.grid_size)
 
     def project(self, data: ArrayLike) -> ArrayLike:
@@ -412,6 +489,8 @@ class LocalFFT(nn.Module):
             )
         leading_shape = grid.shape[:-2]
         flat_grid = grid.reshape(-1, self.grid_size * self.grid_size)
+        if self.projection == "conservative":
+            flat_grid = flat_grid * self._grid_inverse_density
         batch_size = flat_grid.shape[0]
         indices = self._grid_indices.reshape(1, -1).expand(batch_size, -1)
         samples = torch.gather(flat_grid, 1, indices).reshape(
@@ -515,6 +594,82 @@ class LocalFFT(nn.Module):
             self._restore_type(power, is_numpy),
         )
 
+    def blur_floor_px(self, *, per_axis: bool = False) -> np.ndarray:
+        """Blur of the projection pair for each cell, in grid pixels.
+
+        The response of ``unproject(project(.))`` to a single cell is not a
+        single cell: it is spread over its neighbours.  This returns, for every
+        cell, the standard deviation of that response about the source cell, in
+        units of ``pixel_size_rad``, as the square root of half its second
+        moment (the standard deviation per axis for an isotropic response).
+        Gaussian widths below this value cannot be represented by a
+        convolution on this grid.
+
+        The round trip is the same operator for both projection conventions,
+        so the floor does not depend on ``projection``.  It varies from cell to
+        cell with the position of the cell centre inside its grid pixel and is
+        not isotropic: see ``per_axis``.
+
+        Parameters
+        ----------
+        per_axis : bool, default=False
+            Return the standard deviation along the two axes of the gnomonic
+            plane separately, shape ``[N, 2]`` (x, y), instead of the
+            isotropic value.
+
+        Returns
+        -------
+        numpy.ndarray, shape [N] or [N, 2]
+        """
+        g2 = self.grid_size * self.grid_size
+        indices = self._grid_indices.cpu().numpy()                      # [N, 4]
+        weights = self._grid_weights.cpu().numpy().astype(np.float64)   # [N, 4]
+        inverse = self._grid_inverse_density.cpu().numpy().astype(np.float64)
+        x = self.projected_x.cpu().numpy().astype(np.float64) / self.pixel_size_rad
+        y = self.projected_y.cpu().numpy().astype(np.float64) / self.pixel_size_rad
+
+        # With G[i, g] the bilinear weight of cell i on grid pixel g, the
+        # response of cell j is R[i, j] = sum_g G[i, g] inverse[g] G[j, g].
+        # Its moments about cell j only need, for each grid pixel g, the
+        # moments of the cells i that deposit on g, which bincount gathers in
+        # O(N): the N x N matrix R is never formed.
+        flat = indices.reshape(-1)
+        w_flat = weights.reshape(-1)
+        s0 = np.bincount(flat, weights=w_flat, minlength=g2)          # sum_i G[i, g]
+        outer = weights * inverse[indices]                             # G[j, g] inverse[g]
+        mass = (outer * s0[indices]).sum(axis=1)                       # sum_i R[i, j]
+        m2 = []
+        for axis in (x, y):
+            a = np.repeat(axis, indices.shape[1])
+            s1 = np.bincount(flat, weights=w_flat * a, minlength=g2)
+            centroid = np.divide(s1, s0, out=np.zeros(g2), where=s0 > 0)
+            # sum_i G[i, g] (a_i - a_j)^2, taken about the centroid of pixel g
+            # so that no large terms cancel
+            spread = np.bincount(flat, weights=w_flat * (a - centroid[flat]) ** 2, minlength=g2)
+            offset = s0[indices] * (axis[:, None] - centroid[indices]) ** 2
+            m2.append((outer * (spread[indices] + offset)).sum(axis=1) / mass)
+        m2 = np.stack(m2, axis=-1)
+        if per_axis:
+            return np.sqrt(m2)
+        return np.sqrt(0.5 * m2.sum(axis=-1))
+
+    def check_width(
+        self, sigma_px: float, *, on_below: str = "warn", stacklevel: int = 2
+    ) -> bool:
+        """Check a Gaussian width (grid pixels) against this patch's blur floor.
+
+        The floor used is the median over the cells of :meth:`blur_floor_px`,
+        computed at each call (the geometry is not cached), so cells whose own
+        floor is larger are not flagged individually.  See
+        :func:`check_kernel_width`.
+        """
+        return check_kernel_width(
+            sigma_px,
+            float(np.median(self.blur_floor_px())),
+            on_below=on_below,
+            stacklevel=stacklevel + 1,
+        )
+
     def extra_repr(self) -> str:
         return (
             f"level={self.level}, n_cells={self.n_cells}, "
@@ -606,4 +761,11 @@ def ps(
     return frequency, power
 
 
-__all__ = ["LocalFFT", "fft", "ifft", "ps"]
+__all__ = [
+    "LocalFFT",
+    "PROJECTION_BLUR_FLOOR_PX",
+    "check_kernel_width",
+    "fft",
+    "ifft",
+    "ps",
+]

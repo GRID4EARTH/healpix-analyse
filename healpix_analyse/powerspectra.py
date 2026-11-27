@@ -1,9 +1,12 @@
+import warnings
+
 import numpy as np
 import torch
 
 from healpix_analyse.alm import AlmTransform
 
 from typing import Generic, Tuple, Optional, Sequence, Union
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 ArrayLike = Union[np.ndarray, torch.Tensor, Sequence[float], Sequence[int]]
 
@@ -20,6 +23,18 @@ def powerspectra(cell_ids,
                  plot_2D_fft=False):
         """
         Compute the isotropic 1D power spectrum of a 2D HEALPix field.
+
+        **Deprecated**: ``powerspectra`` emits a ``DeprecationWarning`` and
+        will be removed in a future release. It is not differentiable, the
+        harmonic path of ``AlmTransform`` is not implemented, and its binning
+        is ad hoc. Use instead:
+
+        - ``HEALPixSHT.anafast`` (``healpix_analyse.healpix_sht``) for the
+          angular power spectrum on the full sphere;
+        - ``HealPixWaveletSpectrum`` / ``HealPixIsotropicWaveletSpectrum`` for
+          a spectrum on a regional domain or a masked map;
+        - ``build_rings_from_latlon`` + ``anafast_latlon`` for lon/lat and
+          Gaussian grids.
     
         Parameters
         ----------
@@ -36,6 +51,16 @@ def powerspectra(cell_ids,
         Pk : ndarray
             Azimuthally averaged power spectrum over radial frequency bins (arbitrary units unless you add a normalization).
         """
+        warnings.warn(
+            "powerspectra is deprecated and will be removed in a future release. "
+            "Use HEALPixSHT.anafast (full sphere), HealPixWaveletSpectrum "
+            "(regional domain or masked map) or anafast_latlon (lon/lat grids) "
+            "instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         # 2D FFT and power
         
         if ltf is None:

@@ -98,6 +98,7 @@ import torch
 from healpix_analyse.convol import HealPixConv, _local_kernel_grid
 from healpix_analyse.decomp import HealPixDecomp
 from healpix_analyse.validation import direct_spherical_convolution
+from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
 KernelFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
 """A kernel profile ``fn(rho_pix, phi_rad) -> weight``.
@@ -116,6 +117,13 @@ band because the pixel size itself grows.
 # ---------------------------------------------------------------------------
 # Built-in isotropic / anisotropic kernel families
 # ---------------------------------------------------------------------------
+
+def _to_numpy(t) -> np.ndarray:
+    """Tensor (CPU or GPU, possibly requiring grad) or array-like -> numpy array."""
+    if torch.is_tensor(t):
+        return t.detach().cpu().numpy()
+    return np.asarray(t)
+
 
 def kernel_gaussian(sigma_pix: float) -> KernelFn:
     """Isotropic Gaussian, ``exp(-rho^2 / (2 sigma^2))``. Control/reference case."""
@@ -333,6 +341,7 @@ class HealPixKernelPyramid:
             mislabeled. Accepted case-insensitively (canonicalized against
             ``healpix_geo``'s own registry).
         """
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         if compact_kernel_sz < 1 or compact_kernel_sz % 2 == 0:
             raise ValueError("compact_kernel_sz must be a positive odd integer")
         channels = int(channels)
@@ -453,6 +462,7 @@ class HealPixKernelPyramid:
         one fit per channel), so ``reference_fn`` need not know about
         channels at all.
         """
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         channels = int(channels)
         if channels < 1:
             raise ValueError("channels must be a positive integer")
@@ -485,13 +495,13 @@ class HealPixKernelPyramid:
                 x_exc = rng.standard_normal(n)
                 probe_idx = rng.choice(n, size=n_probes_j, replace=False)
 
-                target_full = np.asarray(op(x_exc)).reshape(-1)
+                target_full = _to_numpy(op(x_exc)).reshape(-1)
                 b_rows.append(target_full[probe_idx])
 
                 A_e = np.zeros((n_probes_j, P), dtype=np.float64)
                 for tap in range(P):
                     conv.set_kernel(basis[tap][None, None, :].astype(np.float32), requires_grad=False)
-                    y_tap = np.asarray(conv(x_exc)).reshape(-1)  # x_interp[:, tap]
+                    y_tap = _to_numpy(conv(x_exc)).reshape(-1)  # x_interp[:, tap]
                     A_e[:, tap] = y_tap[probe_idx]
                 A_rows.append(A_e)
 
@@ -565,10 +575,14 @@ class HealPixKernelPyramid:
         represented well by *small* (``compact_kernel_sz``) per-band
         kernels: most of the target's reach comes from the pyramid's
         coarsening itself, and each band only has to correct the local
-        shape at its own scale. See ``docs/pyramid_convolution.md`` for the
+        shape at its own scale. See ``docs/conv/pyramid_conv_maths.md`` for the
         derivation and honest limits (reach is still bounded by
         ``decomp.Jmax``; a target wider than the coarsest band's own reach
         cannot be represented regardless of how the taps are fit).
+
+        Needs SciPy, through the direct reference (``scipy.spatial.cKDTree``):
+        ``pip install 'healpix-analyse[scipy]'``. The rest of the module does
+        not.
 
         Parameters
         ----------
@@ -602,6 +616,7 @@ class HealPixKernelPyramid:
         implemented, a currently unaddressed limitation, not a silent
         approximation.
         """
+        ellipsoid = canonicalize_ellipsoid(ellipsoid)
         if decomp.partial:
             raise ValueError(
                 "calibrate_joint requires a full-sphere HealPixDecomp "
@@ -671,7 +686,7 @@ class HealPixKernelPyramid:
                         filtered_j, dtype=dtype, device=device
                     ).reshape(-1)
                     y_tap = decomp.invert(modified_bands, restore_mask=False)
-                    y_tap_np = np.asarray(y_tap).reshape(-1)
+                    y_tap_np = _to_numpy(y_tap).reshape(-1)
                     A_e[:, j * P + tap] = y_tap_np[probe_idx]
             A_rows.append(A_e)
 

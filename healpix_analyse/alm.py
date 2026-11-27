@@ -111,14 +111,16 @@ class AlmTransform:
         The indexing scheme for the cell IDs.
     ellipsoid : {"sphere", "WGS84"}, default="sphere"
         Geometry model. 
-    method : {"fft", "alm"}, default="fft", Alm approximation, alm option under development.
-        Analysis mode used in the Legendre stage.
+    method : {"fft", "alm"}, default="fft"
+        Analysis mode used in the Legendre stage. Only ``"fft"`` is
+        implemented; ``"alm"`` raises :class:`NotImplementedError`.
     dtype : torch.dtype, default=torch.float32
         Real dtype for maps and geometry.
     device : str or torch.device, optional
         Execution device. If None, uses CUDA when available, else CPU.
     debug : bool, default=False
-        Whether to store diagnostic timing information.
+        Print diagnostics and show debug plots (needs matplotlib).
+        Nothing is printed when ``False``.
 
     Notes
     -----
@@ -156,6 +158,12 @@ class AlmTransform:
             raise ValueError("ellipsoid must be 'sphere' or 'WGS84'")
         if self.method not in {"fft", "alm"}:
             raise ValueError("method must be 'fft' or 'alm'")
+        if self.method == "alm":
+            raise NotImplementedError(
+                "AlmTransform(method='alm') is not implemented: only the FFT "
+                "stage exists. Use method='fft', or HEALPixSHT (full sphere) / "
+                "anafast_latlon (lon/lat grids) for harmonic coefficients."
+            )
         if self.dtype not in {torch.float32, torch.float64}:
             raise ValueError("dtype must be torch.float32 or torch.float64")
 
@@ -176,14 +184,16 @@ class AlmTransform:
         lon_range = healpix_geo.ring.healpix_to_lonlat(cell_ids[0,-1], level, ellipsoid=ellipsoid)[0]
         lon_range -= healpix_geo.ring.healpix_to_lonlat(cell_ids[0,0], level, ellipsoid=ellipsoid)[0]
         lon_range = lon_range[0]
-        print("lon_range", lon_range)
-        print("self.n_lon", self.n_lon)
-        print("self.lons_of_western_edge - self.lons_of_western_edge.min()", self.lons_of_western_edge - self.lons_of_western_edge.min())
+        if self.debug:
+            print("lon_range", lon_range)
+            print("self.n_lon", self.n_lon)
+            print("self.lons_of_western_edge - self.lons_of_western_edge.min()", self.lons_of_western_edge - self.lons_of_western_edge.min())
         pixel_shift = self.n_lon * (self.lons_of_western_edge - self.lons_of_western_edge.min()) / lon_range  # convert from longitude shift to pixel shift
         self.pixel_shift = pixel_shift
         #self.pixel_shift = torch.zeros_like(self.pixel_shift)  # TODO: remove after testing, currently set to zero for testing purposes
         #self.pixel_shift[1::2] = .5
-        print("pixel_shift", self.pixel_shift)
+        if self.debug:
+            print("pixel_shift", self.pixel_shift)
         self.phase_shift = self.compute_phase_shift(-self.pixel_shift)
 
         # TODO: optimize knowing that it is already sorted
@@ -320,7 +330,7 @@ class AlmTransform:
             "the ring bookkeeping it depends on are still missing. Use "
             "HEALPixSHT.anafast (healpix_sht.py, full sky) or LocalFFT "
             "(fft_local.py, local patch) for a working FFT / power-spectrum "
-            "pipeline in the meantime — see docs/powerspectra.md."
+            "pipeline in the meantime — see docs/sht/powerspectra.md."
         )
 
     

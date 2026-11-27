@@ -1,0 +1,1142 @@
+"""Compute backends of :class:`healpix_analyse.convol.HealPixConv`.
+
+The layer is a sum, over the P stencil taps and the 4 bilinear neighbours of
+each tap, of gathered input rows times one weight matrix per gauge and tap::
+
+    y[b, g*Co + o, k] = bias[g*Co + o] + sum_p sum_c A_p[g, b, k, c] W[g, c, o, p]
+    A_p[g, b, k, c]   = sum_j w[p, j, g, k] x[b, c, idx[p, j, g, k]]
+
+``idx`` and ``w`` are the *tap geometry*, both ``[P, 4, G, K]``: ``idx`` holds
+int32 positions in the order of the input (the sort permutation of the
+partial domain is folded in) and ``w`` the renormalised bilinear weights.
+The K output cells (the stencil centres) and the ``K_in`` input cells need
+not be the same: a strided convolution (``HealPixConv(stride=2)``) has its
+centres on the parent cells, ``K = K_in / 4`` on the full sphere.
+
+Three linear operators share this geometry, and each is the derivative of the
+others, so that every order of differentiation runs on the same kernels:
+
+``S``  (:class:`GaugeConvFunction`)
+    the convolution, ``x [B, C, K_in] -> y [B, G*Co, K]``;
+``S^T`` (:class:`GaugeConvTransposeFunction`)
+    its adjoint, ``y [B, G*Co, K] -> x [B, C, K_in]``: the input gradient of
+    ``S`` and the forward pass of
+    :class:`~healpix_analyse.convol.HealPixConvTranspose`;
+``Gw`` (:class:`GaugeConvGradWFunction`)
+    the weight gradient, ``(x, y) -> [G, C, Co, P]``, bilinear in ``x`` and
+    ``y``.
+
+The backward of ``S`` is ``(S^T(gy), Gw(x, gy))``, the backward of ``S^T``
+is ``(S(gx), Gw(gx, y))`` and the backward of ``Gw`` is ``(S^T_Q(y),
+S_Q(x))`` for a cotangent ``Q`` of the weights.  Each is an autograd
+Function whose backward calls the others, so ``create_graph=True`` (a
+gradient penalty) runs on the fused kernels too.  The Functions also define
+``jvp`` (forward mode: ``S`` is linear in ``x`` and in ``W``) and ``vmap``
+(the vmapped dimension is folded into the batch when possible, a loop
+otherwise), so ``torch.func.vmap``, ``jacrev``, ``jacfwd`` and ``jvp`` work.
+
+Neither backend ever materialises the gathered tensor ``[B, C, G, K, P]``
+(the E elements of issue #90).
+
+``"torch"`` (CPU, float64, and the reference everywhere)
+    A loop over the P taps: ``index_select`` of the 4 neighbours into a
+    ``[G, K*B, C]`` buffer, then ``baddbmm``.  ``S^T`` scatters with
+    ``index_add_`` on CPU.  On CUDA, where ``index_add_`` runs with atomics,
+    ``deterministic=True`` (the default) uses a gather on the transposed map
+    instead (:func:`build_gather_map`): no atomics, the same bits at every
+    run.  Memory: input + output + one tap.
+
+``"triton"`` (CUDA, float32 / float16 / bfloat16, fp32 accumulation)
+    Fused kernels.  ``S``: a gather-GEMM, one program per (batch, gauge,
+    block of cells, block of output channels); the tap tile ``A_p`` is built
+    in registers and multiplied by ``W[g, p]``.  ``Gw``: the same gather,
+    reduced over the rows; each program sums a contiguous chunk of rows for a
+    block of taps, contracted by one product over (tap, channel), and writes
+    its partial sum (no atomics, deterministic).  ``S^T``: by default
+    (``deterministic=True``), a gather on the transposed map of the stencil
+    (for each source cell, its incoming (target cell, weight) entries, in CSR
+    form per gauge and tap): no atomics, and the same result at every run.
+    With ``deterministic=False``, a GEMM-scatter with fp32 atomics.
+
+Extension points
+----------------
+The kernels are written so that the two variants needed by
+``HealPixConv(missing="local_mean")`` and the wavelet power spectrum can plug
+in without a rewrite:
+
+* a **masked gather** (value and validity in one pass, renormalisation and the
+  local-mean fallback in registers) replaces ``_gather_taps``, the only place
+  that reads the input through the stencil;
+* a **contraction with arbitrary taps** (complex taps, several voices, the
+  coverage contraction) replaces ``_weight_taps``: the weight tile is read
+  from a ``[G, P, C, Co]`` array whose meaning the kernels do not assume.
+
+Triton is optional: without it (or without CUDA) everything runs on the
+``"torch"`` backend.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import warnings
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+import torch
+
+try:  # Triton is an optional extra
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover - depends on the environment
+    triton = None
+    tl = None
+    _HAS_TRITON = False
+
+__all__ = [
+    "BACKENDS",
+    "triton_available",
+    "tap_geometry",
+    "build_transposed_map",
+    "build_gather_map",
+    "gauge_conv",
+    "gauge_conv_transpose",
+    "GaugeConvFunction",
+    "GaugeConvTransposeFunction",
+    "GaugeConvGradWFunction",
+]
+
+BACKENDS = ("auto", "triton", "torch")
+_TRITON_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def triton_available() -> bool:
+    """True when the Triton kernels can run (Triton importable and CUDA present)."""
+    return _HAS_TRITON and torch.cuda.is_available()
+
+
+# ===========================================================================
+# Geometry helpers
+# ===========================================================================
+
+def tap_geometry(pos_safe, w_norm, sort_order, G, K, P):
+    """Tap-major geometry from the bound stencil.
+
+    Parameters
+    ----------
+    pos_safe : LongTensor [4, G, K*P]
+        Positions of the 4 bilinear neighbours in the *sorted* order of the
+        input cells.
+    w_norm : Tensor [4, G, K*P]
+        Renormalised bilinear weights.
+    sort_order : LongTensor [K_in]
+        ``argsort(cell_ids)`` of the input cells.
+    K : int
+        Number of stencil centres (output cells).
+
+    Returns
+    -------
+    idx : IntTensor [P, 4, G, K]
+        Positions in the order of the input: ``sort_order[pos_safe]``, so that
+        the input is gathered directly, with no per-call reordering copy.
+    w : Tensor [P, 4, G, K]
+    """
+    pos = pos_safe.reshape(4, G, K, P)
+    idx = sort_order.to(torch.int32)[pos].permute(3, 0, 1, 2).contiguous()
+    w = w_norm.reshape(4, G, K, P).permute(3, 0, 1, 2).contiguous()
+    return idx, w
+
+
+def build_transposed_map(idx, w, K):
+    """Transposed stencil map, in CSR form per tap and gauge.
+
+    For tap ``p``, gauge ``g`` and source cell ``s``, the entries
+    ``e in [base[p] + ptr[p, g*K + s], base[p] + ptr[p, g*K + s + 1])`` hold
+    the target cells ``tk[e]`` that read ``s`` through that tap and gauge and
+    the bilinear weights ``tw[e]``.  Zero weights are dropped.  The order of
+    the entries is fixed, so a gather on this map is deterministic.
+
+    Parameters
+    ----------
+    idx, w : Tensor [P, 4, G, K_out]
+        Tap geometry (:func:`tap_geometry`).
+    K : int
+        Number of source (input) cells ``K_in``; ``K_out`` for a stride-1
+        convolution.
+
+    Returns
+    -------
+    ptr : IntTensor [P, G*K + 1]
+        Row offsets relative to ``base[p]``.
+    base : LongTensor [P + 1]
+    tk : IntTensor [nnz]
+        Target cells, in ``[0, K_out)``.
+    tw : Tensor [nnz]  (same dtype as ``w``)
+    """
+    P, J, G, K_out = idx.shape
+    K = int(K)
+    GK = G * K
+    if J * G * K_out >= 2**31 or GK + 1 >= 2**31:
+        raise ValueError("transposed map too large for int32 row offsets.")
+    dev = idx.device
+    nz_counts = [(w[p] != 0).sum().item() for p in range(P)]
+    base_list = [0]
+    for n in nz_counts:
+        base_list.append(base_list[-1] + n)
+    nnz = base_list[-1]
+    tk = torch.empty(nnz, dtype=torch.int32, device=dev)
+    tw = torch.empty(nnz, dtype=w.dtype, device=dev)
+    ptr = torch.empty(P, GK + 1, dtype=torch.int32, device=dev)
+    rows = torch.arange(GK + 1, device=dev, dtype=torch.int64)
+    gofs = (torch.arange(G, device=dev, dtype=torch.int64) * K).view(1, G, 1)
+    k_ids = torch.arange(K_out, device=dev, dtype=torch.int32).view(1, 1, K_out).expand(J, G, K_out)
+    for p in range(P):
+        wp = w[p]
+        nz = wp != 0
+        key = (idx[p].to(torch.int64) + gofs)[nz]
+        order = torch.argsort(key, stable=True)
+        skey = key[order]
+        a, e = base_list[p], base_list[p + 1]
+        tk[a:e] = k_ids[nz][order]
+        tw[a:e] = wp[nz][order]
+        ptr[p] = torch.searchsorted(skey, rows).to(torch.int32)
+    base = torch.tensor(base_list, dtype=torch.int64, device=dev)
+    return ptr, base, tk, tw
+
+
+def build_gather_map(idx, w, K):
+    """Transposed stencil map in the layout of the PyTorch gather (``S^T``).
+
+    For each tap ``p`` the source cells are sorted by decreasing number of
+    incoming entries (over all gauges), and the entries are stored by rank:
+    slot ``r`` holds the ``r``-th entry of each source that has more than
+    ``r`` of them, and those sources are the first ``n[r]`` of the sorted
+    order.  ``S^T`` then adds slot after slot into a prefix of a buffer,
+    with gathers only (no ``index_add_``, so no atomics on CUDA: the same bits
+    at every run), and the buffer is put back in the order of the input by
+    one more gather.  There is no padding: the memory is that of the entries.
+
+    Parameters
+    ----------
+    idx, w : Tensor [P, 4, G, K_out]
+    K : int
+        Number of source (input) cells ``K_in``.
+
+    Returns
+    -------
+    list of P tuples ``(where, tgt, tw, n)``
+        ``where`` IntTensor [K_in], the place of each source in the sorted
+        order; ``tgt`` IntTensor [nnz], rows ``g*K_out + k`` of the targets;
+        ``tw`` [nnz] the weights; ``n`` a list of ints, the size of each slot.
+    """
+    P, J, G, K_out = idx.shape
+    K = int(K)
+    dev = idx.device
+    tgt_all = (torch.arange(G, device=dev, dtype=torch.int64).view(G, 1) * K_out
+               + torch.arange(K_out, device=dev, dtype=torch.int64).view(1, K_out))
+    tgt_all = tgt_all.view(1, G, K_out).expand(J, G, K_out)
+    out = []
+    for p in range(P):
+        wp = w[p]
+        nz = wp != 0
+        src = idx[p].to(torch.int64)[nz]
+        tgt = tgt_all[nz]
+        tw = wp[nz]
+        order = torch.argsort(src, stable=True)
+        src, tgt, tw = src[order], tgt[order], tw[order]
+        counts = torch.bincount(src, minlength=K)
+        start = torch.cumsum(counts, 0) - counts
+        rank = torch.arange(src.numel(), device=dev) - start[src]
+        perm = torch.argsort(-counts, stable=True)
+        where = torch.empty_like(perm)
+        where[perm] = torch.arange(K, device=dev)
+        o2 = torch.argsort(rank * K + where[src])
+        r_max = int(counts.max()) if K else 0
+        hist = torch.bincount(counts, minlength=r_max + 1)
+        n = (K - torch.cumsum(hist, 0)[:r_max]).tolist()       # n[r] = #(counts > r)
+        out.append((where.to(torch.int32), tgt[o2].to(torch.int32), tw[o2], n))
+    return out
+
+
+# ===========================================================================
+# PyTorch backend: tap loop
+# ===========================================================================
+
+def _gather_tap(xt, idx_p, w_p):
+    """xt [K_in, B, C]; idx_p, w_p [4, G, K] -> [G, K*B, C] = sum_j w * xt[idx]."""
+    G, K = idx_p.shape[1], idx_p.shape[2]
+    B, C = xt.shape[1], xt.shape[2]
+    acc = None
+    for j in range(4):
+        # int64 per tap: index_select / index_add_ take a slow path with int32
+        # indices on CPU (index_add_ is ~10x slower), and the copy is small
+        v = xt.index_select(0, idx_p[j].reshape(-1).long()).view(G, K, B, C)
+        v = v * w_p[j].view(G, K, 1, 1)
+        acc = v if acc is None else acc.add_(v)
+    return acc.view(G, K * B, C)
+
+
+def _torch_forward(x, weight, bias, idx, w):
+    """S: x [B, C, K_in] -> [B, G*CO, K]."""
+    B, C, _ = x.shape
+    G, _, CO, P = weight.shape
+    K = idx.shape[-1]
+    w = w.to(x.dtype)
+    xt = x.permute(2, 0, 1).contiguous()                       # [K_in, B, C]
+    y = x.new_zeros(G, K * B, CO)
+    for p in range(P):
+        y.baddbmm_(_gather_tap(xt, idx[p], w[p]), weight[..., p])
+    out = y.view(G, K, B, CO).permute(2, 0, 3, 1).reshape(B, G * CO, K).contiguous()
+    if bias is not None:
+        out.add_(bias.to(out.dtype).view(1, -1, 1))
+    return out
+
+
+def _gy_rows(gy, G, CO, K):
+    """[B, G*CO, K] -> [G, K*B, CO]."""
+    B = gy.shape[0]
+    return gy.reshape(B, G, CO, K).permute(1, 3, 0, 2).reshape(G, K * B, CO)
+
+
+def _torch_transpose(gy, weight, bias, idx, w, k_in, gmap=None):
+    """S^T: gy [B, G*CO, K] -> [B, C, K_in] (+ bias [C]).
+
+    ``gmap`` (:func:`build_gather_map`) selects the gather; None scatters
+    with ``index_add_``.
+    """
+    B = gy.shape[0]
+    G, C, CO, P = weight.shape
+    K = idx.shape[-1]
+    dt = weight.dtype
+    gyt = _gy_rows(gy.to(dt), G, CO, K)
+    gx_flat = gyt.new_zeros(k_in, B * C)
+    acc = gyt.new_empty(k_in, B * C) if gmap is not None else None
+    for p in range(P):
+        h = torch.bmm(gyt, weight[..., p].transpose(1, 2))        # [G, K*B, C]
+        if gmap is None:
+            h = h.view(G, K, B * C)
+            wp = w[p].to(dt)
+            for j in range(4):
+                gx_flat.index_add_(
+                    0, idx[p, j].reshape(-1).long(),
+                    (h * wp[j].view(G, K, 1)).view(G * K, B * C),
+                )
+        else:
+            h = h.view(G * K, B * C)
+            where, tgt, tw, n = gmap[p]
+            tw = tw.to(dt)
+            off = 0
+            for r, nr in enumerate(n):
+                v = h.index_select(0, tgt[off:off + nr]) * tw[off:off + nr, None]
+                if r == 0:
+                    acc[:nr] = v
+                    acc[nr:] = 0
+                else:
+                    acc[:nr] += v
+                off += nr
+            if not n:
+                acc.zero_()
+            gx_flat += acc.index_select(0, where)
+    gx = gx_flat.view(k_in, B, C).permute(1, 2, 0)
+    if bias is not None:
+        return gx + bias.to(dt).view(1, -1, 1)
+    return gx.contiguous()
+
+
+def _torch_grad_w(x, gy, idx, w, CO):
+    """Gw: (x [B, C, K_in], gy [B, G*CO, K]) -> [G, C, CO, P]."""
+    B, C, _ = x.shape
+    P, _, G, K = idx.shape
+    w = w.to(x.dtype)
+    gyt = _gy_rows(gy.to(x.dtype), G, CO, K)
+    xt = x.permute(2, 0, 1).contiguous()
+    gW = x.new_empty(G, C, CO, P)
+    for p in range(P):
+        # recomputed, never stored
+        gW[..., p] = torch.bmm(_gather_tap(xt, idx[p], w[p]).transpose(1, 2), gyt)
+    return gW
+
+
+# ===========================================================================
+# Triton backend
+# ===========================================================================
+
+def _next_pow2(n):
+    return 1 << max(0, int(n) - 1).bit_length()
+
+
+def _block_nc(C, CO):
+    """BLOCK_C, BLOCK_N: the channel tiles (tl.dot needs >= 16)."""
+    return (min(64, max(16, _next_pow2(C))), min(64, max(16, _next_pow2(CO))))
+
+
+def _precision(dtype):
+    if dtype == torch.float32 and not torch.backends.cuda.matmul.allow_tf32:
+        return "ieee"
+    return "tf32"   # TF32 for float32 when allowed; ignored for 16-bit inputs
+
+
+# programs of the grad-W kernel per streaming multiprocessor (row chunks)
+_SPLIT_PROGRAMS_PER_SM = 32
+
+
+def _size_class(n):
+    """Coarse size bucket, part of the autotune key."""
+    return int(math.log2(max(int(n), 1))) // 2
+
+
+def _taps_per_block(P, width):
+    """Taps contracted together by one ``tl.dot`` in the grad-W kernel (TP, a power of two).
+
+    grad W reduces over the rows: with one tap its products are
+    ``[C, rows] @ [rows, Co]``, only 16 x 16 outputs for 16 channels, which
+    leave the GPU idle (3.5x the forward time on an A100).  A block of taps
+    makes them ``[TP*C, rows] @ [rows, Co]``.  TP is the largest power of two
+    with ``TP * width <= 128`` whose padding of the last block stays within a
+    quarter.  The forward and the deterministic grad x keep one tap per
+    product (TP = 1): there the products are already ``[rows, C] @ [C, Co]``,
+    and blocks of taps measured 1.1-2x slower (register pressure).
+    """
+    tp = 1
+    while tp * 2 * width <= 128 and tp * 2 <= P:
+        cand = tp * 2
+        slots = -(-P // cand) * cand
+        if (slots - P) > slots // 4:
+            break
+        tp = cand
+    return tp
+
+
+if _HAS_TRITON:
+
+    def _configs(spec):
+        return [triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=ns) for bm, nw, ns in spec]
+
+    # HEALPIXCONV_AUTOTUNE=small keeps the two likeliest tiles of each kernel
+    # (short benchmark jobs, CI); the default searches the full space
+    _SMALL = os.environ.get("HEALPIXCONV_AUTOTUNE", "").lower() == "small"
+    _FWD_CONFIGS = _configs(((64, 4, 1), (128, 4, 1)) if _SMALL else
+                            ((32, 2, 1), (32, 4, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
+    _BWD_W_CONFIGS = _configs(((64, 4, 1), (128, 8, 1)) if _SMALL else
+                              ((32, 2, 1), (32, 4, 1), (64, 4, 1), (64, 8, 1), (128, 8, 1)))
+    _BWD_X_CONFIGS = _configs(((64, 4, 1), (128, 4, 1)) if _SMALL else
+                              ((32, 2, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1)))
+    _BWD_X_CSR_CONFIGS = _configs(((64, 4, 1), (128, 4, 1)) if _SMALL else
+                                  ((32, 2, 1), (32, 4, 1), (64, 2, 1), (64, 4, 1), (128, 4, 1), (128, 8, 1)))
+
+    @triton.jit
+    def _gather_taps_io(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok, K, K_IN, C, G, P,
+                        BLOCK_M: tl.constexpr, TP: tl.constexpr, BLOCK_C: tl.constexpr):
+        """A[m, t, c] = sum_j w[p0+t, j, g, k_m] * xt[b, idx[p0+t, j, g, k_m], c], in fp32.
+
+        ``xt`` is ``[B, K_IN, C]``, ``idx`` and ``w`` are ``[P, 4, G, K]``;
+        taps beyond P read nothing and give 0.  This is the only place that
+        reads the input through the stencil: a masked variant (value and
+        validity in one pass) replaces it.
+        """
+        p = p0 + tl.arange(0, TP)
+        m2 = k_ok[:, None] & (p < P)[None, :]                          # [BM, TP]
+        a = tl.zeros((BLOCK_M, TP, BLOCK_C), dtype=tl.float32)
+        x_base = xt_ptr + b.to(tl.int64) * K_IN * C
+        for j in tl.static_range(4):
+            off = ((p * 4 + j) * G + g).to(tl.int64)[None, :] * K + k[:, None]
+            src = tl.load(idx_ptr + off, mask=m2, other=0).to(tl.int64)
+            ww = tl.load(w_ptr + off, mask=m2, other=0.0).to(tl.float32)
+            xv = tl.load(x_base + src[:, :, None] * C + c[None, None, :],
+                         mask=m2[:, :, None] & c_ok[None, None, :], other=0.0)
+            a += ww[:, :, None] * xv.to(tl.float32)
+        return a
+
+    @triton.jit
+    def _gather_taps(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok, K, C, G, P,
+                     BLOCK_M: tl.constexpr, TP: tl.constexpr, BLOCK_C: tl.constexpr):
+        """:func:`_gather_taps_io` with as many input cells as centres (stride 1)."""
+        return _gather_taps_io(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok, K, K, C, G, P,
+                               BLOCK_M, TP, BLOCK_C)
+
+    @triton.jit
+    def _weight_taps(wt_ptr, p0, g, c, o, c_ok, o_ok, C, CO, P,
+                     TP: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr):
+        """W2[(t, c), o] = W[g, p0+t, c, o] as a [TP*BLOCK_C, BLOCK_N] tile.
+
+        ``wt`` is ``[G, P, C, CO]``.  The kernels do not assume what these taps
+        are: a contraction with other taps (complex, several voices, the
+        coverage) reads its own array here.
+        """
+        p = p0 + tl.arange(0, TP)
+        rows = ((g * P + p)[:, None] * C + c[None, :]).to(tl.int64)     # [TP, BC]
+        m = ((p < P)[:, None] & c_ok[None, :])[:, :, None] & o_ok[None, None, :]
+        w3 = tl.load(wt_ptr + rows[:, :, None] * CO + o[None, None, :], mask=m, other=0.0)
+        return tl.reshape(w3, (TP * BLOCK_C, BLOCK_N))
+
+    @triton.autotune(configs=_FWD_CONFIGS, key=["C", "CO", "P", "SIZE"])
+    @triton.jit
+    def _fwd_kernel(xt_ptr, idx_ptr, w_ptr, wt_ptr, bias_ptr, y_ptr,
+                    K, K_IN, C, CO, G, P, B, SIZE,
+                    HAS_BIAS: tl.constexpr, PRECISION: tl.constexpr, TP: tl.constexpr,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr):
+        """y[b, g*CO + o, k] = bias + sum_p A_p[g, b, k, :] @ W[g, p]; y is [B, G*CO, K].
+
+        ``xt`` is ``[B, K_IN, C]``.  TP taps are contracted by one ``tl.dot``
+        (reduction over (tap, channel)).
+        """
+        pid = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        b = pid % B                      # batch fastest: the same idx / w tiles
+        rest = pid // B                  # are reused from L2 across the batch
+        g = rest % G
+        kb = rest // G
+        k = kb * BLOCK_M + tl.arange(0, BLOCK_M)
+        k_ok = k < K
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_ok = offs_n < CO
+        offs_c = tl.arange(0, BLOCK_C)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for p0 in range(0, P, TP):
+            for c0 in range(0, C, BLOCK_C):
+                c = c0 + offs_c
+                c_ok = c < C
+                a = _gather_taps_io(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok,
+                                    K, K_IN, C, G, P, BLOCK_M, TP, BLOCK_C)
+                w2 = _weight_taps(wt_ptr, p0, g, c, offs_n, c_ok, n_ok, C, CO, P,
+                                  TP, BLOCK_C, BLOCK_N)
+                a2 = tl.reshape(a, (BLOCK_M, TP * BLOCK_C))
+                acc = tl.dot(a2.to(w2.dtype), w2, acc, input_precision=PRECISION)
+        if HAS_BIAS:
+            bv = tl.load(bias_ptr + g * CO + offs_n, mask=n_ok, other=0.0).to(tl.float32)
+            acc += bv[None, :]
+        ch = (b.to(tl.int64) * G + g) * CO + offs_n
+        tl.store(y_ptr + ch[None, :] * K + k[:, None], acc.to(y_ptr.dtype.element_ty),
+                 mask=k_ok[:, None] & n_ok[None, :])
+
+    @triton.autotune(configs=_BWD_W_CONFIGS, key=["C", "CO", "P", "SIZE"])
+    @triton.jit
+    def _bwd_w_kernel(xt_ptr, idx_ptr, w_ptr, gy_ptr, part_ptr,
+                      K, K_IN, C, CO, G, P, B, N_SPLIT, SIZE,
+                      PRECISION: tl.constexpr, TP: tl.constexpr,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr):
+        """part[s, g, p, c, o] = sum over the rows of chunk s of A_p[g, r, c] * gy[g, r, o].
+
+        One program: TP taps x one channel tile x one output tile, for gauge g
+        and row chunk s; the product is [TP*BLOCK_C, BLOCK_M] @ [BLOCK_M, BLOCK_N].
+        """
+        pid0 = tl.program_id(0)          # tap block fastest: the programs of one
+        pid1 = tl.program_id(1)          # row chunk run together and share gy in L2
+        n_tb = tl.cdiv(P, TP)
+        tb = pid0 % n_tb
+        cn = pid0 // n_tb
+        g = pid1 % G
+        s = pid1 // G
+        n_bn = tl.cdiv(CO, BLOCK_N)
+        c = (cn // n_bn) * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_ok = c < C
+        o = (cn % n_bn) * BLOCK_N + tl.arange(0, BLOCK_N)
+        o_ok = o < CO
+        p0 = tb * TP
+        n_kb = tl.cdiv(K, BLOCK_M)
+        n_tiles = B * n_kb
+        tps = tl.cdiv(n_tiles, N_SPLIT)
+        t_lo = s * tps
+        t_hi = tl.minimum(t_lo + tps, n_tiles)
+        acc = tl.zeros((TP * BLOCK_C, BLOCK_N), dtype=tl.float32)
+        for t in range(t_lo, t_hi):
+            b = t % B
+            kb = t // B
+            k = kb * BLOCK_M + tl.arange(0, BLOCK_M)
+            k_ok = k < K
+            a = _gather_taps_io(xt_ptr, idx_ptr, w_ptr, p0, g, b, k, c, k_ok, c_ok,
+                                K, K_IN, C, G, P, BLOCK_M, TP, BLOCK_C)
+            a2 = tl.reshape(a, (BLOCK_M, TP * BLOCK_C))
+            ch = (b.to(tl.int64) * G + g) * CO + o
+            gy = tl.load(gy_ptr + ch[None, :] * K + k[:, None],
+                         mask=k_ok[:, None] & o_ok[None, :], other=0.0)
+            acc = tl.dot(tl.trans(a2.to(gy.dtype)), gy, acc, input_precision=PRECISION)
+        acc3 = tl.reshape(acc, (TP, BLOCK_C, BLOCK_N))
+        p = p0 + tl.arange(0, TP)
+        rows = (((s * G + g) * P + p).to(tl.int64)[:, None] * C + c[None, :])    # [TP, BC]
+        m = ((p < P)[:, None] & c_ok[None, :])[:, :, None] & o_ok[None, None, :]
+        tl.store(part_ptr + rows[:, :, None] * CO + o[None, None, :], acc3, mask=m)
+
+    @triton.autotune(configs=_BWD_X_CONFIGS, key=["C", "CO", "P", "SIZE"],
+                     reset_to_zero=["gx_ptr"])
+    @triton.jit
+    def _bwd_x_atomic_kernel(gy_ptr, idx_ptr, w_ptr, wt_ptr, gx_ptr,
+                             K, K_IN, C, CO, G, P, B, SIZE,
+                             PRECISION: tl.constexpr,
+                             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr):
+        """gx[b, idx_j, c] += w_j * (gy[g, b, k, :] @ W[g, p]^T); gx is fp32 [B, K_IN, C]."""
+        pid = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        b = pid % B
+        rest = pid // B
+        g = rest % G
+        kb = rest // G
+        k = kb * BLOCK_M + tl.arange(0, BLOCK_M)
+        k_ok = k < K
+        c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_ok = c < C
+        offs_n = tl.arange(0, BLOCK_N)
+        gx_base = gx_ptr + b.to(tl.int64) * K_IN * C
+        for p in range(0, P):
+            h = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
+            for n0 in range(0, CO, BLOCK_N):
+                o = n0 + offs_n
+                o_ok = o < CO
+                ch = (b.to(tl.int64) * G + g) * CO + o
+                gy = tl.load(gy_ptr + ch[None, :] * K + k[:, None],
+                             mask=k_ok[:, None] & o_ok[None, :], other=0.0)
+                wT = tl.load(wt_ptr + ((g * P + p) * C + c)[None, :] * CO + o[:, None],
+                             mask=o_ok[:, None] & c_ok[None, :], other=0.0)
+                h = tl.dot(gy, wT, h, input_precision=PRECISION)
+            for j in tl.static_range(4):
+                off = ((p * 4 + j) * G + g).to(tl.int64) * K + k
+                src = tl.load(idx_ptr + off, mask=k_ok, other=0).to(tl.int64)
+                ww = tl.load(w_ptr + off, mask=k_ok, other=0.0).to(tl.float32)
+                tl.atomic_add(gx_base + src[:, None] * C + c[None, :], ww[:, None] * h,
+                              mask=k_ok[:, None] & c_ok[None, :], sem="relaxed")
+
+    @triton.autotune(configs=_BWD_X_CSR_CONFIGS, key=["C", "CO", "P", "SIZE"])
+    @triton.jit
+    def _bwd_x_csr_kernel(gyt_ptr, tptr_ptr, tbase_ptr, tk_ptr, tw_ptr, wt_ptr, bias_ptr, gx_ptr,
+                          K, K_IN, C, CO, G, P, B, SIZE,
+                          HAS_BIAS: tl.constexpr, PRECISION: tl.constexpr,
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr):
+        """gx[b, c, s] = bias[c] + sum_{g,p} (sum_e tw_e gy[b, g, tk_e, :]) @ W[g, p]^T, no atomics.
+
+        ``gyt`` is ``[B, G, K, CO]``; gx is written as ``[B, C, K_IN]``.
+        """
+        pid = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        b = pid % B
+        sb = pid // B
+        s = sb * BLOCK_M + tl.arange(0, BLOCK_M)
+        s_ok = s < K_IN
+        c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_ok = c < C
+        offs_n = tl.arange(0, BLOCK_N)
+        GK1 = (G * K_IN + 1).to(tl.int64)    # row stride of ptr [P, G*K_IN + 1]
+        s64 = s.to(tl.int64)
+        acc = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
+        for g in range(0, G):
+            gy_base = gyt_ptr + (b.to(tl.int64) * G + g) * K * CO
+            for p in range(0, P):
+                base = tl.load(tbase_ptr + p)
+                row = s64 + g * K_IN + p * GK1
+                start = tl.load(tptr_ptr + row, mask=s_ok, other=0)
+                n = tl.load(tptr_ptr + row + 1, mask=s_ok, other=0) - start
+                n_max = tl.max(n, axis=0)
+                for n0 in range(0, CO, BLOCK_N):
+                    o = n0 + offs_n
+                    o_ok = o < CO
+                    at = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                    for jj in range(0, n_max):
+                        m = s_ok & (jj < n)
+                        e = base + start.to(tl.int64) + jj
+                        kk = tl.load(tk_ptr + e, mask=m, other=0).to(tl.int64)
+                        ww = tl.load(tw_ptr + e, mask=m, other=0.0).to(tl.float32)
+                        v = tl.load(gy_base + kk[:, None] * CO + o[None, :],
+                                    mask=m[:, None] & o_ok[None, :], other=0.0)
+                        at += ww[:, None] * v.to(tl.float32)
+                    wT = tl.load(wt_ptr + ((g * P + p) * C + c)[None, :] * CO + o[:, None],
+                                 mask=o_ok[:, None] & c_ok[None, :], other=0.0)
+                    acc = tl.dot(at.to(wT.dtype), wT, acc, input_precision=PRECISION)
+        if HAS_BIAS:
+            bv = tl.load(bias_ptr + c, mask=c_ok, other=0.0).to(tl.float32)
+            acc += bv[None, :]
+        tl.store(gx_ptr + (b.to(tl.int64) * C + c)[None, :] * K_IN + s[:, None],
+                 acc.to(gx_ptr.dtype.element_ty), mask=s_ok[:, None] & c_ok[None, :])
+
+
+def _check_triton_inputs(x, weight, idx, w):
+    if not x.is_cuda:
+        raise ValueError("the Triton backend needs CUDA tensors.")
+    if x.dtype not in _TRITON_DTYPES:
+        raise ValueError(f"the Triton backend does not support {x.dtype}; use backend='torch'.")
+    if idx.dtype != torch.int32 or not idx.is_contiguous() or not w.is_contiguous():
+        raise ValueError("idx must be a contiguous int32 tensor and w contiguous.")
+
+
+def _triton_forward(x, weight, bias, idx, w):
+    """S: x [B, C, K_in] -> [B, G*CO, K]."""
+    B, C, K_in = x.shape
+    G, _, CO, P = weight.shape
+    K = idx.shape[-1]
+    xt = x.transpose(1, 2).contiguous()                       # [B, K_in, C]
+    wt = weight.permute(0, 3, 1, 2).contiguous()              # [G, P, C, CO]
+    y = torch.empty(B, G * CO, K, device=x.device, dtype=x.dtype)
+    BLOCK_C, BLOCK_N = _block_nc(C, CO)
+
+    def grid(meta):
+        return (B * G * triton.cdiv(K, meta["BLOCK_M"]), triton.cdiv(CO, BLOCK_N))
+
+    with torch.cuda.device(x.device):
+        _fwd_kernel[grid](
+            xt, idx, w, wt, bias if bias is not None else wt, y,
+            K, K_in, C, CO, G, P, B, _size_class(B * K),
+            HAS_BIAS=bias is not None, PRECISION=_precision(x.dtype),
+            TP=1, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,     # see _taps_per_block
+        )
+    return y
+
+
+def _n_split(x, n_rows, G, P, n_cn, C, CO):
+    """Number of row chunks of the grad-W kernel: enough programs to fill the GPU.
+
+    ``P`` is the number of tap blocks of the kernel."""
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    n = triton.cdiv(_SPLIT_PROGRAMS_PER_SM * sms, max(1, G * P * n_cn))
+    n = max(1, min(n, triton.cdiv(n_rows, 8 * 128)))      # >= ~8 row tiles each
+    # bound the buffer of partial sums to ~256 MB
+    n = max(1, min(n, (2**26) // max(1, G * P * C * CO)))
+    return int(n)
+
+
+def _triton_grad_w(x, gy, idx, w, CO):
+    """Gw: (x [B, C, K_in], gy [B, G*CO, K]) -> [G, C, CO, P] in the dtype of x."""
+    B, C, K_in = x.shape
+    P, _, G, K = idx.shape
+    gy = gy.to(x.dtype).contiguous()
+    BLOCK_C, BLOCK_N = _block_nc(C, CO)
+    with torch.cuda.device(x.device):
+        xt = x.transpose(1, 2).contiguous()
+        n_cn = triton.cdiv(C, BLOCK_C) * triton.cdiv(CO, BLOCK_N)
+        tp = _taps_per_block(P, BLOCK_C)
+        n_tb = triton.cdiv(P, tp)
+        n_split = _n_split(x, B * K, G, n_tb, n_cn, C, CO)
+        part = torch.empty(n_split, G, P, C, CO, device=x.device, dtype=torch.float32)
+        _bwd_w_kernel[(n_tb * n_cn, G * n_split)](
+            xt, idx, w, gy, part, K, K_in, C, CO, G, P, B, n_split, _size_class(B * K),
+            PRECISION=_precision(x.dtype), TP=tp, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
+        )
+        del xt
+        gW = part.sum(0).permute(0, 2, 3, 1).to(x.dtype)        # [G, C, CO, P]
+    return gW
+
+
+def _triton_transpose(gy, weight, bias, idx, w, k_in, deterministic, transposed):
+    """S^T: gy [B, G*CO, K] -> [B, C, K_in] (+ bias [C])."""
+    G, C, CO, P = weight.shape
+    K = idx.shape[-1]
+    B = gy.shape[0]
+    gy = gy.to(weight.dtype).contiguous()
+    wt = weight.permute(0, 3, 1, 2).contiguous()              # [G, P, C, CO]
+    BLOCK_C, BLOCK_N = _block_nc(C, CO)
+    prec = _precision(weight.dtype)
+    with torch.cuda.device(gy.device):
+        if deterministic:
+            tmap = (transposed() if transposed is not None
+                    else build_transposed_map(idx, w, k_in))
+            tptr, tbase, tk, tw = tmap
+            gyt = gy.view(B, G, CO, K).transpose(2, 3).contiguous()   # [B, G, K, CO]
+            gx = torch.empty(B, C, k_in, device=gy.device, dtype=weight.dtype)
+
+            def grid(meta):
+                return (B * triton.cdiv(k_in, meta["BLOCK_M"]), triton.cdiv(C, BLOCK_C))
+
+            _bwd_x_csr_kernel[grid](
+                gyt, tptr, tbase, tk, tw, wt, bias if bias is not None else wt, gx,
+                K, k_in, C, CO, G, P, B, _size_class(B * k_in),
+                HAS_BIAS=bias is not None, PRECISION=prec, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
+            )
+            return gx
+        gxt = torch.zeros(B, k_in, C, device=gy.device, dtype=torch.float32)
+
+        def grid(meta):
+            return (B * G * triton.cdiv(K, meta["BLOCK_M"]), triton.cdiv(C, BLOCK_C))
+
+        _bwd_x_atomic_kernel[grid](
+            gy, idx, w, wt, gxt, K, k_in, C, CO, G, P, B, _size_class(B * K),
+            PRECISION=prec, BLOCK_N=BLOCK_N, BLOCK_C=BLOCK_C,
+        )
+        if bias is not None:
+            gxt += bias.to(torch.float32).view(1, 1, -1)
+        return gxt.transpose(1, 2).to(weight.dtype)
+
+
+# ===========================================================================
+# The three operators S, S^T, Gw, each an autograd Function
+# ===========================================================================
+
+@dataclass(frozen=True)
+class _Options:
+    use_triton: bool
+    deterministic: bool
+    transposed: Optional[Callable[[], tuple]] = None
+    #: number of input cells (None: as many as stencil centres, stride 1)
+    k_in: Optional[int] = None
+    #: map of the PyTorch gather of S^T (build_gather_map), cached by the caller
+    gather_map: Optional[Callable[[], list]] = None
+
+
+def _k_in(opts, idx):
+    return idx.shape[-1] if opts.k_in is None else int(opts.k_in)
+
+
+def _op_s(x, weight, bias, idx, w, opts):
+    if opts.use_triton:
+        return _triton_forward(x, weight, bias, idx, w)
+    return _torch_forward(x, weight, bias, idx, w)
+
+
+def _op_st(gy, weight, bias, idx, w, opts):
+    k_in = _k_in(opts, idx)
+    if opts.use_triton:
+        return _triton_transpose(gy, weight, bias, idx, w, k_in,
+                                 opts.deterministic, opts.transposed)
+    gmap = None
+    if opts.deterministic and gy.is_cuda:
+        # index_add_ runs with atomics on CUDA: gather on the transposed map
+        gmap = opts.gather_map() if opts.gather_map is not None else build_gather_map(idx, w, k_in)
+    return _torch_transpose(gy, weight, bias, idx, w, k_in, gmap)
+
+
+def _op_gw(x, gy, idx, w, opts):
+    CO = gy.shape[1] // idx.shape[2]
+    if opts.use_triton:
+        return _triton_grad_w(x, gy, idx, w, CO)
+    return _torch_grad_w(x, gy, idx, w, CO)
+
+
+def _bias_grad(g, dtype):
+    acc = torch.promote_types(g.dtype, torch.float32)        # fp32 for 16-bit
+    return g.sum(dim=(0, 2), dtype=acc).to(dtype)
+
+
+def _add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a + b
+
+
+def _sel(t, d, i):
+    return t if (t is None or d is None) else t.select(d, i)
+
+
+def _check_geometry_unbatched(in_dims, name):
+    if any(d is not None for d in in_dims):
+        raise ValueError(f"{name}: the stencil geometry (idx, w) cannot be vmapped.")
+
+
+def _vmap_loop(fn, info, in_dims, args):
+    """Fallback vmap rule: one call per vmapped element, stacked on dim 0."""
+    outs = [fn(*(_sel(a, d, i) for a, d in zip(args, in_dims)))
+            for i in range(info.batch_size)]
+    return torch.stack(outs), 0
+
+
+def _vmap_fold(fn, info, x, xd, rest):
+    """vmap rule when only the input is vmapped: fold the vmap dim into the batch."""
+    x = x.movedim(xd, 0)
+    V, B = x.shape[0], x.shape[1]
+    out = fn(x.reshape(V * B, *x.shape[2:]), *rest)
+    return out.view(V, B, *out.shape[1:]), 0
+
+
+class GaugeConvFunction(torch.autograd.Function):
+    """``S``: ``x [B, C, K_in] -> y [B, G*Co, K]``; dispatches to Triton or to PyTorch.
+
+    ``idx`` and ``w`` are the tap geometry of :func:`tap_geometry`.  The
+    choice of backend is made by :func:`gauge_conv` and carried in ``opts``.
+    The backward runs ``S^T`` and ``Gw`` as autograd Functions too, so that
+    a double backward stays on the same backend; ``jvp`` and ``vmap`` are
+    defined for ``torch.func``.
+    """
+
+    @staticmethod
+    def forward(x, weight, bias, idx, w, opts):
+        return _op_s(x, weight, bias, idx, w, opts)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, weight, bias, idx, w, opts = inputs
+        ctx.opts = opts
+        ctx.bias_dtype = bias.dtype if bias is not None else None
+        ctx.save_for_backward(x, weight, idx, w)
+        ctx.save_for_forward(x, weight, idx, w)
+
+    @staticmethod
+    def backward(ctx, gy):
+        x, weight, idx, w = ctx.saved_tensors
+        need_x, need_w, need_b = ctx.needs_input_grad[:3]
+        opts = ctx.opts
+        gx = GaugeConvTransposeFunction.apply(gy, weight, None, idx, w, opts) if need_x else None
+        gW = GaugeConvGradWFunction.apply(x, gy, idx, w, opts) if need_w else None
+        gb = _bias_grad(gy, ctx.bias_dtype) if need_b else None
+        return gx, gW, gb, None, None, None
+
+    @staticmethod
+    def jvp(ctx, tx, tW, tb, _ti, _tw, _to):
+        x, weight, idx, w = ctx.saved_tensors
+        opts = ctx.opts
+        out = None
+        if tx is not None:
+            out = GaugeConvFunction.apply(tx, weight, None, idx, w, opts)
+        if tW is not None:
+            out = _add(out, GaugeConvFunction.apply(x, tW, None, idx, w, opts))
+        if tb is not None:
+            tb = tb.view(1, -1, 1)
+            out = tb.expand(x.shape[0], -1, idx.shape[-1]).clone() if out is None else out + tb
+        return out
+
+    @staticmethod
+    def vmap(info, in_dims, x, weight, bias, idx, w, opts):
+        xd, wd, bd = in_dims[:3]
+        _check_geometry_unbatched(in_dims[3:5], "gauge_conv")
+
+        def fn(x, weight, bias):
+            return GaugeConvFunction.apply(x, weight, bias, idx, w, opts)
+
+        if xd is not None and wd is None and bd is None:
+            return _vmap_fold(fn, info, x, xd, (weight, bias))
+        return _vmap_loop(fn, info, (xd, wd, bd), (x, weight, bias))
+
+
+class GaugeConvTransposeFunction(torch.autograd.Function):
+    """``S^T``: ``y [B, G*Co, K] -> x [B, C, K_in]`` (+ bias ``[C]``), the adjoint of ``S``.
+
+    ``opts.k_in`` gives ``K_in`` (None: ``K``).  The input gradient of
+    :class:`GaugeConvFunction` and the forward pass of
+    :class:`~healpix_analyse.convol.HealPixConvTranspose`.
+    """
+
+    @staticmethod
+    def forward(gy, weight, bias, idx, w, opts):
+        return _op_st(gy, weight, bias, idx, w, opts)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        gy, weight, bias, idx, w, opts = inputs
+        ctx.opts = opts
+        ctx.bias_dtype = bias.dtype if bias is not None else None
+        ctx.save_for_backward(gy, weight, idx, w)
+        ctx.save_for_forward(gy, weight, idx, w)
+
+    @staticmethod
+    def backward(ctx, gx):
+        gy, weight, idx, w = ctx.saved_tensors
+        need_y, need_w, need_b = ctx.needs_input_grad[:3]
+        opts = ctx.opts
+        ggy = GaugeConvFunction.apply(gx, weight, None, idx, w, opts) if need_y else None
+        gW = GaugeConvGradWFunction.apply(gx, gy, idx, w, opts) if need_w else None
+        gb = _bias_grad(gx, ctx.bias_dtype) if need_b else None
+        return ggy, gW, gb, None, None, None
+
+    @staticmethod
+    def jvp(ctx, ty, tW, tb, _ti, _tw, _to):
+        gy, weight, idx, w = ctx.saved_tensors
+        opts = ctx.opts
+        out = None
+        if ty is not None:
+            out = GaugeConvTransposeFunction.apply(ty, weight, None, idx, w, opts)
+        if tW is not None:
+            out = _add(out, GaugeConvTransposeFunction.apply(gy, tW, None, idx, w, opts))
+        if tb is not None:
+            tb = tb.view(1, -1, 1)
+            out = (tb.expand(gy.shape[0], -1, _k_in(opts, idx)).clone() if out is None
+                   else out + tb)
+        return out
+
+    @staticmethod
+    def vmap(info, in_dims, gy, weight, bias, idx, w, opts):
+        yd, wd, bd = in_dims[:3]
+        _check_geometry_unbatched(in_dims[3:5], "gauge_conv_transpose")
+
+        def fn(gy, weight, bias):
+            return GaugeConvTransposeFunction.apply(gy, weight, bias, idx, w, opts)
+
+        if yd is not None and wd is None and bd is None:
+            return _vmap_fold(fn, info, gy, yd, (weight, bias))
+        return _vmap_loop(fn, info, (yd, wd, bd), (gy, weight, bias))
+
+
+class GaugeConvGradWFunction(torch.autograd.Function):
+    """``Gw``: ``(x [B, C, K_in], gy [B, G*Co, K]) -> [G, C, Co, P]``, the weight gradient of ``S``.
+
+    Bilinear: ``<Q, Gw(x, gy)> = <S_Q x, gy> = <x, S_Q^T gy>``, which gives
+    its own backward.
+    """
+
+    @staticmethod
+    def forward(x, gy, idx, w, opts):
+        return _op_gw(x, gy, idx, w, opts)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, gy, idx, w, opts = inputs
+        ctx.opts = opts
+        ctx.save_for_backward(x, gy, idx, w)
+        ctx.save_for_forward(x, gy, idx, w)
+
+    @staticmethod
+    def backward(ctx, q):
+        x, gy, idx, w = ctx.saved_tensors
+        need_x, need_y = ctx.needs_input_grad[:2]
+        opts = ctx.opts
+        q = q.to(x.dtype)
+        gx = GaugeConvTransposeFunction.apply(gy, q, None, idx, w, opts) if need_x else None
+        ggy = GaugeConvFunction.apply(x, q, None, idx, w, opts) if need_y else None
+        return gx, ggy, None, None, None
+
+    @staticmethod
+    def jvp(ctx, tx, ty, _ti, _tw, _to):
+        x, gy, idx, w = ctx.saved_tensors
+        opts = ctx.opts
+        out = None
+        if tx is not None:
+            out = GaugeConvGradWFunction.apply(tx, gy, idx, w, opts)
+        if ty is not None:
+            out = _add(out, GaugeConvGradWFunction.apply(x, ty, idx, w, opts))
+        return out
+
+    @staticmethod
+    def vmap(info, in_dims, x, gy, idx, w, opts):
+        _check_geometry_unbatched(in_dims[2:4], "gauge_conv grad W")
+
+        def fn(x, gy):
+            return GaugeConvGradWFunction.apply(x, gy, idx, w, opts)
+
+        # the batch is reduced: no folding, one call per vmapped element
+        return _vmap_loop(fn, info, in_dims[:2], (x, gy))
+
+
+# ===========================================================================
+# Entry points
+# ===========================================================================
+
+def _autocast_dtype(device_type):
+    try:
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
+    except TypeError:  # torch < 2.4
+        if device_type == "cuda" and torch.is_autocast_enabled():
+            return torch.get_autocast_gpu_dtype()
+    return None
+
+
+_WARNED_NO_TRITON = False
+
+
+def _warn_no_triton():
+    global _WARNED_NO_TRITON
+    if not _WARNED_NO_TRITON:
+        _WARNED_NO_TRITON = True
+        warnings.warn(
+            "HealPixConv runs on CUDA without Triton: the PyTorch backend keeps "
+            "the memory low but its backward pass is slow on GPUs. Install the "
+            "optional 'triton' package (pip install healpix-analyse[triton]) "
+            "for the fused kernels.",
+            RuntimeWarning,
+            stacklevel=5,       # the caller of HealPixConv.forward
+        )
+
+
+def _compute_dtype(x):
+    """dtype the Triton kernels run in: the autocast dtype for float32 data."""
+    dt = _autocast_dtype("cuda") if x.is_cuda else None
+    return dt if (dt is not None and x.dtype == torch.float32) else x.dtype
+
+
+def _use_triton(x, backend):
+    if backend not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
+    if backend == "torch":
+        return False
+    if x.is_cuda and not _HAS_TRITON and _compute_dtype(x) in _TRITON_DTYPES:
+        _warn_no_triton()
+    ok = _HAS_TRITON and x.is_cuda and _compute_dtype(x) in _TRITON_DTYPES
+    if backend == "triton" and not ok:
+        raise RuntimeError(
+            "backend='triton' needs Triton, a CUDA tensor and float32, float16 "
+            "or bfloat16 data (float64 runs on backend='torch')."
+        )
+    return ok
+
+
+def _prepare(x, weight, backend):
+    """Backend choice and casts: autocast dtype on Triton, the weight dtype otherwise."""
+    use_triton = _use_triton(x, backend)
+    if use_triton:
+        x = x.to(_compute_dtype(x))           # autocast: 16-bit inputs, fp32 accumulation
+        if weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
+        x = x.contiguous()
+    elif weight.dtype != x.dtype:
+        x = x.to(weight.dtype)
+    return x, weight, use_triton
+
+
+def gauge_conv(x, weight, bias, idx, w, *, backend="auto", deterministic=True,
+               transposed=None, gather_map=None):
+    """Gauge-equivariant convolution ``S`` on precomputed tap geometry.
+
+    Parameters
+    ----------
+    x : Tensor [B, C, K_in]
+    weight : Tensor [G, C, Co, P]
+    bias : Tensor [G*Co] or None
+    idx, w : Tensor [P, 4, G, K]
+        Tap geometry (:func:`tap_geometry`); ``idx`` int32 on the device of
+        ``x``, positions in ``[0, K_in)``.  ``K = K_in`` for a stride-1
+        convolution; a strided one has its K centres on the parent cells.
+    backend : {"auto", "triton", "torch"}
+        ``"auto"`` runs Triton on CUDA for float32/float16/bfloat16 when Triton
+        is installed, and PyTorch otherwise (CPU, float64).
+    deterministic : bool, default True
+        Compute grad x by a gather on the transposed map (no atomics,
+        identical results at every run): with the Triton kernels, and with
+        the PyTorch backend on CUDA.  ``False`` uses fp32 atomics (Triton)
+        or ``index_add_`` (PyTorch on CUDA).  The PyTorch backend on CPU is
+        deterministic either way.  ``torch.are_deterministic_algorithms_enabled()``
+        selects the gather even with ``False``.  A double backward
+        (``create_graph=True``) runs on the same backend and kernels.
+    transposed : callable or None
+        Returns the transposed map (:func:`build_transposed_map`) of
+        ``idx, w``, so that the caller can cache it; called only by a
+        deterministic Triton backward.  None builds the map at every
+        backward pass.
+    gather_map : callable or None
+        Returns the map of the PyTorch gather (:func:`build_gather_map`),
+        likewise; called only by a deterministic PyTorch backward on CUDA.
+
+    Returns
+    -------
+    Tensor [B, G*Co, K]
+    """
+    x, weight, use_triton = _prepare(x, weight, backend)
+    deterministic = bool(deterministic) or torch.are_deterministic_algorithms_enabled()
+    opts = _Options(use_triton, deterministic, transposed, int(x.shape[-1]), gather_map)
+    return GaugeConvFunction.apply(x, weight, bias, idx, w, opts)
+
+
+def gauge_conv_transpose(y, weight, bias, idx, w, *, k_in, backend="auto",
+                         deterministic=True, transposed=None, gather_map=None):
+    """Transposed gauge convolution ``S^T``, the adjoint of :func:`gauge_conv`.
+
+    ``<gauge_conv(x, W, None, idx, w), y> = <x, gauge_conv_transpose(y, W, None, idx, w)>``.
+
+    Parameters
+    ----------
+    y : Tensor [B, G*Co, K]
+        Gauge-major channels, as :func:`gauge_conv` returns them.
+    weight : Tensor [G, C, Co, P]
+        The weight layout of :func:`gauge_conv` (C output channels here).
+    bias : Tensor [C] or None
+    idx, w : Tensor [P, 4, G, K]
+    k_in : int
+        Number of output cells (the input cells of ``S``).
+    backend, deterministic, transposed, gather_map
+        As in :func:`gauge_conv`; ``deterministic`` selects the gather for
+        the forward pass here.
+
+    Returns
+    -------
+    Tensor [B, C, k_in]
+    """
+    y, weight, use_triton = _prepare(y, weight, backend)
+    deterministic = bool(deterministic) or torch.are_deterministic_algorithms_enabled()
+    opts = _Options(use_triton, deterministic, transposed, int(k_in), gather_map)
+    return GaugeConvTransposeFunction.apply(y, weight, bias, idx, w, opts)

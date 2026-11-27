@@ -98,14 +98,16 @@ def set_ellipsoid(name: str) -> str:
     any embedding is computed.
     """
     from healpix_geo import ellipsoid as _ell
+    from healpix_analyse._ellipsoid import canonicalize_ellipsoid
 
     # healpix-geo's names are case-sensitive ("WGS84"), while stores spell the
-    # same thing in lower case ("wgs84"); accept either.
-    for candidate in (str(name), str(name).upper(), str(name).lower()):
-        try:
-            _ell.resolve(candidate)
-        except Exception:                      # noqa: BLE001
-            continue
+    # same thing in lower case ("wgs84"); accept any casing.
+    candidate = canonicalize_ellipsoid(name)
+    try:
+        _ell.resolve(candidate)
+    except Exception:                          # noqa: BLE001
+        pass
+    else:
         global HEALPIX_ELLIPSOID
         previous, HEALPIX_ELLIPSOID = HEALPIX_ELLIPSOID, candidate
         return previous
@@ -133,6 +135,9 @@ def _unmask(a, fill):
         data = data.astype(np.int64)
     if mask is None:
         return data
+    if fill < 0 and np.issubdtype(data.dtype, np.unsignedinteger):
+        # cell ids come back as uint64, which cannot hold the -1 fill
+        data = data.astype(np.int64)
     return np.where(np.asarray(mask), fill, data)
 
 
@@ -349,7 +354,8 @@ def nested_to_tiles(
     data : array [N, C] or [N]
         Pixel values at HEALPix ``level``.  NaN marks a missing pixel.
     cell_id : int array [N]
-        NESTED cell ids at ``level``.  Duplicates are not allowed.
+        NESTED cell ids at ``level``.  Repeated ids are handled as
+        ``duplicates`` says.
     level : int
         Resolution of ``data`` (``nside = 2**level``).
     parent_level : int
@@ -1445,7 +1451,7 @@ def GetDINOV3SAT(
         Resolution of the tile centres; ``level - parent_level >= 4`` is
         required (one DINO patch is 16 px = 4 HEALPix levels).  ``level - 8``
         (256 px tiles, 16x16 patch tokens) is the natural choice.
-    projection : {"tangent", "nested"}
+    projection : {"tangent", "nested", "percell"}
         See above.
     context_px : int, optional
         Side of the window in ``percell`` mode, a multiple of 16.  The default

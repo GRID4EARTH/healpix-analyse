@@ -7,9 +7,16 @@ side) matches names **case-sensitively**: it accepts e.g. ``"WGS84"`` and
 sources do not all agree on a casing -- for example EOPF/GRID4EARTH
 Sentinel-2 HEALPix products declare their ellipsoid as the lowercase
 string ``"wgs84"``. Rather than have every caller (and every notebook)
-remember to re-case that string by hand, every constructor in this package
-that accepts an ``ellipsoid`` argument canonicalizes it once, here, at
-construction time.
+remember to re-case that string by hand, the public constructors and
+functions of this package that accept an ``ellipsoid`` argument pass it
+through :func:`canonicalize_ellipsoid` on entry, so ``"wgs84"``,
+``"Wgs84"``, ``"Sphere"`` or ``"SPHERE"`` work wherever ``"WGS84"`` or
+``"sphere"`` do. Names ``healpix_geo`` does not know under any of these
+casings are passed through unchanged and fail with ``healpix_geo``'s own
+error at the point of use.
+
+Known exception: ``healpix_analyse.alm.AlmTransform`` does not canonicalize
+yet (``powerspectra`` does it before calling it).
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ from healpix_geo._healpix_geo_python import resolve_ellipsoid
 __all__ = ["canonicalize_ellipsoid"]
 
 
-def canonicalize_ellipsoid(ellipsoid: str) -> str:
+def canonicalize_ellipsoid(ellipsoid):
     """Return ``ellipsoid`` re-cased to whatever spelling ``healpix_geo``'s
     own registry accepts, trying the string as given, then upper case,
     lower case, and title case, in that order.
@@ -31,8 +38,13 @@ def canonicalize_ellipsoid(ellipsoid: str) -> str:
     a genuinely unknown name still fails with ``healpix_geo``'s own, more
     informative error at the point of use, rather than a confusing one
     raised from here.
+
+    Anything that is not a string (for instance a ``dict`` of ellipsoid
+    parameters, which ``healpix_geo`` also accepts) is returned unchanged.
     """
-    s = str(ellipsoid)
+    if not isinstance(ellipsoid, str):
+        return ellipsoid
+    s = ellipsoid
     for candidate in (s, s.upper(), s.lower(), s.title()):
         try:
             resolve_ellipsoid(candidate)

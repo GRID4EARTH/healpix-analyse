@@ -31,7 +31,7 @@ Requirements: healpix_analyse, healpix_plot, xarray, zarr, umap-learn,
 scikit-learn, matplotlib, cartopy, and the DINOv3 backbone (torch-hub clone of
 facebookresearch/dinov3 or `transformers`).  DINOv3 code and weights are
 distributed by Meta under the DINOv3 License (gated download); see
-docs/dino.md.
+docs/other/dino.md.
 """
 
 from __future__ import annotations

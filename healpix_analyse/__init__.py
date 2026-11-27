@@ -44,8 +44,9 @@ Connected components::
 
 from healpix_analyse.down import HealPixDown
 from healpix_analyse.up import HealPixUp
-from healpix_analyse.large_conv import LargeConv
+from healpix_analyse.large_conv import GaussianPlan, LargeConv, down_up_blur, gaussian_plan
 from healpix_analyse.fft_conv import HealPixFFTConv
+from healpix_analyse.geo_fft import HealPixGeoFFT, geo_fft_convolve
 
 from healpix_analyse.decomp import (
     HealPixDecomp,
@@ -75,13 +76,25 @@ from healpix_analyse.divcurl import (
 from healpix_analyse.resample import (
     HealPixResampler,
     resample_healpix,
+    resample_to_latlon_grid,
 )
+from healpix_analyse.healpix_interp import get_interp_val, get_interp_weights
+from healpix_analyse.convol import HealPixConv, HealPixConvTranspose
+from healpix_analyse.patches import HealPixPatches
+from healpix_analyse.attention import (
+    DEFAULT_WINDOW_SHIFT,
+    WINDOW_SHIFTS,
+    HealPixNeighbourhoodAttention,
+    HealPixWindowAttention,
+)
+from healpix_analyse.morphology import binary_dilation, binary_erosion
 
 
 # ---------------------------------------------------------------------------
 # Spherical harmonic transforms
 # ---------------------------------------------------------------------------
 
+from healpix_analyse.healpix_sht import HEALPixSHT
 from healpix_analyse.alm_latlon import (
     build_rings_from_latlon,
     anafast_latlon,
@@ -90,8 +103,6 @@ from healpix_analyse.alm_latlon import (
     compute_weights,
     grid_summary,
 )
-
-from healpix_analyse.alm import AlmCoeffs
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +114,19 @@ from healpix_analyse.fft_local import (
     fft as local_fft,
     ifft as local_ifft,
     ps as local_ps,
+)
+
+
+# ---------------------------------------------------------------------------
+# Wavelet power spectrum (NaN- and mask-aware, differentiable)
+# ---------------------------------------------------------------------------
+
+from healpix_analyse.wavelet_spectrum import (
+    HealPixWaveletSpectrum,
+    HealPixIsotropicWaveletSpectrum,
+    wavelet_power_spectrum,
+    wavelet_morlet,
+    wavelet_morlet_isotropic,
 )
 
 
@@ -136,6 +160,7 @@ from healpix_analyse.neighbour_reduce import (
 )
 
 from healpix_analyse.gradient import (
+    HealPixGradient,
     directional_derivative,
     gradient,
     gradient_magnitude,
@@ -156,10 +181,9 @@ from .directional_filter import directional_filter
 #     Cells sharing either an edge or a vertex.
 #     This is the HEALPix analogue of Cartesian 8-connectivity.
 #
-# The topology backend itself is intentionally private.  The current
-# implementation uses healpy temporarily through ``_topology.py`` and is
-# intended to move to healpix-geo / CDSHEALPix once directional neighbour
-# access is available there.
+# The topology backend itself is intentionally private. ``_topology.py``
+# delegates direction-preserving immediate-neighbour access to healpix-geo /
+# CDSHEALPix.
 # ---------------------------------------------------------------------------
 
 from healpix_analyse.components import (
@@ -170,9 +194,16 @@ from healpix_analyse.components import (
     remove_small_components,
 )
 
+from healpix_analyse.multiorder_filter import multiorder_filter_operator
 from healpix_analyse.radial_filter import (
+    FilterOperator,
+    apply_filter_operator,
+    configure_radial_filter_cache,
     gaussian_filter,
+    gaussian_filter_operator,
     radial_filter,
+    radial_filter_operator,
+    radial_filter_cache_info,
 )
 
 # ---------------------------------------------------------------------------
@@ -180,7 +211,7 @@ from healpix_analyse.radial_filter import (
 #
 # The backbone is loaded at run time from Meta's own distribution and is
 # subject to the DINOv3 License; nothing of it is vendored here (see
-# docs/dino.md).
+# docs/other/dino.md).
 # ---------------------------------------------------------------------------
 
 from healpix_analyse.dino import (
@@ -191,6 +222,49 @@ from healpix_analyse.dino import (
     tiles_to_nested,
 )
 
+# ---------------------------------------------------------------------------
+# Batched data augmentation (GPU, per-sample random draws)
+# ---------------------------------------------------------------------------
+
+from healpix_analyse.augment import (
+    HealPixAugment,
+    AugmentPlan,
+    AugmentResult,
+    RandomRotation,
+    RandomSO3,
+    RandomShift,
+    RandomZoom,
+    RandomFlip,
+    Rotation3D,
+    TangentLinear,
+    RandomGaugeRotation,
+    AdditiveNoise,
+    RandomMask,
+    RandomCrop,
+    gauge_rotate,
+    neighbour_mismatch,
+)
+
+# ---------------------------------------------------------------------------
+# AI layers: masked normalisation, pooling and positional encodings (#109)
+# ---------------------------------------------------------------------------
+
+from healpix_analyse.masked_norm import (
+    HealPixGroupNorm,
+    HealPixLayerNorm,
+    HealPixBatchNorm,
+    HealPixGlobalPool,
+    HealPixRegionPool,
+    global_pool,
+    region_pool,
+)
+from healpix_analyse.positional_encoding import (
+    HealPixPositionalEncoding,
+    healpix_positional_encoding,
+    positional_encoding_cache_info,
+    clear_positional_encoding_cache,
+)
+
 __all__ = [
     # ------------------------------------------------------------------
     # Multi-resolution operators
@@ -198,7 +272,12 @@ __all__ = [
     "HealPixDown",
     "HealPixUp",
     "LargeConv",
+    "down_up_blur",
+    "gaussian_plan",
+    "GaussianPlan",
     "HealPixFFTConv",
+    "HealPixGeoFFT",
+    "geo_fft_convolve",
     "HealPixDecomp",
     "HealPixWideConv",
     "HealPixPyramid",
@@ -215,10 +294,23 @@ __all__ = [
     "HealPixDivCurlPyramid",
     "HealPixResampler",
     "resample_healpix",
+    "resample_to_latlon_grid",
+    "get_interp_val",
+    "get_interp_weights",
+    "HealPixConv",
+    "HealPixConvTranspose",
+    "HealPixPatches",
+    "HealPixWindowAttention",
+    "HealPixNeighbourhoodAttention",
+    "WINDOW_SHIFTS",
+    "DEFAULT_WINDOW_SHIFT",
+    "binary_dilation",
+    "binary_erosion",
 
     # ------------------------------------------------------------------
     # Spherical harmonic transforms
     # ------------------------------------------------------------------
+    "HEALPixSHT",
     "build_rings_from_latlon",
     "anafast_latlon",
     "map2alm_latlon",
@@ -227,17 +319,20 @@ __all__ = [
     "grid_summary",
 
     # ------------------------------------------------------------------
-    # ALM containers
-    # ------------------------------------------------------------------
-    "AlmCoeffs",
-
-    # ------------------------------------------------------------------
     # Local flat-sky FFT
     # ------------------------------------------------------------------
     "LocalFFT",
     "local_fft",
     "local_ifft",
     "local_ps",
+    # ------------------------------------------------------------------
+    # Wavelet power spectrum
+    # ------------------------------------------------------------------
+    "HealPixWaveletSpectrum",
+    "HealPixIsotropicWaveletSpectrum",
+    "wavelet_power_spectrum",
+    "wavelet_morlet",
+    "wavelet_morlet_isotropic",
 
     # ------------------------------------------------------------------
     # Minkowski functionals — 2D planar
@@ -272,6 +367,13 @@ __all__ = [
     # ------------------------------------------------------------------
     "radial_filter",
     "gaussian_filter",
+    "FilterOperator",
+    "apply_filter_operator",
+    "gaussian_filter_operator",
+    "multiorder_filter_operator",
+    "radial_filter_operator",
+    "configure_radial_filter_cache",
+    "radial_filter_cache_info",
 
     # ------------------------------------------------------------------
     # HEALPix scalar-field gradients
@@ -279,6 +381,7 @@ __all__ = [
     "gradient",
     "gradient_magnitude",
     "directional_derivative",
+    "HealPixGradient",
 
     # ------------------------------------------------------------------
     # HEALPix connected components
@@ -297,4 +400,39 @@ __all__ = [
     "load_dinov3_sat",
     "nested_to_tiles",
     "tiles_to_nested",
+
+    # ------------------------------------------------------------------
+    # Batched data augmentation
+    # ------------------------------------------------------------------
+    "HealPixAugment",
+    "AugmentPlan",
+    "AugmentResult",
+    "RandomRotation",
+    "RandomSO3",
+    "RandomShift",
+    "RandomZoom",
+    "RandomFlip",
+    "Rotation3D",
+    "TangentLinear",
+    "RandomGaugeRotation",
+    "AdditiveNoise",
+    "RandomMask",
+    "RandomCrop",
+    "gauge_rotate",
+    "neighbour_mismatch",
+
+    # ------------------------------------------------------------------
+    # AI layers: masked normalisation, pooling, positional encodings
+    # ------------------------------------------------------------------
+    "HealPixGroupNorm",
+    "HealPixLayerNorm",
+    "HealPixBatchNorm",
+    "HealPixGlobalPool",
+    "HealPixRegionPool",
+    "global_pool",
+    "region_pool",
+    "HealPixPositionalEncoding",
+    "healpix_positional_encoding",
+    "positional_encoding_cache_info",
+    "clear_positional_encoding_cache",
 ]
