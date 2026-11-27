@@ -24,7 +24,15 @@ stored on a NESTED HEALPix grid, **without modifying the network**. Every cell
 of `parent_level` present in the data gives one square image, which is passed
 to the unmodified backbone. How that image is built is set by `projection`:
 
-- **`"tangent"` (default).** The cell is resampled onto a north-up gnomonic
+- **`"gauge"` (default).** The image is a
+  [`HealPixPatches`](../conv/patches.md) patch of `tile_px` pixels centred on
+  the cell: the `N x N` grid of the North Pole rotated by the gauge to the
+  cell and sampled by bilinear interpolation at the spacing of `level`,
+  exactly as a `HealPixConv` kernel, then transposed to north up, east right.
+  The tokens are folded back to the cells of `level - 4` with the adjoint of
+  the same operator: **one vector per cell of `level - 4`**, attached to that
+  cell. See [the gauge mode](#gauge-mode) below.
+- **`"tangent"`.** The cell is resampled onto a north-up gnomonic
   plane tangent at its centre, with a constant ground sampling (`gsd_m`,
   `sqrt(cell area)` at `level` by default). Shapes are then correct: HEALPix
   cells have equal area but not equal shape — at 52° N the two NESTED axes
@@ -82,17 +90,79 @@ grid never changes.
 
 ---
 
+(gauge-mode)=
+## The gauge mode: images and tokens on `HealPixPatches`
+
+Every cell of `parent_level` holding data is the centre of one image of
+`tile_px = N` pixels (a power of two; by default the smallest one containing
+the cell, 64 px for cells of 32 px). The image is
+`HealPixPatches(level, N, centres=parent_level)` of the data: the patch of a
+`HealPixConv` kernel, with the spacing of one cell of `level`. `N` is even,
+so no pixel sits on the cell centre: the cell is the centre of the grid, and
+the bilinear interpolation puts every pixel where it belongs.
+
+With `gauge_type="phi"` the raw patch runs east down the rows and south
+along the columns: it is the transpose (a mirror image) of a north-up map.
+`GetDINOV3SAT` transposes it before the network, which therefore sees north
+up, east right, as in its training imagery.
+
+The `T x T` tokens of an image (`T = N / 16`) are centred at the offsets
+`16 j + 7.5 - (N - 1) / 2` cells of `level`, that is `j - (T - 1) / 2` cells
+of `level - 4`: **the token grid is exactly the grid of
+`HealPixPatches(level - 4, T)` centred on the same cell**. Its fold, the
+adjoint of its bilinear extraction normalised by the weights, returns the
+tokens to the cells of `level - 4`: every cell receives the weighted mean of
+the tokens of all the images that read it. No token index is computed by
+hand, so no cell is shifted, duplicated or left empty.
+
+```python
+res = GetDINOV3SAT(rgb, src.cell_id, level=19, parent_level=14, model=model,
+                   ellipsoid="wgs84")          # GRID4EARTH Sentinel-2 stores
+res.embedding      # [K, 1024]  one vector per cell of level 15 (= level - 4)
+res.cell_id        # [K]        those cells; res.cell_level == 15
+res.coverage       # [K]        fraction of the bilinear weight inside the data
+res.image_embedding, res.image_cell_id    # one vector per image (`pooling`), level 14
+```
+
+- `ellipsoid`: the reference ellipsoid of the store (`"wgs84"` for the
+  GRID4EARTH Sentinel-2 products). The cells read do not depend on it — a
+  HEALPix grid on an ellipsoid is the grid of its authalic sphere — but the
+  image is then square in metres on the ellipsoid rather than on the
+  authalic sphere (a correction below 0.34 %), and the reported coordinates
+  (`patch_lon`, `patch_lat`, `centre_lon`, `centre_lat`) are geodetic.
+- `rotations=4` averages the tokens of the four quarter turns of every
+  image, each turned back before the fold: an embedding that does not depend
+  on the orientation of the scene, for 4 forward passes.
+- `centre_batch`: images per geometry build (about 4e6 pixels by default),
+  so that the geometry of a whole scene is never in memory at once. Images
+  and fold run on the device, with the Triton kernels of `HealPixPatches` on
+  CUDA.
+- `over_sample` and `stride` do not apply: the output is already one vector
+  per token cell. Denser outputs need finer images (a smaller `level` step),
+  not a denser sampling of the same 16-px tokens: a token always summarises
+  its 16 x 16 pixels.
+- Missing cells (NaN in any band) are left out of the domain; image pixels
+  with no data are filled with the image mean (`fill="mean"`) or 0.
+  `min_coverage` drops the images whose mean coverage is below it.
+
+With a fake backbone whose token is the mean of its 16 x 16 pixels, a field
+drawn at random per cell of `level - 4` comes back on its own cell with a
+correlation of 0.76 against at most 0.23 with any neighbour cell (0.65
+against 0.31 with `"tangent"`); `tests/test_dino_gauge.py` checks it.
+
+---
+
 ## Signature
 
 ```python
 GetDINOV3SAT(
-    data,                     # [N, C] reflectances in [0, 1], NaN = missing
+    data,                     # [N, C] any units (input_range maps to [0, 1]), NaN = missing
     cell_id,                  # [N] NESTED ids at `level`
     level,                    # resolution of `data`
     parent_level,             # resolution of the tiles (level - parent_level >= 4,
                               #   >= 1 with projection="percell")
     *,
-    projection     = "tangent",          # "tangent" | "percell" | "nested"
+    projection     = "gauge",            # "gauge" | "tangent" | "percell" | "nested"
     over_sample    = 1,                  # sliding window: tokens n times denser, cost n**2
     context_px     = None,               # window side in "percell" mode (multiple of 16)
     out_cells      = None,               # restrict "percell" mode to these cells
@@ -113,18 +183,22 @@ GetDINOV3SAT(
     batch_size     = 16,
     device         = None,
     autocast       = True,
+    ellipsoid      = None,               # "wgs84" for Sentinel-2; None = set_ellipsoid()
+    rotations      = 1,                  # gauge mode: 1 or 4 quarter turns averaged
+    centre_batch   = None,               # gauge mode: images per geometry build
 ) -> DINOEmbedding
 ```
 
 The backbone runs under `torch.inference_mode` (no gradients) and returns
-NumPy arrays; on CUDA it uses bf16 autocast. The ellipsoid used to place the
-cells is a module setting, `healpix_analyse.dino.set_ellipsoid(name)`,
-`"sphere"` by default.
+NumPy arrays; on CUDA it uses bf16 autocast. The ellipsoid is the
+`ellipsoid` argument, or else the module setting
+`healpix_analyse.dino.set_ellipsoid(name)`, `"sphere"` by default.
 
 | Field of `DINOEmbedding` | Shape | Meaning |
 |---|---|---|
-| `embedding` | `[M, Ndino]` | one vector per cell of `parent_level` present in `cell_id` |
+| `embedding` | `[M, Ndino]` | one vector per cell of `parent_level` present in `cell_id`; in `"gauge"` mode one per cell of `cell_level = level - 4` |
 | `cell_id` | `[M]` | NESTED ids of those cells |
+| `image_embedding`, `image_cell_id`, `image_coverage` | `[Mi, Ndino]`, `[Mi]` | `"gauge"` mode: one vector per image (`pooling`), centred on a cell of `parent_level` |
 | `coverage` | `[M]` | fraction of `level` pixels available in each tile |
 | `patch_embedding` | `[M·P, Ndino]` | patch tokens (`return_patches=True`) |
 | `patch_cell_id` | `[M·P]` | NESTED ids of the patches at `patch_level` |
@@ -156,6 +230,91 @@ of ≈ 2.5 km and patch embeddings on level-15 cells (≈ 160 m).
 
 ---
 
+## Input range — what the network expects
+
+DINOv3 SAT-493M was trained on 8-bit RGB imagery divided by 255, then
+normalised with `SAT493M_MEAN` / `SAT493M_STD`. It expects values in [0, 1]
+with the brightness of an 8-bit visual product. `GetDINOV3SAT` therefore maps
+its input through `input_range` before anything else, and prints the ranges
+before and after (`verbose=True`):
+
+| `input_range` | mapping to [0, 1], then clipped |
+|---|---|
+| `"auto"` (default), `"percentile"` | 1st-99th percentiles of all the input values, all bands together |
+| `"sat493m"` | per band: the scene gets the mean / std of the SAT-493M training images (about 110 / 105 / 75 ± 54 / 40 / 36 in 0-255 levels) |
+| `"reflectance"` | `(0, REFLECTANCE_WHITE)` = `(0, 0.3)` |
+| `"uint8"` | `(0, 255)` |
+| `"unit"` | `(0, 1)`: the data are already in range |
+| `(lo, hi)` | explicit |
+
+Raw units fed unchanged (Sentinel-2 DN, scaled floats of order 1e6, ...) give
+a white or black image and tokens that carry almost nothing. With `"auto"`
+the embeddings no longer depend on the units. For a time series, pass the
+`res.input_range` of the first date to the others so that every date shares
+one mapping. `scale_input(data, input_range, verbose=True)` does the same
+mapping on its own, to check a store before running the network; it prints
+the per-band mean / std in 0-255 levels next to the SAT-493M ones.
+
+The constants are those of Meta's transform for the SAT-493M weights
+(`ToTensor()` then `Normalize(mean=(0.430, 0.411, 0.296), std=(0.213, 0.156,
+0.143))`). Note that SAT-493M was trained on sub-metre imagery: at Sentinel-2's
+10 m a 16-px patch covers ~160 m, and objects look 15-20 times smaller than in
+training -- a gap no radiometric mapping removes.
+
+---
+
+## One vector per image: `pooling`
+
+DINOv3 returns one token per 16 x 16 px patch plus a global CLS token: a 64 px
+image gives 16 patch tokens and one CLS. `pooling` chooses the vector kept:
+
+| `pooling` | vector | describes |
+|---|---|---|
+| `"cls"` (package default) | CLS token | the whole image |
+| `"mean"` | mean of all patch tokens | the whole image, every patch equal |
+| `"cls+mean"` | both, concatenated (2 x Ndino) | global and local |
+| `"centre"` | mean of the patch tokens covering the parent cell at the image centre | the cell itself, the rest of the image serving as context |
+
+With images larger than their cell (`TILE_PX = 64` for 32 px cells), only
+`"centre"` describes the cell rather than its surroundings: it averages the
+central 2 x 2 tokens. The window is a centred square of the cell's size,
+widened when needed to stay centred on the token grid. The notebooks use it.
+
+---
+
+## Sliding window over the images: `stride`
+
+In tangent mode, `stride` sets the step between image centres, in parent
+cells. `stride=1` (default) gives one image per parent cell. `stride=1/2`
+adds the images centred between two neighbouring cells and between four, with
+the same projection, resolution and size: a block of `G x G` cells gives
+`(2G - 1)**2` images inside it, e.g. 31 x 31 for 16 x 16.
+
+```python
+res = GetDINOV3SAT(rgb, cell_id, level=20, parent_level=15, projection="tangent",
+                   tile_px=64, stride=0.5, model=model)
+res.embedding        # [4 M, Ndino]  four images per parent cell
+res.cell_id          # [4 M]  cells of res.cell_level = parent_level + 1
+res.centre_lon, res.centre_lat   # image centres
+res.on_parent_grid   # True for the images that stride=1 gives
+```
+
+The centres are exact HEALPix points, defined across face boundaries: the
+north corners (largest face `x` and `y`) of the cells of
+`parent_level + log2(1/stride)` (`stride_centres`). The images centred on a
+parent cell are exactly those of `stride=1`.
+
+`stride` is not `over_sample`: `over_sample=n` keeps one image per cell and
+shifts the windows by `16/n` px *inside* it to get a denser token field;
+`stride` moves the images themselves. The two cannot be combined, and
+`stride < 1` does not return patch tokens.
+
+`Notebooks/dino_debug_petite_zone.ipynb` checks all this on a 512 x 512 px
+zone: the images DINO receives, the classes (UMAP + k-means) with
+`stride=1` and `stride=1/2`.
+
+---
+
 ## Orientation and geometry
 
 Inside a HEALPix base face the local axes are rotated by 45° with respect to
@@ -167,7 +326,7 @@ mild effect; when fine-tuning, use rotation augmentations rather than image
 flips. This paragraph is about the `"nested"` mode: there, the pixel-shape
 distortion of HEALPix cells (equal area, variable shape) is **not**
 negligible away from the equator (a factor 2 stretch at 52° N, see the
-overview), which is why `"tangent"` is the default.
+overview), which is why it is not the default.
 
 ---
 

@@ -7,7 +7,9 @@ token-based models, and its adjoint ``fold``.
 :class:`HealPixPatches` cuts a field at level ``L`` into square patches of
 ``N x N = 2**p x 2**p`` pixels, centred on the cells of level ``L - p``
 (``centres="coarse"``, a tiling aligned with NESTED) or on every cell
-(``centres="all"``, overlapping patches).  Two modes:
+(``centres="all"``, overlapping patches), or on the cells of any level in
+between (``centres=<level>``, e.g. images larger than their cell for a
+pre-trained ViT).  Two modes:
 
 ``mode="gauge"`` (default)
     An ``N x N`` grid in the local tangent plane of each centre, oriented by
@@ -39,6 +41,7 @@ from healpix_analyse.convol import (
     _get_interp_weights,
     _significant,
 )
+from healpix_analyse._ellipsoid import authalic_scale, canonicalize_ellipsoid
 from healpix_analyse.dino import xy_to_nested
 from healpix_analyse._patches_backend import (
     BACKENDS,
@@ -71,6 +74,40 @@ def _patch_grid(N: int, nside: int) -> np.ndarray:
     return np.stack([np.sin(dtheta) * np.cos(dphi),
                      np.sin(dtheta) * np.sin(dphi),
                      np.cos(dtheta)], axis=-1)
+
+
+def _stretch_to_ellipsoid(rot, th, ph, k, G, P):
+    """Map a grid that is isotropic on the ground onto the authalic sphere.
+
+    ``rot`` [M*G*P, 3] are the grid points rotated to the centres (colatitude
+    ``th``, longitude ``ph`` on the authalic sphere); ``k`` [M] is the scale
+    of :func:`~healpix_analyse._ellipsoid.authalic_scale`.  Every offset from
+    the centre (azimuthal equidistant) is multiplied by ``k`` along the
+    meridian and divided by ``k`` along the parallel, so that the patch keeps
+    its shape on the ellipsoid.  Modified in place and returned.
+    """
+    M = th.shape[0]
+    v = rot.view(M, G * P, 3)
+    th_t = torch.as_tensor(th, dtype=v.dtype)[:, None]
+    ph_t = torch.as_tensor(ph, dtype=v.dtype)[:, None]
+    ct, st, cp, sp = th_t.cos(), th_t.sin(), ph_t.cos(), ph_t.sin()
+    n = torch.stack([st * cp, st * sp, ct], -1)                    # [M, 1, 3]
+    e_s = torch.stack([ct * cp, ct * sp, -st], -1)                 # south
+    e_e = torch.stack([-sp, cp, torch.zeros_like(st)], -1)         # east
+    t_s = (v * e_s).sum(-1)
+    t_e = (v * e_e).sum(-1)
+    up = (v * n).sum(-1)
+    t = torch.hypot(t_s, t_e)
+    d = torch.atan2(t, up)
+    one = torch.ones_like(t)
+    scale = torch.where(t > 0, d / torch.where(t > 0, t, one), one)
+    kk = torch.as_tensor(k, dtype=v.dtype)[:, None]
+    o_s, o_e = t_s * scale * kk, t_e * scale / kk
+    r = torch.hypot(o_s, o_e)
+    sinc = torch.where(r > 0, r.sin() / torch.where(r > 0, r, one), one)
+    v.copy_(r.cos()[..., None] * n
+            + sinc[..., None] * (o_s[..., None] * e_s + o_e[..., None] * e_e))
+    return rot
 
 
 def _lonlat_to_vec(lon_deg, lat_deg):
@@ -106,11 +143,19 @@ def _ref_direction(gauge_type, singularity_lonlat, ref_direction):
     return rd / np.linalg.norm(rd, axis=-1, keepdims=True)
 
 
-def _bind(cells, ids_np, full):
+def _bind(cells, ids_np, full, is_sorted=False):
     """Positions of the NESTED ``cells`` in the domain ``ids_np`` (input order)
-    and their presence."""
+    and their presence.  ``is_sorted``: ``ids_np`` is strictly increasing, no
+    sort needed (the batches of centres of a large domain then cost O(K) each
+    instead of O(K log K))."""
     if full:
         return cells, np.ones(cells.shape, dtype=bool)
+    if is_sorted:
+        srt = ids_np
+        pos = np.searchsorted(srt, cells)
+        pos_c = np.minimum(pos, srt.size - 1)
+        present = srt[pos_c] == cells
+        return np.where(present, pos_c, 0), present
     order = np.argsort(ids_np, kind="stable")
     srt = ids_np[order]
     pos = np.searchsorted(srt, cells)
@@ -163,18 +208,40 @@ class HealPixPatches(nn.Module):
     cell_ids : array-like or None
         NESTED cell ids of a regional domain at level ``L``, in the order of
         the data (any order).  None = the full sphere in NESTED order.
-    centres : {"coarse", "all"}, default "coarse"
+    centres : {"coarse", "all"} or int, default "coarse"
         ``"coarse"``: one patch per cell of level ``L - p`` (the parents of
         the cells of the domain), a tiling aligned with NESTED.  ``"all"``:
         one overlapping patch centred on every cell of the domain, in the
-        order of ``cell_ids`` (``mode="gauge"`` only).
+        order of ``cell_ids`` (``mode="gauge"`` only).  An integer ``c``
+        with ``L - p <= c <= L``: one patch per cell of level ``c`` holding
+        cells of the domain, overlapping as soon as ``c > L - p``
+        (``mode="gauge"`` only unless ``c = L - p``): images larger than
+        their cell, as a pre-trained ViT wants.  ``"coarse"`` is ``L - p``,
+        ``"all"`` is ``L`` in the order of ``cell_ids``.
+    centre_ids : array-like or None
+        NESTED ids of the patch centres at the centre level, instead of the
+        cells derived from the domain: a subset, to build the geometry by
+        batches of centres, or centres outside the domain (their patches
+        read what the domain holds; ``coverage`` says how much).  Unique.
+    ellipsoid : str or dict, default "sphere"
+        Reference ellipsoid of the HEALPix grid, e.g. ``"WGS84"`` for the
+        GRID4EARTH Sentinel-2 stores.  The cells read and the patch centres
+        do not depend on it (a HEALPix grid on an ellipsoid is the grid of
+        its authalic sphere, so ids are ids); it sets the shape of the patch
+        on the ground: with an ellipsoid the grid is square in metres on the
+        ellipsoid instead of on the authalic sphere, a correction below
+        0.34 % on WGS84.  :meth:`centre_lonlat` returns geodetic coordinates
+        on it.
     mode : {"gauge", "nested"}, default "gauge"
         ``"gauge"``: an ``N x N`` grid in the tangent plane of each centre,
         rotated by the gauge and sampled by bilinear interpolation, exactly
         like a :class:`~healpix_analyse.convol.HealPixConv` kernel with
-        ``ellipsoid="sphere"`` (with WGS84, ``HealPixConv`` places its stencil
-        at geodetic latitudes, shifted from the cell centres), with the
-        spacing of one cell of level ``L``.  ``"nested"``: the ``4**p``
+        ``ellipsoid="sphere"``, with the spacing of one cell of level ``L``.
+        With ``gauge_type="phi"``, gauge 0, row ``a`` of the patch runs
+        towards the east and column ``b`` towards the south: the patch is
+        the **transpose** of a north-up map (a mirror image, not a
+        rotation); ``y.transpose(-1, -2)`` gives north up, east right, which
+        is what a network pre-trained on map imagery expects.  ``"nested"``: the ``4**p``
         descendants of each centre as a ``2**p x 2**p`` image (row ``N-1-y``,
         column ``x`` in the face coordinates of HEALPix, the layout of
         :func:`~healpix_analyse.dino.nested_to_tiles`).
@@ -236,7 +303,7 @@ class HealPixPatches(nn.Module):
         level: int,
         patch_size: int = 4,
         cell_ids=None,
-        centres: str = "coarse",
+        centres="coarse",
         mode: str = "gauge",
         n_gauges: int = 1,
         gauge_type: str = "phi",
@@ -246,6 +313,8 @@ class HealPixPatches(nn.Module):
         backend: str = "auto",
         device=None,
         dtype: torch.dtype = torch.float32,
+        centre_ids=None,
+        ellipsoid="sphere",
     ):
         super().__init__()
         if isinstance(level, bool) or int(level) != level or int(level) < 0:
@@ -259,11 +328,21 @@ class HealPixPatches(nn.Module):
         self.p = N.bit_length() - 1
         if self.p > self.level:
             raise ValueError(f"patch_size 2**{self.p} needs level >= {self.p}.")
-        if centres not in ("coarse", "all"):
-            raise ValueError("centres must be 'coarse' or 'all'.")
+        if isinstance(centres, str):
+            if centres not in ("coarse", "all"):
+                raise ValueError("centres must be 'coarse', 'all' or a level.")
+            centre_level = self.level - self.p if centres == "coarse" else self.level
+        else:
+            if isinstance(centres, bool) or int(centres) != centres:
+                raise ValueError("centres must be 'coarse', 'all' or a level.")
+            centre_level = int(centres)
+            if not self.level - self.p <= centre_level <= self.level:
+                raise ValueError(f"centres={centre_level} must lie in "
+                                 f"[{self.level - self.p}, {self.level}] for "
+                                 f"patch_size={N} at level {self.level}.")
         if mode not in ("gauge", "nested"):
             raise ValueError("mode must be 'gauge' or 'nested'.")
-        if mode == "nested" and centres == "all":
+        if mode == "nested" and centre_level != self.level - self.p:
             raise ValueError("mode='nested' tiles the domain: use centres='coarse'.")
         if gauge_type not in _GAUGE_TYPES:
             raise ValueError(f"gauge_type must be one of {_GAUGE_TYPES}.")
@@ -272,6 +351,7 @@ class HealPixPatches(nn.Module):
         if backend not in BACKENDS:
             raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
         self.centres = centres
+        self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
         self.mode = mode
         self.G = int(max(1, n_gauges)) if mode == "gauge" else 1
         self.gauge_type = gauge_type
@@ -292,19 +372,32 @@ class HealPixPatches(nn.Module):
                 raise ValueError("cell_ids must not be empty.")
             if np.any(ids_np < 0) or np.any(ids_np >= npix):
                 raise ValueError(f"cell_ids contain identifiers outside level={self.level}.")
-            if np.unique(ids_np).size != ids_np.size:
+            # strictly increasing ids (the usual NESTED order) are unique and
+            # need no sort: an O(K) check instead of an O(K log K) unique
+            self._sorted = bool(ids_np.size < 2 or np.all(ids_np[1:] > ids_np[:-1]))
+            if not self._sorted and np.unique(ids_np).size != ids_np.size:
                 raise ValueError("cell_ids must contain unique identifiers.")
         else:
             ids_np = np.arange(npix, dtype=np.int64)
+            self._sorted = True
         self.K = ids_np.size
         Q = 4**self.p
-        if centres == "coarse":
-            self.centre_level = self.level - self.p
-            centre_ids = (np.unique(ids_np >> (2 * self.p)) if self.partial
-                          else np.arange(12 * 4**self.centre_level, dtype=np.int64))
-        else:
-            self.centre_level = self.level
+        self.centre_level = centre_level
+        explicit_centres = centre_ids is not None
+        if explicit_centres:
+            centre_ids = np.asarray(centre_ids, dtype=np.int64).ravel()
+            if centre_ids.size == 0:
+                raise ValueError("centre_ids must not be empty.")
+            if np.any(centre_ids < 0) or np.any(centre_ids >= 12 * 4**centre_level):
+                raise ValueError(f"centre_ids contain identifiers outside level={centre_level}.")
+            if np.unique(centre_ids).size != centre_ids.size:
+                raise ValueError("centre_ids must contain unique identifiers.")
+        elif centres == "all":
             centre_ids = ids_np.copy()
+        else:
+            centre_ids = (np.unique(ids_np >> (2 * (self.level - centre_level)))
+                          if self.partial
+                          else np.arange(12 * 4**centre_level, dtype=np.int64))
         self.M = centre_ids.size
         self.P = N * N
 
@@ -313,16 +406,17 @@ class HealPixPatches(nn.Module):
             a, b = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")   # row, col
             perm = xy_to_nested(b.ravel(), (N - 1) - a.ravel())             # [P] child index
             cells = (centre_ids[:, None] * Q + perm[None, :]).reshape(1, -1)
-            pos, present = _bind(cells, ids_np, not self.partial)
+            pos, present = _bind(cells, ids_np, not self.partial, self._sorted)
             w = present.astype(np.float64)
             coverage = w[0]
             inv = np.empty_like(perm)
             inv[perm] = np.arange(perm.size)
             self.register_buffer("_perm", torch.as_tensor(perm, device=device), persistent=False)
             self.register_buffer("_iperm", torch.as_tensor(inv, device=device), persistent=False)
-            # contiguous fast path: the full sphere, or a sorted domain made of
-            # complete level L - p cells
-            self.contiguous = (not self.partial) or (
+            # contiguous fast path: the full sphere with all its centres, or a
+            # sorted domain made of complete level L - p cells (explicit
+            # centre_ids are checked by the second test)
+            self.contiguous = (not self.partial and not explicit_centres) or (
                 self.K == self.M * Q
                 and np.array_equal(ids_np, (centre_ids[:, None] * Q + np.arange(Q)).ravel()))
             idx_t = torch.as_tensor(pos, dtype=torch.int32)
@@ -331,6 +425,11 @@ class HealPixPatches(nn.Module):
             self.contiguous = False
             lon, lat = healpix_geo.nested.healpix_to_lonlat(
                 centre_ids, self.centre_level, ellipsoid="sphere")
+            k_ell = None
+            if self.ellipsoid != "sphere" and N > 1:
+                _, lat_g = healpix_geo.nested.healpix_to_lonlat(
+                    centre_ids, self.centre_level, ellipsoid=self.ellipsoid)
+                k_ell = authalic_scale(np.asarray(lat_g, dtype=np.float64), self.ellipsoid)
             th = np.deg2rad(90.0 - np.asarray(lat, dtype=np.float64))
             ph = np.deg2rad(np.asarray(lon, dtype=np.float64))
             # built in float64 whatever the dtype, as HealPixConv: which cells a
@@ -340,9 +439,11 @@ class HealPixPatches(nn.Module):
             vec = torch.as_tensor(_patch_grid(N, self.nside), dtype=torch.float64)
             rot = torch.einsum("mgij,pj->mgpi", R, vec).reshape(-1, 3)
             del R
+            if k_ell is not None:
+                rot = _stretch_to_ellipsoid(rot, th, ph, k_ell, self.G, self.P)
             i4, w4 = _get_interp_weights(self.nside, rot, True, "cpu", torch.float64)   # [4, R]
             del rot
-            pos, present = _bind(i4.numpy(), ids_np, not self.partial)
+            pos, present = _bind(i4.numpy(), ids_np, not self.partial, self._sorted)
             w4 = w4.numpy()
             # the rule of HealPixConv: a neighbour with less than 1e-6 of the
             # full bilinear weight does not count
@@ -391,6 +492,14 @@ class HealPixPatches(nn.Module):
     @property
     def device(self) -> torch.device:
         return self._idx.device
+
+    def centre_lonlat(self):
+        """Longitudes and latitudes of the patch centres, in degrees, on
+        ``ellipsoid`` (geodetic latitudes on an ellipsoid)."""
+        ids = self.centre_ids.detach().cpu().numpy()
+        lon, lat = healpix_geo.nested.healpix_to_lonlat(
+            ids, self.centre_level, ellipsoid=self.ellipsoid)
+        return np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64)
 
     # ------------------------------------------------------------------
     # Input handling
@@ -547,5 +656,6 @@ class HealPixPatches(nn.Module):
 
     def extra_repr(self):
         return (f"level={self.level}, patch_size={self.patch_size}, mode={self.mode!r}, "
-                f"centres={self.centres!r}, n_centres={self.M}, n_gauges={self.G}, "
+                f"centres={self.centres!r}, centre_level={self.centre_level}, "
+                f"ellipsoid={self.ellipsoid!r}, n_centres={self.M}, n_gauges={self.G}, "
                 f"gauge_type={self.gauge_type!r}, partial={self.partial}")

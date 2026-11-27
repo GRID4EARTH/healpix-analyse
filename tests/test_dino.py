@@ -263,6 +263,7 @@ def test_tangent_output_tiles_the_cells_without_holes():
 
     for n in (1, 2):
         res = GetDINOV3SAT(data, cell_id, level, parent_level, over_sample=n,
+                           projection="tangent",
                            model=_FakeDino(), return_patches=True, device="cpu")
         tl = level - 4 + int(np.log2(n))
         assert res.patch_level == tl
@@ -354,3 +355,207 @@ def test_percell_one_embedding_per_cell():
     # the tiled modes need level - parent_level >= 4; per-cell does not
     with pytest.raises(ValueError, match="percell"):
         GetDINOV3SAT(data, cell_id, level, parent_level, model=_FakeDino())
+
+
+# ---------------------------------------------------------------------------
+# over_sample in tangent mode: a true sliding window
+# ---------------------------------------------------------------------------
+
+class _MeanDino(nn.Module):
+    """Exact stand-in: each token is the mean colour of its 16x16 patch."""
+
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward_features(self, x):
+        tok = nn.functional.avg_pool2d(x, 16).flatten(2).transpose(1, 2)
+        return {"x_norm_clstoken": tok.mean(1), "x_norm_patchtokens": tok}
+
+
+def _smooth_field(level, block_level, lon0=2.35, lat0=48.85):
+    """A smooth, anisotropic field on a block of cells around (lon0, lat0) plus its neighbours."""
+    from healpix_analyse.dino import cell_neighbours, cells_at_lonlat, cell_centres_lonlat
+    b = int(cells_at_lonlat(block_level, np.array([lon0]), np.array([lat0]))[0])
+    nb = cell_neighbours(block_level, np.array([b]))[:, 0]
+    blocks = np.r_[b, nb[nb >= 0]]
+    kk = level - block_level
+    ids = ((blocks[:, None] << (2 * kk)) + np.arange(4 ** kk)[None]).ravel()
+    lon, lat = cell_centres_lonlat(level, ids)
+    data = np.stack([np.sin(lat * 300), np.cos(lon * 250), np.sin(lat * 200 + lon * 150)], 1)
+    return (0.2 + 0.1 * data).astype(np.float32), ids, b
+
+
+def test_tangent_shift_moves_window_south_and_east():
+    """shift=(dy, dx) must give the base grid moved dy rows south and dx columns east."""
+    from healpix_analyse.dino import tangent_tiles
+    level, parent_level = 17, 12
+    data, ids, b = _smooth_field(level, 10)
+    kw = dict(tile_px=(64, 64), fill="nan")
+    base, cid = tangent_tiles(data, ids, level, parent_level, **kw)[:2]
+    sel = np.isin(cid, (b << 4) + np.arange(16))
+    base = base[sel]
+    for dy, dx in [(8, 0), (0, 8), (4, 12)]:
+        v = tangent_tiles(data, ids, level, parent_level, shift=(dy, dx), **kw)[0][sel]
+        # v[r, c] == base[r + dy, c + dx]
+        a = base[..., dy:, dx:]
+        w = v[..., :64 - dy, :64 - dx]
+        assert np.nanmax(np.abs(a - w)) < 1e-6
+
+
+def test_tangent_over_sample_is_a_sliding_window():
+    """With an exact backbone, a finer over_sample must get closer to the true
+    16-px sliding-window mean at the position of each output cell."""
+    from healpix_analyse.dino import (
+        EARTH_RADIUS_M, cell_centres_lonlat, healpix_gsd_m, sample_healpix,
+        tangent_grid_lonlat,
+    )
+    level, parent_level = 17, 12               # cells of 32 px in 64 px images
+    data, ids, b = _smooth_field(level, 10)
+    errs = []
+    for n in (1, 2, 4):
+        r = GetDINOV3SAT(data, ids, level, parent_level, projection="tangent",
+                         tile_px=64, over_sample=n, model=_MeanDino(), device="cpu",
+                         return_patches=True, mean=(0, 0, 0), std=(1, 1, 1),
+                         input_range="unit", verbose=False)
+        assert r.patch_level == level - 4 + int(np.log2(n))
+        # cells of the central block: their images are entirely inside the data
+        c = (r.patch_cell_id >> (2 * (r.patch_level - 10))) == b
+        emb, cid = r.patch_embedding[c], r.patch_cell_id[c]
+        lon, lat = cell_centres_lonlat(r.patch_level, cid)
+        glon, glat = tangent_grid_lonlat(lon, lat, 16, healpix_gsd_m(level) / EARTH_RADIUS_M)
+        v, ok = sample_healpix(data, ids, level, glon, glat)
+        good = ok.reshape(lon.size, -1).all(1)
+        truth = v.reshape(lon.size, -1, 3)[good].mean(1)
+        errs.append(np.abs(emb[good] - truth).mean())
+    assert errs[1] < 0.8 * errs[0] and errs[2] < 0.8 * errs[1], errs
+
+
+# ---------------------------------------------------------------------------
+# stride: sliding window over the images
+# ---------------------------------------------------------------------------
+
+def test_stride_centres_lattice():
+    """stride=1/2: 4 centres per parent, the parent centre among them, the
+    others at the midpoints / centres of four of the parent lattice."""
+    from healpix_analyse.dino import cell_centres_lonlat, stride_centres, _lonlat_to_vec
+    P = 12
+    block = 1234
+    parents = (block << 4) + np.arange(16)                       # a 4 x 4 block
+    cid, lev, lon, lat, on = stride_centres(parents, P, 0.5)
+    assert lev == P + 1 and cid.size == 64 and on.sum() == 16
+    plon, plat = cell_centres_lonlat(P, parents)
+    on_ids = cid[on] >> 2
+    order = np.argsort(on_ids)
+    assert np.array_equal(on_ids[order], np.sort(parents))
+    vp = _lonlat_to_vec(plon, plat)[np.argsort(parents)]
+    assert np.abs(_lonlat_to_vec(lon[on][order], lat[on][order]) - vp).max() < 1e-12
+    # off-grid centres sit midway between two parent centres (along an axis,
+    # or across a diagonal for the centre of four): check it on an 8 x 8 block,
+    # away from its +x / +y edges where the neighbours are missing
+    from healpix_analyse.dino import nested_to_xy
+    big = (block << 6) + np.arange(64)
+    cid8, _, lon8, lat8, on8 = stride_centres(big, P, 0.5)
+    bx, by = nested_to_xy((cid8 >> 2) & 63)
+    inner = ~on8 & (bx < 7) & (by < 7)
+    blon, blat = cell_centres_lonlat(P, big)
+    vb = _lonlat_to_vec(blon, blat)
+    d = np.sort(np.linalg.norm(_lonlat_to_vec(lon8, lat8)[inner][:, None] - vb[None], axis=-1), axis=1)
+    spacing = np.sort(np.linalg.norm(vb[:, None] - vb[None], axis=-1), axis=1)[:, 1].min()
+    assert np.allclose(d[:, 0], d[:, 1], rtol=0.01)
+    assert (d[:, 0] > 0.3 * spacing).all() and (d[:, 0] < 0.8 * spacing).all()
+    assert stride_centres(parents, P, 1)[0].size == 16
+    with pytest.raises(ValueError, match="power of two"):
+        stride_centres(parents, P, 1 / 3)
+
+
+def test_get_dinov3sat_stride_half():
+    """stride=1/2 adds images between the stride=1 ones, which are unchanged."""
+    level, parent_level = 17, 13               # cells of 16 px in 32 px images
+    data, ids, b = _smooth_field(level, 11)
+    sel = (ids >> (2 * (level - 11))) == b     # one block of 4 x 4 parents
+    kw = dict(projection="tangent", tile_px=32, model=_MeanDino(), device="cpu",
+              mean=(0, 0, 0), std=(1, 1, 1), pooling="cls")
+    r1 = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, **kw)
+    r2 = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, stride=0.5, **kw)
+    assert r1.cell_id.size == 16 and r2.embedding.shape[0] == 64
+    assert r2.cell_level == parent_level + 1 and r2.stride == 0.5
+    assert r2.on_parent_grid.sum() == 16
+    a = r1.embedding[np.argsort(r1.cell_id)]
+    o = np.argsort(r2.cell_id[r2.on_parent_grid] >> 2)
+    assert np.allclose(r2.embedding[r2.on_parent_grid][o], a, atol=1e-5)
+    assert np.isfinite(r2.centre_lon).all() and r2.centre_lat.shape == (64,)
+    with pytest.raises(ValueError, match="over_sample"):
+        GetDINOV3SAT(data[sel], ids[sel], level, parent_level, stride=0.5, over_sample=2, **kw)
+
+
+# ---------------------------------------------------------------------------
+# input range: the network always gets [0, 1]
+# ---------------------------------------------------------------------------
+
+def test_scale_input_modes():
+    from healpix_analyse.dino import scale_input, REFLECTANCE_WHITE
+    x = np.array([[0.0, 0.1, 0.2], [0.3, np.nan, 0.6]], np.float32)
+    out, (lo, hi), how = scale_input(x, "reflectance")
+    assert how == "reflectance" and (lo, hi) == (0.0, REFLECTANCE_WHITE)
+    assert np.isnan(out[1, 1]) and np.nanmax(out) == 1.0 and np.nanmin(out) == 0.0
+    assert np.allclose(scale_input(x * 255 / 0.6, "uint8")[0][0], x[0] / 0.6, atol=1e-6)
+    out, (lo, hi), how = scale_input(x, (0.1, 0.5))
+    assert how == "fixed" and np.isclose(out[0, 2], 0.25)
+    with pytest.raises(ValueError):
+        scale_input(x, "kelvin")
+
+
+def test_scale_input_sat493m_matches_training_statistics():
+    from healpix_analyse.dino import scale_input, SAT493M_MEAN, SAT493M_STD
+    rng = np.random.default_rng(0)
+    x = np.stack([rng.normal(0.08, 0.02, 200000), rng.normal(0.07, 0.015, 200000),
+                  rng.normal(0.05, 0.01, 200000)], 1) * 1e6           # any units
+    out, (lo, hi), how = scale_input(x, "sat493m")
+    assert how == "sat493m" and np.shape(lo) == (3,)
+    assert np.allclose(out.mean(0), SAT493M_MEAN, atol=0.01)
+    assert np.allclose(out.std(0), SAT493M_STD, atol=0.01)
+    # the per-band range is reusable as is, e.g. for another date
+    out2, _, how2 = scale_input(x, (lo, hi))
+    assert how2 == "fixed" and np.allclose(out2, out)
+
+
+def test_units_do_not_change_the_embeddings():
+    """With input_range='auto' the same scene in reflectance, DN or x1e6 units
+    gives the same embeddings: the network always sees the same image."""
+    level, parent_level = 17, 13
+    data, ids, b = _smooth_field(level, 11)
+    sel = (ids >> (2 * (level - 11))) == b
+    kw = dict(projection="tangent", tile_px=32, model=_MeanDino(), device="cpu", verbose=False)
+    ref = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, **kw)
+    for k in (1e4, 1e6):
+        r = GetDINOV3SAT(data[sel] * k + 3.0, ids[sel], level, parent_level, **kw)
+        assert np.allclose(r.embedding, ref.embedding, atol=1e-4)
+        assert r.input_scaling == "percentile"
+    ref_s = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, input_range="sat493m", **kw)
+    r_s = GetDINOV3SAT(data[sel] * 1e6, ids[sel], level, parent_level, input_range="sat493m", **kw)
+    assert np.allclose(r_s.embedding, ref_s.embedding, atol=1e-4) and r_s.input_scaling == "sat493m"
+    # reusing the range of a first date gives the same mapping on a second one
+    r2 = GetDINOV3SAT(data[sel], ids[sel], level, parent_level, input_range=ref.input_range, **kw)
+    assert np.allclose(r2.embedding, ref.embedding, atol=1e-5) and r2.input_scaling == "fixed"
+
+
+def test_centre_pooling_describes_the_cell():
+    """pooling='centre' = mean of the tokens over the cell at the image centre
+    (central 2 x 2 tokens for 64 px images of 32 px cells), with or without stride."""
+    from healpix_analyse.dino import _centre_window, tangent_images
+    assert _centre_window(4, 4, 32) == (1, 2, 1, 2)
+    assert _centre_window(4, 4, 16) == (1, 2, 1, 2)       # kept centred
+    assert _centre_window(8, 8, 64) == (2, 4, 2, 4)
+    assert _centre_window(4, 4, 128) == (0, 4, 0, 4)      # whole image = "mean"
+    level, parent_level = 17, 12                          # cells of 32 px in 64 px images
+    data, ids, b = _smooth_field(level, 10)
+    kw = dict(projection="tangent", tile_px=64, model=_MeanDino(), device="cpu",
+              mean=(0, 0, 0), std=(1, 1, 1), input_range="unit", verbose=False)
+    for stride in (1.0, 0.5):
+        r = GetDINOV3SAT(data, ids, level, parent_level, pooling="centre", stride=stride, **kw)
+        img = tangent_images(data, ids, level, r.centre_lon[:50], r.centre_lat[:50], 64)[0]
+        expect = img[:, :, 16:48, 16:48].mean(axis=(2, 3))
+        assert np.allclose(r.embedding[:50], expect, atol=1e-5)
+        rm = GetDINOV3SAT(data, ids, level, parent_level, pooling="mean", stride=stride, **kw)
+        assert not np.allclose(r.embedding, rm.embedding)
