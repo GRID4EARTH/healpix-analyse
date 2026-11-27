@@ -81,6 +81,9 @@ def parse():
                         "[[a, b, label], ...] and 'sensitivity_site'; default: the "
                         "48 deg N set of this file")
     p.add_argument("--k", type=int, default=8, help="k-means classes for the pair agreement")
+    p.add_argument("--save-emb", action="store_true",
+                   help="save the embeddings (mean of patch tokens, float16) per site, for "
+                        "downstream probes (Notebooks/dino_worldcover_probe.py)")
     p.add_argument("--resampler", default="psf", choices=("psf", "ct", "bilinear"),
                    help="UTM -> HEALPix: 'psf' (PSFResampler, damped fit: sharpens small "
                         "scales) or 'ct' (CloughTocherResampler, C1 interpolation, no "
@@ -328,6 +331,10 @@ def main():
         E = {kind: embed(model, im[sel]) for kind, im in
              (("utm", utm), ("utm_c", utm_c), ("hpx", hpx))}
         res[name] = dict(cells=cand[sel], gamma=gamma[sel], k=k[sel], E=E)
+        if a.save_emb:
+            np.savez_compressed(os.path.join(a.out, f"emb_{name}.npz"), cells=cand[sel],
+                                lon=clon[sel], lat=clat[sel], gamma=gamma[sel],
+                                **{kind: E[kind]["mean"].astype(np.float16) for kind in E})
         perm = np.random.default_rng(1).permutation(int(sel.sum()))
         site_info[name] = dict(item=item, platform=props.get("platform"),
                                datatake=props.get("s2:datatake_id"), lon=lon0, lat=lat0,
