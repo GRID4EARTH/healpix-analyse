@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- `HealPixPatches(pixel_size=...)`: the step of the gauge grid in metres on
+  the ground, independent of the level of the map (e.g. a Sentinel-2 map
+  kept at level 20 and 10 m patches for a model trained on 10 m imagery).
+  The grid is still built at the North Pole with a constant step and
+  rotated to every centre; `centres="coarse"` becomes the coarsest level
+  whose cells are not larger than the patch. The default (one cell of `L`)
+  is unchanged.
 - `GetDINOV3SAT(projection="gauge")`, the new default: the images are
   `HealPixPatches` patches centred on the cells of `parent_level` (the patch
   of a `HealPixConv` kernel, transposed to north up), and the tokens are

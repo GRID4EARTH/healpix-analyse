@@ -44,7 +44,8 @@ Patch sizes are powers of 2, `N = 2**p`. The patches are centred:
   domain cells. This is the ViT tiling, aligned with NESTED.
 - `centres="all"`: on every cell of the domain, in the order of `cell_ids`
   (overlapping patches, `mode="gauge"` only).
-- `centres=c`, an integer level with `L − p ≤ c ≤ L`: on the cells of level
+- `centres=c`, an integer level with `L − p ≤ c ≤ L` (with `pixel_size`,
+  `p` is the exponent given below): on the cells of level
   `c` holding cells of the domain, patches overlapping as soon as `c > L − p`
   (`mode="gauge"` only unless `c = L − p`). This is the image of a
   pre-trained ViT, larger than its cell for context: 64 px images centred on
@@ -57,11 +58,16 @@ Patch sizes are powers of 2, `N = 2**p`. The patches are centred:
 Two modes give the pixels of a patch:
 
 `mode="gauge"` (default)
-: An `N × N` grid in the tangent plane of the centre, oriented by the gauge
-  and sampled by bilinear interpolation, exactly like a
-  {doc}`HealPixConv <convol>` kernel: the same rotation matrices, the same
-  gauge types (`phi`, `cosmo`, `projected_ref`, `two_ref`) and `n_gauges`
-  orientations `g·π/G`, the spacing of one cell of level `L`. The grid
+: An `N × N` grid built once at the North Pole with a constant step,
+  rotated to the centre, oriented by the gauge and sampled by bilinear
+  interpolation, exactly like a {doc}`HealPixConv <convol>` kernel: the same
+  rotation matrices, the same gauge types (`phi`, `cosmo`, `projected_ref`,
+  `two_ref`) and `n_gauges` orientations `g·π/G`. The plane offsets are put
+  on the sphere by the inverse azimuthal equidistant projection: every pixel
+  is at its exact geodesic distance from the centre, and the step is exact
+  along the two axes through the centre (elsewhere within a relative
+  `(N·step/R)²`, below 10⁻⁷ for a 1.3 km image). The step is one cell of
+  level `L` by default, or `pixel_size` metres (below). The grid
   offsets are `i − (N − 1)/2`, so an even `N` is centred on the centre of the
   cell. A shared patch embedding sees the same orientation everywhere on the
   sphere, and with `G = 4` gauge `g + 2` is gauge `g` rotated by 90° (a
@@ -85,6 +91,29 @@ Two modes give the pixels of a patch:
   local scale factor `k` of the authalic map along the meridian and by `1/k`
   along the parallel, a correction below 0.34 %. `centre_lonlat()` returns
   the centres in geodetic coordinates on that ellipsoid.
+
+  **Pixel size.** `pixel_size=` sets the step of the grid in metres on the
+  ground, independently of the level of the map. The map is kept at the
+  level that preserves the data and the patch is sampled at the pixel size
+  the model expects. For example, a Sentinel-2 field converted at level 20
+  (6.2 m) with `CloughTocherResampler`, read as 10 m images for a model
+  trained on 10 m imagery:
+
+  ```python
+  img = HealPixPatches(20, 128, cell_ids=ids, centres=14, ellipsoid="WGS84",
+                       pixel_size=10.0)
+  ```
+
+  The angle of a step is `pixel_size / R`, `R` the radius of the sphere of
+  the grid: the authalic radius of the ellipsoid (6 371 007.2 m for WGS84),
+  6 370 997 m for `"sphere"`. With an ellipsoid the step is in metres on the
+  ellipsoid along both axes. The exponent that sets the centre levels becomes
+  `p = floor(log2(N · pixel_size / cell))`, clipped to `[0, L]`, `cell` the
+  side of a cell of level `L`: `centres="coarse"` is then the coarsest level
+  whose cells are not larger than the patch, so the patches leave no gap. A
+  step larger than the cell undersamples the map (bilinear, no anti-aliasing):
+  keep the map at least as fine as the patch. `mode="nested"` has no
+  `pixel_size`.
 
 `mode="nested"`
 : The `4**p` descendants of each coarse cell, as a `2**p × 2**p` image: row
