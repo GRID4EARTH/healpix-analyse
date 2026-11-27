@@ -12,11 +12,15 @@ between (``centres=<level>``, e.g. images larger than their cell for a
 pre-trained ViT).  Two modes:
 
 ``mode="gauge"`` (default)
-    An ``N x N`` grid in the local tangent plane of each centre, oriented by
-    the gauge exactly like a :class:`~healpix_analyse.convol.HealPixConv`
-    kernel built with ``ellipsoid="sphere"`` (same rotation matrices, same
-    bilinear interpolation) with the spacing of one cell of level ``L``.  A shared patch embedding then sees
-    the same orientation everywhere on the sphere.
+    An ``N x N`` grid built once at the North Pole with a constant step
+    (azimuthal equidistant: every point at its exact geodesic distance from
+    the centre), rotated to each centre and oriented by the gauge exactly
+    like a :class:`~healpix_analyse.convol.HealPixConv` kernel built with
+    ``ellipsoid="sphere"`` (same rotation matrices, same bilinear
+    interpolation).  The step is one cell of level ``L`` by default, or
+    ``pixel_size`` metres on the ground, independent of the level of the
+    map.  A shared patch embedding then sees the same orientation and the
+    same pixel size everywhere on the sphere.
 ``mode="nested"``
     The ``4**p`` descendants of each level ``L - p`` cell, as a
     ``2**p x 2**p`` image in the layout of
@@ -41,7 +45,11 @@ from healpix_analyse.convol import (
     _get_interp_weights,
     _significant,
 )
-from healpix_analyse._ellipsoid import authalic_scale, canonicalize_ellipsoid
+from healpix_analyse._ellipsoid import (
+    authalic_radius,
+    authalic_scale,
+    canonicalize_ellipsoid,
+)
 from healpix_analyse.dino import xy_to_nested
 from healpix_analyse._patches_backend import (
     BACKENDS,
@@ -58,17 +66,28 @@ __all__ = ["HealPixPatches"]
 _GAUGE_TYPES = ("phi", "cosmo", "projected_ref", "two_ref")
 
 
-def _patch_grid(N: int, nside: int) -> np.ndarray:
+def _cell_angle(nside: int) -> float:
+    """Side of a HEALPix cell, in radians: the square root of its area."""
+    return float(np.sqrt(4 * np.pi / (12 * nside**2)))
+
+
+def _patch_grid(N: int, nside: int, step: Optional[float] = None) -> np.ndarray:
     """``N x N`` grid of unit vectors around the North Pole, ``[N*N, 3]``.
 
-    Same construction as ``convol._local_kernel_grid`` (azimuthal equidistant
-    offsets of one cell width), with the offsets ``i - (N - 1) / 2`` so that
-    an even ``N`` is centred on the cell centre.  Pixel ``p = a*N + b`` is the
-    point ``(x, y) = (u[b], u[a])``.
+    Same construction as ``convol._local_kernel_grid``: the plane offsets
+    ``(x, y)`` are placed on the sphere by the inverse azimuthal equidistant
+    projection, at the colatitude ``step * sqrt(x**2 + y**2)`` and the
+    longitude ``atan2(y, x)``.  Every point is therefore at its exact
+    geodesic distance from the pole, and the step is exactly ``step`` along
+    the two axes through it (elsewhere within a relative
+    ``O((N * step)**2)``).  ``step`` is in radians, one cell of ``nside`` by
+    default.  The offsets are ``i - (N - 1) / 2`` so that an even ``N`` is
+    centred on the cell centre.  Pixel ``p = a*N + b`` is the point
+    ``(x, y) = (u[b], u[a])``.
     """
     u = np.arange(N, dtype=np.float64) - (N - 1) / 2.0
     xx, yy = np.meshgrid(u, u)
-    alpha_pix = np.sqrt(4 * np.pi / (12 * nside**2))
+    alpha_pix = _cell_angle(nside) if step is None else float(step)
     dtheta = np.sqrt(xx**2 + yy**2).ravel() * alpha_pix
     dphi = np.arctan2(yy, xx).ravel()
     return np.stack([np.sin(dtheta) * np.cos(dphi),
@@ -205,6 +224,24 @@ class HealPixPatches(nn.Module):
         Level ``L`` of the data (``nside = 2**L``).
     patch_size : int, default 4
         Side ``N = 2**p`` of the patches, a power of 2 with ``p <= L``.
+    pixel_size : float or None, default None
+        Step of the patch grid in metres on the ground (``mode="gauge"``
+        only), independent of the level of the map: e.g. a Sentinel-2 field
+        kept at level 20 (6.2 m) and patches of 10 m pixels, as a model
+        trained on 10 m imagery expects.  The angle is ``pixel_size / R``,
+        ``R`` the radius of the sphere of the grid (the authalic radius of
+        ``ellipsoid``, 6 371 007.2 m for WGS84; 6 370 997 m for
+        ``"sphere"``); with an ellipsoid the step is in metres on the
+        ellipsoid along both axes.  None: one cell of level ``L`` (side
+        ``sqrt(4 pi / (12 nside**2))`` radians), the step of
+        :class:`~healpix_analyse.convol.HealPixConv`.  A step larger than
+        the cell undersamples the map (bilinear, no anti-aliasing): keep the
+        map at least as fine as the patch.  With ``pixel_size``, the
+        exponent ``p`` of ``centres`` below becomes
+        ``floor(log2(N * pixel_size / cell))`` (clipped to ``[0, L]``),
+        ``cell`` the side of a cell of level ``L`` in metres: ``L - p`` is
+        then the coarsest level whose cells are not larger than the patch,
+        so that the ``"coarse"`` patches leave no gap.
     cell_ids : array-like or None
         NESTED cell ids of a regional domain at level ``L``, in the order of
         the data (any order).  None = the full sphere in NESTED order.
@@ -315,6 +352,7 @@ class HealPixPatches(nn.Module):
         dtype: torch.dtype = torch.float32,
         centre_ids=None,
         ellipsoid="sphere",
+        pixel_size: Optional[float] = None,
     ):
         super().__init__()
         if isinstance(level, bool) or int(level) != level or int(level) < 0:
@@ -328,20 +366,37 @@ class HealPixPatches(nn.Module):
         self.p = N.bit_length() - 1
         if self.p > self.level:
             raise ValueError(f"patch_size 2**{self.p} needs level >= {self.p}.")
+        if mode not in ("gauge", "nested"):
+            raise ValueError("mode must be 'gauge' or 'nested'.")
+        self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
+        # step of the grid in radians on the sphere of the grid, and the
+        # exponent that sets the coarse centre level (p for one cell)
+        self.pixel_size = None if pixel_size is None else float(pixel_size)
+        if self.pixel_size is None:
+            self._step = None
+            p_cov = self.p
+        else:
+            if mode != "gauge":
+                raise ValueError("pixel_size needs mode='gauge'.")
+            if not math.isfinite(self.pixel_size) or self.pixel_size <= 0:
+                raise ValueError("pixel_size must be a positive number of metres.")
+            self._step = self.pixel_size / authalic_radius(self.ellipsoid)
+            ratio = N * self._step / _cell_angle(self.nside)
+            p_cov = int(min(self.level, max(0, math.floor(math.log2(ratio) + 1e-9))))
         if isinstance(centres, str):
             if centres not in ("coarse", "all"):
                 raise ValueError("centres must be 'coarse', 'all' or a level.")
-            centre_level = self.level - self.p if centres == "coarse" else self.level
+            centre_level = self.level - p_cov if centres == "coarse" else self.level
         else:
             if isinstance(centres, bool) or int(centres) != centres:
                 raise ValueError("centres must be 'coarse', 'all' or a level.")
             centre_level = int(centres)
-            if not self.level - self.p <= centre_level <= self.level:
+            if not self.level - p_cov <= centre_level <= self.level:
                 raise ValueError(f"centres={centre_level} must lie in "
-                                 f"[{self.level - self.p}, {self.level}] for "
-                                 f"patch_size={N} at level {self.level}.")
-        if mode not in ("gauge", "nested"):
-            raise ValueError("mode must be 'gauge' or 'nested'.")
+                                 f"[{self.level - p_cov}, {self.level}] for "
+                                 f"patch_size={N} at level {self.level}"
+                                 + ("" if self.pixel_size is None
+                                    else f" and pixel_size={self.pixel_size} m") + ".")
         if mode == "nested" and centre_level != self.level - self.p:
             raise ValueError("mode='nested' tiles the domain: use centres='coarse'.")
         if gauge_type not in _GAUGE_TYPES:
@@ -351,7 +406,6 @@ class HealPixPatches(nn.Module):
         if backend not in BACKENDS:
             raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
         self.centres = centres
-        self.ellipsoid = canonicalize_ellipsoid(ellipsoid)
         self.mode = mode
         self.G = int(max(1, n_gauges)) if mode == "gauge" else 1
         self.gauge_type = gauge_type
@@ -434,7 +488,8 @@ class HealPixPatches(nn.Module):
             # grid point reads must not depend on rounding
             R = _build_rotation_matrices(th, ph, self.G, gauge_type, "cpu", torch.float64,
                                          ref_direction=self.ref_direction)   # [M, G, 3, 3]
-            vec = torch.as_tensor(_patch_grid(N, self.nside), dtype=torch.float64)
+            vec = torch.as_tensor(_patch_grid(N, self.nside, self._step),
+                                  dtype=torch.float64)
             rot = torch.einsum("mgij,pj->mgpi", R, vec).reshape(-1, 3)
             del R
             if k_ell is not None:
@@ -655,5 +710,6 @@ class HealPixPatches(nn.Module):
     def extra_repr(self):
         return (f"level={self.level}, patch_size={self.patch_size}, mode={self.mode!r}, "
                 f"centres={self.centres!r}, centre_level={self.centre_level}, "
-                f"ellipsoid={self.ellipsoid!r}, n_centres={self.M}, n_gauges={self.G}, "
+                + ("" if self.pixel_size is None else f"pixel_size={self.pixel_size}, ")
+                + f"ellipsoid={self.ellipsoid!r}, n_centres={self.M}, n_gauges={self.G}, "
                 f"gauge_type={self.gauge_type!r}, partial={self.partial}")

@@ -24,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 from healpix_geo._healpix_geo_python import resolve_ellipsoid
 
-__all__ = ["canonicalize_ellipsoid", "authalic_scale"]
+__all__ = ["canonicalize_ellipsoid", "authalic_scale", "authalic_radius"]
 
 
 def canonicalize_ellipsoid(ellipsoid):
@@ -91,3 +91,25 @@ def authalic_scale(lat_geodetic_deg, ellipsoid):
         k = n_rad * np.cos(phi) / (r_a * cosb)
     # at the poles both cosines vanish: the limit is the polar value
     return np.where(cosb > 1e-12, k, 1.0)
+
+
+def authalic_radius(ellipsoid):
+    """Radius in metres of the sphere of a HEALPix grid on ``ellipsoid``.
+
+    The authalic radius ``R_a`` (the sphere of the same area) of an
+    ellipsoid, 6 371 007.18 m for WGS84; the radius of a sphere
+    (``"sphere"``: 6 370 997 m).
+    """
+    params = resolve_ellipsoid(canonicalize_ellipsoid(ellipsoid)) if isinstance(
+        ellipsoid, str) else dict(ellipsoid)
+    if "radius" in params:
+        return float(params["radius"])
+    a = float(params["semimajor_axis"])
+    inv_f = params.get("inverse_flattening")
+    if inv_f is None or not np.isfinite(inv_f) or inv_f == 0:
+        return a
+    f = 1.0 / float(inv_f)
+    e2 = f * (2.0 - f)
+    e = np.sqrt(e2)
+    qp = (1 - e2) * (1 / (1 - e2) - np.log((1 - e) / (1 + e)) / (2 * e))
+    return float(a * np.sqrt(qp / 2.0))

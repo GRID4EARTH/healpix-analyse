@@ -486,3 +486,108 @@ def test_triton_double_backward():
     gr, = torch.autograd.grad((hr(xr) ** 2).sum(), xr, create_graph=True)
     ggr, = torch.autograd.grad(gr.sum(), xr)
     torch.testing.assert_close(gg, ggr, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# pixel_size: a step in metres, independent of the level of the map
+# ---------------------------------------------------------------------------
+
+def _cell_metres(level, ellipsoid="sphere"):
+    from healpix_analyse._ellipsoid import authalic_radius
+    return authalic_radius(ellipsoid) * np.sqrt(4 * np.pi / (12 * 4**level))
+
+
+@pytest.mark.parametrize("ellipsoid", ["sphere", "WGS84"])
+def test_pixel_size_of_one_cell_is_the_default(ellipsoid):
+    L, N = 5, 4
+    ids = _regional_ids(L)
+    ref = HealPixPatches(L, N, cell_ids=ids, centres=L - 1, ellipsoid=ellipsoid, **F64)
+    hp = HealPixPatches(L, N, cell_ids=ids, centres=L - 1, ellipsoid=ellipsoid,
+                        pixel_size=_cell_metres(L, ellipsoid), **F64)
+    assert hp.centre_level == ref.centre_level and hp.M == ref.M
+    x = torch.as_tensor(_smooth_field(L, ids))
+    torch.testing.assert_close(hp(x), ref(x), atol=1e-12, rtol=0)
+    torch.testing.assert_close(hp.coverage, ref.coverage, atol=1e-12, rtol=0)
+    assert "pixel_size=" in repr(hp) and "pixel_size=" not in repr(ref)
+
+
+def test_pixel_size_grid_has_a_constant_step_from_the_pole():
+    """Every grid point at its exact geodesic distance from the pole; along
+    the two axes through the centre the step is exactly the pixel size."""
+    from healpix_analyse.patches import _patch_grid
+    N, step = 8, 3e-3
+    v = _patch_grid(N, 2**10, step).reshape(N, N, 3)
+    u = np.arange(N) - (N - 1) / 2
+    d = np.arctan2(np.hypot(v[..., 0], v[..., 1]), v[..., 2])
+    np.testing.assert_allclose(d, step * np.hypot(u[None, :], u[:, None]), rtol=1e-12, atol=1e-18)
+    w = _patch_grid(N + 1, 2**10, step).reshape(N + 1, N + 1, 3)   # odd: an axis through the pole
+    c = N // 2
+    for line in (w[c, :], w[:, c]):
+        gap = np.arctan2(np.linalg.norm(np.cross(line[1:], line[:-1]), axis=-1),
+                         (line[1:] * line[:-1]).sum(-1))
+        np.testing.assert_allclose(gap, step, rtol=1e-10)
+
+
+def test_pixel_size_values_match_independent_sampling():
+    """A map at level L read with pixel_size = 1.6 cells: the patch is the
+    bilinear sample at offsets 1.6 * u cells, as for the default step."""
+    L, N, f = 6, 4, 1.6
+    hp = HealPixPatches(L, N, centres=L - 2, pixel_size=f * _cell_metres(L), **F64)
+    hp_ids = hp.centre_ids.numpy()
+    x = np.random.default_rng(2).standard_normal(hp.K)
+    y = hp(torch.as_tensor(x))[:, 0, 0].numpy()
+    lon, lat = np.radians(_lonlat(hp_ids, L - 2))
+    th = np.pi / 2 - lat
+    n = np.stack([np.sin(th) * np.cos(lon), np.sin(th) * np.sin(lon), np.cos(th)], -1)
+    e_th = np.stack([np.cos(th) * np.cos(lon), np.cos(th) * np.sin(lon), -np.sin(th)], -1)
+    e_ph = np.stack([-np.sin(lon), np.cos(lon), np.zeros_like(lon)], -1)
+    u = np.arange(N) - (N - 1) / 2
+    alpha = f * np.sqrt(4 * np.pi / (12 * 4**L))
+    ref = np.empty_like(y)
+    for a in range(N):
+        for b in range(N):
+            d = np.hypot(u[a], u[b]) * alpha
+            az = np.arctan2(u[a], u[b])
+            v = np.cos(d) * n + np.sin(d) * (np.cos(az) * e_th + np.sin(az) * e_ph)
+            vlat = np.degrees(np.arcsin(np.clip(v[:, 2], -1, 1)))
+            vlon = np.degrees(np.arctan2(v[:, 1], v[:, 0])) % 360
+            ref[:, a, b] = get_interp_val(x, vlon, vlat, L)
+    np.testing.assert_allclose(y, ref, atol=1e-10)
+
+
+def test_pixel_size_same_ground_grid_at_any_map_level():
+    """The same pixel size at levels L and L + 1 samples the same points:
+    on a smooth field the patches agree to the interpolation error."""
+    N, d = 8, 0.7 * _cell_metres(6)
+    c = np.arange(20) * 37                                         # level-3 centres
+    a = HealPixPatches(6, N, centres=3, centre_ids=c, pixel_size=d, **F64)
+    b = HealPixPatches(7, N, centres=3, centre_ids=c, pixel_size=d, **F64)
+    ya = a(torch.as_tensor(_smooth_field(6)))
+    yb = b(torch.as_tensor(_smooth_field(7)))
+    assert float((ya - yb).abs().max()) < 0.02
+    assert float((ya - yb).abs().max()) < 0.2 * float(ya.std())
+
+
+def test_pixel_size_coarse_centres():
+    L, N = 10, 16
+    cell = _cell_metres(L)
+    ids = np.arange(4**6)                     # the level-10 cells of level-4 cell 0
+    assert HealPixPatches(L, N, cell_ids=ids, centre_ids=[0], centres="coarse", pixel_size=cell,
+                          **F64).centre_level == L - 4
+    # 16 px of 1.6 cells = 25.6 cells: coarsest level not larger than the patch is L - 4
+    assert HealPixPatches(L, N, cell_ids=ids, centre_ids=[0], pixel_size=1.6 * cell, **F64).centre_level == L - 4
+    assert HealPixPatches(L, N, cell_ids=ids, centre_ids=[0], pixel_size=2.0 * cell, **F64).centre_level == L - 5
+    assert HealPixPatches(L, N, cell_ids=ids, centre_ids=[0], pixel_size=0.25 * cell, **F64).centre_level == L - 2
+    assert HealPixPatches(L, 1, cell_ids=ids, centre_ids=[0], pixel_size=0.5 * cell, **F64).centre_level == L
+    # centres coarser than the coarse level are refused, finer ones accepted
+    HealPixPatches(L, N, cell_ids=ids, centre_ids=[0], centres=L - 5, pixel_size=2.0 * cell, **F64)
+    with pytest.raises(ValueError):
+        HealPixPatches(L, N, cell_ids=ids, centre_ids=[0], centres=L - 6, pixel_size=2.0 * cell, **F64)
+
+
+def test_pixel_size_errors():
+    with pytest.raises(ValueError):
+        HealPixPatches(3, 2, mode="nested", pixel_size=10.0)
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            HealPixPatches(3, 2, pixel_size=bad)
