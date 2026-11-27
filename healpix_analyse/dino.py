@@ -1398,6 +1398,7 @@ def _gauge_embeddings(
     dev: torch.device,
     autocast: bool,
     verbose: bool,
+    backend: str = "auto",
 ) -> dict:
     """
     Images from :class:`~healpix_analyse.patches.HealPixPatches`, tokens folded back.
@@ -1454,7 +1455,8 @@ def _gauge_embeddings(
         for c0 in range(0, centres_all.size, centre_batch):
             chunk = centres_all[c0:c0 + centre_batch]
             P = HealPixPatches(level, N, cell_ids=ids_f, centres=int(parent_level),
-                               centre_ids=chunk, ellipsoid=ellipsoid, device=dev)
+                               centre_ids=chunk, ellipsoid=ellipsoid, device=dev,
+                               backend=backend)
             img = P(x)[0, :, 0]                                   # [Mc, 3, N, N]
             cov = P.coverage[:, 0].to(torch.float32)              # [Mc, N, N]
             del P
@@ -1508,7 +1510,8 @@ def _gauge_embeddings(
             tok = tok.permute(0, 3, 2, 1).contiguous()            # [Mc, D, T, T]
 
             Tm = HealPixPatches(tok_level, T, cell_ids=tok_ids, centres=int(parent_level),
-                                centre_ids=chunk, ellipsoid=ellipsoid, device=dev)
+                                centre_ids=chunk, ellipsoid=ellipsoid, device=dev,
+                               backend=backend)
             kk = keep.to(dev)
             if acc is None:
                 acc = torch.zeros(D, tok_ids.size, dtype=torch.float32, device=dev)
@@ -1579,6 +1582,7 @@ def GetDINOV3SAT(
     ellipsoid: Optional[str] = None,
     rotations: int = 1,
     centre_batch: Optional[int] = None,
+    backend: str = "auto",
 ) -> DINOEmbedding:
     """
     DINOv3 SAT-493M embeddings of NESTED HEALPix data.
@@ -1759,6 +1763,10 @@ def GetDINOV3SAT(
         depend on the orientation of the scene.  Costs 4 forward passes.
     centre_batch : int, optional
         Gauge mode: images per geometry build (default: about 4e6 pixels).
+    backend : {"auto", "triton", "torch"}
+        Gauge mode: backend of ``HealPixPatches`` for the images and the
+        fold.  ``"torch"`` where Triton is installed but cannot compile
+        (no C compiler on the node).
 
     Returns
     -------
@@ -1835,6 +1843,7 @@ def GetDINOV3SAT(
             rotations=int(rotations), fill=fill, min_coverage=min_coverage,
             model=model, mean=mean, std=std, pooling=pooling, batch_size=batch_size,
             centre_batch=centre_batch, dev=dev, autocast=autocast, verbose=verbose,
+            backend=backend,
         )
         res = DINOEmbedding(
             embedding=out["embedding"], cell_id=out["cell_id"],

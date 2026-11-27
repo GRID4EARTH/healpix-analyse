@@ -68,6 +68,8 @@ def parse():
     p.add_argument("--fake", action="store_true")
     p.add_argument("--synthetic", action="store_true")
     p.add_argument("--device", default=None)
+    p.add_argument("--backend", default="auto", choices=("auto", "triton", "torch"),
+                   help="HealPixPatches backend; 'torch' when Triton cannot compile")
     return p.parse_args()
 
 
@@ -218,7 +220,7 @@ def main():
     t0 = time.time()
     res = D.GetDINOV3SAT(rgb, ids, L, PL, model=model, tile_px=a.tile_px, ellipsoid=ell,
                          rotations=a.rotations, input_range=(lo, hi), min_coverage=0.0,
-                         batch_size=64, device=a.device)
+                         batch_size=64, device=a.device, backend=a.backend)
     t_dino = time.time() - t0
     keep = (res.cell_id >> (2 * (TL - zone_level))) == zone
     cells, E = res.cell_id[keep], res.embedding[keep]
