@@ -77,6 +77,9 @@ def parse():
     p.add_argument("--backend", default="torch")
     p.add_argument("--fake", action="store_true")
     p.add_argument("--max-centres", type=int, default=800)
+    p.add_argument("--lam", type=float, default=0.1,
+                   help="PSFResampler damping: level 20 (6.2 m) is finer than the 10 m "
+                        "samples, the undamped fit amplifies the noise")
     return p.parse_args()
 
 
@@ -96,7 +99,9 @@ def read_crop(item_id, lon, lat, size):
         e, n = tr.transform(lon, lat)
         row, col = src.index(e, n)
         win = Window(col - size // 2, row - size // 2, size, size)
-        arr = src.read(window=win)                                    # [3, H, W]
+        # boundless: a window crossing the tile edge keeps its size and origin
+        # (a clipped read would shift the whole crop); outside = 0 = TCI nodata
+        arr = src.read(window=win, boundless=True, fill_value=0)      # [3, H, W]
         transform = src.window_transform(win)
         crs = src.crs
     return arr, transform, crs, item["properties"]
@@ -235,7 +240,7 @@ def main():
         op = PSFResampler(lon.ravel()[ok], lat.ravel()[ok], a.level, device=dev,
                           ellipsoid="WGS84")
         r = op.resample(torch.as_tensor(arr.reshape(3, -1)[:, ok], dtype=torch.float32,
-                                        device=dev))
+                                        device=dev), lam=a.lam, clip=(0.0, 255.0))
         hid = np.asarray(torch.as_tensor(r.cell_ids).cpu()).astype(np.int64)
         hval = torch.as_tensor(r.cell_data).float().cpu()
         o = np.argsort(hid)
@@ -271,7 +276,7 @@ def main():
         hpx = P(hval.to(dev)[None])[0, :, 0].transpose(-1, -2).float().cpu().numpy()
         cov = P.coverage[:, 0].float().mean((1, 2)).cpu().numpy()
         del P, op
-        sel = cov > 0.999
+        sel = (cov > 0.999) & (utm > 0).any(1).all((1, 2)) & (utm_c > 0).any(1).all((1, 2))
         E = {kind: embed(model, im[sel]) for kind, im in
              (("utm", utm), ("utm_c", utm_c), ("hpx", hpx))}
         res[name] = dict(cells=cand[sel], gamma=gamma[sel], k=k[sel], E=E)
