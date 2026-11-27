@@ -328,6 +328,10 @@ def main():
         cov = P.coverage[:, 0].float().mean((1, 2)).cpu().numpy()
         del P, op
         sel = (cov > 0.999) & (utm > 0).any(1).all((1, 2)) & (utm_c > 0).any(1).all((1, 2))
+        if sel.sum() < 30:
+            print(f"{name}: only {int(sel.sum())} complete images (nodata or edge), skipped",
+                  flush=True)
+            continue
         E = {kind: embed(model, im[sel]) for kind, im in
              (("utm", utm), ("utm_c", utm_c), ("hpx", hpx))}
         res[name] = dict(cells=cand[sel], gamma=gamma[sel], k=k[sel], E=E)
@@ -350,7 +354,8 @@ def main():
               flush=True)
 
     # ---- 1. sensitivity on the central-meridian site
-    name0, item0, lon0, lat0 = next(x for x in sites if x[0] == sens_site)
+    name0, item0, lon0, lat0 = next((x for x in sites if x[0] == sens_site and x[0] in res),
+                                    next(x for x in sites if x[0] in res))
     arr, transform, crs, _ = read_crop(item0, lon0, lat0, a.crop)
     cells = res[name0]["cells"]
     clon, clat = healpix_geo.nested.healpix_to_lonlat(cells.astype(np.uint64), a.centre_level,
@@ -394,7 +399,7 @@ def main():
     pairs = {}
     from sklearn.cluster import KMeans
     from sklearn.metrics import adjusted_rand_score
-    for n1, n2, label in pairs_cfg:
+    for n1, n2, label in [p_ for p_ in pairs_cfg if p_[0] in res and p_[1] in res]:
         c1, c2 = res[n1]["cells"], res[n2]["cells"]
         common, i1, i2 = np.intersect1d(c1, c2, return_indices=True)
         pr = {"n": int(common.size)}
