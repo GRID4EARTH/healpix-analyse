@@ -388,6 +388,9 @@ def main():
         hid, hval = hid[o], hval[:, torch.as_tensor(o)]
         good = torch.isfinite(hval).all(0).cpu().numpy()
         hid, hval = hid[good], hval[:, torch.as_tensor(good)]
+        if hid.size < 1000:
+            print(f"{name}: no usable data in the crop, skipped", flush=True)
+            continue
         # ---- centres: level-c cells whose whole image lies inside the crop
         to_utm = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
         lev_c = a.centre_level
@@ -405,6 +408,9 @@ def main():
             pick = np.random.default_rng(0).choice(cand.size, a.max_centres, replace=False)
             pick.sort()
             cand, clon, clat, ce, cn = cand[pick], clon[pick], clat[pick], ce[pick], cn[pick]
+        if cand.size < 30:
+            print(f"{name}: only {cand.size} centres inside the crop, skipped", flush=True)
+            continue
         cen = np.stack([ce, cn], -1)
         J, gamma, k = jacobian(crs, clon, clat)
         # ---- the three images
