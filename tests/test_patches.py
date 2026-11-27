@@ -559,9 +559,9 @@ def test_pixel_size_same_ground_grid_at_any_map_level():
     """The same pixel size at levels L and L + 1 samples the same points:
     on a smooth field the patches agree to the interpolation error."""
     N, d = 8, 0.7 * _cell_metres(6)
-    c = np.arange(20) * 37                                         # level-3 centres
-    a = HealPixPatches(6, N, centres=3, centre_ids=c, pixel_size=d, **F64)
-    b = HealPixPatches(7, N, centres=3, centre_ids=c, pixel_size=d, **F64)
+    c = np.arange(20) * 137                                        # level-4 centres
+    a = HealPixPatches(6, N, centres=4, centre_ids=c, pixel_size=d, **F64)
+    b = HealPixPatches(7, N, centres=4, centre_ids=c, pixel_size=d, **F64)
     ya = a(torch.as_tensor(_smooth_field(6)))
     yb = b(torch.as_tensor(_smooth_field(7)))
     assert float((ya - yb).abs().max()) < 0.02
