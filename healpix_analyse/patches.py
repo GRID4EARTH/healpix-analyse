@@ -13,8 +13,8 @@ pre-trained ViT).  Two modes:
 
 ``mode="gauge"`` (default)
     An ``N x N`` grid built once at the North Pole with a constant step
-    (azimuthal equidistant: every point at its exact geodesic distance from
-    the centre), rotated to each centre and oriented by the gauge exactly
+    (azimuthal equidistant: on the sphere of the grid, every point at its
+    exact geodesic distance from the centre), rotated to each centre and oriented by the gauge exactly
     like a :class:`~healpix_analyse.convol.HealPixConv` kernel built with
     ``ellipsoid="sphere"`` (same rotation matrices, same bilinear
     interpolation).  The step is one cell of level ``L`` by default, or
@@ -241,7 +241,8 @@ class HealPixPatches(nn.Module):
         ``floor(log2(N * pixel_size / cell))`` (clipped to ``[0, L]``),
         ``cell`` the side of a cell of level ``L`` in metres: ``L - p`` is
         then the coarsest level whose cells are not larger than the patch,
-        so that the ``"coarse"`` patches leave no gap.
+        so that the ``"coarse"`` patches are at least as large as their
+        cells (they still miss the tips of diamond-shaped cells, see Notes).
     cell_ids : array-like or None
         NESTED cell ids of a regional domain at level ``L``, in the order of
         the data (any order).  None = the full sphere in NESTED order.
@@ -381,6 +382,9 @@ class HealPixPatches(nn.Module):
             if not math.isfinite(self.pixel_size) or self.pixel_size <= 0:
                 raise ValueError("pixel_size must be a positive number of metres.")
             self._step = self.pixel_size / authalic_radius(self.ellipsoid)
+            if (N - 1) / 2.0 * math.sqrt(2.0) * self._step >= math.pi / 2:
+                raise ValueError(f"a patch of {N} pixels of {self.pixel_size} m reaches "
+                                 "beyond a quarter of the sphere from its centre.")
             ratio = N * self._step / _cell_angle(self.nside)
             p_cov = int(min(self.level, max(0, math.floor(math.log2(ratio) + 1e-9))))
         if isinstance(centres, str):

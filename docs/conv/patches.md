@@ -63,8 +63,10 @@ Two modes give the pixels of a patch:
   interpolation, exactly like a {doc}`HealPixConv <convol>` kernel: the same
   rotation matrices, the same gauge types (`phi`, `cosmo`, `projected_ref`,
   `two_ref`) and `n_gauges` orientations `g·π/G`. The plane offsets are put
-  on the sphere by the inverse azimuthal equidistant projection: every pixel
-  is at its exact geodesic distance from the centre, and the step is exact
+  on the sphere by the inverse azimuthal equidistant projection: on the
+  sphere of the grid every pixel is at its exact geodesic distance from the
+  centre (the ellipsoid correction below then rescales the two axes), and
+  the step is exact
   along the two axes through the centre (elsewhere within a relative
   `(N·step/R)²`, below 10⁻⁷ for a 1.3 km image). The step is one cell of
   level `L` by default, or `pixel_size` metres (below). The grid
@@ -110,7 +112,8 @@ Two modes give the pixels of a patch:
   ellipsoid along both axes. The exponent that sets the centre levels becomes
   `p = floor(log2(N · pixel_size / cell))`, clipped to `[0, L]`, `cell` the
   side of a cell of level `L`: `centres="coarse"` is then the coarsest level
-  whose cells are not larger than the patch, so the patches leave no gap. A
+  whose cells are not larger than the patch (the gauge squares still miss
+  the tips of diamond-shaped cells, as with the default step). A
   step larger than the cell undersamples the map (bilinear, no anti-aliasing):
   keep the map at least as fine as the patch. `mode="nested"` has no
   `pixel_size`.

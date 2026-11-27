@@ -585,9 +585,18 @@ def test_pixel_size_coarse_centres():
         HealPixPatches(L, N, cell_ids=ids, centre_ids=[0], centres=L - 6, pixel_size=2.0 * cell, **F64)
 
 
+def test_authalic_radius():
+    from healpix_analyse._ellipsoid import authalic_radius
+    assert authalic_radius("sphere") == 6370997.0
+    assert abs(authalic_radius("WGS84") - 6371007.1809) < 1e-3
+    assert abs(authalic_radius("wgs84") - 6371007.1809) < 1e-3
+
+
 def test_pixel_size_errors():
     with pytest.raises(ValueError):
         HealPixPatches(3, 2, mode="nested", pixel_size=10.0)
     for bad in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError):
             HealPixPatches(3, 2, pixel_size=bad)
+    with pytest.raises(ValueError):                 # beyond a quarter of the sphere
+        HealPixPatches(3, 8, pixel_size=3.0e6)
