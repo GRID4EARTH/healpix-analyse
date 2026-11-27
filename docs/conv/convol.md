@@ -430,7 +430,7 @@ HealPixConv(
 | `nest` | `bool` | `True` | Kept for compatibility. The geometry is always built on NESTED ids: the flag only enters the cache key and has no effect on the result. Pass NESTED data. |
 | `use_norm` | `bool` | `False` | Apply GroupNorm + ReLU after the convolution. |
 | `device` | `str` or `torch.device` or `None` | `None` | Target device. Defaults to CUDA if available, else CPU. |
-| `ellipsoid` | `str` | `"WGS84"` | Reference ellipsoid for healpix_geo coordinate conversions. |
+| `ellipsoid` | `str` or `dict` | `"WGS84"` | Reference ellipsoid of the HEALPix grid. The grid of an ellipsoid is the grid of its authalic sphere: the stencil is centred on each cell and interpolated there for every ellipsoid; the ellipsoid only makes the stencil square in metres on the ground (offsets change by at most 0.11 % on WGS84). `"sphere"`: isotropic on the authalic sphere. |
 | `dtype` | `torch.dtype` | `torch.float32` | Floating-point precision for all buffers and parameters. `module.to(...)` moves and casts the layer afterwards. |
 | `backend` | `str` | `"auto"` | `"auto"`, `"triton"` or `"torch"`; see *Backends* below. |
 | `deterministic` | `bool` | `True` | On CUDA: input gradient by a gather on the transposed stencil map, without atomics, identical at every run (Triton kernels, and the PyTorch backend). `False`: fp32 atomics (Triton) or `index_add_` (PyTorch), no extra memory. |

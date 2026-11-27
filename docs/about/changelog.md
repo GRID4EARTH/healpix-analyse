@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Fixed
+- **`HealPixConv` with an ellipsoid (the default `ellipsoid="WGS84"`) read
+  the wrong cells.** It took the stencil centres at the *geodetic* latitude
+  of each cell, then interpolated them as if they were latitudes of the
+  authalic sphere, where the HEALPix grid lives. The whole stencil was moved
+  towards the pole by `phi - beta`: 0 at the equator and the poles, up to
+  0.128° (about 14 km) near 45°. In cells, that is 0.13 cell at level 6,
+  0.56 at level 8, about 9 at level 12 and 2000 at level 20: at fine levels
+  the output had nothing to do with the field around the cell (on a 64 × 64
+  block at level 12 near 48° N, kernel 3, random input, the output
+  correlated with the input at −0.01, against 0.49 with
+  `ellipsoid="sphere"`). The stencil is now built on the authalic sphere,
+  centred on its cell, for every ellipsoid; the ellipsoid only sets its
+  metric, so that it is square in metres on the ground (its offsets are
+  scaled by `k` along the meridian and `1/k` along the parallel, `k` between
+  1 and 1.0011 on WGS84).
+
+  **Every output of a layer built with an ellipsoid other than `"sphere"`
+  changes, and models trained with the default `ellipsoid="WGS84"` are
+  affected:** their kernels were learned on shifted stencils, so they should
+  be retrained (or at least fine-tuned); at levels of 8 and above the old
+  weights do not carry over. Layers with `ellipsoid="sphere"` are unchanged.
+  The same applies to everything that builds its stencil with `HealPixConv`:
+  its strided and transposed forms (`stride=2`, `HealPixConvTranspose`),
+  `missing="local_mean"`, `HealPixNeighbourhoodAttention`,
+  `HealPixDivCurl`, `HealPixKernelPyramid`, `HealPixLargeConv` and
+  `HealPixWideConv`. `HealPixDivCurl` also takes its east/north frames on
+  the authalic sphere now, to match the stencil. The disk-cache format is
+  bumped (5), so geometry cached by earlier versions is rebuilt once.
+
+  With it, `down_up_blur` at zero levels is 0 (a point-like compact kernel
+  is now the identity; it was 0.74 cell) and 1.71 to 16.2 cells at 1 to 4
+  levels (level 10; it was 2.01 to 16.5), and a constant now stays 1 at the
+  edge of a regional domain in `LargeConv`. The other `LargeConv` accuracy
+  figures in the documentation predate the fix.
+
 ### Changed
 - Stencil binding (`HealPixConv`, its strided and transposed forms,
   `missing="local_mean"`, `HealPixNeighbourhoodAttention`, and the gauge mode

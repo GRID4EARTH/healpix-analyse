@@ -406,7 +406,7 @@ tools:
   keywords: [CNN, deep learning, neural network, learned kernel, equivariant, gauge, U-Net, stencil, strided, transposed convolution, encoder, decoder]
   domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction
   ordering: NESTED (the `nest` flag has no effect on the geometry)
-  ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
+  ellipsoid: '"WGS84" by default; the stencil is centred on each cell (the grid of the authalic sphere) and square in metres on the ellipsoid'
   io: "[B, N] or [B, C_in, N] -> [B, G*C_out, N] (G = n_gauges); [N] -> [G*C_out, N], or [N] when G*C_out = 1; NumPy in -> NumPy out. stride=2: N -> N/4 outputs on the parent cells. HealPixConvTranspose: [B, G*C_in, N/4] -> [B, C_out, N]"
   differentiable: yes, in the input and in the kernel weights; double backward on the same kernels; torch.func (vmap, jacrev, jacfwd, jvp)
   gpu: yes (CUDA by default when available); fused Triton kernels for float32, float16 and bfloat16 with the optional triton package
@@ -586,7 +586,7 @@ tools:
   keywords: [attention, transformer, neighbourhood attention, NATTEN, local attention, gauge, relative position bias, deep learning]
   domain: whole sphere (cell_ids=None) or a regional set of cell ids given at construction (any order)
   ordering: NESTED
-  ellipsoid: '"WGS84" for the cell centres; the stencil is interpolated on the sphere'
+  ellipsoid: '"WGS84" by default; the stencil is centred on each cell (the grid of the authalic sphere) and square in metres on the ellipsoid'
   io: "[B, C, N] -> [B, G*C, N] (G = n_gauges)"
   differentiable: yes, in the input, the projections and the position bias
   gpu: yes; fused Triton kernels (float32, float16, bfloat16, autocast) with the optional triton package, deterministic backward

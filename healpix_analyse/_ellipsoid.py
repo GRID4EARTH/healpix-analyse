@@ -21,9 +21,10 @@ yet (``powerspectra`` does it before calling it).
 
 from __future__ import annotations
 
+import numpy as np
 from healpix_geo._healpix_geo_python import resolve_ellipsoid
 
-__all__ = ["canonicalize_ellipsoid"]
+__all__ = ["canonicalize_ellipsoid", "authalic_scale"]
 
 
 def canonicalize_ellipsoid(ellipsoid):
@@ -52,3 +53,43 @@ def canonicalize_ellipsoid(ellipsoid):
         except Exception:
             continue
     return s
+
+
+def authalic_scale(lat_geodetic_deg, ellipsoid):
+    """Scale factor ``k`` of the authalic sphere at the given geodetic latitudes.
+
+    A HEALPix grid on an ellipsoid is the HEALPix grid of its authalic sphere
+    (radius ``R_a``, same area), reached through the authalic latitude
+    ``beta``.  That map keeps areas but not shapes: a ground displacement of
+    ``ds`` metres becomes ``k * ds`` along the meridian and ``ds / k`` along
+    the parallel on the authalic sphere, with
+
+        k = N(phi) cos(phi) / (R_a cos(beta)),
+
+    ``N`` the prime-vertical radius of curvature.  ``k`` is 1 on a sphere; on
+    WGS84 it runs from 1 at the poles to 1.0011 at the equator.  Returns an
+    array of the shape of ``lat_geodetic_deg``.
+    """
+    phi = np.radians(np.asarray(lat_geodetic_deg, dtype=np.float64))
+    params = resolve_ellipsoid(canonicalize_ellipsoid(ellipsoid)) if isinstance(
+        ellipsoid, str) else dict(ellipsoid)
+    inv_f = params.get("inverse_flattening")
+    if inv_f is None or not np.isfinite(inv_f) or inv_f == 0:
+        return np.ones_like(phi)
+    a = 1.0                                     # k is a ratio: any unit
+    f = 1.0 / float(inv_f)
+    e2 = f * (2.0 - f)
+    e = np.sqrt(e2)
+    q = lambda s: (1 - e2) * (s / (1 - e2 * s * s)
+                              - np.log((1 - e * s) / (1 + e * s)) / (2 * e))
+    qp = q(1.0)
+    r_a = a * np.sqrt(qp / 2.0)
+    # At the poles both cosines vanish and cos(beta), from 1 - sin(beta)**2,
+    # loses all its digits: k is taken at 89.99 degrees there, where it is
+    # within 1e-8 of its polar limit.
+    lim = np.radians(89.99)
+    phi = np.clip(phi, -lim, lim)
+    sinb = np.clip(q(np.sin(phi)) / qp, -1.0, 1.0)
+    cosb = np.sqrt((1.0 - sinb) * (1.0 + sinb))
+    n_rad = a / np.sqrt(1.0 - e2 * np.sin(phi) ** 2)
+    return n_rad * np.cos(phi) / (r_a * cosb)

@@ -220,8 +220,12 @@ class HealPixDivCurl(nn.Module):
         self.pixel_spacing_rad = alpha_pix
         self.pixel_spacing_m = self.radius_m * alpha_pix
 
+        # The frames are those of the stencil of HealPixConv, which sits on
+        # the authalic sphere whatever the ellipsoid (the HEALPix grid of an
+        # ellipsoid is the grid of its authalic sphere): east and north are
+        # the same directions there, at the authalic latitude of the cell.
         lon, lat = healpix_geo.nested.healpix_to_lonlat(
-            ids.tolist(), self.level, ellipsoid=self.ellipsoid
+            ids.tolist(), self.level, ellipsoid="sphere"
         )
         lon_rad = np.deg2rad(np.asarray(lon, dtype=np.float64))
         lat_rad = np.deg2rad(np.asarray(lat, dtype=np.float64))

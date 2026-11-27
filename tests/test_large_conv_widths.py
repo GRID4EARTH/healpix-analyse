@@ -144,8 +144,9 @@ def test_down_up_blur_values_and_units():
     blurs = [down_up_blur(LEVEL, n) / CELL for n in range(0, 5)]
     # radians: about 2e-3 rad for one level at level 10
     assert 1.5e-3 < down_up_blur(LEVEL, 1) < 2.6e-3
-    # even zero levels blur (the compact HealPixConv is not the identity)
-    assert 0.5 < blurs[0] < 1.0
+    # zero levels: a point-like compact HealPixConv is the identity (before
+    # the fix of the ellipsoid stencil it blurred by 0.74 cell)
+    assert blurs[0] < 1e-9
     for lo, hi in zip(blurs[1:], blurs[2:]):
         assert 1.8 < hi / lo < 2.3
 
@@ -402,7 +403,9 @@ def test_partial_domain_edge_is_a_zero_padding_effect():
     assert 0.85 < t_edge < 1.1         # the total of one cell is not conserved
     const = np.asarray(layer(np.ones(ids.size))).ravel()
     assert const[np.argmin(r)] == pytest.approx(1.0, abs=1e-3)
-    assert 0.9 < const.min() < 1.0     # a constant drops near the edge
+    # a constant stays 1 up to the edge (it dropped to 0.9-1.0 while the
+    # WGS84 stencil was shifted off its cell)
+    assert 0.999 < const.min() and const.max() < 1.001
 
 
 def test_sigma_m_is_the_sigma_m_of_gaussian_filter():

@@ -59,10 +59,10 @@ Two modes give the pixels of a patch:
   `torch.rot90` of the patch, `k=1`). With `gauge_type="cosmo"` the gauge
   angle changes sign across the equator, so at southern centres the rotation
   goes the other way: gauge `g + 2` is `torch.rot90(..., k=3)` of gauge `g`.
-  The grid matches the stencil of `HealPixConv(ellipsoid="sphere")`; with
-  the default `ellipsoid="WGS84"`, `HealPixConv` places its stencil at
-  geodetic latitudes, shifted from the cell centres of the grid, while
-  `HealPixPatches` always uses the sphere of the grid.
+  The grid matches the stencil of `HealPixConv(ellipsoid="sphere")`. With
+  `ellipsoid="WGS84"`, `HealPixConv` centres its stencil on the same cells
+  and only makes it square in metres on the ellipsoid (offsets change by at
+  most 0.11 %), while `HealPixPatches` keeps the sphere of the grid.
 
 `mode="nested"`
 : The `4**p` descendants of each coarse cell, as a `2**p × 2**p` image: row
