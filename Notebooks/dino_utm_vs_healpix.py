@@ -1,0 +1,362 @@
+"""
+Is the UTM map distortion visible in DINOv3 embeddings?  UTM tiles against HEALPix.
+
+For every ground point (a cell of level ``CENTRE_LEVEL``) three images of
+``N`` px at the HEALPix level-``LEVEL`` spacing (6.1 m at level 20) are fed to
+DINOv3 SAT-493M:
+
+``utm``     the UTM tile resampled on its own grid axes (grid north up, UTM
+            metres): what a model sees when it is run on the native product
+``utm_c``   the same tile resampled on a true-north, ground-metre grid, built
+            from the numerical Jacobian of the projection at the point: UTM
+            with its distortion (scale factor k, meridian convergence gamma)
+            removed
+``hpx``     the HEALPix conversion of the tile (``healpix_resample``
+            ``PSFResampler``, level ``LEVEL``) cut by
+            ``HealPixPatches(mode="gauge", ellipsoid="WGS84")``, north up
+
+The distances between the image vectors (1 - cosine) answer three questions:
+
+1. *sensitivity*: how much DINO moves for a known rotation, shift or scale
+   of the same image (on the site at the central meridian);
+2. *zone gradient*: ``d(utm, hpx)`` and ``d(utm_c, hpx)`` on sites at
+   increasing distance from the central meridian of UTM zone 30;
+3. *same ground, two zones*: on the overlap of tiles 30UYU and 31UCP
+   (same datatake), ``d(utm_30, utm_31)`` against ``d(hpx_30, hpx_31)``.
+   A same-zone overlap (30UXU / 30UYU) is the null test.
+
+Sentinel-2 L2A true-colour (TCI) COGs are read from the public Earth Search
+catalogue (AWS).  Run on a GPU node with the DINOv3 weights::
+
+    PYTHONPATH=<healpix-analyse clone> python Notebooks/dino_utm_vs_healpix.py \
+        --weights ~/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth --out ~/dino_utm_hpx
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+
+import numpy as np
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+STAC = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items/"
+
+# (name, STAC item, lon, lat): 2025-07-11, S2A and S2B datatakes, UTM 30 / 31
+SITES = [
+    ("z30_dl0.0", "S2A_30UVU_20250711_0_L2A", -3.00, 48.25),
+    ("z30_dl1.0", "S2A_30UWU_20250711_1_L2A", -2.00, 48.25),
+    ("z30_dl2.0", "S2B_30UXU_20250711_0_L2A", -1.00, 48.25),
+    ("z30_dl3.0", "S2B_30UYU_20250711_0_L2A", 0.00, 48.25),
+    ("z30_dl3.75", "S2B_30UYU_20250711_0_L2A", 0.75, 48.25),     # overlap with 31UCP
+    ("z31_dl-2.25", "S2B_31UCP_20250711_0_L2A", 0.75, 48.25),
+    ("null_30UXU", "S2B_30UXU_20250711_0_L2A", -0.24, 48.30),    # same-zone overlap
+    ("null_30UYU", "S2B_30UYU_20250711_0_L2A", -0.24, 48.30),
+]
+PAIRS = [("z30_dl3.75", "z31_dl-2.25", "cross-zone"), ("null_30UXU", "null_30UYU", "same-zone")]
+
+A_WGS84, F_WGS84 = 6378137.0, 1 / 298.257223563
+R_AUTHALIC = 6371007.1809
+
+
+def parse():
+    p = argparse.ArgumentParser()
+    p.add_argument("--weights", default=os.path.expanduser(
+        "~/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"))
+    p.add_argument("--out", default=os.path.expanduser("~/dino_utm_hpx"))
+    p.add_argument("--level", type=int, default=20)
+    p.add_argument("--centre-level", type=int, default=14)
+    p.add_argument("--n", type=int, default=128, help="image side, px")
+    p.add_argument("--crop", type=int, default=1100, help="UTM crop side, 10 m px")
+    p.add_argument("--backend", default="torch")
+    p.add_argument("--fake", action="store_true")
+    p.add_argument("--max-centres", type=int, default=800)
+    return p.parse_args()
+
+
+# --------------------------------------------------------------------------- data
+
+def read_crop(item_id, lon, lat, size):
+    """TCI crop of ``size`` px centred on (lon, lat): uint8 [3, H, W], transform, CRS."""
+    import rasterio
+    from pyproj import Transformer
+    from rasterio.windows import Window
+
+    req = urllib.request.Request(STAC + item_id, headers={"User-Agent": "healpix-analyse-test"})
+    item = json.load(urllib.request.urlopen(req, timeout=120))
+    href = item["assets"]["visual"]["href"]
+    with rasterio.open(href) as src:
+        tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+        e, n = tr.transform(lon, lat)
+        row, col = src.index(e, n)
+        win = Window(col - size // 2, row - size // 2, size, size)
+        arr = src.read(window=win)                                    # [3, H, W]
+        transform = src.window_transform(win)
+        crs = src.crs
+    return arr, transform, crs, item["properties"]
+
+
+def utm_lonlat(transform, crs, H, W):
+    from pyproj import Transformer
+    tr = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    jj, ii = np.meshgrid(np.arange(W) + 0.5, np.arange(H) + 0.5)
+    e = transform.c + transform.a * jj
+    n = transform.f + transform.e * ii
+    lon, lat = tr.transform(e, n)
+    return np.asarray(lon), np.asarray(lat)
+
+
+def jacobian(crs, lon, lat):
+    """UTM metres per ground metre east / north at (lon, lat): columns of J [M, 2, 2],
+    plus the convergence gamma (deg, grid north from true north) and scale k."""
+    from pyproj import Transformer
+    tr = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    phi = np.radians(lat)
+    e2 = F_WGS84 * (2 - F_WGS84)
+    w = np.sqrt(1 - e2 * np.sin(phi) ** 2)
+    n_rad = A_WGS84 / w                                   # prime vertical
+    m_rad = A_WGS84 * (1 - e2) / w ** 3                   # meridian
+    d = 1e-5                                              # degrees
+    e0, n0 = tr.transform(lon, lat)
+    ee, ne = tr.transform(lon + d, lat)
+    en, nn = tr.transform(lon, lat + d)
+    g_east = n_rad * np.cos(phi) * np.radians(d)          # ground metres
+    g_north = m_rad * np.radians(d)
+    east = np.stack([(ee - e0) / g_east, (ne - n0) / g_east], -1)
+    north = np.stack([(en - e0) / g_north, (nn - n0) / g_north], -1)
+    J = np.stack([east, north], -1)                       # [M, 2(E,N), 2(east,north)]
+    gamma = np.degrees(np.arctan2(north[:, 0], north[:, 1]))
+    k = np.hypot(north[:, 0], north[:, 1])
+    return J, gamma, k
+
+
+def sample_utm(arr, transform, centres_en, offsets_en):
+    """Bilinear samples of the crop at centre + offset (UTM metres).
+
+    centres_en [M, 2], offsets_en [M, P, 2] -> float [M, 3, P]."""
+    C, H, W = arr.shape
+    img = torch.as_tensor(arr, dtype=torch.float32)[None]          # [1, 3, H, W]
+    pts = centres_en[:, None, :] + offsets_en                      # [M, P, 2]
+    col = (pts[..., 0] - transform.c) / transform.a                # pixel units, edges at ints
+    row = (pts[..., 1] - transform.f) / transform.e
+    gx = 2 * col / W - 1
+    gy = 2 * row / H - 1
+    grid = torch.as_tensor(np.stack([gx, gy], -1), dtype=torch.float32)[None]   # [1, M, P, 2]
+    out = torch.nn.functional.grid_sample(img, grid, mode="bilinear", align_corners=False)
+    return out[0].permute(1, 0, 2).numpy()                         # [M, 3, P]
+
+
+def grid_offsets(n, s):
+    """Image pixel offsets (east, north) in ground metres, row 0 = north, col 0 = west."""
+    u = (np.arange(n) - (n - 1) / 2.0) * s
+    east = np.tile(u, (n, 1))
+    north = -np.repeat(u[:, None], n, 1)
+    return np.stack([east.ravel(), north.ravel()], -1)             # [P, 2]
+
+
+# --------------------------------------------------------------------------- DINO
+
+def make_model(a):
+    import healpix_analyse.dino as D
+    if a.fake:
+        import torch.nn as nn
+
+        class MeanDino(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dummy = nn.Parameter(torch.zeros(1))
+
+            def forward_features(self, x):
+                tok = nn.functional.avg_pool2d(x, 16).flatten(2).transpose(1, 2)
+                return {"x_norm_clstoken": tok.mean(1), "x_norm_patchtokens": tok}
+        return MeanDino().cuda() if torch.cuda.is_available() else MeanDino()
+    return D.load_dinov3_sat("dinov3_vitl16", weights=a.weights)
+
+
+def embed(model, imgs, bs=64):
+    """imgs uint8-range float [M, 3, n, n] -> dict of [M, D] vectors."""
+    import healpix_analyse.dino as D
+    dev = next(model.parameters()).device
+    mean = torch.tensor(D.SAT493M_MEAN, device=dev).view(1, 3, 1, 1)
+    std = torch.tensor(D.SAT493M_STD, device=dev).view(1, 3, 1, 1)
+    out = {"cls": [], "mean": [], "centre": []}
+    with torch.inference_mode():
+        for i in range(0, len(imgs), bs):
+            x = torch.as_tensor(imgs[i:i + bs], dtype=torch.float32, device=dev) / 255.0
+            x = (x.clamp(0, 1) - mean) / std
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+                cls, pt = D._forward(model, x)
+            cls, pt = cls.float(), pt.float()
+            T = int(round(pt.shape[1] ** 0.5))
+            g = pt.reshape(pt.shape[0], T, T, -1)
+            c0 = T // 2 - 1
+            out["cls"].append(cls.cpu())
+            out["mean"].append(pt.mean(1).cpu())
+            out["centre"].append(g[:, c0:c0 + 2, c0:c0 + 2].mean((1, 2)).cpu())
+    return {k: torch.cat(v).numpy() for k, v in out.items()}
+
+
+def cosd(a, b):
+    a = a / np.linalg.norm(a, axis=1, keepdims=True)
+    b = b / np.linalg.norm(b, axis=1, keepdims=True)
+    return 1.0 - (a * b).sum(1)
+
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    a = parse()
+    os.makedirs(a.out, exist_ok=True)
+    import healpix_geo
+    from healpix_resample.psf import PSFResampler
+    from pyproj import Transformer
+    from healpix_analyse.patches import HealPixPatches
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model = make_model(a)
+    s = R_AUTHALIC * np.sqrt(np.pi / 3) / 2 ** a.level            # image spacing, m
+    offs = grid_offsets(a.n, s)
+    print(f"images {a.n} px at {s:.3f} m = {a.n * s:.0f} m, centres level {a.centre_level}")
+
+    res, site_info, examples = {}, {}, {}
+    for name, item, lon0, lat0 in SITES:
+        t0 = time.time()
+        arr, transform, crs, props = read_crop(item, lon0, lat0, a.crop)
+        H, W = arr.shape[1:]
+        lon, lat = utm_lonlat(transform, crs, H, W)
+        ok = (arr > 0).any(0).ravel()                               # TCI nodata = 0
+        # ---- HEALPix conversion of the crop (PSF resampler, WGS84)
+        op = PSFResampler(lon.ravel()[ok], lat.ravel()[ok], a.level, device=dev,
+                          ellipsoid="WGS84")
+        r = op.resample(torch.as_tensor(arr.reshape(3, -1)[:, ok], dtype=torch.float32,
+                                        device=dev))
+        hid = np.asarray(torch.as_tensor(r.cell_ids).cpu()).astype(np.int64)
+        hval = torch.as_tensor(r.cell_data).float().cpu()
+        o = np.argsort(hid)
+        hid, hval = hid[o], hval[:, torch.as_tensor(o)]
+        good = torch.isfinite(hval).all(0).cpu().numpy()
+        hid, hval = hid[good], hval[:, torch.as_tensor(good)]
+        # ---- centres: level-c cells whose whole image lies inside the crop
+        to_utm = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+        lev_c = a.centre_level
+        cand = np.unique(hid >> (2 * (a.level - lev_c)))
+        clon, clat = healpix_geo.nested.healpix_to_lonlat(cand.astype(np.uint64), lev_c,
+                                                          ellipsoid="WGS84")
+        clon, clat = np.asarray(clon, float), np.asarray(clat, float)
+        ce, cn = to_utm.transform(clon, clat)
+        margin = a.n * s * 0.75 + 200.0
+        x0, y0 = transform.c, transform.f
+        inside = ((ce - x0 > margin) & (x0 + W * 10 - ce > margin)
+                  & (y0 - cn > margin) & (cn - (y0 - H * 10) > margin))
+        cand, clon, clat, ce, cn = cand[inside], clon[inside], clat[inside], ce[inside], cn[inside]
+        if cand.size > a.max_centres:
+            pick = np.random.default_rng(0).choice(cand.size, a.max_centres, replace=False)
+            pick.sort()
+            cand, clon, clat, ce, cn = cand[pick], clon[pick], clat[pick], ce[pick], cn[pick]
+        cen = np.stack([ce, cn], -1)
+        J, gamma, k = jacobian(crs, clon, clat)
+        # ---- the three images
+        utm = sample_utm(arr, transform, cen, np.broadcast_to(offs, (cand.size,) + offs.shape)
+                         ).reshape(-1, 3, a.n, a.n)
+        utm_c = sample_utm(arr, transform, cen, np.einsum("mij,pj->mpi", J, offs)
+                           ).reshape(-1, 3, a.n, a.n)
+        P = HealPixPatches(a.level, a.n, cell_ids=hid, centres=lev_c, centre_ids=cand,
+                           ellipsoid="WGS84", device=dev, backend=a.backend)
+        hpx = P(hval.to(dev)[None])[0, :, 0].transpose(-1, -2).float().cpu().numpy()
+        cov = P.coverage[:, 0].float().mean((1, 2)).cpu().numpy()
+        del P, op
+        sel = cov > 0.999
+        E = {kind: embed(model, im[sel]) for kind, im in
+             (("utm", utm), ("utm_c", utm_c), ("hpx", hpx))}
+        res[name] = dict(cells=cand[sel], gamma=gamma[sel], k=k[sel], E=E)
+        site_info[name] = dict(item=item, platform=props.get("platform"),
+                               datatake=props.get("s2:datatake_id"), lon=lon0, lat=lat0,
+                               dlon_cm=round(lon0 - (3.0 if crs.to_epsg() == 32631 else -3.0), 3),
+                               epsg=crs.to_epsg(), n=int(sel.sum()),
+                               gamma_med=float(np.median(gamma)), k_med=float(np.median(k)))
+        mid = int(np.argmin(np.hypot(ce - ce.mean(), cn - cn.mean())[sel]))
+        examples[name] = dict(utm=utm[sel][mid], utm_c=utm_c[sel][mid], hpx=hpx[sel][mid])
+        print(f"{name}: {item}, epsg {crs.to_epsg()}, gamma {np.median(gamma):+.3f} deg, "
+              f"k {np.median(k):.5f}, {int(sel.sum())} centres, {time.time() - t0:.0f} s",
+              flush=True)
+
+    # ---- 1. sensitivity on the central-meridian site
+    name0, item0, lon0, lat0 = SITES[0]
+    arr, transform, crs, _ = read_crop(item0, lon0, lat0, a.crop)
+    cells = res[name0]["cells"]
+    clon, clat = healpix_geo.nested.healpix_to_lonlat(cells.astype(np.uint64), a.centre_level,
+                                                      ellipsoid="WGS84")
+    ce, cn = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform(
+        np.asarray(clon, float), np.asarray(clat, float))
+    cen = np.stack([ce, cn], -1)
+    M = cen.shape[0]
+    ref = embed(model, sample_utm(arr, transform, cen, np.broadcast_to(offs, (M,) + offs.shape)
+                                  ).reshape(-1, 3, a.n, a.n))
+    sens = {"rotation_deg": {}, "shift_px": {}, "scale_pct": {}}
+    for th in (0.25, 0.5, 1, 2, 3, 4, 6, 10, 20, 45, 90):
+        t = np.radians(th)
+        R = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+        e = embed(model, sample_utm(arr, transform, cen, np.broadcast_to(offs @ R.T, (M,) + offs.shape)
+                                    ).reshape(-1, 3, a.n, a.n))
+        sens["rotation_deg"][th] = {kk: float(np.median(cosd(ref[kk], e[kk]))) for kk in ref}
+    for sh in (0.25, 0.5, 1, 2, 4):
+        e = embed(model, sample_utm(arr, transform, cen,
+                                    np.broadcast_to(offs + np.array([sh * s, 0.0]), (M,) + offs.shape)
+                                    ).reshape(-1, 3, a.n, a.n))
+        sens["shift_px"][sh] = {kk: float(np.median(cosd(ref[kk], e[kk]))) for kk in ref}
+    for sc in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10):
+        e = embed(model, sample_utm(arr, transform, cen,
+                                    np.broadcast_to(offs * (1 + sc / 100), (M,) + offs.shape)
+                                    ).reshape(-1, 3, a.n, a.n))
+        sens["scale_pct"][sc] = {kk: float(np.median(cosd(ref[kk], e[kk]))) for kk in ref}
+
+    # ---- 2. zone gradient and 3. pairs
+    grad = {}
+    for name in res:
+        E = res[name]["E"]
+        grad[name] = {kk: dict(utm_hpx=float(np.median(cosd(E["utm"][kk], E["hpx"][kk]))),
+                               utmc_hpx=float(np.median(cosd(E["utm_c"][kk], E["hpx"][kk]))),
+                               utm_utmc=float(np.median(cosd(E["utm"][kk], E["utm_c"][kk]))),
+                               utm_hpx_q=np.percentile(cosd(E["utm"][kk], E["hpx"][kk]),
+                                                       [25, 75]).tolist(),
+                               utmc_hpx_q=np.percentile(cosd(E["utm_c"][kk], E["hpx"][kk]),
+                                                        [25, 75]).tolist())
+                      for kk in E["utm"]}
+    pairs = {}
+    for n1, n2, label in PAIRS:
+        c1, c2 = res[n1]["cells"], res[n2]["cells"]
+        common, i1, i2 = np.intersect1d(c1, c2, return_indices=True)
+        pr = {"n": int(common.size)}
+        for kk in res[n1]["E"]["utm"]:
+            for kind in ("utm", "utm_c", "hpx"):
+                d = cosd(res[n1]["E"][kind][kk][i1], res[n2]["E"][kind][kk][i2])
+                pr[f"{kind}/{kk}"] = dict(median=float(np.median(d)),
+                                          q=np.percentile(d, [25, 75]).tolist())
+        pairs[label] = pr
+
+    # ---- save numbers, distributions and examples
+    out = dict(spacing_m=s, n_px=a.n, level=a.level, centre_level=a.centre_level,
+               fake=a.fake, sites=site_info, sensitivity=sens, gradient=grad, pairs=pairs)
+    with open(os.path.join(a.out, "results.json"), "w") as f:
+        json.dump(out, f, indent=1)
+    np.savez_compressed(os.path.join(a.out, "distances.npz"), **{
+        f"{name}__{pair}__{kk}": cosd(res[name]["E"][p1][kk], res[name]["E"][p2][kk])
+        for name in res for kk in res[name]["E"]["utm"]
+        for pair, (p1, p2) in {"utm_hpx": ("utm", "hpx"), "utmc_hpx": ("utm_c", "hpx"),
+                               "utm_utmc": ("utm", "utm_c")}.items()})
+    np.savez_compressed(os.path.join(a.out, "examples.npz"),
+                        **{f"{n}__{k}": v for n, d in examples.items() for k, v in d.items()})
+    print(json.dumps(dict(sites=site_info, gradient={n: grad[n]["mean"] for n in grad},
+                          pairs={l: {k: v for k, v in p.items() if "mean" in k or k == "n"}
+                                 for l, p in pairs.items()}), indent=1))
+    print("results in", a.out)
+
+
+if __name__ == "__main__":
+    main()
