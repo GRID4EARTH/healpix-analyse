@@ -2,8 +2,10 @@
 Is the UTM map distortion visible in DINOv3 embeddings?  UTM tiles against HEALPix.
 
 For every ground point (a cell of level ``CENTRE_LEVEL``) three images of
-``N`` px at the HEALPix level-``LEVEL`` spacing (6.1 m at level 20) are fed to
-DINOv3 SAT-493M:
+``N`` px are fed to DINOv3 SAT-493M, at the HEALPix level-``LEVEL`` spacing
+(6.2 m at level 20) or, with ``--pixel-size``, at a pixel size in metres
+independent of the level (e.g. a level-20 Clough-Tocher map, which keeps the
+10 m input, read as 10 m images: ``--resampler ct --level 20 --pixel-size 10``):
 
 ``utm``     the UTM tile resampled on its own grid axes (grid north up, UTM
             metres): what a model sees when it is run on the native product
@@ -73,6 +75,9 @@ def parse():
     p.add_argument("--level", type=int, default=20)
     p.add_argument("--centre-level", type=int, default=14)
     p.add_argument("--n", type=int, default=128, help="image side, px")
+    p.add_argument("--pixel-size", type=float, default=None,
+                   help="image pixel in metres (HealPixPatches pixel_size); "
+                        "default: one cell of --level")
     p.add_argument("--crop", type=int, default=1100, help="UTM crop side, 10 m px")
     p.add_argument("--backend", default="torch")
     p.add_argument("--fake", action="store_true")
@@ -329,7 +334,8 @@ def main():
         pairs_cfg = [tuple(x) for x in cfg["pairs"]]
         sens_site = cfg.get("sensitivity_site", sites[0][0])
     model = make_model(a)
-    s = R_AUTHALIC * np.sqrt(np.pi / 3) / 2 ** a.level            # image spacing, m
+    s = (R_AUTHALIC * np.sqrt(np.pi / 3) / 2 ** a.level           # image spacing, m
+         if a.pixel_size is None else float(a.pixel_size))
     offs = grid_offsets(a.n, s)
     print(f"images {a.n} px at {s:.3f} m = {a.n * s:.0f} m, centres level {a.centre_level}")
 
@@ -419,7 +425,8 @@ def main():
         utm_c = sample_multi(bands, cen, np.einsum("mij,pj->mpi", J, offs)
                              ).reshape(-1, C, a.n, a.n)
         P = HealPixPatches(a.level, a.n, cell_ids=hid, centres=lev_c, centre_ids=cand,
-                           ellipsoid="WGS84", device=dev, backend=a.backend)
+                           ellipsoid="WGS84", device=dev, backend=a.backend,
+                           pixel_size=a.pixel_size)
         hpx = P(hval.to(dev)[None])[0, :, 0].transpose(-1, -2).float().cpu().numpy()
         cov = P.coverage[:, 0].float().mean((1, 2)).cpu().numpy()
         del P, op
@@ -523,7 +530,7 @@ def main():
         pairs[label] = pr
 
     # ---- save numbers, distributions and examples
-    out = dict(spacing_m=s, n_px=a.n, level=a.level, centre_level=a.centre_level,
+    out = dict(spacing_m=s, pixel_size=a.pixel_size, n_px=a.n, level=a.level, centre_level=a.centre_level,
                fake=a.fake, lam=a.lam, resampler=a.resampler, sensitivity_site=sens_site,
                sites=site_info,
                sensitivity=sens, gradient=grad, pairs=pairs)
