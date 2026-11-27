@@ -1434,6 +1434,10 @@ def _gauge_embeddings(
     if not finite.any():
         raise ValueError("no cell with all three bands finite")
     d_f, ids_f = d[finite], ids[finite]
+    # sorted once here: every batch of centres then binds its grid to the
+    # domain without sorting it again (HealPixPatches' sorted fast path)
+    o = np.argsort(ids_f, kind="stable")
+    d_f, ids_f = d_f[o], ids_f[o]
     centres_all = np.unique(ids_f >> (2 * k))
     tok_ids = np.unique(ids_f >> (2 * DINOV3_PATCH_LEVELS))
 

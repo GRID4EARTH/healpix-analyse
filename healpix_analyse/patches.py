@@ -143,11 +143,19 @@ def _ref_direction(gauge_type, singularity_lonlat, ref_direction):
     return rd / np.linalg.norm(rd, axis=-1, keepdims=True)
 
 
-def _bind(cells, ids_np, full):
+def _bind(cells, ids_np, full, is_sorted=False):
     """Positions of the NESTED ``cells`` in the domain ``ids_np`` (input order)
-    and their presence."""
+    and their presence.  ``is_sorted``: ``ids_np`` is strictly increasing, no
+    sort needed (the batches of centres of a large domain then cost O(K) each
+    instead of O(K log K))."""
     if full:
         return cells, np.ones(cells.shape, dtype=bool)
+    if is_sorted:
+        srt = ids_np
+        pos = np.searchsorted(srt, cells)
+        pos_c = np.minimum(pos, srt.size - 1)
+        present = srt[pos_c] == cells
+        return np.where(present, pos_c, 0), present
     order = np.argsort(ids_np, kind="stable")
     srt = ids_np[order]
     pos = np.searchsorted(srt, cells)
@@ -364,10 +372,14 @@ class HealPixPatches(nn.Module):
                 raise ValueError("cell_ids must not be empty.")
             if np.any(ids_np < 0) or np.any(ids_np >= npix):
                 raise ValueError(f"cell_ids contain identifiers outside level={self.level}.")
-            if np.unique(ids_np).size != ids_np.size:
+            # strictly increasing ids (the usual NESTED order) are unique and
+            # need no sort: an O(K) check instead of an O(K log K) unique
+            self._sorted = bool(ids_np.size < 2 or np.all(ids_np[1:] > ids_np[:-1]))
+            if not self._sorted and np.unique(ids_np).size != ids_np.size:
                 raise ValueError("cell_ids must contain unique identifiers.")
         else:
             ids_np = np.arange(npix, dtype=np.int64)
+            self._sorted = True
         self.K = ids_np.size
         Q = 4**self.p
         self.centre_level = centre_level
@@ -393,7 +405,7 @@ class HealPixPatches(nn.Module):
             a, b = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")   # row, col
             perm = xy_to_nested(b.ravel(), (N - 1) - a.ravel())             # [P] child index
             cells = (centre_ids[:, None] * Q + perm[None, :]).reshape(1, -1)
-            pos, present = _bind(cells, ids_np, not self.partial)
+            pos, present = _bind(cells, ids_np, not self.partial, self._sorted)
             w = present.astype(np.float64)
             coverage = w[0]
             inv = np.empty_like(perm)
@@ -429,7 +441,7 @@ class HealPixPatches(nn.Module):
                 rot = _stretch_to_ellipsoid(rot, th, ph, k_ell, self.G, self.P)
             i4, w4 = _get_interp_weights(self.nside, rot, True, "cpu", torch.float64)   # [4, R]
             del rot
-            pos, present = _bind(i4.numpy(), ids_np, not self.partial)
+            pos, present = _bind(i4.numpy(), ids_np, not self.partial, self._sorted)
             w4 = w4.numpy()
             # the rule of HealPixConv: a neighbour with less than 1e-6 of the
             # full bilinear weight does not count
