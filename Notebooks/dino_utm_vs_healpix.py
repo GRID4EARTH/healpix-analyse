@@ -76,6 +76,11 @@ def parse():
     p.add_argument("--crop", type=int, default=1100, help="UTM crop side, 10 m px")
     p.add_argument("--backend", default="torch")
     p.add_argument("--fake", action="store_true")
+    p.add_argument("--config", default=None,
+                   help="JSON with 'sites' [[name, item, lon, lat], ...], 'pairs' "
+                        "[[a, b, label], ...] and 'sensitivity_site'; default: the "
+                        "48 deg N set of this file")
+    p.add_argument("--k", type=int, default=8, help="k-means classes for the pair agreement")
     p.add_argument("--max-centres", type=int, default=800)
     p.add_argument("--lam", type=float, default=0.1,
                    help="PSFResampler damping: level 20 (6.2 m) is finer than the 10 m "
@@ -224,13 +229,19 @@ def main():
     from healpix_analyse.patches import HealPixPatches
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    sites, pairs_cfg, sens_site = SITES, PAIRS, SITES[0][0]
+    if a.config:
+        cfg = json.load(open(os.path.expanduser(a.config)))
+        sites = [tuple(x) for x in cfg["sites"]]
+        pairs_cfg = [tuple(x) for x in cfg["pairs"]]
+        sens_site = cfg.get("sensitivity_site", sites[0][0])
     model = make_model(a)
     s = R_AUTHALIC * np.sqrt(np.pi / 3) / 2 ** a.level            # image spacing, m
     offs = grid_offsets(a.n, s)
     print(f"images {a.n} px at {s:.3f} m = {a.n * s:.0f} m, centres level {a.centre_level}")
 
     res, site_info, examples = {}, {}, {}
-    for name, item, lon0, lat0 in SITES:
+    for name, item, lon0, lat0 in sites:
         t0 = time.time()
         arr, transform, crs, props = read_crop(item, lon0, lat0, a.crop)
         H, W = arr.shape[1:]
@@ -280,11 +291,14 @@ def main():
         E = {kind: embed(model, im[sel]) for kind, im in
              (("utm", utm), ("utm_c", utm_c), ("hpx", hpx))}
         res[name] = dict(cells=cand[sel], gamma=gamma[sel], k=k[sel], E=E)
+        perm = np.random.default_rng(1).permutation(int(sel.sum()))
         site_info[name] = dict(item=item, platform=props.get("platform"),
                                datatake=props.get("s2:datatake_id"), lon=lon0, lat=lat0,
                                dlon_cm=round(lon0 - (3.0 if crs.to_epsg() == 32631 else -3.0), 3),
                                epsg=crs.to_epsg(), n=int(sel.sum()),
-                               gamma_med=float(np.median(gamma)), k_med=float(np.median(k)))
+                               gamma_med=float(np.median(gamma)), k_med=float(np.median(k)),
+                               content={kk: float(np.median(cosd(E["hpx"][kk], E["hpx"][kk][perm])))
+                                        for kk in E["hpx"]})
         mid = int(np.argmin(np.hypot(ce - ce.mean(), cn - cn.mean())[sel]))
         examples[name] = dict(utm=utm[sel][mid], utm_c=utm_c[sel][mid], hpx=hpx[sel][mid])
         print(f"{name}: {item}, epsg {crs.to_epsg()}, gamma {np.median(gamma):+.3f} deg, "
@@ -292,7 +306,7 @@ def main():
               flush=True)
 
     # ---- 1. sensitivity on the central-meridian site
-    name0, item0, lon0, lat0 = SITES[0]
+    name0, item0, lon0, lat0 = next(x for x in sites if x[0] == sens_site)
     arr, transform, crs, _ = read_crop(item0, lon0, lat0, a.crop)
     cells = res[name0]["cells"]
     clon, clat = healpix_geo.nested.healpix_to_lonlat(cells.astype(np.uint64), a.centre_level,
@@ -334,20 +348,35 @@ def main():
                                                         [25, 75]).tolist())
                       for kk in E["utm"]}
     pairs = {}
-    for n1, n2, label in PAIRS:
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import adjusted_rand_score
+    for n1, n2, label in pairs_cfg:
         c1, c2 = res[n1]["cells"], res[n2]["cells"]
         common, i1, i2 = np.intersect1d(c1, c2, return_indices=True)
         pr = {"n": int(common.size)}
         for kk in res[n1]["E"]["utm"]:
             for kind in ("utm", "utm_c", "hpx"):
                 d = cosd(res[n1]["E"][kind][kk][i1], res[n2]["E"][kind][kk][i2])
+                a1 = res[n1]["E"][kind][kk][i1]
+                a2 = res[n2]["E"][kind][kk][i2]
+                u1 = a1 / np.linalg.norm(a1, axis=1, keepdims=True)
+                u2 = a2 / np.linalg.norm(a2, axis=1, keepdims=True)
+                # retrieval: is the same ground point the nearest neighbour in the other tile?
+                top1 = float((np.argmax(u1 @ u2.T, axis=1) == np.arange(len(u1))).mean())
+                # classification agreement: one k-means on both views, labels compared
+                km = KMeans(a.k, n_init=10, random_state=0).fit(np.r_[u1, u2])
+                ari = float(adjusted_rand_score(km.labels_[:len(u1)], km.labels_[len(u1):]))
                 pr[f"{kind}/{kk}"] = dict(median=float(np.median(d)),
-                                          q=np.percentile(d, [25, 75]).tolist())
+                                          q=np.percentile(d, [25, 75]).tolist(),
+                                          top1=top1, kmeans_ari=ari,
+                                          kmeans_agree=float((km.labels_[:len(u1)]
+                                                              == km.labels_[len(u1):]).mean()))
         pairs[label] = pr
 
     # ---- save numbers, distributions and examples
     out = dict(spacing_m=s, n_px=a.n, level=a.level, centre_level=a.centre_level,
-               fake=a.fake, sites=site_info, sensitivity=sens, gradient=grad, pairs=pairs)
+               fake=a.fake, lam=a.lam, sensitivity_site=sens_site, sites=site_info,
+               sensitivity=sens, gradient=grad, pairs=pairs)
     with open(os.path.join(a.out, "results.json"), "w") as f:
         json.dump(out, f, indent=1)
     np.savez_compressed(os.path.join(a.out, "distances.npz"), **{
