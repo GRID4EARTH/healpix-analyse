@@ -81,6 +81,10 @@ def parse():
                         "[[a, b, label], ...] and 'sensitivity_site'; default: the "
                         "48 deg N set of this file")
     p.add_argument("--k", type=int, default=8, help="k-means classes for the pair agreement")
+    p.add_argument("--model", default="dinov3", choices=("dinov3", "prithvi"),
+                   help="dinov3: SAT-493M on the RGB TCI; prithvi: Prithvi-EO-2.0-300M on six "
+                        "L2A bands (B02 B03 B04 B8A B11 B12, the 20 m ones on their own grid); "
+                        "prithvi takes the bilinear conversion only")
     p.add_argument("--save-emb", action="store_true",
                    help="save the embeddings (mean of patch tokens, float16) per site, for "
                         "downstream probes (Notebooks/dino_worldcover_probe.py)")
@@ -118,6 +122,47 @@ def read_crop(item_id, lon, lat, size):
         transform = src.window_transform(win)
         crs = src.crs
     return arr, transform, crs, item["properties"]
+
+
+PRITHVI_ASSETS = ("blue", "green", "red", "nir08", "swir16", "swir22")
+
+
+def read_source(item_id, lon, lat, size, model):
+    """The crop as a list of (float32 [C, h, w], transform), NaN = nodata, plus CRS and
+    properties.  ``size`` is in 10 m pixels; a 20 m band gets the same ground window.
+    dinov3: the TCI (0-255).  prithvi: six L2A bands as reflectance x 10000."""
+    import rasterio
+    from pyproj import Transformer
+    from rasterio.windows import Window
+
+    req = urllib.request.Request(STAC + item_id, headers={"User-Agent": "healpix-analyse-test"})
+    item = json.load(urllib.request.urlopen(req, timeout=120))
+    keys = ("visual",) if model == "dinov3" else PRITHVI_ASSETS
+    bands, crs = [], None
+    for key in keys:
+        asset = item["assets"][key]
+        with rasterio.open(asset["href"]) as src:
+            tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+            e, n = tr.transform(lon, lat)
+            row, col = src.index(e, n)
+            sz = int(round(size * 10.0 / src.res[0]))
+            win = Window(col - sz // 2, row - sz // 2, sz, sz)
+            arr = src.read(window=win, boundless=True, fill_value=0).astype(np.float32)
+            transform = src.window_transform(win)
+            crs = src.crs
+        nod = (arr == 0).all(0)
+        if key != "visual":
+            rb = (asset.get("raster:bands") or [{}])[0]
+            arr = (arr * rb.get("scale", 1e-4) + rb.get("offset", 0.0)) * 1e4
+        arr[:, nod] = np.nan
+        bands.append((arr, transform))
+    return bands, crs, item["properties"]
+
+
+def sample_multi(bands, centres_en, offsets_en):
+    """``sample_utm`` on every band, each on its own grid: [M, C_total, P]."""
+    return np.concatenate([sample_utm(arr, tr, centres_en, offsets_en) for arr, tr in bands],
+                          axis=1)
 
 
 def utm_lonlat(transform, crs, H, W):
@@ -180,8 +225,37 @@ def grid_offsets(n, s):
 
 # --------------------------------------------------------------------------- DINO
 
+def make_prithvi(n):
+    """Prithvi-EO-2.0-300M encoder for single-frame images of n px (sin-cos positions)."""
+    import importlib.util
+    from huggingface_hub import hf_hub_download
+    repo = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M"
+    d = "/tmp/prithvi"
+    code = hf_hub_download(repo, "prithvi_mae.py", local_dir=d)
+    ckpt = hf_hub_download(repo, "Prithvi_EO_V2_300M.pt", local_dir=d)
+    cfg = json.load(open(hf_hub_download(repo, "config.json", local_dir=d)))["pretrained_cfg"]
+    spec = importlib.util.spec_from_file_location("prithvi_mae", code)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    enc = mod.PrithviViT(img_size=n, patch_size=(1, 16, 16), num_frames=1, in_chans=6,
+                         embed_dim=cfg["embed_dim"], depth=cfg["depth"],
+                         num_heads=cfg["num_heads"], mlp_ratio=cfg["mlp_ratio"])
+    sd = torch.load(ckpt, map_location="cpu")
+    sd = sd.get("model", sd)
+    sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
+    sd = {k: v for k, v in sd.items() if k != "pos_embed"}
+    missing, unexpected = enc.load_state_dict(sd, strict=False)
+    print("Prithvi: missing", missing, "unexpected", len(unexpected))
+    enc.prithvi_mean = torch.tensor(cfg["mean"]).view(1, 6, 1, 1)
+    enc.prithvi_std = torch.tensor(cfg["std"]).view(1, 6, 1, 1)
+    enc.kind = "prithvi"
+    return enc.eval().to("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def make_model(a):
     import healpix_analyse.dino as D
+    if a.model == "prithvi":
+        return make_prithvi(a.n)
     if a.fake:
         import torch.nn as nn
 
@@ -198,18 +272,29 @@ def make_model(a):
 
 
 def embed(model, imgs, bs=64):
-    """imgs uint8-range float [M, 3, n, n] -> dict of [M, D] vectors."""
+    """imgs [M, C, n, n] (TCI 0-255, or Prithvi reflectance x 1e4) -> dict of [M, D]."""
     import healpix_analyse.dino as D
     dev = next(model.parameters()).device
-    mean = torch.tensor(D.SAT493M_MEAN, device=dev).view(1, 3, 1, 1)
-    std = torch.tensor(D.SAT493M_STD, device=dev).view(1, 3, 1, 1)
+    prithvi = getattr(model, "kind", "") == "prithvi"
+    if prithvi:
+        mean, std = model.prithvi_mean.to(dev), model.prithvi_std.to(dev)
+    else:
+        mean = torch.tensor(D.SAT493M_MEAN, device=dev).view(1, 3, 1, 1)
+        std = torch.tensor(D.SAT493M_STD, device=dev).view(1, 3, 1, 1)
     out = {"cls": [], "mean": [], "centre": []}
     with torch.inference_mode():
         for i in range(0, len(imgs), bs):
-            x = torch.as_tensor(imgs[i:i + bs], dtype=torch.float32, device=dev) / 255.0
-            x = (x.clamp(0, 1) - mean) / std
+            x = torch.as_tensor(imgs[i:i + bs], dtype=torch.float32, device=dev)
+            if prithvi:
+                x = (x - mean) / std
+            else:
+                x = (x.clamp(0, 255) / 255.0 - mean) / std
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
-                cls, pt = D._forward(model, x)
+                if prithvi:
+                    h = model.forward_features(x)[-1]
+                    cls, pt = h[:, 0], h[:, 1:]
+                else:
+                    cls, pt = D._forward(model, x)
             cls, pt = cls.float(), pt.float()
             T = int(round(pt.shape[1] ** 0.5))
             g = pt.reshape(pt.shape[0], T, T, -1)
@@ -251,12 +336,16 @@ def main():
     res, site_info, examples = {}, {}, {}
     for name, item, lon0, lat0 in sites:
         t0 = time.time()
-        arr, transform, crs, props = read_crop(item, lon0, lat0, a.crop)
+        bands, crs, props = read_source(item, lon0, lat0, a.crop, a.model)
+        arr, transform = bands[0]                                   # the 10 m reference grid
+        C = sum(b[0].shape[0] for b in bands)
         H, W = arr.shape[1:]
         lon, lat = utm_lonlat(transform, crs, H, W)
-        ok = (arr > 0).any(0).ravel()                               # TCI nodata = 0
+        ok = np.isfinite(arr).all(0).ravel()
         # ---- HEALPix conversion of the crop (PSF resampler, WGS84)
-        vals = torch.as_tensor(arr.reshape(3, -1)[:, ok], dtype=torch.float32, device=dev)
+        if a.resampler != "bilinear" and len(bands) > 1:
+            raise SystemExit("multi-resolution bands: use --resampler bilinear")
+        vals = torch.as_tensor(arr.reshape(C, -1)[:, ok], dtype=torch.float32, device=dev)
         if a.resampler == "bilinear":
             # every level-20 cell of the crop: the children of the level-(L-2) cells
             # holding a pixel, sampled bilinearly at their centres
@@ -272,9 +361,9 @@ def main():
             rowf = (hn - transform.f) / transform.e
             inside_c = (colf > 0.5) & (colf < W - 0.5) & (rowf > 0.5) & (rowf < H - 0.5)
             hid = hid[inside_c]
-            v = sample_utm(arr, transform, np.zeros((1, 2)),
-                           np.stack([he[inside_c], hn[inside_c]], -1)[None])[0]   # [3, K]
-            good_c = (v > 0).any(0)
+            v = sample_multi(bands, np.zeros((1, 2)),
+                             np.stack([he[inside_c], hn[inside_c]], -1)[None])[0]   # [C, K]
+            good_c = np.isfinite(v).all(0)
             hid, v = hid[good_c], v[:, good_c]
             o = np.argsort(hid)
 
@@ -318,16 +407,17 @@ def main():
         cen = np.stack([ce, cn], -1)
         J, gamma, k = jacobian(crs, clon, clat)
         # ---- the three images
-        utm = sample_utm(arr, transform, cen, np.broadcast_to(offs, (cand.size,) + offs.shape)
-                         ).reshape(-1, 3, a.n, a.n)
-        utm_c = sample_utm(arr, transform, cen, np.einsum("mij,pj->mpi", J, offs)
-                           ).reshape(-1, 3, a.n, a.n)
+        utm = sample_multi(bands, cen, np.broadcast_to(offs, (cand.size,) + offs.shape)
+                           ).reshape(-1, C, a.n, a.n)
+        utm_c = sample_multi(bands, cen, np.einsum("mij,pj->mpi", J, offs)
+                             ).reshape(-1, C, a.n, a.n)
         P = HealPixPatches(a.level, a.n, cell_ids=hid, centres=lev_c, centre_ids=cand,
                            ellipsoid="WGS84", device=dev, backend=a.backend)
         hpx = P(hval.to(dev)[None])[0, :, 0].transpose(-1, -2).float().cpu().numpy()
         cov = P.coverage[:, 0].float().mean((1, 2)).cpu().numpy()
         del P, op
-        sel = (cov > 0.999) & (utm > 0).any(1).all((1, 2)) & (utm_c > 0).any(1).all((1, 2))
+        sel = ((cov > 0.999) & np.isfinite(utm).all((1, 2, 3)) & np.isfinite(utm_c).all((1, 2, 3))
+               & np.isfinite(hpx).all((1, 2, 3)))
         if sel.sum() < 30:
             print(f"{name}: only {int(sel.sum())} complete images (nodata or edge), skipped",
                   flush=True)
@@ -348,7 +438,9 @@ def main():
                                content={kk: float(np.median(cosd(E["hpx"][kk], E["hpx"][kk][perm])))
                                         for kk in E["hpx"]})
         mid = int(np.argmin(np.hypot(ce - ce.mean(), cn - cn.mean())[sel]))
-        examples[name] = dict(utm=utm[sel][mid], utm_c=utm_c[sel][mid], hpx=hpx[sel][mid])
+        rgb = [0, 1, 2] if C == 3 else [2, 1, 0]
+        examples[name] = dict(utm=utm[sel][mid][rgb], utm_c=utm_c[sel][mid][rgb],
+                              hpx=hpx[sel][mid][rgb])
         print(f"{name}: {item}, epsg {crs.to_epsg()}, gamma {np.median(gamma):+.3f} deg, "
               f"k {np.median(k):.5f}, {int(sel.sum())} centres, {time.time() - t0:.0f} s",
               flush=True)
@@ -356,7 +448,8 @@ def main():
     # ---- 1. sensitivity on the central-meridian site
     name0, item0, lon0, lat0 = next((x for x in sites if x[0] == sens_site and x[0] in res),
                                     next(x for x in sites if x[0] in res))
-    arr, transform, crs, _ = read_crop(item0, lon0, lat0, a.crop)
+    bands, crs, _ = read_source(item0, lon0, lat0, a.crop, a.model)
+    C = sum(b[0].shape[0] for b in bands)
     cells = res[name0]["cells"]
     clon, clat = healpix_geo.nested.healpix_to_lonlat(cells.astype(np.uint64), a.centre_level,
                                                       ellipsoid="WGS84")
@@ -364,24 +457,24 @@ def main():
         np.asarray(clon, float), np.asarray(clat, float))
     cen = np.stack([ce, cn], -1)
     M = cen.shape[0]
-    ref = embed(model, sample_utm(arr, transform, cen, np.broadcast_to(offs, (M,) + offs.shape)
-                                  ).reshape(-1, 3, a.n, a.n))
+    ref = embed(model, sample_multi(bands, cen, np.broadcast_to(offs, (M,) + offs.shape)
+                                  ).reshape(-1, C, a.n, a.n))
     sens = {"rotation_deg": {}, "shift_px": {}, "scale_pct": {}}
     for th in (0.25, 0.5, 1, 2, 3, 4, 6, 10, 20, 45, 90):
         t = np.radians(th)
         R = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
-        e = embed(model, sample_utm(arr, transform, cen, np.broadcast_to(offs @ R.T, (M,) + offs.shape)
-                                    ).reshape(-1, 3, a.n, a.n))
+        e = embed(model, sample_multi(bands, cen, np.broadcast_to(offs @ R.T, (M,) + offs.shape)
+                                    ).reshape(-1, C, a.n, a.n))
         sens["rotation_deg"][th] = {kk: float(np.median(cosd(ref[kk], e[kk]))) for kk in ref}
     for sh in (0.25, 0.5, 1, 2, 4):
-        e = embed(model, sample_utm(arr, transform, cen,
+        e = embed(model, sample_multi(bands, cen,
                                     np.broadcast_to(offs + np.array([sh * s, 0.0]), (M,) + offs.shape)
-                                    ).reshape(-1, 3, a.n, a.n))
+                                    ).reshape(-1, C, a.n, a.n))
         sens["shift_px"][sh] = {kk: float(np.median(cosd(ref[kk], e[kk]))) for kk in ref}
     for sc in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10):
-        e = embed(model, sample_utm(arr, transform, cen,
+        e = embed(model, sample_multi(bands, cen,
                                     np.broadcast_to(offs * (1 + sc / 100), (M,) + offs.shape)
-                                    ).reshape(-1, 3, a.n, a.n))
+                                    ).reshape(-1, C, a.n, a.n))
         sens["scale_pct"][sc] = {kk: float(np.median(cosd(ref[kk], e[kk]))) for kk in ref}
 
     # ---- 2. zone gradient and 3. pairs
