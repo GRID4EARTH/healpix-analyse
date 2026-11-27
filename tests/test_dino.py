@@ -263,6 +263,7 @@ def test_tangent_output_tiles_the_cells_without_holes():
 
     for n in (1, 2):
         res = GetDINOV3SAT(data, cell_id, level, parent_level, over_sample=n,
+                           projection="tangent",
                            model=_FakeDino(), return_patches=True, device="cpu")
         tl = level - 4 + int(np.log2(n))
         assert res.patch_level == tl

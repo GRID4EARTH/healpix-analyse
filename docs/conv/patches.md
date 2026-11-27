@@ -44,6 +44,15 @@ Patch sizes are powers of 2, `N = 2**p`. The patches are centred:
   domain cells. This is the ViT tiling, aligned with NESTED.
 - `centres="all"`: on every cell of the domain, in the order of `cell_ids`
   (overlapping patches, `mode="gauge"` only).
+- `centres=c`, an integer level with `L − p ≤ c ≤ L`: on the cells of level
+  `c` holding cells of the domain, patches overlapping as soon as `c > L − p`
+  (`mode="gauge"` only unless `c = L − p`). This is the image of a
+  pre-trained ViT, larger than its cell for context: 64 px images centred on
+  cells of 32 px are `HealPixPatches(L, 64, centres=L - 5)`.
+- `centre_ids=` gives the centres explicitly, at the centre level: a subset,
+  to build the geometry by batches of centres on a large scene, or centres
+  outside the domain (their patches read what the domain holds, `coverage`
+  says how much).
 
 Two modes give the pixels of a patch:
 
@@ -59,10 +68,23 @@ Two modes give the pixels of a patch:
   `torch.rot90` of the patch, `k=1`). With `gauge_type="cosmo"` the gauge
   angle changes sign across the equator, so at southern centres the rotation
   goes the other way: gauge `g + 2` is `torch.rot90(..., k=3)` of gauge `g`.
-  The grid matches the stencil of `HealPixConv(ellipsoid="sphere")`; with
-  the default `ellipsoid="WGS84"`, `HealPixConv` places its stencil at
-  geodetic latitudes, shifted from the cell centres of the grid, while
-  `HealPixPatches` always uses the sphere of the grid.
+  The grid matches the stencil of `HealPixConv(ellipsoid="sphere")`.
+
+  **Orientation.** With `gauge_type="phi"`, gauge 0, the rows of a patch run
+  towards the east and its columns towards the south: a patch is the
+  *transpose* of a north-up map, a mirror image rather than a rotation. A
+  network trained from scratch learns in that frame; for a network
+  pre-trained on map imagery (DINOv3, ...) use `y.transpose(-1, -2)`, which
+  gives north up, east right, and transpose back before the fold.
+
+  **Ellipsoid.** The cells and the centres are the same for any
+  `ellipsoid`: a HEALPix grid on an ellipsoid is the grid of its authalic
+  sphere, and the patches work on cell ids. With `ellipsoid="WGS84"` (the
+  GRID4EARTH Sentinel-2 stores) the grid is square in metres on the
+  ellipsoid instead of on the authalic sphere: every offset is scaled by the
+  local scale factor `k` of the authalic map along the meridian and by `1/k`
+  along the parallel, a correction below 0.34 %. `centre_lonlat()` returns
+  the centres in geodetic coordinates on that ellipsoid.
 
 `mode="nested"`
 : The `4**p` descendants of each coarse cell, as a `2**p × 2**p` image: row

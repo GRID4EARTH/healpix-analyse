@@ -21,9 +21,10 @@ yet (``powerspectra`` does it before calling it).
 
 from __future__ import annotations
 
+import numpy as np
 from healpix_geo._healpix_geo_python import resolve_ellipsoid
 
-__all__ = ["canonicalize_ellipsoid"]
+__all__ = ["canonicalize_ellipsoid", "authalic_scale"]
 
 
 def canonicalize_ellipsoid(ellipsoid):
@@ -52,3 +53,41 @@ def canonicalize_ellipsoid(ellipsoid):
         except Exception:
             continue
     return s
+
+
+def authalic_scale(lat_geodetic_deg, ellipsoid):
+    """Scale factor ``k`` of the authalic sphere at the given geodetic latitudes.
+
+    A HEALPix grid on an ellipsoid is the HEALPix grid of its authalic sphere
+    (radius ``R_a``, same area), reached through the authalic latitude
+    ``beta``.  That map keeps areas but not shapes: a ground displacement of
+    ``ds`` metres becomes ``k * ds`` along the meridian and ``ds / k`` along
+    the parallel on the authalic sphere, with
+
+        k = N(phi) cos(phi) / (R_a cos(beta)),
+
+    ``N`` the prime-vertical radius of curvature.  ``k`` is 1 on a sphere and
+    stays within 0.34 % of 1 on WGS84 (1.0011 at the equator).  Returns an
+    array of the shape of ``lat_geodetic_deg``.
+    """
+    phi = np.radians(np.asarray(lat_geodetic_deg, dtype=np.float64))
+    params = resolve_ellipsoid(canonicalize_ellipsoid(ellipsoid)) if isinstance(
+        ellipsoid, str) else dict(ellipsoid)
+    inv_f = params.get("inverse_flattening")
+    if inv_f is None or not np.isfinite(inv_f) or inv_f == 0:
+        return np.ones_like(phi)
+    a = 1.0                                     # k is a ratio: any unit
+    f = 1.0 / float(inv_f)
+    e2 = f * (2.0 - f)
+    e = np.sqrt(e2)
+    q = lambda s: (1 - e2) * (s / (1 - e2 * s * s)
+                              - np.log((1 - e * s) / (1 + e * s)) / (2 * e))
+    qp = q(1.0)
+    r_a = a * np.sqrt(qp / 2.0)
+    sinb = np.clip(q(np.sin(phi)) / qp, -1.0, 1.0)
+    cosb = np.sqrt(1.0 - sinb * sinb)
+    n_rad = a / np.sqrt(1.0 - e2 * np.sin(phi) ** 2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        k = n_rad * np.cos(phi) / (r_a * cosb)
+    # at the poles both cosines vanish: the limit is the polar value
+    return np.where(cosb > 1e-12, k, 1.0)

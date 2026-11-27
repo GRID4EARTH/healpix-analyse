@@ -462,7 +462,7 @@ tools:
   page: conv/patches
   status: experimental
   symbols: [HealPixPatches]
-  also: [fold, centre_ids, coverage, index, zorder]
+  also: [fold, centre_ids, centre_lonlat, coverage, index, zorder, ellipsoid]
   summary: >-
     Cut a field into square N x N patches (N a power of 2), the tokens of
     ViT, MAE and JEPA models: gauge-oriented grids sampled like a HealPixConv
@@ -473,10 +473,12 @@ tools:
       use: [HealPixPatches]
     - do: fold patches back onto the cells (MAE decoder, dense head)
       use: [HealPixPatches.fold]
+    - do: images larger than their cell, centred on the cells of a coarser level, for a pre-trained ViT
+      use: [HealPixPatches]
   keywords: [ViT, MAE, JEPA, tokens, patch embedding, foundation model, transformer, fold, unfold, masking]
   domain: whole sphere (cell_ids=None) or a regional set of cell ids, in any order, given at construction
   ordering: NESTED
-  ellipsoid: none (the grid is placed on the sphere of the HEALPix grid)
+  ellipsoid: "sphere by default (the authalic sphere of the HEALPix grid); ellipsoid=\"WGS84\" keeps the patch square in metres on the ellipsoid (same cells, < 0.34 % change)"
   io: "[B, C, K] -> [B, M, G, C, N, N] (M centres, G gauges); fold: [B, M, G, C, N, N] -> [B, C, K]"
   differentiable: yes, forward and fold, to any order
   gpu: yes; fused Triton kernels for float32, float16 and bfloat16 with the optional triton package, deterministic backward
@@ -490,9 +492,11 @@ tools:
     - "Gauge-oriented tokens: the same orientation everywhere, unlike face-oriented NESTED tiles."
     - "Masked sampling: an MAE that keeps 25 % of the tokens gathers only those, with one draw per sample."
     - "`mode=\"nested\"` is a view plus one gather on complete domains (`zorder=True`: zero-copy)."
+    - "`centres=<level>` centres the patches on the cells of any level between L - p and L; `centre_ids=` builds the geometry for a subset of centres (batches)."
   cons:
     - "Experimental. With coarse centres, the gauge squares do not tile the diamond-shaped cells: from N = 8, the fold misses the tips of the diamonds."
     - "With `index`, the fold visits only the cells the selected patches read; with overlapping patches (`centres=\"all\"`) that is nearly every cell."
+    - "With gauge_type=\"phi\" a patch is the transpose (mirror image) of a north-up map: y.transpose(-1, -2) before a network pre-trained on map imagery."
   use_instead:
     - when: NumPy tiles for the DINOv3 pipeline, with mean filling of the gaps
       use: nested_to_tiles
@@ -1598,9 +1602,12 @@ tools:
   status: experimental
   symbols: [GetDINOV3SAT, DINOEmbedding, load_dinov3_sat, nested_to_tiles, tiles_to_nested]
   summary: >-
-    Run an unmodified DINOv3 SAT-493M backbone on HEALPix data (tangent,
-    per-cell or NESTED images) and map every embedding back to a HEALPix
-    cell; plus the NESTED block <-> square image reshape.
+    Run an unmodified DINOv3 SAT-493M backbone on HEALPix data and attach
+    every embedding to a HEALPix cell: by default the images are
+    HealPixPatches patches (gauge-oriented, north up) and the tokens are
+    folded back to the cells of level - 4; tangent, per-cell and NESTED
+    images are kept for comparison; plus the NESTED block <-> square image
+    reshape.
   tasks:
     - do: compute foundation-model embeddings of Sentinel-2 data on HEALPix cells (for clustering or classification)
       use: [GetDINOV3SAT]
@@ -1609,15 +1616,15 @@ tools:
   keywords: [DINOv3, foundation model, embeddings, Sentinel-2, self-supervised, UMAP, clustering, tiles]
   domain: the cells present in the data
   ordering: NESTED
-  ellipsoid: module setting set_ellipsoid(), "sphere" by default
+  ellipsoid: the ellipsoid argument ("wgs84" for the GRID4EARTH Sentinel-2 stores), else the module setting set_ellipsoid(), "sphere" by default
   io: "data [N, C] reflectances in [0, 1] -> DINOEmbedding (NumPy)"
   differentiable: no (inference mode)
   gpu: yes, bf16 autocast on CUDA
-  nan: missing pixels filled (per-tile mean or zero); min_coverage drops tiles
-  cost: one backbone pass per tile (per cell in "percell" mode); cost grows as over_sample**2 and (context_px / cell)**2
+  nan: cells with a NaN band are left out; image pixels without data filled (per-image mean or zero); min_coverage drops images
+  cost: one backbone pass per image (x4 with rotations=4; per cell in "percell" mode); images and token fold on the GPU by batches of centres; over_sample**2 and (context_px / cell)**2 in the other modes
   pros:
     - No change to the network; embeddings on a fixed grid, comparable across dates.
-    - "`\"tangent\"` (default) corrects the shape distortion of HEALPix cells."
+    - "`\"gauge\"` (default): images built like HealPixConv kernels, one vector per cell of level - 4 with no half-cell shift, duplicate or hole."
   cons:
     - Experimental; the weights are gated by Meta and never downloaded by the package.
     - Not differentiable; three bands (R, G, B) per run.

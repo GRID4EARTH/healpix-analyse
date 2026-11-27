@@ -15,6 +15,13 @@ square image of side ``2**(level - parent_level)`` pixels, fed to an
 unmodified DINOv3 network, and every 16x16 patch token maps back to one
 HEALPix cell at ``level - 4``.
 
+The default ``projection="gauge"`` builds the images with
+:class:`~healpix_analyse.patches.HealPixPatches` -- the patch of a
+``HealPixConv`` kernel: an ``N x N`` grid of the North Pole rotated by the
+gauge to the centre cell and sampled by bilinear interpolation -- and folds
+the tokens back to the cells of ``level - 4`` with the adjoint of the same
+operator, so that every embedding is attached to a precise cell.
+
 This module provides
 
 - :func:`nested_to_tiles`   NESTED block  -> square tiles ``[M, C, S, S]``
@@ -664,7 +671,7 @@ def sample_healpix(
     interpolation: str = "bilinear",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Sample a partial-sky NESTED HEALPix map at arbitrary lon/lat.
+    Sample a NESTED HEALPix map of a regional domain at arbitrary lon/lat.
 
     Cells absent from ``cell_id`` and non-finite values are treated as missing:
     the interpolation weights are renormalised over the available neighbours,
@@ -1245,6 +1252,14 @@ class DINOEmbedding:
     on_parent_grid : bool array [M]
         True for the images centred on a parent cell, i.e. those that
         ``stride = 1`` produces.
+    image_embedding : array [Mi, Ndino] or None
+        ``projection="gauge"``: one vector per image (``pooling``), the image
+        centred on the cell ``image_cell_id`` of ``parent_level``.
+    image_cell_id, image_coverage : arrays [Mi] or None
+    rotations : int
+        ``projection="gauge"``: number of quarter turns averaged (1 or 4).
+    ellipsoid : str or None
+        Ellipsoid of the patch geometry and of the reported coordinates.
     input_range : (lo, hi)
         The ``(lo, hi)`` (scalars or per band) mapped to [0, 1] before the network; pass it as
         ``input_range`` to process other dates with the same mapping.
@@ -1272,6 +1287,11 @@ class DINOEmbedding:
     on_parent_grid: Optional[np.ndarray] = None
     input_range: Optional[Tuple[float, float]] = None
     input_scaling: Optional[str] = None
+    image_embedding: Optional[np.ndarray] = None
+    image_cell_id: Optional[np.ndarray] = None
+    image_coverage: Optional[np.ndarray] = None
+    rotations: int = 1
+    ellipsoid: Optional[str] = None
 
 
 def _percell_embeddings(
@@ -1358,13 +1378,181 @@ def _percell_embeddings(
     return np.concatenate(out).astype(np.float32), np.concatenate(cov)
 
 
+def _gauge_embeddings(
+    d: np.ndarray,
+    ids: np.ndarray,
+    level: int,
+    parent_level: int,
+    *,
+    tile_px: int,
+    ellipsoid,
+    rotations: int,
+    fill: str,
+    min_coverage: float,
+    model: nn.Module,
+    mean: Sequence[float],
+    std: Sequence[float],
+    pooling: str,
+    batch_size: int,
+    centre_batch: Optional[int],
+    dev: torch.device,
+    autocast: bool,
+    verbose: bool,
+) -> dict:
+    """
+    Images from :class:`~healpix_analyse.patches.HealPixPatches`, tokens folded back.
+
+    Every cell of ``parent_level`` holding data is the centre of one image of
+    ``tile_px`` pixels at the spacing of ``level``, built exactly like a
+    ``HealPixConv`` kernel: the ``N x N`` grid of the North Pole rotated by
+    the gauge to the centre and sampled by bilinear interpolation.  The image
+    is transposed to north up / east right before the network (see
+    ``HealPixPatches``, ``mode="gauge"``).
+
+    The ``T x T`` tokens of an image (``T = tile_px / 16``) sit, by
+    construction, on the grid of ``HealPixPatches(level - 4, T)`` centred on
+    the same cell: their centres are the offsets ``16 j + 7.5 - (N - 1) / 2``
+    cells of ``level``, i.e. ``j - (T - 1) / 2`` cells of ``level - 4``.  The
+    fold of that module (the adjoint of its bilinear extraction, normalised
+    by the weights) returns them to the cells of ``level - 4``: every cell
+    receives the weighted mean of all the tokens of all the images that read
+    it.  No token index is ever computed by hand.
+
+    The centres are processed by batches (``centre_batch`` images per
+    geometry build) so that the geometry of a whole scene never sits in
+    memory at once.
+    """
+    from healpix_analyse.patches import HealPixPatches      # dino <- patches import
+
+    N = int(tile_px)
+    T = N // DINOV3_PATCH
+    k = int(level) - int(parent_level)
+    tok_level = int(level) - DINOV3_PATCH_LEVELS
+
+    finite = np.isfinite(d).all(axis=1)
+    if not finite.any():
+        raise ValueError("no cell with all three bands finite")
+    d_f, ids_f = d[finite], ids[finite]
+    centres_all = np.unique(ids_f >> (2 * k))
+    tok_ids = np.unique(ids_f >> (2 * DINOV3_PATCH_LEVELS))
+
+    x = torch.from_numpy(np.ascontiguousarray(d_f.T, dtype=np.float32))[None].to(dev)
+    mean_t = torch.tensor(mean, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
+    std_t = torch.tensor(std, dtype=torch.float32, device=dev).view(1, 3, 1, 1)
+    use_ac = autocast and dev.type == "cuda"
+    cr0, cnr, cc0, cnc = _centre_window(T, T, 2 ** k)
+    rots = list(range(int(rotations)))
+
+    if centre_batch is None:
+        # ~4e6 sample points per geometry build: ~100 MB of float64
+        # temporaries while it is built, a few tens of MB once on the device
+        centre_batch = max(1, (1 << 22) // (N * N))
+
+    acc = wsum = covsum = None
+    img_vec, img_ids, img_cov = [], [], []
+    with torch.inference_mode():
+        for c0 in range(0, centres_all.size, centre_batch):
+            chunk = centres_all[c0:c0 + centre_batch]
+            P = HealPixPatches(level, N, cell_ids=ids_f, centres=int(parent_level),
+                               centre_ids=chunk, ellipsoid=ellipsoid, device=dev)
+            img = P(x)[0, :, 0]                                   # [Mc, 3, N, N]
+            cov = P.coverage[:, 0].to(torch.float32)              # [Mc, N, N]
+            del P
+            cov_img = cov.mean(dim=(1, 2))
+            keep = torch.nonzero(cov_img >= float(min_coverage)).flatten()
+            if keep.numel() == 0:
+                continue
+            img, cov, cov_img = img[keep], cov[keep], cov_img[keep]
+            if fill == "mean":
+                have = (cov > 0).unsqueeze(1)                     # [Mc, 1, N, N]
+                cnt = have.sum(dim=(2, 3)).clamp_min(1)
+                m = (img * have).sum(dim=(2, 3)) / cnt             # [Mc, 3]
+                img = torch.where(have, img, m[:, :, None, None])
+            # "zero": HealPixPatches already gives 0 where nothing is read
+            img = img.transpose(-1, -2)                           # north up, east right
+
+            toks, vecs = [], []
+            for i in range(0, img.shape[0], batch_size):
+                xb = (img[i:i + batch_size] - mean_t) / std_t
+                tok_b, vec_b = 0.0, 0.0
+                for r in rots:
+                    xr = torch.rot90(xb, r, (-2, -1)) if r else xb
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                                        enabled=use_ac):
+                        cls, patches = _forward(model, xr)
+                    cls, patches = cls.float(), patches.float()
+                    if patches.shape[1] != T * T:
+                        raise RuntimeError(
+                            f"got {patches.shape[1]} patch tokens for a {T}x{T} grid; "
+                            "is the model patch size 16?")
+                    g = patches.reshape(patches.shape[0], T, T, -1)
+                    if r:
+                        g = torch.rot90(g, -r, (1, 2))            # back to north up
+                    tok_b = tok_b + g
+                    if pooling == "cls":
+                        v = cls
+                    elif pooling == "mean":
+                        v = patches.mean(dim=1)
+                    elif pooling == "cls+mean":
+                        v = torch.cat([cls, patches.mean(dim=1)], dim=1)
+                    elif pooling == "centre":
+                        v = g[:, cr0:cr0 + cnr, cc0:cc0 + cnc].mean(dim=(1, 2))
+                    else:
+                        raise ValueError("pooling must be 'cls', 'mean', 'cls+mean' or 'centre'")
+                    vec_b = vec_b + v
+                toks.append(tok_b / len(rots))
+                vecs.append((vec_b / len(rots)).cpu())
+            tok = torch.cat(toks)                                 # [Mc, T, T, D] north up
+            D = tok.shape[-1]
+            # north-up [row = south, col = east] -> gauge layout [row = east, col = south]
+            tok = tok.permute(0, 3, 2, 1).contiguous()            # [Mc, D, T, T]
+
+            Tm = HealPixPatches(tok_level, T, cell_ids=tok_ids, centres=int(parent_level),
+                                centre_ids=chunk, ellipsoid=ellipsoid, device=dev)
+            kk = keep.to(dev)
+            if acc is None:
+                acc = torch.zeros(D, tok_ids.size, dtype=torch.float32, device=dev)
+                wsum = torch.zeros(tok_ids.size, dtype=torch.float32, device=dev)
+                covsum = torch.zeros(tok_ids.size, dtype=torch.float32, device=dev)
+            acc += Tm.fold(tok[None, :, None], index=kk, norm="none")[0]
+            ones = torch.ones(1, kk.numel(), 1, 1, T, T, dtype=torch.float32, device=dev)
+            wsum += Tm.fold(ones, index=kk, norm="none")[0, 0]
+            # token coverage: the mean pixel coverage of its 16 x 16 block
+            ctok = torch.nn.functional.avg_pool2d(cov[:, None], DINOV3_PATCH)  # [Mc,1,T,T]
+            covsum += Tm.fold(ctok.view(1, -1, 1, 1, T, T),
+                              index=kk, norm="none")[0, 0]
+            del Tm
+            img_vec.append(torch.cat(vecs).numpy())
+            img_ids.append(chunk[keep.cpu().numpy()])
+            img_cov.append(cov_img.cpu().numpy())
+            if verbose:
+                done = min(c0 + centre_batch, centres_all.size)
+                print(f"DINO gauge: {done}/{centres_all.size} images", end="\r")
+    if verbose:
+        print()
+    if acc is None:
+        raise ValueError("no image reaches min_coverage")
+
+    got = wsum > 0
+    emb = (acc[:, got] / wsum[got]).T.contiguous().cpu().numpy()
+    return dict(
+        embedding=emb.astype(np.float32),
+        cell_id=tok_ids[got.cpu().numpy()],
+        coverage=(covsum[got] / wsum[got]).cpu().numpy(),
+        cell_level=tok_level,
+        image_embedding=np.concatenate(img_vec).astype(np.float32),
+        image_cell_id=np.concatenate(img_ids),
+        image_coverage=np.concatenate(img_cov),
+    )
+
+
 def GetDINOV3SAT(
     data: ArrayLike,
     cell_id: ArrayLike,
     level: int,
     parent_level: int,
     *,
-    projection: str = "tangent",
+    projection: str = "gauge",
     over_sample: int = 1,
     stride: float = 1.0,
     context_px: Optional[int] = None,
@@ -1388,6 +1576,9 @@ def GetDINOV3SAT(
     batch_size: int = 16,
     device: Optional[Union[str, torch.device]] = None,
     autocast: bool = True,
+    ellipsoid: Optional[str] = None,
+    rotations: int = 1,
+    centre_batch: Optional[int] = None,
 ) -> DINOEmbedding:
     """
     DINOv3 SAT-493M embeddings of NESTED HEALPix data.
@@ -1396,7 +1587,28 @@ def GetDINOV3SAT(
     square image, which is passed to an unmodified DINOv3 backbone.  How that
     image is built is the important choice:
 
-    ``projection="tangent"`` (default)
+    ``projection="gauge"`` (default)
+        The image is a :class:`~healpix_analyse.patches.HealPixPatches` patch
+        of ``tile_px`` pixels centred on the cell of ``parent_level``: the
+        ``N x N`` grid of the North Pole rotated by the gauge to the cell and
+        sampled by bilinear interpolation at the spacing of ``level``,
+        exactly as a ``HealPixConv`` kernel -- then transposed to north up,
+        east right.  ``tile_px`` is a power of two, so no pixel is at the
+        centre: the cell is the centre of the grid, and the bilinear
+        interpolation places every pixel where it belongs.
+
+        The ``T x T`` tokens of an image (``T = tile_px / 16``) are the grid
+        of ``HealPixPatches(level - 4, T)`` centred on the same cell, so the
+        adjoint of that operator (its ``fold``, normalised by the weights)
+        returns them to the cells of ``level - 4``: **one vector per cell of
+        ``level - 4``**, the weighted mean of the tokens of every image that
+        reads it.  ``embedding`` / ``cell_id`` hold that field (and
+        ``patch_*`` the same arrays); the per-image vector (``pooling``) is
+        in ``image_embedding`` / ``image_cell_id``.  Images and fold run on
+        the device (Triton kernels on CUDA), the centres by batches of
+        ``centre_batch``.
+
+    ``projection="tangent"``
         The image is resampled onto a north-up gnomonic plane tangent at the
         cell centre, with a constant ground sampling.  Shapes are then correct:
         HEALPix cells have equal area but not equal shape, and at 52 deg N the
@@ -1451,7 +1663,7 @@ def GetDINOV3SAT(
         Resolution of the tile centres; ``level - parent_level >= 4`` is
         required (one DINO patch is 16 px = 4 HEALPix levels).  ``level - 8``
         (256 px tiles, 16x16 patch tokens) is the natural choice.
-    projection : {"tangent", "nested", "percell"}
+    projection : {"gauge", "tangent", "percell", "nested"}
         See above.
     context_px : int, optional
         Side of the window in ``percell`` mode, a multiple of 16.  The default
@@ -1535,6 +1747,18 @@ def GetDINOV3SAT(
     device : str or torch.device, optional
     autocast : bool
         Use bfloat16 autocast on CUDA.
+    ellipsoid : str, optional
+        Reference ellipsoid of the HEALPix grid -- ``"wgs84"`` for the
+        GRID4EARTH Sentinel-2 stores.  ``None`` uses the module setting
+        (:func:`set_ellipsoid`).  In gauge mode it sets the shape of the
+        images on the ground (see ``HealPixPatches``); the cells read do not
+        depend on it.
+    rotations : {1, 4}
+        Gauge mode: average the tokens over the 4 quarter turns of every
+        image (each turned back before the fold), an embedding that does not
+        depend on the orientation of the scene.  Costs 4 forward passes.
+    centre_batch : int, optional
+        Gauge mode: images per geometry build (default: about 4e6 pixels).
 
     Returns
     -------
@@ -1543,6 +1767,8 @@ def GetDINOV3SAT(
     k = int(level) - int(parent_level)
     if k < 1:
         raise ValueError("parent_level must be coarser than level")
+    if projection not in ("gauge", "tangent", "nested", "percell"):
+        raise ValueError("projection must be 'gauge', 'tangent', 'nested' or 'percell'")
     if k < DINOV3_PATCH_LEVELS and projection != "percell":
         raise ValueError(
             f"level - parent_level must be >= {DINOV3_PATCH_LEVELS} "
@@ -1567,8 +1793,15 @@ def GetDINOV3SAT(
             raise ValueError("stride < 1 cannot be combined with over_sample > 1 "
                              "or return_patches")
         _stride_n(stride)                                       # validates the value
-    if projection not in ("tangent", "nested", "percell"):
-        raise ValueError("projection must be 'tangent', 'nested' or 'percell'")
+    if projection == "gauge" and (n > 1 or stride != 1.0):
+        raise ValueError("projection='gauge' already returns one vector per cell of "
+                         "level - 4: over_sample and stride do not apply")
+    if int(rotations) not in (1, 4):
+        raise ValueError("rotations must be 1 or 4")
+    if int(rotations) != 1 and projection != "gauge":
+        raise ValueError("rotations is only available with projection='gauge'")
+    from healpix_analyse._ellipsoid import canonicalize_ellipsoid
+    ell = canonicalize_ellipsoid(HEALPIX_ELLIPSOID if ellipsoid is None else str(ellipsoid))
 
     d = _as_numpy(data)
     if d.ndim == 1:
@@ -1578,6 +1811,52 @@ def GetDINOV3SAT(
     d, ids = _deduplicate(d, ids, duplicates)
     # the network expects an 8-bit-like RGB image in [0, 1]; never feed raw units
     d, in_range, in_how = scale_input(d, input_range, verbose=verbose)
+
+    # ---- HealPixPatches images, tokens folded to level - 4 -----------------
+    if projection == "gauge":
+        if tile_px is None:
+            N = pow2_cover_px(np.unique(ids >> (2 * k)), parent_level, healpix_gsd_m(level))
+            N = max(N, 2 ** k, DINOV3_PATCH)
+        elif np.isscalar(tile_px):
+            N = int(tile_px)
+        else:
+            raise ValueError("projection='gauge' takes a single tile_px (square images)")
+        if N < DINOV3_PATCH or N & (N - 1):
+            raise ValueError(f"tile_px must be a power of two >= {DINOV3_PATCH}")
+        if N < 2 ** k:
+            raise ValueError(f"tile_px={N} is smaller than the cell of parent_level "
+                             f"({2 ** k} px)")
+        if model is None:
+            model = load_dinov3_sat(model_name, weights, device=device)
+        dev = next(model.parameters()).device if device is None else torch.device(device)
+        model = model.to(dev).eval()
+        out = _gauge_embeddings(
+            d, ids, level, parent_level, tile_px=N, ellipsoid=ell,
+            rotations=int(rotations), fill=fill, min_coverage=min_coverage,
+            model=model, mean=mean, std=std, pooling=pooling, batch_size=batch_size,
+            centre_batch=centre_batch, dev=dev, autocast=autocast, verbose=verbose,
+        )
+        res = DINOEmbedding(
+            embedding=out["embedding"], cell_id=out["cell_id"],
+            parent_level=int(parent_level), coverage=out["coverage"],
+            projection="gauge", gsd_m=healpix_gsd_m(level), tile_px=(N, N),
+            cell_level=out["cell_level"], input_range=in_range, input_scaling=in_how,
+            image_embedding=out["image_embedding"], image_cell_id=out["image_cell_id"],
+            image_coverage=out["image_coverage"], rotations=int(rotations), ellipsoid=ell,
+        )
+        res.patch_embedding, res.patch_cell_id, res.patch_level = (
+            res.embedding, res.cell_id, out["cell_level"])
+        from healpix_geo import nested as _hg
+        lon, lat = _hg.healpix_to_lonlat(_as_ids(res.cell_id), out["cell_level"],
+                                         ellipsoid=ell)
+        res.patch_lon = np.asarray(lon, dtype=np.float64)
+        res.patch_lat = np.asarray(lat, dtype=np.float64)
+        if res.image_cell_id.size:
+            clon, clat = _hg.healpix_to_lonlat(_as_ids(res.image_cell_id),
+                                               int(parent_level), ellipsoid=ell)
+            res.centre_lon = np.asarray(clon, dtype=np.float64)
+            res.centre_lat = np.asarray(clat, dtype=np.float64)
+        return res
 
     # ---- one tangent plane per output cell --------------------------------
     if projection == "percell":

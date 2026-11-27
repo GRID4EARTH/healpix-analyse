@@ -2,7 +2,29 @@
 
 ## Unreleased
 
+### Added
+- `GetDINOV3SAT(projection="gauge")`, the new default: the images are
+  `HealPixPatches` patches centred on the cells of `parent_level` (the patch
+  of a `HealPixConv` kernel, transposed to north up), and the tokens are
+  folded back to the cells of `level - 4` with the adjoint of
+  `HealPixPatches(level - 4, tile_px / 16)`, whose grid is exactly the token
+  grid. One vector per cell of `level - 4`, with no half-cell shift (the
+  `"nested"` mode with `over_sample >= 2` and the `stride < 1` labels are off
+  by half a cell), no nearest-token duplicates and no holes. New arguments
+  `ellipsoid`, `rotations` (average over the 4 quarter turns) and
+  `centre_batch`; new result fields `image_embedding`, `image_cell_id`,
+  `image_coverage`. Images and fold run on the device by batches of centres.
+- `HealPixPatches`: `centres=<level>` (patches centred on the cells of any
+  level between `L - p` and `L`), `centre_ids=` (a subset of centres, to
+  build the geometry by batches), `ellipsoid=` (the patch square in metres on
+  the ellipsoid; same cells, below 0.34 % change on WGS84) and
+  `centre_lonlat()`.
+
 ### Changed
+- **`GetDINOV3SAT` defaults to `projection="gauge"`**, which returns one
+  vector per cell of `level - 4` in `embedding` / `cell_id` (the per-image
+  vector moves to `image_embedding`). Pass `projection="tangent"` for the
+  previous behaviour.
 - Stencil binding (`HealPixConv`, its strided and transposed forms,
   `missing="local_mean"`, `HealPixNeighbourhoodAttention`, and the gauge mode
   of `HealPixPatches`): a bilinear neighbour inside the domain counts only if
