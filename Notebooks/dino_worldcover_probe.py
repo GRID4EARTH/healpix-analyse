@@ -50,6 +50,7 @@ def wc_tile(lon, lat):
 def worldcover_labels(lon, lat, half_m=150.0, n=9):
     """Majority WorldCover class in an n x n grid within +-half_m of each point."""
     import rasterio
+    lon = (np.asarray(lon, float) + 180.0) % 360.0 - 180.0     # healpix-geo gives [0, 360)
     u = np.linspace(-half_m, half_m, n)
     dy, dx = np.meshgrid(u, u, indexing="ij")
     dlat = dy.ravel() / 111320.0
