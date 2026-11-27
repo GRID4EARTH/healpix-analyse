@@ -1617,7 +1617,7 @@ tools:
   domain: the cells present in the data
   ordering: NESTED
   ellipsoid: the ellipsoid argument ("wgs84" for the GRID4EARTH Sentinel-2 stores), else the module setting set_ellipsoid(), "sphere" by default
-  io: "data [N, C] reflectances in [0, 1] -> DINOEmbedding (NumPy)"
+  io: "data [N, C] in any units, mapped to [0, 1] by input_range (default: 1-99 percentiles), NaN = missing -> DINOEmbedding (NumPy)"
   differentiable: no (inference mode)
   gpu: yes, bf16 autocast on CUDA
   nan: cells with a NaN band are left out; image pixels without data filled (per-image mean or zero); min_coverage drops images

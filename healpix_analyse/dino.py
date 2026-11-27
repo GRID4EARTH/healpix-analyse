@@ -1521,12 +1521,16 @@ def _gauge_embeddings(
                 acc = torch.zeros(D, tok_ids.size, dtype=torch.float32, device=dev)
                 wsum = torch.zeros(tok_ids.size, dtype=torch.float32, device=dev)
                 covsum = torch.zeros(tok_ids.size, dtype=torch.float32, device=dev)
-            acc += Tm.fold(tok[None, :, None], index=kk, norm="none")[0]
-            ones = torch.ones(1, kk.numel(), 1, 1, T, T, dtype=torch.float32, device=dev)
-            wsum += Tm.fold(ones, index=kk, norm="none")[0, 0]
+            # HealPixPatches renormalises the bilinear weights over the
+            # neighbours inside the domain; multiplying by its coverage gives
+            # back the true weights, so that a token lying mostly outside the
+            # domain (edge, clouded cell) counts for its overlap only
+            tw = Tm.coverage[kk, 0].to(torch.float32)             # [Mk, T, T]
+            acc += Tm.fold((tok * tw[:, None])[None, :, None], index=kk, norm="none")[0]
+            wsum += Tm.fold(tw.view(1, -1, 1, 1, T, T), index=kk, norm="none")[0, 0]
             # token coverage: the mean pixel coverage of its 16 x 16 block
-            ctok = torch.nn.functional.avg_pool2d(cov[:, None], DINOV3_PATCH)  # [Mc,1,T,T]
-            covsum += Tm.fold(ctok.view(1, -1, 1, 1, T, T),
+            ctok = torch.nn.functional.avg_pool2d(cov[:, None], DINOV3_PATCH)  # [Mk,1,T,T]
+            covsum += Tm.fold((ctok[:, 0] * tw).view(1, -1, 1, 1, T, T),
                               index=kk, norm="none")[0, 0]
             del Tm
             img_vec.append(torch.cat(vecs).numpy())
@@ -1792,6 +1796,8 @@ def GetDINOV3SAT(
         raise ValueError("DINOv3 SAT expects 3 bands (R, G, B)")
     if fill == "nan":
         raise ValueError("fill='nan' cannot be fed to the network")
+    if fill not in ("mean", "zero"):
+        raise ValueError("fill must be 'mean' or 'zero'")
     n = int(over_sample)
     if n < 1 or (n & (n - 1)):
         raise ValueError("over_sample must be a power of two (1, 2, 4, ...)")
@@ -1813,7 +1819,7 @@ def GetDINOV3SAT(
     if int(rotations) != 1 and projection != "gauge":
         raise ValueError("rotations is only available with projection='gauge'")
     from healpix_analyse._ellipsoid import canonicalize_ellipsoid
-    ell = canonicalize_ellipsoid(HEALPIX_ELLIPSOID if ellipsoid is None else str(ellipsoid))
+    ell = canonicalize_ellipsoid(HEALPIX_ELLIPSOID if ellipsoid is None else ellipsoid)
 
     d = _as_numpy(data)
     if d.ndim == 1:

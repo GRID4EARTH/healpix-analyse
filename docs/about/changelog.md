@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+- `GetDINOV3SAT` debugging and sampling options: `stride` (tangent images
+  centred on a sub-grid of `parent_level`, with `stride_centres`),
+  `pooling="centre"` (the tokens over the centre cell), and the public
+  helpers `tangent_images`, `stride_centres`,
+  `scale_input` and `input_range_of`.
 - `GetDINOV3SAT(projection="gauge")`, the new default: the images are
   `HealPixPatches` patches centred on the cells of `parent_level` (the patch
   of a `HealPixConv` kernel, transposed to north up), and the tokens are
@@ -25,6 +30,21 @@
   vector per cell of `level - 4` in `embedding` / `cell_id` (the per-image
   vector moves to `image_embedding`). Pass `projection="tangent"` for the
   previous behaviour.
+- **`GetDINOV3SAT` maps its input to [0, 1] in every projection**
+  (`input_range="auto"`: the 1-99 percentiles of all bands together, then
+  clipped), so data already in [0, 1] are stretched and the embeddings of the
+  `tangent`, `nested` and `percell` projections change; pass
+  `input_range="unit"` for the previous behaviour. Near-constant data raise
+  ("empty input range"). Other choices: `"sat493m"`, `"reflectance"`,
+  `"uint8"` or an explicit `(lo, hi)`; `scale_input` and `input_range_of`
+  are public.
+- `GetDINOV3SAT(verbose=True)` is the default: it prints the input mapping
+  and the progress. Pass `verbose=False` to silence it.
+- `GetDINOV3SAT` validates `fill` (`"mean"` or `"zero"`) and accepts a dict
+  ellipsoid.
+- `tangent_grid_lonlat`: the sign of `shift[0]` is flipped, so that row `r`
+  of the shifted grid is row `r + shift[0]` of the unshifted one (it was
+  `r - shift[0]`, which mis-interleaved the `over_sample` grids).
 - Stencil binding (`HealPixConv`, its strided and transposed forms,
   `missing="local_mean"`, `HealPixNeighbourhoodAttention`, and the gauge mode
   of `HealPixPatches`): a bilinear neighbour inside the domain counts only if
