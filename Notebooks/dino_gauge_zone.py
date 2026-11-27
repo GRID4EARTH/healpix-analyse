@@ -60,6 +60,11 @@ def parse():
     p.add_argument("--weights", default="/home/jovyan/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth")
     p.add_argument("--cache", default="/home/jovyan/s2_cache")
     p.add_argument("--k", type=int, default=8)
+    p.add_argument("--exact-zone", action="store_true",
+                   help="use the zone holding (lon, lat) even if the data cover it partly "
+                        "(default: the best-covered zone, nearest to (lon, lat))")
+    p.add_argument("--min-cell-coverage", type=float, default=0.95,
+                   help="cells whose tokens read less of the data are not classified")
     p.add_argument("--rotations", type=int, default=1, choices=(1, 4))
     p.add_argument("--input-range", default="sat493m")
     p.add_argument("--compare-tangent", action="store_true",
@@ -176,12 +181,23 @@ def main():
         date = str(src.dates[a.product])
         zk = 2 * (L - zone_level)
         zone = int(D.cells_at_lonlat(zone_level, np.array([a.lon]), np.array([a.lat]))[0])
+        if not a.exact_zone:
+            # the best-covered zone, nearest to (lon, lat) among the equally covered
+            fin = np.isfinite(rgb_all).all(axis=1)
+            zid, cnt = np.unique(ids_all[fin] >> zk, return_counts=True)
+            full = np.round(cnt / 4 ** (L - zone_level), 2)
+            zl_, za_ = D.cell_centres_lonlat(zone_level, zid)
+            dist = np.hypot((zl_ - a.lon) * np.cos(np.radians(a.lat)), za_ - a.lat)
+            zone = int(zid[np.lexsort((dist, -full))[0]])
+            print(f"zone {zone}: {100 * full.max():.0f} % covered, "
+                  f"{111 * dist[zid == zone][0]:.1f} km from ({a.lon}, {a.lat})")
         znb = D.cell_neighbours(zone_level, np.array([zone]))[:, 0]
         sel = np.isin(ids_all >> zk, np.r_[zone, znb[znb >= 0]])
         ids, rgb = ids_all[sel], rgb_all[sel]
         del rgb_all, ids_all
     D.set_ellipsoid(ell)
-    zone = int(D.cells_at_lonlat(zone_level, np.array([a.lon]), np.array([a.lat]))[0])
+    if a.synthetic:
+        zone = int(D.cells_at_lonlat(zone_level, np.array([a.lon]), np.array([a.lat]))[0])
     zk = 2 * (L - zone_level)
     # keep the parent cells of the zone and enough rings around it for the
     # images that reach the zone to see their data: no image is wasted on the
@@ -223,6 +239,12 @@ def main():
                          batch_size=64, device=a.device, backend=a.backend)
     t_dino = time.time() - t0
     keep = (res.cell_id >> (2 * (TL - zone_level))) == zone
+    n_zone = int(keep.sum())
+    # the cells at the edge of the data read mostly filled pixels: their
+    # vectors describe the filling, not the ground, and make classes of their own
+    keep &= res.coverage >= a.min_cell_coverage
+    print(f"{n_zone - int(keep.sum())} cells of the zone below "
+          f"min_cell_coverage={a.min_cell_coverage} left out")
     cells, E = res.cell_id[keep], res.embedding[keep]
     print(f"{label}: {res.image_cell_id.size} images of {a.tile_px} px -> {cells.size} cells of "
           f"level {TL} in the zone, vectors {E.shape[1]}-D, {t_dino:.0f} s")
@@ -251,8 +273,12 @@ def main():
     OH, OW = D.parent_cover_px(np.array([zone]), zone_level, gsd, margin_px=0)
     olon, olat = D.tangent_grid_lonlat(zl, za, (OH, OW), gsd / D.EARTH_RADIUS_M)
     olon, olat = olon[0], olat[0]
-    view, _ = D.sample_healpix(rgb, ids, L, olon, olat)
-    inside = D.cells_at_lonlat(zone_level, olon, olat) == zone
+    view, has = D.sample_healpix(rgb, ids, L, olon, olat)
+    inside = (D.cells_at_lonlat(zone_level, olon, olat) == zone) & has
+    # crop to the data
+    rr, cc = np.nonzero(inside)
+    sl = (slice(rr.min(), rr.max() + 1), slice(cc.min(), cc.max() + 1))
+    olon, olat, view, inside = olon[sl], olat[sl], view[sl], inside[sl]
     pix_cell = D.cells_at_lonlat(TL, olon, olat)
     o = np.argsort(cells)
     p = np.clip(np.searchsorted(cells[o], pix_cell), 0, cells.size - 1)
@@ -297,17 +323,22 @@ def main():
 
     names = [n for n in ("pca3-kmeans", "cos-kmeans", "umap-kmeans", "umap-hdbscan",
                          "spectral", "colour") if n in labs]
-    fig, axes = plt.subplots(2, 3, figsize=(21, 14.5))
-    for x, n in zip(axes.ravel(), names):
+    fig, axes = plt.subplots(2, 4, figsize=(28, 15))
+    axes[0, 0].imshow(rgb_img, interpolation="nearest")
+    axes[0, 0].set_title("RGB, north up", fontsize=11)
+    axes[1, 0].imshow(pca_img, interpolation="nearest")
+    axes[1, 0].set_title(f"PCA of the DINO vectors as RGB ({100 * evr.sum():.0f} % of variance)",
+                         fontsize=11)
+    for x in (axes[0, 0], axes[1, 0]):
+        x.set_axis_off()
+    for x, n in zip(np.r_[axes[0, 1:], axes[1, 1:]], names):
         s = stats[n]
         extra = f", {100 * s['unclassified']:.0f} % left out" if s["unclassified"] > 0 else ""
         show_classes(x, labs[n], f"{n}  K={s['k']}{extra}\ncoherence {s['coherence']:.2f} "
                      f"(chance {1 / max(s['k'], 1):.2f}), ARI vs colour {s['ari_colour']:.2f}")
-    for x in axes.ravel()[len(names):]:
-        x.set_axis_off()
-    fig.suptitle(head, fontsize=10)
+    fig.suptitle(head, fontsize=11)
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "2_classes.png"), dpi=110)
+    fig.savefig(os.path.join(out_dir, "2_classes.png"), dpi=90)
 
     # ---- the previous mode, for comparison
     if a.compare_tangent:
