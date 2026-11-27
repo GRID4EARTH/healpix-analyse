@@ -45,12 +45,28 @@ period $L$ along each coordinate that must be larger than the extent of the
 coordinates. With $N$ modes, the frequencies are $k / L$ for
 $k = -\lfloor N/2 \rfloor, \dots, N - \lfloor N/2 \rfloor - 1$, the order of
 `np.fft.fftshift(np.fft.fftfreq(N, d=L / N))`.
-By default $L$ is the extent of the coordinate plus the median spacing between
-its distinct values. On a regular grid of $n$ samples with spacing $dx$ this is
-$n \, dx$, and the result equals `np.fft.fftshift(np.fft.fft2(...))` of the
-gridded data. For scattered samples such as HEALPix cell centres the median
-spacing is small and the period is close to the extent; pass
-`period=(Lx, Ly)` to choose it, for instance the extent plus one cell size.
+
+The module has several ways to compute $L$:
+- {func}`~.nufft.period_median` : the extent of the coordinate plus the median
+  spacing between its distinct values. On a regular grid of $n$ samples with
+  spacing $dx$ this is $n \, dx$, and the result equals
+  `np.fft.fftshift(np.fft.fft2(...))` of the gridded data. This is not adapted
+  for scattered samples such as HEALPix cell centres where the median gap is not
+  representative of the pixel size.
+- {func}`~.nufft.period_area` : the extent of the coordinate plus an average
+  pixel size, estimated as the samples extent area divided by the number of
+  samples. This tends to overestimate the average pixel size for any grid that
+  is not rectangular. For rectangular grids, this slightly underestimates the
+  pixel size as the coordinates extent are limited to cell centers (_ie_ we are
+  missing the border).
+- {func}`~.nufft.period_vertices` : the exact extent from HEALPix cell vertices
+  is used. The function takes in the output of {func}`healpix_geo.auto.vertices`
+  (eventually transformed with a projection). The output can be passed to the
+  `period` argument.
+
+By default (`period="auto"`), if the `nufft` function detects that the samples
+are on a regular grid it uses the "median" method, otherwise the "area" method.
+Any user-picked values can be passed.
 
 **Number of modes:** frequencies above the Nyquist frequency of the sampling,
 $1 / (2 \, dx)$ for a sample spacing $dx$, are aliased. Since the HEALPix grid is

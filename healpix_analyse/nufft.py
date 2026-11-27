@@ -22,6 +22,7 @@ periods. This is the sign of :func:`numpy.fft.fft2`. On a regular grid of
 
 import itertools
 from collections.abc import Sequence
+from typing import Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -140,7 +141,91 @@ def get_bounds(*coordinates: npt.ArrayLike) -> list[tuple[float, float]]:
     return [(float(np.min(x)), float(np.max(x))) for x in coordinates]
 
 
-def default_period(x: npt.ArrayLike) -> float:
+def _unique_float(x: np.ndarray, rtol: float = 1e-8) -> np.ndarray:
+    """Return unique float values, up to a tolerance."""
+    # See https://stackoverflow.com/a/38050528
+    as_int = np.floor(x.ravel() / rtol).astype("int")
+    return (np.unique(as_int) + 0.5) * rtol
+
+
+def _is_regular(x: np.ndarray, y: np.ndarray) -> bool:
+    """Return if coordinates correspond to a regular grid.
+
+    A regular grid is rectangular, not rotated, but not necessarily uniformly
+    spaced. Typically coordinates created by ``np.meshgrid(x, y)``.
+    """
+    x1d = _unique_float(x)
+    y1d = _unique_float(y)
+
+    return x1d.size * y1d.size == x.size
+
+
+def period_vertices(
+    x_vertices: npt.NDArray, y_vertices: npt.NDArray
+) -> tuple[float, float]:
+    """Return the exact period from the extent of HEALPix cells.
+
+    Parameters
+    ----------
+    x_vertices, y_vertices : array-like of float
+        Coordinates of the vertices of HEALPix cells, as given by the function
+        :func:`healpix_geo.auto.vertices`, with an eventual projection applied.
+        The last axis must be of size 4.
+
+    Returns
+    -------
+    period_x, period_y : float
+        Tuple of the period for both dimensions.
+    """
+    for x in (x_vertices, y_vertices):
+        if x.ndim < 2 or x.shape[-1] != 4:
+            raise ValueError(
+                "Vertices coordinates must have their last axis of size 4 "
+                f"(received shape {x.shape})."
+            )
+
+    xmin = np.min(x_vertices[..., 3])
+    xmax = np.max(x_vertices[..., 1])
+    ymin = np.min(y_vertices[..., 0])
+    ymax = np.max(y_vertices[..., 2])
+    return xmax - xmin, ymax - ymin
+
+
+def period_area(
+    n_samples: int, bounds: Sequence[tuple[float, float]]
+) -> tuple[float, float]:
+    """Return a period computed from the estimated average pixel size.
+
+    This estimates the average pixel size from the extent of both coordinates
+    and the number of samples. This will overestimate the average pixel size for
+    anything that is not rectangular. For rectangular grids, this slightly
+    underestimates the pixel size as the coordinates extent are limited to cell
+    centers (*ie* we are missing the border) and using another method would be
+    recommended.
+
+    Parameters
+    ----------
+    n_samples : int
+        Number of samples.
+    bounds : list of tuple of float
+        The minimum and maximum values of each coordinates, as given by
+        :func:`get_bounds`.
+
+    Returns
+    -------
+    period_x, period_y : float
+        Tuple of the period for both dimensions.
+    """
+    if len(bounds) != 2:
+        raise ValueError("Not as many bounds as coordinates.")
+
+    (xmin, xmax), (ymin, ymax) = bounds
+    rect_area = (xmax - xmin) * (ymax - ymin)
+    avg_pixel_size = np.sqrt(rect_area / n_samples)
+    return (xmax - xmin + avg_pixel_size), (ymax - ymin + avg_pixel_size)
+
+
+def period_median(x: npt.ArrayLike) -> float:
     """Return the default period of the transform along one coordinate.
 
     The period is the extent of the coordinate plus its typical sample spacing,
@@ -149,16 +234,26 @@ def default_period(x: npt.ArrayLike) -> float:
     :func:`numpy.fft.fft`: the first and last samples are one spacing apart on
     the periodic domain instead of coinciding.
 
-    For scattered samples, such as HEALPix cell centres, the median gap is small
-    and the period is close to the extent; pass ``period`` to :func:`nufft` to
-    choose it (for instance the extent plus one cell size).
+    For scattered samples or rotated grids, such as HEALPix cell centres, the
+    median gap is not representative of the pixel size. Other methods to find
+    the period should be used.
+
+    Parameters
+    ----------
+    x : array-like of float
+        Coordinates along one dimension.
+
+    Returns
+    -------
+    period : float
+        Period along one dimension.
 
     Raises
     ------
     ValueError
         If the coordinate takes a single value (zero extent).
     """
-    values = np.unique(np.asarray(x, dtype=np.float64))
+    values = _unique_float(np.asarray(x, dtype=np.float64))
     if values.size < 2:
         raise ValueError(
             "A coordinate takes a single value: its extent is zero and the "
@@ -239,11 +334,9 @@ def nufft(
     data: npt.ArrayLike,
     *,
     n_frequencies: Sequence[int],
-    period: Sequence[float] | None = None,
+    period: Sequence[float] | Literal["auto", "median", "area"] = "auto",
     rtol: float = 1e-6,
-) -> tuple[
-    npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.complex128]
-]:
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.complex128]]:
     """Compute a two-dimensional non-uniform FFT.
 
     This is a thin wrapper around ``finufft.nufft2d1``. It returns
@@ -268,9 +361,13 @@ def nufft(
         Number of frequencies to keep for each dimension (Nx, Ny).
     period:
         Period of the transform along x and y, in the units of the coordinates;
-        it must be larger than the extent of the coordinates. Defaults to
-        :func:`default_period` of each coordinate: ``n * dx`` on a regular grid.
-        The frequency step is ``1 / period``.
+        it must be larger than the extent of the coordinates. Can also be a
+        method to guess the period values:
+
+        - "median": Uses :func:`period_median`, best suited for rectangular grids.
+        - "area": Uses :func:`period_area`, best suited for non-rectangular grids.
+        - "auto" (default): If the grid is detected as regular, uses "median",
+          otherwise "area".
     rtol:
         Relative tolerance. Smaller values give better accuracy but slower
         computations.
@@ -299,14 +396,27 @@ def nufft(
     if len(n_frequencies) != 2 or min(n_frequencies) < 1:
         raise ValueError("n_frequencies must be two positive integers (Nx, Ny).")
 
-    if period is None:
-        periods = [default_period(x), default_period(y)]
+    bounds = get_bounds(x, y)
+
+    if isinstance(period, str):
+        if period == "auto":
+            if _is_regular(x, y):
+                periods = (period_median(x), period_median(y))
+            else:
+                periods = period_area(x.size, bounds)
+        elif period == "median":
+            periods = (period_median(x), period_median(y))
+        elif period == "area":
+            periods = period_area(x.size, bounds)
+        else:
+            raise KeyError(
+                "Invalid period '{}', must be 'auto', 'median', 'area' or a sequence of floats."
+            )
     else:
         periods = [float(p) for p in period]
         if len(periods) != 2:
             raise ValueError("period must be two values (Lx, Ly).")
 
-    bounds = get_bounds(x, y)
     xy_norm = normalize_coordinates([x, y], bounds, periods)
     fx, fy = get_frequencies(n_frequencies, periods)
 

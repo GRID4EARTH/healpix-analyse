@@ -6,8 +6,12 @@ import pytest
 pytest.importorskip("finufft")
 
 from healpix_analyse.nufft import (  # noqa: E402
-    default_period,
+    _is_regular,
+    _unique_float,
+    get_bounds,
     nufft,
+    period_area,
+    period_median,
     windowing_weights_bbox,
     windowing_weights_polygon,
 )
@@ -17,6 +21,62 @@ def regular_grid(nx, ny, dx=1.0, dy=1.0, x0=0.0, y0=0.0):
     """Coordinates of a regular nx x ny grid, flattened like a C-ordered (ny, nx) array."""
     yy, xx = np.meshgrid(y0 + dy * np.arange(ny), x0 + dx * np.arange(nx), indexing="ij")
     return xx.ravel(), yy.ravel()
+
+
+# --------------------------------------------------------------------- periods
+
+
+def test_unique_float():
+    rng = np.random.default_rng(0)
+    Nx, Ny = 12, 18
+    dx, dy = 0.5, 0.8
+
+    x = -5 + np.arange(Nx) * dx + rng.uniform(size=Nx) * dx / 3
+    y = -3 + np.arange(Ny) * dy + rng.uniform(size=Ny) * dy / 3
+    xx, yy = np.meshgrid(x, y)
+
+    np.testing.assert_allclose(x, _unique_float(xx.ravel()))
+    np.testing.assert_allclose(y, _unique_float(yy.ravel()))
+
+
+def test_is_regular():
+    rng = np.random.default_rng(0)
+    Nx, Ny = 12, 18
+    dx, dy = 0.5, 0.8
+
+    x = -5 + np.arange(Nx) * dx + rng.uniform(size=Nx) * dx / 3
+    y = -3 + np.arange(Ny) * dy + rng.uniform(size=Ny) * dy / 3
+    xx, yy = np.meshgrid(x, y)
+
+    assert _is_regular(xx.ravel(), yy.ravel())
+
+    xx[5, 5] += 0.05
+    assert not _is_regular(xx.ravel(), yy.ravel())
+
+
+def test_period_median():
+    # regular samples, repeated: n * dx
+    assert period_median(np.repeat(0.25 * np.arange(5), 3)) == pytest.approx(1.25)
+    with pytest.raises(ValueError, match="single value"):
+        period_median(np.full(4, 3.0))
+
+
+def test_period_area():
+    """Test equivalent to regular grid."""
+    dx = 0.7
+    Nx, Ny = 7, 12
+    xx, yy = regular_grid(Nx, Ny, dx=dx, dy=dx)
+
+    # Because we only have the left edge of pixels (or centers same result) we are
+    # underestimating to total surface area by a border of one pixel.
+    expected_dx = dx / np.sqrt(Nx * Ny / (Nx - 1) / (Ny - 1))
+    expected_period_x = dx * (Nx - 1) + expected_dx
+    expected_period_y = dx * (Ny - 1) + expected_dx
+
+    bounds = get_bounds(xx, yy)
+    period_x, period_y = period_area(xx.size, bounds)
+    assert np.isclose(period_x, expected_period_x)
+    assert np.isclose(period_y, expected_period_y)
 
 
 # --------------------------------------------------------------------- nufft
@@ -87,13 +147,6 @@ def test_period_not_larger_than_extent_raises():
     x, y = regular_grid(8, 8)  # extent 7
     with pytest.raises(ValueError, match="period"):
         nufft(x, y, np.ones(x.size), n_frequencies=(8, 8), period=(7.0, 8.0))
-
-
-def test_default_period():
-    # regular samples, repeated: n * dx
-    assert default_period(np.repeat(0.25 * np.arange(5), 3)) == pytest.approx(1.25)
-    with pytest.raises(ValueError, match="single value"):
-        default_period(np.full(4, 3.0))
 
 
 @pytest.mark.parametrize("case", ["constant", "nan", "inf"])
