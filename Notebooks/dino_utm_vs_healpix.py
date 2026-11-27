@@ -81,6 +81,10 @@ def parse():
                         "[[a, b, label], ...] and 'sensitivity_site'; default: the "
                         "48 deg N set of this file")
     p.add_argument("--k", type=int, default=8, help="k-means classes for the pair agreement")
+    p.add_argument("--resampler", default="psf", choices=("psf", "ct"),
+                   help="UTM -> HEALPix: 'psf' (PSFResampler, damped fit: sharpens small "
+                        "scales) or 'ct' (CloughTocherResampler, C1 interpolation, no "
+                        "deconvolution: the closest analogue of the bilinear UTM chain)")
     p.add_argument("--max-centres", type=int, default=800)
     p.add_argument("--lam", type=float, default=0.1,
                    help="PSFResampler damping: level 20 (6.2 m) is finer than the 10 m "
@@ -248,10 +252,16 @@ def main():
         lon, lat = utm_lonlat(transform, crs, H, W)
         ok = (arr > 0).any(0).ravel()                               # TCI nodata = 0
         # ---- HEALPix conversion of the crop (PSF resampler, WGS84)
-        op = PSFResampler(lon.ravel()[ok], lat.ravel()[ok], a.level, device=dev,
-                          ellipsoid="WGS84")
-        r = op.resample(torch.as_tensor(arr.reshape(3, -1)[:, ok], dtype=torch.float32,
-                                        device=dev), lam=a.lam, clip=(0.0, 255.0))
+        vals = torch.as_tensor(arr.reshape(3, -1)[:, ok], dtype=torch.float32, device=dev)
+        if a.resampler == "ct":
+            from healpix_resample.clough_tocher import CloughTocherResampler
+            op = CloughTocherResampler(lon.ravel()[ok], lat.ravel()[ok], a.level, device=dev,
+                                       ellipsoid="WGS84", dtype=torch.float32, verbose=False)
+            r = op.resample(vals)
+        else:
+            op = PSFResampler(lon.ravel()[ok], lat.ravel()[ok], a.level, device=dev,
+                              ellipsoid="WGS84")
+            r = op.resample(vals, lam=a.lam, clip=(0.0, 255.0))
         hid = np.asarray(torch.as_tensor(r.cell_ids).cpu()).astype(np.int64)
         hval = torch.as_tensor(r.cell_data).float().cpu()
         o = np.argsort(hid)
@@ -375,7 +385,8 @@ def main():
 
     # ---- save numbers, distributions and examples
     out = dict(spacing_m=s, n_px=a.n, level=a.level, centre_level=a.centre_level,
-               fake=a.fake, lam=a.lam, sensitivity_site=sens_site, sites=site_info,
+               fake=a.fake, lam=a.lam, resampler=a.resampler, sensitivity_site=sens_site,
+               sites=site_info,
                sensitivity=sens, gradient=grad, pairs=pairs)
     with open(os.path.join(a.out, "results.json"), "w") as f:
         json.dump(out, f, indent=1)
