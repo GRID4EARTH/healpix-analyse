@@ -600,3 +600,19 @@ def test_pixel_size_errors():
             HealPixPatches(3, 2, pixel_size=bad)
     with pytest.raises(ValueError):                 # beyond a quarter of the sphere
         HealPixPatches(3, 8, pixel_size=3.0e6)
+
+
+def test_nested_explicit_centres_on_the_full_sphere():
+    """centre_ids on the full sphere: no contiguous fast path, only those tiles."""
+    L, N = 4, 4
+    full = HealPixPatches(L, N, mode="nested", **F64)
+    sub = HealPixPatches(L, N, mode="nested", centre_ids=[5, 17], **F64)
+    assert not sub.contiguous and sub.M == 2
+    x = torch.randn(1, 2, full.K, dtype=torch.float64)
+    torch.testing.assert_close(sub(x), full(x)[:, [5, 17]], atol=0, rtol=0)
+    f = sub.fold(sub(x), norm="none")
+    assert f.shape == x.shape
+    read = np.zeros(full.K, bool)
+    read[np.concatenate([np.arange(c * 16, c * 16 + 16) for c in (5, 17)])] = True
+    torch.testing.assert_close(f[..., read], x[..., read], atol=0, rtol=0)
+    assert float(f[..., ~read].abs().max()) == 0.0

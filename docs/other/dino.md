@@ -156,7 +156,7 @@ against 0.31 with `"tangent"`); `tests/test_dino_gauge.py` checks it.
 
 ```python
 GetDINOV3SAT(
-    data,                     # [N, C] reflectances in [0, 1], NaN = missing
+    data,                     # [N, C] any units (input_range maps to [0, 1]), NaN = missing
     cell_id,                  # [N] NESTED ids at `level`
     level,                    # resolution of `data`
     parent_level,             # resolution of the tiles (level - parent_level >= 4,

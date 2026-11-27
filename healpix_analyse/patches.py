@@ -441,7 +441,8 @@ class HealPixPatches(nn.Module):
         self.K = ids_np.size
         Q = 4**self.p
         self.centre_level = centre_level
-        if centre_ids is not None:
+        explicit_centres = centre_ids is not None
+        if explicit_centres:
             centre_ids = np.asarray(centre_ids, dtype=np.int64).ravel()
             if centre_ids.size == 0:
                 raise ValueError("centre_ids must not be empty.")
@@ -470,9 +471,10 @@ class HealPixPatches(nn.Module):
             inv[perm] = np.arange(perm.size)
             self.register_buffer("_perm", torch.as_tensor(perm, device=device), persistent=False)
             self.register_buffer("_iperm", torch.as_tensor(inv, device=device), persistent=False)
-            # contiguous fast path: the full sphere, or a sorted domain made of
-            # complete level L - p cells
-            self.contiguous = (not self.partial) or (
+            # contiguous fast path: the full sphere with all its centres, or a
+            # sorted domain made of complete level L - p cells (explicit
+            # centre_ids are checked by the second test)
+            self.contiguous = (not self.partial and not explicit_centres) or (
                 self.K == self.M * Q
                 and np.array_equal(ids_np, (centre_ids[:, None] * Q + np.arange(Q)).ravel()))
             idx_t = torch.as_tensor(pos, dtype=torch.int32)
