@@ -23,3 +23,5 @@ Interactive Jupyter notebooks demonstrating the main features of **healpix-analy
    Pyramidal convolution on Sentinel-2 <../external_notebooks/pyramid_conv_sentinel2_test>
    Wide-kernel recipes <../external_notebooks/wide_conv_kernel_recipes>
    DINOv3 tuning on one date <../external_notebooks/dino_tuning_single_date>
+   DINOv3 debugging on a small zone <../external_notebooks/dino_debug_petite_zone>
+   DINOv3 tuning on one date, before stride <../external_notebooks/dino_tuning_single_date_avant_stride>
