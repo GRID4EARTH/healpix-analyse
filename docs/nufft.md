@@ -33,7 +33,7 @@ are in cycles per metre.
 
 **Input data:** `data` can be of shape (M), or (K, M). In the latter case,
 fiNUFFT computes the K transforms in one batch, saving some overhead time. The
-data are converted to a complex type.
+data are converted to a complex type. It must be finite.
 
 **Output:** the coefficients have shape (Ny, Nx), or (K, Ny, Nx) for batched
 data, with Nx and Ny the numbers of frequencies requested with

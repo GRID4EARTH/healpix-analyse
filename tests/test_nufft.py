@@ -172,6 +172,14 @@ def test_bad_shapes_raise():
         nufft(x, y, np.ones((2, 2, x.size)), n_frequencies=(4, 4))
 
 
+def test_nan_in_data_raise():
+    x, y = regular_grid(4, 4)
+    data = np.ones(x.size)
+    data[3] = np.nan
+    with pytest.raises(ValueError):
+        nufft(x, y, data, n_frequencies=(4, 4))
+
+
 # ------------------------------------------------------------------- windows
 
 L_SHAPE = [[0, 0], [2, 0], [2, 1], [1, 1], [1, 2], [0, 2]]

@@ -356,7 +356,7 @@ def nufft(
         periodic interval [0, 2 pi) with :func:`normalize_coordinates`.
     data:
         Data to compute FFT on. Can be of shape (M,) or (K, M) in which case the
-        NUFFT is batched. It is converted to complex128.
+        NUFFT is batched. It must be finite. It is converted to complex128.
     n_frequencies:
         Number of frequencies to keep for each dimension (Nx, Ny).
     period:
@@ -391,6 +391,8 @@ def nufft(
     data = np.asarray(data)
     if data.ndim not in (1, 2) or data.shape[-1] != x.size:
         raise ValueError("data must have shape (M,) or (K, M).")
+    if not np.isfinite(data).all():
+        raise ValueError("data must be finite.")
 
     n_frequencies = tuple(int(n) for n in n_frequencies)
     if len(n_frequencies) != 2 or min(n_frequencies) < 1:
