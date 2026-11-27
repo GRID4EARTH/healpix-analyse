@@ -106,7 +106,7 @@ import healpix_geo.nested as hgn
 import matplotlib.pyplot as plt
 import numpy as np
 
-from healpix_analyse.nufft import nufft, windowing_weights_polygon
+from healpix_analyse.nufft import nufft, windowing_weights_polygon, period_vertices
 
 level = 12  # cells of about 1.6 km
 
@@ -122,9 +122,15 @@ data = np.cos(2 * np.pi * lon / 0.25) + 0.5 * rng.standard_normal(lon.size)
 # Taper over 0.2 degree inside the polygon, after removing the mean
 weights = windowing_weights_polygon(lon, lat, vertices, length=0.2)
 
+# Find exact extent of input cells
+cell_vertices_lon, cell_vertices_lat = hgn.vertices(
+    cell_ids, level, ellipsoid="WGS84"
+)
+periods = period_vertices(cell_vertices_lon, cell_vertices_lat)
+
 # About as many modes as cells across the domain in each direction
 fx, fy, spectrum = nufft(
-    lon, lat, (data - data.mean()) * weights, n_frequencies=(100, 270)
+    lon, lat, (data - data.mean()) * weights, n_frequencies=(100, 270), period=periods
 )
 
 fig, ax = plt.subplots()
