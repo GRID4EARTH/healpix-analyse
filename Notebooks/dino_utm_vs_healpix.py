@@ -81,10 +81,11 @@ def parse():
                         "[[a, b, label], ...] and 'sensitivity_site'; default: the "
                         "48 deg N set of this file")
     p.add_argument("--k", type=int, default=8, help="k-means classes for the pair agreement")
-    p.add_argument("--resampler", default="psf", choices=("psf", "ct"),
+    p.add_argument("--resampler", default="psf", choices=("psf", "ct", "bilinear"),
                    help="UTM -> HEALPix: 'psf' (PSFResampler, damped fit: sharpens small "
                         "scales) or 'ct' (CloughTocherResampler, C1 interpolation, no "
-                        "deconvolution: the closest analogue of the bilinear UTM chain)")
+                        "deconvolution) or 'bilinear' (the tile sampled bilinearly at the "
+                        "HEALPix cell centres: the same interpolation as the UTM images)")
     p.add_argument("--max-centres", type=int, default=800)
     p.add_argument("--lam", type=float, default=0.1,
                    help="PSFResampler damping: level 20 (6.2 m) is finer than the 10 m "
@@ -253,7 +254,33 @@ def main():
         ok = (arr > 0).any(0).ravel()                               # TCI nodata = 0
         # ---- HEALPix conversion of the crop (PSF resampler, WGS84)
         vals = torch.as_tensor(arr.reshape(3, -1)[:, ok], dtype=torch.float32, device=dev)
-        if a.resampler == "ct":
+        if a.resampler == "bilinear":
+            # every level-20 cell of the crop: the children of the level-(L-2) cells
+            # holding a pixel, sampled bilinearly at their centres
+            up = a.level - 2
+            par = np.unique(np.asarray(healpix_geo.nested.lonlat_to_healpix(
+                lon.ravel()[ok], lat.ravel()[ok], up, ellipsoid="WGS84"), dtype=np.int64))
+            hid = ((par[:, None] << 4) + np.arange(16)[None]).ravel()
+            hl, ha = healpix_geo.nested.healpix_to_lonlat(hid.astype(np.uint64), a.level,
+                                                          ellipsoid="WGS84")
+            he, hn = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform(
+                np.asarray(hl, float), np.asarray(ha, float))
+            colf = (he - transform.c) / transform.a
+            rowf = (hn - transform.f) / transform.e
+            inside_c = (colf > 0.5) & (colf < W - 0.5) & (rowf > 0.5) & (rowf < H - 0.5)
+            hid = hid[inside_c]
+            v = sample_utm(arr, transform, np.zeros((1, 2)),
+                           np.stack([he[inside_c], hn[inside_c]], -1)[None])[0]   # [3, K]
+            good_c = (v > 0).any(0)
+            hid, v = hid[good_c], v[:, good_c]
+            o = np.argsort(hid)
+
+            class _R:
+                pass
+            r = _R()
+            r.cell_ids, r.cell_data = hid[o], torch.as_tensor(v[:, o])
+            op = None
+        elif a.resampler == "ct":
             from healpix_resample.clough_tocher import CloughTocherResampler
             op = CloughTocherResampler(lon.ravel()[ok], lat.ravel()[ok], a.level, device=dev,
                                        ellipsoid="WGS84", dtype=torch.float32, verbose=False)
