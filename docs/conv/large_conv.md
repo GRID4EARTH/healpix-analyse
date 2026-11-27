@@ -93,9 +93,8 @@ plus its fine-resolution bias and optional normalisation.
 
 ### The problem: the width is a staircase
 
-Every level adds a blur of its own, and so does the compact `HealPixConv`
-(it is not the identity: with a point-like kernel it already blurs by about
-0.74 cell). `down_up_blur(level, n)` measures the narrowest response of a
+Every level adds a blur of its own (with a point-like kernel the compact
+`HealPixConv` is the identity). `down_up_blur(level, n)` measures the narrowest response of a
 `LargeConv` with `n` levels: the response to one cell with a point-like
 compact kernel.
 
@@ -113,11 +112,16 @@ size divided by the authalic radius.
 
 | Levels | `down_up_blur`, level 10 (cells) | (rad) |
 |---:|---:|---:|
-| 0 | 0.74 | 0.00074 |
-| 1 | 2.01 | 0.00201 |
-| 2 | 4.20 | 0.00420 |
-| 3 | 8.33 | 0.00833 |
-| 4 | 16.5 | 0.0165 |
+| 0 | 0 | 0 |
+| 1 | 1.71 | 0.00171 |
+| 2 | 3.93 | 0.00392 |
+| 3 | 8.07 | 0.00807 |
+| 4 | 16.2 | 0.0162 |
+
+The other figures of this page and of the developer notes (steps, accuracy,
+domain edge, 55 degrees latitude) were measured with `ellipsoid="WGS84"`
+before the stencil was centred on its cell (see the changelog) and have not
+been measured again yet.
 
 With the automatic level rule the number of levels follows from `kernel_sz`
 and the width of a fitted Gaussian sits on these values. Measured at

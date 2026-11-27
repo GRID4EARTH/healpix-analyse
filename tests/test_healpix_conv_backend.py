@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 
+from healpix_analyse._ellipsoid import authalic_scale
 from healpix_analyse import _conv_backend as cb
 from healpix_analyse.convol import (
     HealPixConv,
@@ -26,6 +27,7 @@ from healpix_analyse.convol import (
     _geometry_cache_key,
     _get_interp_weights,
     _local_kernel_grid,
+    _stretch_to_ellipsoid,
 )
 
 HAS_CUDA = torch.cuda.is_available()
@@ -44,8 +46,9 @@ def reference_geometry(conv, cell_ids, dtype, device, return_support=False):
     level, G, P, K = conv.level, conv.G, conv.P, conv.K
     ids_np = (np.arange(12 * 4**level, dtype=np.int64) if cell_ids is None
               else np.asarray(cell_ids, dtype=np.int64).ravel())
+    # centres on the authalic sphere (the grid), metric of the ellipsoid
     lon, lat = healpix_geo.nested.healpix_to_lonlat(
-        ids_np.tolist(), level, ellipsoid=conv.ellipsoid
+        ids_np.tolist(), level, ellipsoid="sphere"
     )
     th = np.deg2rad(90.0 - np.asarray(lat, dtype=np.float64))
     ph = np.deg2rad(np.asarray(lon, dtype=np.float64))
@@ -54,6 +57,12 @@ def reference_geometry(conv, cell_ids, dtype, device, return_support=False):
     vec_t = torch.as_tensor(_local_kernel_grid(conv.kernel_sz, conv.nside),
                             device=device, dtype=dtype)
     flat = torch.einsum("kgij,pj->kgpi", R_tot, vec_t).reshape(-1, 3)
+    if conv.ellipsoid != "sphere" and conv.kernel_sz > 1:
+        _, lat_g = healpix_geo.nested.healpix_to_lonlat(
+            ids_np.tolist(), level, ellipsoid=conv.ellipsoid
+        )
+        flat = _stretch_to_ellipsoid(flat, th, ph,
+                                     authalic_scale(lat_g, conv.ellipsoid), G, P)
     idx_flat, w_flat = _get_interp_weights(conv.nside, flat, True, device, dtype)
     idx_all = idx_flat.view(4, K, G, P).permute(2, 0, 1, 3).reshape(G, 4, K * P)
     w_all = w_flat.view(4, K, G, P).permute(2, 0, 1, 3).reshape(G, 4, K * P)

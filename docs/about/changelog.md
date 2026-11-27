@@ -32,6 +32,12 @@
   the authalic sphere now, to match the stencil. The disk-cache format is
   bumped (5), so geometry cached by earlier versions is rebuilt once.
 
+  With it, `down_up_blur` at zero levels is 0 (a point-like compact kernel
+  is now the identity; it was 0.74 cell) and 1.71 to 16.2 cells at 1 to 4
+  levels (level 10; it was 2.01 to 16.5), and a constant now stays 1 at the
+  edge of a regional domain in `LargeConv`. The other `LargeConv` accuracy
+  figures in the documentation predate the fix.
+
 ### Changed
 - Stencil binding (`HealPixConv`, its strided and transposed forms,
   `missing="local_mean"`, `HealPixNeighbourhoodAttention`, and the gauge mode

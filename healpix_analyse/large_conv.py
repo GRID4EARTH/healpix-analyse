@@ -721,8 +721,8 @@ def down_up_blur(
     The compact kernel is point-like (``kernel_sz=1``, weight 1) and the
     response to a single cell is measured.  It therefore contains the
     ``n_levels`` Down/Up pairs **and** the compact ``HealPixConv`` itself,
-    which is not the identity: at ``n_levels=0`` it already blurs by about
-    0.74 cell.  The result is in **radians**, as the one-axis RMS width
+    which is the identity for a point-like kernel: at ``n_levels=0`` the
+    width is 0.  The result is in **radians**, as the one-axis RMS width
     ``sqrt(sum(w d**2) / (2 sum(w)))`` of the response ``w`` with ``d`` the
     angular distance to the impulse cell (not a FWHM; FWHM is 2.355 times
     larger for a Gaussian).  To read it in cells divide by the nominal cell
