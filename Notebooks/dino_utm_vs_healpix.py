@@ -345,7 +345,8 @@ def main():
         # ---- HEALPix conversion of the crop (PSF resampler, WGS84)
         if a.resampler != "bilinear" and len(bands) > 1:
             raise SystemExit("multi-resolution bands: use --resampler bilinear")
-        vals = torch.as_tensor(arr.reshape(C, -1)[:, ok], dtype=torch.float32, device=dev)
+        vals = (torch.as_tensor(arr.reshape(arr.shape[0], -1)[:, ok], dtype=torch.float32,
+                                device=dev) if a.resampler != "bilinear" else None)
         if a.resampler == "bilinear":
             # every level-20 cell of the crop: the children of the level-(L-2) cells
             # holding a pixel, sampled bilinearly at their centres
