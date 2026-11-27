@@ -60,8 +60,12 @@ def worldcover_labels(lon, lat, half_m=150.0, n=9):
     vals = np.zeros(pts_lon.shape, dtype=np.int64)
     for t in np.unique(tiles):
         m = tiles == t
-        with rasterio.open(WC_URL.format(tile=t)) as src:
-            vals[m] = np.array([v[0] for v in src.sample(zip(pts_lon[m], pts_lat[m]))])
+        try:
+            with rasterio.open(WC_URL.format(tile=t)) as src:
+                vals[m] = np.array([v[0] for v in src.sample(zip(pts_lon[m], pts_lat[m]))])
+        except Exception as e:                                  # noqa: BLE001
+            print(f"WorldCover tile {t} not readable ({e}); its samples left unlabelled")
+            vals[m] = 0
     for i in range(len(lon)):
         labels[i] = Counter(vals[i]).most_common(1)[0][0]
     return labels
@@ -101,7 +105,7 @@ def probe(Xtr, ytr, Xte_list, yte, folds, k=5):
 
 def keep_classes(y, min_n=15):
     c = Counter(y)
-    return np.array([c[v] >= min_n for v in y])
+    return np.array([v > 0 and c[v] >= min_n for v in y])
 
 
 def main():
